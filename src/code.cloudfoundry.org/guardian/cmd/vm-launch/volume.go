@@ -80,7 +80,9 @@ type vcapServices map[string][]struct {
 // or process_type in VCAP_APPLICATION, a bad CF_INSTANCE_INDEX, and a task
 // are errors, so a misconfigured app fails to start instead of losing data to
 // the wrong volume. Errors never repeat VCAP_SERVICES, which carries
-// credentials.
+// credentials. lookup reads the environment the rest of vm-launch shares
+// (see lastWinsEnv), so the volume always comes from the VCAP_SERVICES value
+// the guest gets.
 func volumeFromEnv(lookup func(string) (string, bool)) (*guestVolume, error) {
 	raw, ok := lookup(vcapServicesEnv)
 	if !ok {

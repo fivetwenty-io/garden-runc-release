@@ -31,28 +31,6 @@ func envMap(vars map[string]string) func(string) (string, bool) {
 	}
 }
 
-// sourceAndDumpEnv sources file in a POSIX shell (argv of the shell
-// command) with an otherwise empty environment and returns the resulting
-// environment, less the variables the shell sets itself.
-func sourceAndDumpEnv(shell []string, file string) map[string]string {
-	cmd := exec.Command(shell[0], append(shell[1:], "-c", `. "$1"; exec /usr/bin/env -0`, "sh", file)...)
-	cmd.Env = []string{}
-	out, err := cmd.Output()
-	Expect(err).NotTo(HaveOccurred())
-	env := map[string]string{}
-	for _, kv := range strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00") {
-		name, value, ok := strings.Cut(kv, "=")
-		Expect(ok).To(BeTrue(), kv)
-		env[name] = value
-	}
-	// The file never exports PATH (a spec checks), but busybox sh sets a
-	// default one.
-	for _, own := range []string{"PWD", "SHLVL", "_", "PATH"} {
-		delete(env, own)
-	}
-	return env
-}
-
 // fixedMTU is an MTU lookup that reports mtu for every interface.
 func fixedMTU(mtu int) func(string) (int, error) {
 	return func(string) (int, error) { return mtu, nil }
@@ -128,7 +106,6 @@ var _ = Describe("guest network", func() {
 				address:    "10.0.2.15/24",
 				gateway:    "10.0.2.2",
 				resolvConf: "search service.cf.internal apps.internal\nnameserver 10.0.2.3\n",
-				env:        "export CF_INSTANCE_GUID='g'\n",
 			}))
 			Expect(logBuf.String()).To(BeEmpty())
 		})
@@ -140,7 +117,6 @@ var _ = Describe("guest network", func() {
 				address:    "169.254.100.2/30",
 				gateway:    "169.254.100.1",
 				resolvConf: "search service.cf.internal apps.internal\nnameserver 169.254.0.2\n",
-				env:        "export CF_INSTANCE_GUID='g'\n",
 				mtu:        1450,
 			}))
 			Expect(logBuf.String()).To(BeEmpty())
@@ -159,7 +135,6 @@ var _ = Describe("guest network", func() {
 				address:    "10.0.2.15/24",
 				gateway:    "10.0.2.2",
 				resolvConf: "search service.cf.internal apps.internal\nnameserver 10.0.2.3\n",
-				env:        "export PORT='8080'\n",
 			}))
 			Expect(logBuf.String()).To(BeEmpty())
 		})
@@ -273,46 +248,7 @@ var _ = Describe("guest network", func() {
 		})
 	})
 
-	Describe("guest environment file", func() {
-		hostile := map[string]string{
-			"PORT":              "8080",
-			"CF_INSTANCE_GUID":  `it's a "guid"`,
-			"CF_INSTANCE_ADDR":  "$HOME `id` $(id) \\n \\",
-			"CF_INSTANCE_PORTS": `[{"external":61000,"internal":8080}]`,
-			"INSTANCE_INDEX":    "line one\nline two\n",
-			"CF_INSTANCE_IP":    "",
-			"INSTANCE_GUID":     "'''",
-			"VCAP_SERVICES":     `{"db":[{"credentials":{"password":"secret"}}]}`,
-			"VCAP_APPLICATION":  `{"name":"app"}`,
-			"CF_INSTANCE_CERT":  "/etc/cf-instance-credentials/instance.crt",
-			"PATH":              "/usr/bin",
-		}
-		allowed := map[string]string{}
-		for _, name := range guestEnvVars {
-			if v, ok := hostile[name]; ok {
-				allowed[name] = v
-			}
-		}
-
-		It("exports only the allowed variables", func() {
-			file := guestEnvFile(envMap(hostile))
-			for _, name := range []string{"VCAP_SERVICES", "VCAP_APPLICATION", "CF_INSTANCE_CERT", "PATH", "CF_INSTANCE_INTERNAL_IP", "secret"} {
-				Expect(file).NotTo(ContainSubstring(name))
-			}
-			Expect(strings.HasPrefix(file, "export PORT='8080'\n")).To(BeTrue())
-		})
-
-		It("keeps every value byte for byte when a shell sources it", func() {
-			path := writeTempFile("env", guestEnvFile(envMap(hostile)))
-			shells := [][]string{{"/bin/sh"}}
-			if bb, err := exec.LookPath("busybox"); err == nil {
-				shells = append(shells, []string{bb, "sh"})
-			}
-			for _, shell := range shells {
-				Expect(sourceAndDumpEnv(shell, path)).To(Equal(allowed), strings.Join(shell, " "))
-			}
-		})
-
+	Describe("guest network files", func() {
 		It("writes /rvm/net as shell assignments", func() {
 			nw := &network{address: fcGuestCIDR, gateway: fcHostIP, mtu: 1450}
 			path := writeTempFile("net", netFile(nw))
@@ -332,15 +268,15 @@ var _ = Describe("guest network", func() {
 			address:    qemuGuestCIDR,
 			gateway:    qemuGateway,
 			resolvConf: "nameserver 10.0.2.3\n",
-			env:        "export PORT='8080'\n",
 		}
 
 		It("adds the network and environment files", func() {
-			names, byName := archiveEntries(buildInitramfs([]byte("busybox"), "httpd -f -p $PORT", nw, nil))
+			names, byName := archiveEntries(buildInitramfsWithEnv([]byte("busybox"), "httpd -f -p $PORT", nw, "export PORT='8080'\n", nil))
 			Expect(names).To(Equal([]string{"bin", "dev", "dev/console", "dev/null", "etc", "proc", "sys", "tmp", "rvm",
 				"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "etc/resolv.conf", "init", cpioTrailer}))
 			Expect(string(byName["rvm/net"].data)).To(Equal("RVM_ADDRESS='10.0.2.15/24'\nRVM_GATEWAY='10.0.2.2'\n"))
 			Expect(string(byName["rvm/env"].data)).To(Equal("export PORT='8080'\n"))
+			Expect(byName["rvm/env"].mode).To(Equal(uint32(0o100600)))
 			Expect(string(byName["etc/resolv.conf"].data)).To(Equal("nameserver 10.0.2.3\n"))
 			Expect(byName["etc/resolv.conf"].mode).To(Equal(uint32(0o100644)))
 			Expect(string(byName["init"].data)).To(Equal(initScript(testNonce, false)))
@@ -357,13 +293,13 @@ var _ = Describe("guest network", func() {
 				"ip link set eth0 up",
 				`ip addr add "$RVM_ADDRESS" dev eth0`,
 				`ip route add default via "$RVM_GATEWAY" dev eth0`,
-				". /rvm/env\n",
+				"( . /rvm/env ) || rvm_fail \"reading /rvm/env failed\"\n",
 			} {
 				idx := strings.Index(script, step)
 				Expect(idx).To(BeNumerically(">", 0), step)
 				Expect(idx).To(BeNumerically("<", start), step)
 			}
-			Expect(script).To(HaveSuffix("\nsh /rvm/cmd </dev/null\necho RVM_EXIT_" + testNonce + "=$?\nreboot -f\n"))
+			Expect(script).To(HaveSuffix("\n( . /rvm/env && exec sh /rvm/cmd ) </dev/null\necho RVM_EXIT_" + testNonce + "=$?\nreboot -f\n"))
 		})
 
 		It("sets the mtu of eth0 only when /rvm/net names one, and before it brings eth0 up", func() {
@@ -382,11 +318,9 @@ var _ = Describe("guest network", func() {
 			fakeIP := "#!/bin/sh\necho \"$*\" >> " + shellQuote(ipLog) + "\ncase \"$*\" in *mtu*) exit 2 ;; esac\n"
 			Expect(os.WriteFile(filepath.Join(dir, "ip"), []byte(fakeIP), 0o755)).To(Succeed())
 			Expect(os.WriteFile(filepath.Join(dir, "net"), []byte("RVM_ADDRESS='10.0.2.15/24'\nRVM_GATEWAY='10.0.2.2'\nRVM_MTU='9001'\n"), 0o644)).To(Succeed())
-			Expect(os.WriteFile(filepath.Join(dir, "env"), []byte(""), 0o644)).To(Succeed())
 			Expect(os.MkdirAll(filepath.Join(dir, "sys/class/net/eth0"), 0o755)).To(Succeed())
 			setup := strings.NewReplacer(
 				"/rvm/net", filepath.Join(dir, "net"),
-				"/rvm/env", filepath.Join(dir, "env"),
 				"/sys/class/net/eth0", filepath.Join(dir, "sys/class/net/eth0"),
 				"reboot -f", "echo REBOOT",
 			).Replace(guestFailFunc + guestNetworkSetup)
@@ -412,7 +346,7 @@ var _ = Describe("guest network", func() {
 			Expect(byName["init"].data).To(Equal(lrp["init"].data))
 			Expect(byName["rvm/net"].data).To(Equal(lrp["rvm/net"].data))
 			Expect(byName["etc/resolv.conf"].data).To(Equal(lrp["etc/resolv.conf"].data))
-			Expect(byName["rvm/env"].data).To(BeEmpty())
+			Expect(byName["rvm/env"].data).To(Equal(lrp["rvm/env"].data))
 		})
 
 		It("defines rvm_fail before any step uses it", func() {

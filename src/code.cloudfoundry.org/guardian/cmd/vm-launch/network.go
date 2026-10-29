@@ -56,27 +56,6 @@ const containerResolvConf = "/etc/resolv.conf"
 // maxNameservers is the number of nameservers a resolver reads (MAXNS).
 const maxNameservers = 3
 
-// guestEnvVars are the container environment variables passed to the guest
-// command, in this order. PORT is what the app must listen on; the
-// CF_INSTANCE_* and INSTANCE_* values describe the instance and mean the same
-// inside the guest. Everything else stays out: VCAP_SERVICES and
-// VCAP_APPLICATION carry credentials and app metadata, CF_INSTANCE_CERT and
-// CF_INSTANCE_KEY name files the guest does not have, PATH, HOME, TMPDIR,
-// and USER name container paths and users, and MEMORY_LIMIT is the
-// container's limit, not the guest's.
-var guestEnvVars = []string{
-	"PORT",
-	"CF_INSTANCE_ADDR",
-	"CF_INSTANCE_GUID",
-	"CF_INSTANCE_INDEX",
-	"CF_INSTANCE_INTERNAL_IP",
-	"CF_INSTANCE_IP",
-	"CF_INSTANCE_PORT",
-	"CF_INSTANCE_PORTS",
-	"INSTANCE_GUID",
-	"INSTANCE_INDEX",
-}
-
 // network is the guest network. Every guest has one. A process that serves
 // on PORT, an LRP, also gets connections to PORT forwarded to the guest. A
 // process started without PORT, such as a task, has port 0: its guest
@@ -91,8 +70,6 @@ type network struct {
 	gateway string
 	// resolvConf is the guest /etc/resolv.conf.
 	resolvConf string
-	// env is the guest /rvm/env: shell export lines for guestEnvVars.
-	env string
 	// mtu is the guest eth0 MTU, or 0 to leave the driver's default. Only the
 	// Firecracker guest sets it: QEMU's user-mode network ends every guest TCP
 	// connection in QEMU itself, which opens its own sockets from the
@@ -112,9 +89,12 @@ func (n *network) listenAddr() string {
 	return net.JoinHostPort("0.0.0.0", strconv.Itoa(n.port))
 }
 
-// networkFor returns the guest network for kind. Without PORT in the
-// environment, as for a task, the network has port 0 and is otherwise the
-// same. A PORT that is set but not a TCP port number is an error.
+// networkFor returns the guest network for kind. lookupEnv reads the
+// environment that every part of vm-launch shares (see lastWinsEnv). Without
+// PORT, as for a task, the network has port 0 and is otherwise the same. A
+// PORT that is set but not a TCP port number is an error. The network holds
+// only the NIC, routes, MTU, and resolver; the guest environment is built
+// separately (see buildGuestEnv).
 // The container resolver configuration supplies the guest's search domains
 // and, for Firecracker, its nameservers (QEMU's DNS proxy resolves through
 // the container's configuration itself). When it cannot be read, the guest
@@ -123,7 +103,7 @@ func (n *network) listenAddr() string {
 // Firecracker guest: without it the guest keeps the default MTU.
 func networkFor(kind backend.Kind, lookupEnv func(string) (string, bool), resolvConfPath string, lookupMTU func(name string) (int, error), logger *log.Logger) (*network, error) {
 	port := 0
-	if portValue, ok := lookupEnv("PORT"); ok {
+	if portValue, ok := lookupEnv(portEnv); ok {
 		p, err := parsePort(portValue)
 		if err != nil {
 			return nil, err
@@ -140,7 +120,7 @@ func networkFor(kind backend.Kind, lookupEnv func(string) (string, bool), resolv
 	}
 	conf := parseResolvConf(data)
 
-	n := &network{port: port, env: guestEnvFile(lookupEnv)}
+	n := &network{port: port}
 	switch kind {
 	case backend.VMQemu:
 		n.address, n.gateway = qemuGuestCIDR, qemuGateway
@@ -250,18 +230,6 @@ func formatResolvConf(nameservers, search []string) string {
 	return b.String()
 }
 
-// guestEnvFile returns export lines, for the guest shell to source, for each
-// of guestEnvVars that is set.
-func guestEnvFile(lookupEnv func(string) (string, bool)) string {
-	var b strings.Builder
-	for _, name := range guestEnvVars {
-		if v, ok := lookupEnv(name); ok {
-			b.WriteString("export " + name + "=" + shellQuote(v) + "\n")
-		}
-	}
-	return b.String()
-}
-
 // netFile returns the guest /rvm/net, which /init sources before it
 // configures eth0.
 func netFile(n *network) string {
@@ -271,11 +239,4 @@ func netFile(n *network) string {
 		s += "RVM_MTU=" + shellQuote(strconv.Itoa(n.mtu)) + "\n"
 	}
 	return s
-}
-
-// shellQuote quotes s as one POSIX sh word. Inside single quotes every byte
-// but the single quote is literal, so newlines, $, backslashes, and double
-// quotes need nothing more.
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

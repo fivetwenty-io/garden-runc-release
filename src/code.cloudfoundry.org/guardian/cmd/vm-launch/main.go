@@ -17,12 +17,11 @@
 // Every guest gets a NIC, a default route, and DNS, and its traffic leaves
 // from the container's network namespace with the container's address, so
 // network policies and application security groups apply as they do to the
-// container. The guest command sees the instance's PORT, CF_INSTANCE_*, and
-// INSTANCE_* variables that are set. With PORT, as for an LRP, connections
-// to PORT on the container also reach PORT in the guest. QEMU forwards them
-// itself (user-mode networking); for Firecracker, vm-launch listens on PORT
-// and proxies each connection to the guest over Garden's tap device. The
-// listener is up before the guest boots, and connections that arrive early
+// container. With PORT, as for an LRP, connections to PORT on the container
+// also reach PORT in the guest. QEMU forwards them itself (user-mode
+// networking); for Firecracker, vm-launch listens on PORT and proxies each
+// connection to the guest over Garden's tap device. The listener is up
+// before the guest boots, and connections that arrive early
 // wait for the guest app to listen. At the first SIGTERM or SIGINT the
 // listener closes; open connections close when the guest stops. Without
 // PORT, as for a task, nothing outside can connect to the guest, as for a
@@ -54,8 +53,33 @@
 // locked file, and passes the image to the hypervisor as file descriptor 3.
 // The guest formats the image as ext2 when its first 64 KiB are all zero and
 // mounts it synchronously; a non-blank image that does not mount is never
-// formatted. A VM app supports one read-write volume mount, and
-// VCAP_SERVICES itself never reaches the guest.
+// formatted. A VM app supports one read-write volume mount.
+//
+// Environment: the guest command sees the container's environment after the
+// changes the CF launcher would have made to it. vm-launch reads its
+// environment once, and when a name appears twice, the last value wins, as
+// under runc. VCAP_APPLICATION gets the launcher's host, instance_id, port,
+// and instance_index, and its limits.mem becomes the guest size. DATABASE_URL
+// is derived from the first MySQL or PostgreSQL uri in VCAP_SERVICES, as the
+// launcher derives it. MEMORY_LIMIT, when it is set, becomes the guest size.
+// The guest never gets PATH, HOME, TMPDIR, USER, PWD, OLDPWD, DEPS_DIR,
+// CF_INSTANCE_CERT, CF_INSTANCE_KEY, CF_SYSTEM_CERT_PATH,
+// SERVICE_BINDING_ROOT, VCAP_SERVICES_FILE_PATH, VCAP_PLATFORM_OPTIONS, or a
+// name that starts with __GARDEN_. It also never gets the variables that its
+// busybox sh sets for itself, because the shell would replace a value from
+// the container before the command saw it: IFS, OPTIND, PPID, and SHLVL.
+// vm-launch names those that are set in one line. The guest's busybox sh
+// drops names that are not shell identifiers, such as
+// spring.profiles.active, from the environment it starts with, so vm-launch
+// leaves them out with one line that names the first 20 and counts any
+// others. Every other variable is exported from /rvm/env, which has mode
+// 0600 and exists only in the initramfs. One NAME=value entry may have at most
+// 131071 bytes, and /rvm/env at most 1 MiB; vm-launch fails rather than
+// truncate a value. Unlike the launcher, vm-launch does not run
+// buildpack profile.d scripts or .profile, starts the command in /, and runs
+// it with busybox sh rather than bash. No line about the guest environment
+// holds a value from it. Other lines name values the platform sets, such as
+// PORT, MEMORY_LIMIT, the volume path, and the CredHub host.
 //
 // Memory: the guest gets MEMORY_LIMIT less 192 MiB, which the container
 // keeps for the hypervisor and everything else it runs, with a floor of 128
@@ -64,10 +88,11 @@
 // and the reserve need, the guest gets 128 MiB and vm-launch logs a line
 // that says so.
 //
-// The initramfs that holds the guest's /init, busybox, and command is built
-// in a sealed memfd and never written to disk. The hypervisor gets it as the
-// file descriptor after the volume image's, 3 without a volume and 4 with
-// one, and vm-launch closes its own copy once the hypervisor has started.
+// The initramfs that holds the guest's /init, busybox, command, and
+// environment is built in a sealed memfd and never written to disk. The
+// hypervisor gets it as the file descriptor after the volume image's, 3
+// without a volume and 4 with one, and vm-launch closes its own copy once
+// the hypervisor has started.
 //
 // Core dumps: vm-launch sets its RLIMIT_CORE to zero, soft and hard, and its
 // coredump_filter to zero before it does anything else, and the hypervisor
@@ -96,7 +121,10 @@
 //	       one volume mount, a read-only mount, a bad volume path,
 //	       CF_INSTANCE_INDEX, application_id, or process_type, a task with
 //	       a volume, an image that fails a check or cannot be created, or
-//	       an image another instance still holds after 30 seconds
+//	       an image another instance still holds after 30 seconds, or a
+//	       guest environment that is too large, with one entry over
+//	       131071 bytes or more than 1 MiB in all, or a value that holds a
+//	       NUL byte
 //	128+N  vm-launch received signal N (SIGTERM or SIGINT), or the hypervisor
 //	       died from signal N, before the guest reported a status; this
 //	       includes a signal while vm-launch waits for the volume image
@@ -226,17 +254,28 @@ func run(argv []string, logger *log.Logger) int {
 		logger.Print(err)
 		return exitLaunchError
 	}
-	nw, err := networkFor(cfg.backend, os.LookupEnv, containerResolvConf, interfaceMTU, logger)
+	// Every reader sees the same environment, so the volume and the guest
+	// can never disagree about VCAP_SERVICES. All of this happens before the
+	// work directory and the volume lock, so a bad environment exits before
+	// any image is opened or created.
+	env := lastWinsEnv(os.Environ(), logger)
+	lookupEnv := lookupIn(env)
+	nw, err := networkFor(cfg.backend, lookupEnv, containerResolvConf, interfaceMTU, logger)
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError
 	}
-	vol, err := volumeFromEnv(os.LookupEnv)
+	vol, err := volumeFromEnv(lookupEnv)
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError
 	}
-	memMiB := guestMemory(os.LookupEnv, logger)
+	memMiB := guestMemory(lookupEnv, logger)
+	envFile, err := buildGuestEnv(env, memMiB, logger)
+	if err != nil {
+		logger.Print(err)
+		return exitLaunchError
+	}
 
 	workDir, err := os.MkdirTemp("", "vm-launch-")
 	if err != nil {
@@ -266,7 +305,7 @@ func run(argv []string, logger *log.Logger) int {
 		defer img.Close()
 	}
 
-	initrd, err := newInitramfs(filepath.Join(cfg.artifacts, artBusybox), cfg.command, nonce, nw, vol)
+	initrd, err := newInitramfs(filepath.Join(cfg.artifacts, artBusybox), cfg.command, nonce, nw, envFile, vol)
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError

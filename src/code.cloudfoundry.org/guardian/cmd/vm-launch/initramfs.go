@@ -112,21 +112,27 @@ func exitTag(nonce string) string  { return "RVM_EXIT_" + nonce + "=" }
 // that ends the hypervisor. poweroff -f hangs Firecracker, so it is not used.
 //
 // Right after the mounts, /init defines rvm_fail, which every setup step
-// uses. It then brings up lo and eth0 from /rvm/net and exports /rvm/env,
-// for every guest, a task's included. A guest with a volume then formats the
-// volume image when it is blank and mounts it, and after the command it
-// syncs and unmounts it before it reports the status. When a setup step
-// fails, /init reboots before the start tag, so vm-launch reports a guest
-// that never started its command and shows the console output, which ends
-// with the failed step.
+// uses. It then brings up lo and eth0 from /rvm/net, for every guest, a
+// task's included, and checks that /rvm/env sources. A guest with a volume
+// then formats the volume image when it is blank and mounts it. When a setup
+// step fails, /init reboots before the start tag, so vm-launch reports a
+// guest that never started its command and shows the console output, which
+// ends with the failed step.
+//
+// The command runs in a subshell that sources /rvm/env and then becomes the
+// shell that runs /rvm/cmd, so its status is the command's. The guest
+// environment applies only inside that subshell, never to /init's own steps,
+// such as the unquoted status in the exit line or the volume teardown. With
+// a volume, /init syncs and unmounts it after the command and before it
+// reports the status.
 func initScript(nonce string, volume bool) string {
-	setup := guestFailFunc + guestNetworkSetup
+	setup := guestFailFunc + guestNetworkSetup + guestEnvChecks
 	if volume {
 		setup += guestVolumeSetup
 	}
-	run := "sh /rvm/cmd </dev/null\necho " + exitTag(nonce) + "$?\n"
+	run := guestRunCommand + "echo " + exitTag(nonce) + "$?\n"
 	if volume {
-		run = "sh /rvm/cmd </dev/null\n" + guestVolumeTeardown + "echo " + exitTag(nonce) + "$rvm_status\n"
+		run = guestRunCommand + guestVolumeTeardown + "echo " + exitTag(nonce) + "$rvm_status\n"
 	}
 	return `#!/bin/busybox sh
 /bin/busybox --install -s /bin
@@ -160,8 +166,17 @@ fi
 ip link set eth0 up || rvm_fail "bringing up eth0 failed"
 ip addr add "$RVM_ADDRESS" dev eth0 || rvm_fail "adding $RVM_ADDRESS to eth0 failed"
 ip route add default via "$RVM_GATEWAY" dev eth0 || rvm_fail "adding the default route via $RVM_GATEWAY failed"
-. /rvm/env
 `
+
+// guestEnvChecks makes a broken /rvm/env a failed setup step, with the
+// console shown, instead of a command that fails to start. It sources
+// /rvm/env in a subshell, so /init itself never gets the guest environment.
+const guestEnvChecks = `( . /rvm/env ) || rvm_fail "reading /rvm/env failed"
+`
+
+// guestRunCommand runs the guest command with the guest environment, in a
+// subshell that becomes the shell running the command.
+const guestRunCommand = "( . /rvm/env && exec sh /rvm/cmd ) </dev/null\n"
 
 // guestVolumeDevice is the guest block device of the volume image. The guest
 // boots from the initramfs and has no other drive, so the image is the first
@@ -261,13 +276,13 @@ func createInitramfsMemfd() (int, error) {
 // for it. The descriptor is close-on-exec: vm-launch passes it to the
 // hypervisor as an extra file, which the hypervisor opens through
 // /proc/self/fd, and closes its own copy once the hypervisor has started.
-func newInitramfs(busyboxPath, command, nonce string, nw *network, vol *guestVolume) (*os.File, error) {
+func newInitramfs(busyboxPath, command, nonce string, nw *network, guestEnv string, vol *guestVolume) (*os.File, error) {
 	fd, err := createInitramfsMemfd()
 	if err != nil {
 		return nil, fmt.Errorf("creating the initramfs memfd: %w", err)
 	}
 	f := os.NewFile(uintptr(fd), "memfd:"+initramfsName)
-	if err := writeInitramfs(f, busyboxPath, command, nonce, nw, vol); err != nil {
+	if err := writeInitramfs(f, busyboxPath, command, nonce, nw, guestEnv, vol); err != nil {
 		f.Close()
 		return nil, err
 	}
@@ -295,10 +310,11 @@ func addSeals(f *os.File, seals int) error {
 
 // writeInitramfs writes a gzip-compressed newc initramfs to dst holding a
 // static busybox, the console and null device nodes, the command script at
-// /rvm/cmd, the guest network's /rvm/net, /rvm/env, and /etc/resolv.conf,
-// and the /init that runs it. With a volume it also holds /rvm/mounts. nw
-// is the guest network, which run always builds.
-func writeInitramfs(dst *os.File, busyboxPath, command, nonce string, nw *network, vol *guestVolume) error {
+// /rvm/cmd, the guest network's /rvm/net and /etc/resolv.conf, the guest
+// environment guestEnv as /rvm/env with mode 0600, and the /init that runs
+// it. With a volume it also holds /rvm/mounts. nw is the guest network,
+// which run always builds.
+func writeInitramfs(dst *os.File, busyboxPath, command, nonce string, nw *network, guestEnv string, vol *guestVolume) error {
 	busybox, err := os.Open(busyboxPath)
 	if err != nil {
 		return fmt.Errorf("opening busybox: %w", err)
@@ -312,18 +328,18 @@ func writeInitramfs(dst *os.File, busyboxPath, command, nonce string, nw *networ
 		return fmt.Errorf("busybox %s is not a regular file", busyboxPath)
 	}
 
-	if err := writeInitramfsArchive(dst, busybox, info.Size(), command, nonce, nw, vol); err != nil {
+	if err := writeInitramfsArchive(dst, busybox, info.Size(), command, nonce, nw, guestEnv, vol); err != nil {
 		return fmt.Errorf("writing the initramfs: %w", err)
 	}
 	return nil
 }
 
-func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, command, nonce string, nw *network, vol *guestVolume) error {
+func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, command, nonce string, nw *network, guestEnv string, vol *guestVolume) error {
 	buf := bufio.NewWriter(w)
 	gz := gzip.NewWriter(buf)
 	cw := newCPIOWriter(gz)
-	file := func(name, content string) func() error {
-		return func() error { return cw.File(name, 0o644, int64(len(content)), strings.NewReader(content)) }
+	file := func(name string, perm uint32, content string) func() error {
+		return func() error { return cw.File(name, perm, int64(len(content)), strings.NewReader(content)) }
 	}
 
 	init := initScript(nonce, vol != nil)
@@ -338,13 +354,13 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, co
 		func() error { return cw.Dir("tmp", 0o1777) },
 		func() error { return cw.Dir("rvm", 0o755) },
 		func() error { return cw.File("bin/busybox", 0o755, busyboxSize, busybox) },
-		file("rvm/cmd", command),
-		file("rvm/net", netFile(nw)),
-		file("rvm/env", nw.env),
-		file("etc/resolv.conf", nw.resolvConf),
+		file("rvm/cmd", 0o644, command),
+		file("rvm/net", 0o644, netFile(nw)),
+		file("rvm/env", 0o600, guestEnv),
+		file("etc/resolv.conf", 0o644, nw.resolvConf),
 	}
 	if vol != nil {
-		steps = append(steps, file("rvm/mounts", mountsFile(vol)))
+		steps = append(steps, file("rvm/mounts", 0o644, mountsFile(vol)))
 	}
 	steps = append(steps,
 		func() error { return cw.File("init", 0o755, int64(len(init)), strings.NewReader(init)) },

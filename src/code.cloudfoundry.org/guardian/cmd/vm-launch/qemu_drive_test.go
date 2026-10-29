@@ -248,10 +248,11 @@ var _ = Describe("the initramfs memfd against a real QEMU", func() {
 		return code, stderr
 	}
 
-	// memfdInitramfs builds an initramfs for command, with the busybox at
-	// busyboxPath, in the sealed memfd vm-launch passes to the hypervisor.
-	memfdInitramfs := func(busyboxPath, command string) *os.File {
-		f, err := newInitramfs(busyboxPath, command, testNonce, taskNetwork(), nil)
+	// memfdInitramfs builds an initramfs for command and the guest
+	// environment guestEnv, with the busybox at busyboxPath, in the sealed
+	// memfd vm-launch passes to the hypervisor.
+	memfdInitramfs := func(busyboxPath, command, guestEnv string) *os.File {
+		f, err := newInitramfs(busyboxPath, command, testNonce, taskNetwork(), guestEnv, nil)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(f.Close)
 		return f
@@ -267,7 +268,7 @@ var _ = Describe("the initramfs memfd against a real QEMU", func() {
 		art := realArtifacts()
 		qemu := realQEMU()
 		requireMicrovm(qemu)
-		files, _, initrdPath := hypervisorFiles(nil, memfdInitramfs(fakeBusybox(), "true"))
+		files, _, initrdPath := hypervisorFiles(nil, memfdInitramfs(fakeBusybox(), "true", noGuestEnv))
 		Expect(initrdPath).To(Equal(goldenInitrd))
 		code, stderr := stoppedQEMU(qemu, filepath.Join(art, artBzImage), initrdPath, files)
 		Expect(code).To(Equal(0), "QEMU could not load the memfd initramfs: %s", stderr)
@@ -277,18 +278,18 @@ var _ = Describe("the initramfs memfd against a real QEMU", func() {
 		art := realArtifacts()
 		qemu := realQEMU()
 		requireMicrovm(qemu)
-		files, _, _ := hypervisorFiles(nil, memfdInitramfs(fakeBusybox(), "true"))
+		files, _, _ := hypervisorFiles(nil, memfdInitramfs(fakeBusybox(), "true", noGuestEnv))
 		code, stderr := stoppedQEMU(qemu, filepath.Join(art, artBzImage), procSelfFD(9), files)
 		Expect(code).NotTo(Equal(0))
 		Expect(stderr).To(ContainSubstring(procSelfFD(9)))
 	})
 
-	It("boots a guest from the memfd initramfs under TCG and runs the command", func() {
+	It("boots a guest from the memfd initramfs under TCG and runs the command with the guest environment", func() {
 		art := realArtifacts()
 		qemu := realQEMU()
 		requireMicrovm(qemu)
 		bb := guestBusybox()
-		files, _, initrdPath := hypervisorFiles(nil, memfdInitramfs(bb, `echo "hello from the memfd initramfs"; exit 7`))
+		files, _, initrdPath := hypervisorFiles(nil, memfdInitramfs(bb, `echo "hello from the $RVM_SOURCE"; exit 7`, "export RVM_SOURCE='memfd initramfs'\n"))
 		argv := tcgArgv(qemu, qemuArgv(art, initrdPath, 128, taskNetwork(), ""))
 		code, stdout, stderr := runRealQEMU(argv, files, "", 5*time.Minute)
 		Expect(code).To(Equal(0), "QEMU failed: %s\n%s", stderr, stdout)

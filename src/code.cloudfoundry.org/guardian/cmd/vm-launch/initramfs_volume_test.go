@@ -12,12 +12,12 @@ import (
 	. "github.com/onsi/gomega"
 )
 
-// The /init script of a guest without a volume, for testNonce. It is the
-// networked /init of cf68f18, from before volume support, which every guest
-// now gets, a task's included. A guest without a volume must keep getting
-// exactly this.
+// The /init script of a guest without a volume, for testNonce, which every
+// guest gets, a task's included. It brings up the network, checks that the
+// guest environment sources, and runs the command in a subshell with the guest
+// environment. A guest without a volume must keep getting exactly this.
 const (
-	goldenInitNet = "#!/bin/busybox sh\n/bin/busybox --install -s /bin\nexport PATH=/bin\nmount -t proc proc /proc\nmount -t sysfs sys /sys\nmount -t devtmpfs dev /dev 2>/dev/null\nrvm_fail() { echo \"vm-launch guest setup: $1\"; reboot -f; exit 1; }\n. /rvm/net\nip link set lo up || rvm_fail \"bringing up lo failed\"\nn=0\nwhile [ ! -e /sys/class/net/eth0 ]; do\n\tn=$((n + 1))\n\t[ \"$n\" -gt 5 ] && rvm_fail \"no eth0 network device\"\n\tsleep 1\ndone\nif [ -n \"${RVM_MTU:-}\" ]; then\n\tip link set eth0 mtu \"$RVM_MTU\" || echo \"vm-launch guest setup: setting the mtu of eth0 to $RVM_MTU failed; keeping the default mtu\"\nfi\nip link set eth0 up || rvm_fail \"bringing up eth0 failed\"\nip addr add \"$RVM_ADDRESS\" dev eth0 || rvm_fail \"adding $RVM_ADDRESS to eth0 failed\"\nip route add default via \"$RVM_GATEWAY\" dev eth0 || rvm_fail \"adding the default route via $RVM_GATEWAY failed\"\n. /rvm/env\necho RVM_START_0123456789abcdef\nsh /rvm/cmd </dev/null\necho RVM_EXIT_0123456789abcdef=$?\nreboot -f\n"
+	goldenInitNet = "#!/bin/busybox sh\n/bin/busybox --install -s /bin\nexport PATH=/bin\nmount -t proc proc /proc\nmount -t sysfs sys /sys\nmount -t devtmpfs dev /dev 2>/dev/null\nrvm_fail() { echo \"vm-launch guest setup: $1\"; reboot -f; exit 1; }\n. /rvm/net\nip link set lo up || rvm_fail \"bringing up lo failed\"\nn=0\nwhile [ ! -e /sys/class/net/eth0 ]; do\n\tn=$((n + 1))\n\t[ \"$n\" -gt 5 ] && rvm_fail \"no eth0 network device\"\n\tsleep 1\ndone\nif [ -n \"${RVM_MTU:-}\" ]; then\n\tip link set eth0 mtu \"$RVM_MTU\" || echo \"vm-launch guest setup: setting the mtu of eth0 to $RVM_MTU failed; keeping the default mtu\"\nfi\nip link set eth0 up || rvm_fail \"bringing up eth0 failed\"\nip addr add \"$RVM_ADDRESS\" dev eth0 || rvm_fail \"adding $RVM_ADDRESS to eth0 failed\"\nip route add default via \"$RVM_GATEWAY\" dev eth0 || rvm_fail \"adding the default route via $RVM_GATEWAY failed\"\n( . /rvm/env ) || rvm_fail \"reading /rvm/env failed\"\necho RVM_START_0123456789abcdef\n( . /rvm/env && exec sh /rvm/cmd ) </dev/null\necho RVM_EXIT_0123456789abcdef=$?\nreboot -f\n"
 )
 
 // archiveEntries parses a gzip newc archive into its entry names, in order,
@@ -34,7 +34,7 @@ func archiveEntries(raw []byte) ([]string, map[string]cpioEntry) {
 
 var _ = Describe("guest volume initramfs", func() {
 	vol := &guestVolume{ContainerDir: "/data/it's $here", ImageName: "rvm-disk-3.img"}
-	nw := &network{port: 8080, address: qemuGuestCIDR, gateway: qemuGateway, resolvConf: "nameserver 10.0.2.3\n", env: "export PORT='8080'\n"}
+	nw := &network{port: 8080, address: qemuGuestCIDR, gateway: qemuGateway, resolvConf: "nameserver 10.0.2.3\n"}
 	task := taskNetwork()
 
 	writeArchive := func(nw *network, vol *guestVolume) []byte {
@@ -82,8 +82,8 @@ var _ = Describe("guest volume initramfs", func() {
 		setup := strings.Index(script, guestVolumeSetup)
 		Expect(setup).To(BeNumerically(">", 0))
 		Expect(setup + len(guestVolumeSetup)).To(BeNumerically("<=", start+1))
-		Expect(strings.Index(script, ". /rvm/env\n")).To(BeNumerically("<", strings.Index(script, ". /rvm/mounts\n")))
-		Expect(script).To(HaveSuffix("\necho RVM_START_" + testNonce + "\nsh /rvm/cmd </dev/null\n" + guestVolumeTeardown +
+		Expect(strings.Index(script, guestEnvChecks)).To(BeNumerically("<", strings.Index(script, ". /rvm/mounts\n")))
+		Expect(script).To(HaveSuffix("\necho RVM_START_" + testNonce + "\n( . /rvm/env && exec sh /rvm/cmd ) </dev/null\n" + guestVolumeTeardown +
 			"echo RVM_EXIT_" + testNonce + "=$rvm_status\nreboot -f\n"))
 	})
 

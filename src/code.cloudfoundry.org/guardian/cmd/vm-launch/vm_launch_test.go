@@ -100,12 +100,23 @@ func taskNetwork() *network {
 	return &network{address: qemuGuestCIDR, gateway: qemuGateway, resolvConf: "nameserver 10.0.2.3\n"}
 }
 
+// noGuestEnv is the /rvm/env of a container environment that holds nothing
+// the guest gets.
+const noGuestEnv = ""
+
 // buildInitramfs builds an initramfs through newInitramfs, with busybox as
-// the busybox binary, and returns the archive.
+// the busybox binary and an empty guest environment, and returns the
+// archive.
 func buildInitramfs(busybox []byte, command string, nw *network, vol *guestVolume) []byte {
+	return buildInitramfsWithEnv(busybox, command, nw, noGuestEnv, vol)
+}
+
+// buildInitramfsWithEnv is buildInitramfs with the guest environment
+// guestEnv.
+func buildInitramfsWithEnv(busybox []byte, command string, nw *network, guestEnv string, vol *guestVolume) []byte {
 	bb := filepath.Join(GinkgoT().TempDir(), "busybox")
 	Expect(os.WriteFile(bb, busybox, 0o755)).To(Succeed())
-	f, err := newInitramfs(bb, command, testNonce, nw, vol)
+	f, err := newInitramfs(bb, command, testNonce, nw, guestEnv, vol)
 	Expect(err).NotTo(HaveOccurred())
 	defer f.Close()
 	return fileBytes(f)
@@ -212,7 +223,7 @@ var _ = Describe("initramfs", func() {
 		script := initScript(testNonce, false)
 		Expect(script).To(HavePrefix("#!/bin/busybox sh\n"))
 		Expect(script).To(ContainSubstring("\necho RVM_START_" + testNonce + "\n"))
-		Expect(script).To(ContainSubstring("\nsh /rvm/cmd </dev/null\necho RVM_EXIT_" + testNonce + "=$?\nreboot -f\n"))
+		Expect(script).To(ContainSubstring("\n( . /rvm/env && exec sh /rvm/cmd ) </dev/null\necho RVM_EXIT_" + testNonce + "=$?\nreboot -f\n"))
 		Expect(script).NotTo(ContainSubstring("poweroff"))
 	})
 
@@ -258,7 +269,7 @@ var _ = Describe("initramfs", func() {
 			bb := filepath.Join(GinkgoT().TempDir(), "busybox")
 			Expect(os.WriteFile(bb, busybox, 0o755)).To(Succeed())
 			var err error
-			f, err = newInitramfs(bb, "true", testNonce, taskNetwork(), nil)
+			f, err = newInitramfs(bb, "true", testNonce, taskNetwork(), noGuestEnv, nil)
 			Expect(err).NotTo(HaveOccurred())
 			DeferCleanup(func() { _ = f.Close() })
 		})
@@ -348,7 +359,7 @@ var _ = Describe("initramfs", func() {
 
 		It("asks for MFD_NOEXEC_SEAL first", func() {
 			kernel(nil)
-			f, err := newInitramfs(bb, "true", testNonce, taskNetwork(), nil)
+			f, err := newInitramfs(bb, "true", testNonce, taskNetwork(), noGuestEnv, nil)
 			Expect(err).NotTo(HaveOccurred())
 			defer f.Close()
 			Expect(calls).To(Equal([]int{unix.MFD_CLOEXEC | unix.MFD_ALLOW_SEALING | unix.MFD_NOEXEC_SEAL}))
@@ -356,7 +367,7 @@ var _ = Describe("initramfs", func() {
 
 		It("falls back to the plain flags on a kernel that rejects MFD_NOEXEC_SEAL", func() {
 			kernel(unix.EINVAL)
-			f, err := newInitramfs(bb, "true", testNonce, taskNetwork(), nil)
+			f, err := newInitramfs(bb, "true", testNonce, taskNetwork(), noGuestEnv, nil)
 			Expect(err).NotTo(HaveOccurred())
 			defer f.Close()
 			Expect(calls).To(Equal([]int{
@@ -372,7 +383,7 @@ var _ = Describe("initramfs", func() {
 		It("returns any other error without trying again, and holds no memfd", func() {
 			kernel(unix.EACCES)
 			held := heldInitramfs()
-			_, err := newInitramfs(bb, "true", testNonce, taskNetwork(), nil)
+			_, err := newInitramfs(bb, "true", testNonce, taskNetwork(), noGuestEnv, nil)
 			Expect(err).To(MatchError("creating the initramfs memfd: permission denied"))
 			Expect(errors.Is(err, unix.EACCES)).To(BeTrue())
 			Expect(calls).To(HaveLen(1))
@@ -383,9 +394,9 @@ var _ = Describe("initramfs", func() {
 	It("fails when busybox is missing or not a regular file, and leaves no memfd behind", func() {
 		dir := GinkgoT().TempDir()
 		held := heldInitramfs()
-		_, err := newInitramfs(filepath.Join(dir, "nope"), "true", testNonce, taskNetwork(), nil)
+		_, err := newInitramfs(filepath.Join(dir, "nope"), "true", testNonce, taskNetwork(), noGuestEnv, nil)
 		Expect(err).To(MatchError(ContainSubstring("opening busybox")))
-		_, err = newInitramfs(dir, "true", testNonce, taskNetwork(), nil)
+		_, err = newInitramfs(dir, "true", testNonce, taskNetwork(), noGuestEnv, nil)
 		Expect(err).To(MatchError(ContainSubstring("not a regular file")))
 		Expect(heldInitramfs()).To(Equal(held))
 	})
@@ -396,7 +407,7 @@ var _ = Describe("initramfs", func() {
 		ro, err := os.Open(bb)
 		Expect(err).NotTo(HaveOccurred())
 		defer ro.Close()
-		Expect(writeInitramfs(ro, bb, "true", testNonce, taskNetwork(), nil)).To(MatchError(ContainSubstring("writing the initramfs")))
+		Expect(writeInitramfs(ro, bb, "true", testNonce, taskNetwork(), noGuestEnv, nil)).To(MatchError(ContainSubstring("writing the initramfs")))
 	})
 
 	Describe("cpioWriter", func() {
