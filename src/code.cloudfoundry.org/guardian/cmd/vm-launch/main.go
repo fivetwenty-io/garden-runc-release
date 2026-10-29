@@ -118,6 +118,11 @@
 // 64-bit kernel allows, is lowered to that with a line that says so. Only
 // the command gets the limit; /init's own steps keep the kernel's default.
 //
+// Shared memory: the guest has a tmpfs at /dev/shm with the options Garden
+// gives a container's (noexec, nosuid, nodev, mode 1777), sized at half the
+// guest's memory, as the unsized container mount is bounded by the
+// container's memory.
+//
 // Memory: the guest gets MEMORY_LIMIT less 192 MiB, which the container
 // keeps for the hypervisor and everything else it runs, with a floor of 128
 // MiB and a ceiling of 16 GiB. MEMORY_LIMIT must be whole megabytes, such as

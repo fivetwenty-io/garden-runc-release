@@ -112,13 +112,13 @@ func exitTag(nonce string) string  { return "RVM_EXIT_" + nonce + "=" }
 // that ends the hypervisor. poweroff -f hangs Firecracker, so it is not used.
 //
 // Right after the mounts, /init defines rvm_fail, which every setup step
-// uses. It then brings up lo and eth0 from /rvm/net, for every guest, a
-// task's included, prepares the open-files limit from /rvm/limits, and
-// checks that /rvm/env sources. A guest with a volume then formats the
-// volume image when it is blank and mounts it. When a setup step fails,
-// /init reboots before the start tag, so vm-launch reports a guest that
-// never started its command and shows the console output, which ends with
-// the failed step.
+// uses. It then mounts /dev/shm, brings up lo and eth0 from /rvm/net (in
+// every guest, a task's included), prepares the open-files limit from
+// /rvm/limits, and checks that /rvm/env sources. A guest with a volume
+// then formats the volume image when it is blank and mounts it. When a
+// setup step fails, /init reboots before the start tag, so vm-launch
+// reports a guest that never started its command and shows the console
+// output, which ends with the failed step.
 //
 // The command runs in a subshell that sets its open-files limit, sources
 // /rvm/env, and then becomes the shell that runs /rvm/cmd, so its status is
@@ -127,7 +127,7 @@ func exitTag(nonce string) string  { return "RVM_EXIT_" + nonce + "=" }
 // or the volume teardown. With a volume, /init syncs and unmounts it after
 // the command and before it reports the status.
 func initScript(nonce string, volume bool) string {
-	setup := guestFailFunc + guestNetworkSetup + guestLimitsSetup + guestEnvChecks
+	setup := guestFailFunc + guestShmSetup + guestNetworkSetup + guestLimitsSetup + guestEnvChecks
 	if volume {
 		setup += guestVolumeSetup
 	}
@@ -148,6 +148,19 @@ mount -t devtmpfs dev /dev 2>/dev/null
 // guestFailFunc defines rvm_fail, which a setup step calls when it fails: it
 // names the step on the console and reboots before the start tag.
 const guestFailFunc = `rvm_fail() { echo "vm-launch guest setup: $1"; reboot -f; exit 1; }
+`
+
+// guestShmSetup mounts a tmpfs at /dev/shm with the options Garden gives a
+// container's /dev/shm (noexec, nosuid, nodev, and mode 1777), so POSIX
+// shared memory and semaphores work in the guest as they do in a container.
+// Garden sets no size, unlike runc's own 64 MiB default, so a container's
+// /dev/shm can grow to half the host's memory, bounded in practice by the
+// container's memory limit. The guest's bound is its memory, so /init asks
+// for half of what the guest kernel has, which is the tmpfs default spelled
+// out: about 51 MiB in the smallest guest, whose kernel keeps part of its
+// 128 MiB. Pages in it count as guest memory in use, as they count against a
+// container's limit.
+const guestShmSetup = `mkdir -p /dev/shm && mount -t tmpfs -o noexec,nosuid,nodev,mode=1777,size=50% tmpfs /dev/shm || rvm_fail "mounting /dev/shm failed"
 `
 
 // guestNetworkSetup configures the guest NIC. The virtio-net driver is built

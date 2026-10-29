@@ -8,6 +8,9 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -70,6 +73,41 @@ echo "init=$(sed -n 's/^Max open files *\([0-9]*\) *\([0-9]*\).*/\1 \2/p' /proc/
 		// container's.
 		Expect(out).To(MatchRegexp(`init=\d+ \d+`))
 		Expect(out).NotTo(ContainSubstring("init=1500000 2000000"))
+		Expect(out).To(ContainSubstring(exitTag(testNonce) + "0"))
+	})
+
+	It("gives the command a /dev/shm tmpfs of half the guest's memory, mounted as Garden mounts it", func() {
+		out := bootRealGuest(taskGuest(`grep ' /dev/shm ' /proc/mounts
+ls -ld /dev/shm
+echo "memtotal=$(sed -n 's/^MemTotal: *\([0-9]*\) kB$/\1/p' /proc/meminfo)"
+echo "shm_kib=$(df -k /dev/shm | sed -n '2s/^[^ ]*  *\([0-9]*\) .*/\1/p')"
+echo shared >/dev/shm/probe && echo "wrote=$(cat /dev/shm/probe)"
+cp /bin/busybox /dev/shm/bb && chmod 755 /dev/shm/bb
+/dev/shm/bb true && echo exec=allowed || echo exec=denied`))
+		m := regexp.MustCompile(`(?m)^tmpfs /dev/shm tmpfs (\S+) 0 0\r?$`).FindStringSubmatch(out)
+		Expect(m).NotTo(BeNil(), out)
+		opts := strings.Split(m[1], ",")
+		Expect(opts).To(ContainElements("rw", "nosuid", "nodev", "noexec"), out)
+		// The kernel leaves mode=1777 out of the options, because it is the
+		// tmpfs default, so the mode is checked on the directory.
+		Expect(out).To(MatchRegexp(`(?m)^drwxrwxrwt +\d+ 0 +0 .* /dev/shm\r?$`))
+		// The kernel also leaves the size out when it equals the tmpfs
+		// default of half the memory at the time it shows the options, which
+		// moves as the kernel frees boot memory, so the size comes from df.
+		kib := func(name string) uint64 {
+			m := regexp.MustCompile(name + `=(\d+)`).FindStringSubmatch(out)
+			Expect(m).NotTo(BeNil(), out)
+			n, err := strconv.ParseUint(m[1], 10, 64)
+			Expect(err).NotTo(HaveOccurred())
+			return n
+		}
+		sizeKiB, memKiB := kib("shm_kib"), kib("memtotal")
+		// tmpfs takes half of the guest's pages, so the size is within a
+		// page of half of MemTotal.
+		Expect(sizeKiB).To(BeNumerically("~", memKiB/2, 4), out)
+		Expect(sizeKiB).To(BeNumerically("<=", minGuestMemoryMiB*1024/2), out)
+		Expect(out).To(ContainSubstring("wrote=shared"))
+		Expect(out).To(ContainSubstring("exec=denied"))
 		Expect(out).To(ContainSubstring(exitTag(testNonce) + "0"))
 	})
 })
