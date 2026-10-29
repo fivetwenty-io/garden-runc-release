@@ -42,8 +42,16 @@ describe 'garden' do
       expect(server['containerd-socket']).to eql('/var/vcap/sys/run/containerd/containerd.sock')
     end
 
+    it 'raises when a runtime type is selected with the backend disabled' do
+      expect { render_runtime({'containerd_mode' => false, 'containerd_runtime_type' => 'io.containerd.runsc.v1'}) }.to raise_error(/require garden.containerd_mode/)
+    end
+
+    it 'raises when the process backend is enabled with the backend disabled' do
+      expect { render_runtime({'containerd_mode' => false, 'use_containerd_for_processes' => true}) }.to raise_error(/require garden.containerd_mode/)
+    end
+
     it 'omits containerd settings when the backend is disabled' do
-      server = render_runtime({'containerd_mode' => false, 'containerd_runtime_type' => 'io.containerd.runsc.v1', 'use_containerd_for_processes' => true})
+      server = render_runtime({'containerd_mode' => false})
       expect(server['containerd-socket']).to be_nil
       expect(server['containerd-runtime-type']).to be_nil
       expect(server['use-containerd-for-processes']).to be_nil

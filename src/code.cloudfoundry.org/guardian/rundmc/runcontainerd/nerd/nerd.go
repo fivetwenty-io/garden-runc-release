@@ -238,17 +238,18 @@ func (n *Nerd) Delete(log lager.Logger, containerID string) (result error) {
 	}
 
 	log.Debug("deleting-task", lager.Data{"containerID": containerID})
-	status, err := task.Status(n.context)
-	if err != nil {
-		return err
-	}
-	if status.Status == client.Created && task.Pid() != 0 && n.policy == runcontainerd.RunscRuntime {
-		ctx, cancel := context.WithTimeout(n.context, 2*time.Minute)
-		defer cancel()
-		if err := deleteCreatedTask(ctx, n.client.TaskService(), containerID, task.IO(), n.mp); err != nil {
+	// Only runsc needs the status: a stock task goes straight to Delete, so a
+	// dead shim cannot block it with a failed Status call.
+	if n.policy == runcontainerd.RunscRuntime {
+		status, err := task.Status(n.context)
+		if err != nil {
 			return err
 		}
-		return nil
+		if status.Status == client.Created && task.Pid() != 0 {
+			ctx, cancel := context.WithTimeout(n.context, 2*time.Minute)
+			defer cancel()
+			return deleteCreatedTask(ctx, n.client.TaskService(), containerID, task.IO(), n.mp)
+		}
 	}
 	_, err = task.Delete(n.context, withProcessKillLogging(log, n.mp))
 	return err

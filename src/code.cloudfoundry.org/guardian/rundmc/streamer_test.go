@@ -69,7 +69,7 @@ var _ = Describe("ExecStreamer", func() {
 			_, handle, spec, pio = fakeRuntime.ExecArgsForCall(1)
 			Expect(handle).To(Equal("some-handle"))
 			Expect(spec.Path).To(Equal("/bin/tar"))
-			Expect(spec.Args).To(Equal([]string{"-xf", "-", "-C", "/dst/dir"}))
+			Expect(spec.Args).To(Equal([]string{"--no-same-owner", "--no-same-permissions", "-xf", "-", "-C", "/dst/dir"}))
 			Expect(spec.User).To(Equal("alice"))
 			Expect(pio.Stdin).To(Equal(tarContent))
 		})

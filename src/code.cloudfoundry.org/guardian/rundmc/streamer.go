@@ -77,7 +77,7 @@ func (s *ExecStreamer) StreamIn(log lager.Logger, handle string, spec garden.Str
 	var stderrBuf streamStderr
 	if err := s.execAndWait(log, handle, garden.ProcessSpec{
 		Path: "/bin/tar",
-		Args: []string{"-xf", "-", "-C", spec.Path},
+		Args: []string{"--no-same-owner", "--no-same-permissions", "-xf", "-", "-C", spec.Path},
 		User: user,
 	}, garden.ProcessIO{Stdin: spec.TarStream, Stdout: io.Discard, Stderr: &stderrBuf}); err != nil {
 		return fmt.Errorf("stream-in: tar: %w: %s", err, stderrBuf.String())
