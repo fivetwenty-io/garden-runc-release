@@ -97,6 +97,7 @@ type RunContainerd struct {
 	containerdStatser         Statser
 	useContainerdForProcesses bool
 	userLookupper             users.UserLookupper
+	imageUserLookupper        users.UserLookupper
 	cgroupManager             CgroupManager
 	mkdirer                   Mkdirer
 	peaHandlesGetter          PeaHandlesGetter
@@ -107,6 +108,14 @@ type RunContainerd struct {
 
 // Option configures a RunContainerd.
 type Option func(*RunContainerd)
+
+// WithImageUserLookupper replaces the user lookup that Exec uses for gVisor
+// containers, which by default is users.LookupImageUser.
+func WithImageUserLookupper(lookupper users.UserLookupper) Option {
+	return func(r *RunContainerd) {
+		r.imageUserLookupper = lookupper
+	}
+}
 
 // WithBackendDispatch makes RunContainerd look up which execution backend a
 // container uses before it starts, executes in, attaches to, or reads metrics
@@ -141,6 +150,7 @@ func New(containerManager ContainerManager,
 		containerdStatser:         NewContainerdStatser(containerManager),
 		useContainerdForProcesses: useContainerdForProcesses,
 		userLookupper:             userLookupper,
+		imageUserLookupper:        users.LookupFunc(users.LookupImageUser),
 		cgroupManager:             cgroupManager,
 		mkdirer:                   mkdirer,
 		peaHandlesGetter:          peaHandlesGetter,
@@ -238,7 +248,16 @@ func (r *RunContainerd) Exec(log lager.Logger, containerID string, gardenProcess
 		return nil, err
 	}
 
-	resolvedUser, err := r.userLookupper.Lookup(rootfsPath, gardenProcessSpec.User)
+	// A gVisor rootfs path is a host path whose contents the image controls,
+	// so its passwd and group files are read with every symlink resolved
+	// inside the rootfs. The working directory below is created by a helper
+	// that chroots into the rootfs first, so it is confined already.
+	userLookupper := r.userLookupper
+	if gvisor {
+		userLookupper = r.imageUserLookupper
+	}
+
+	resolvedUser, err := userLookupper.Lookup(rootfsPath, gardenProcessSpec.User)
 	if err != nil {
 		return nil, err
 	}
@@ -290,7 +309,8 @@ func (r *RunContainerd) Exec(log lager.Logger, containerID string, gardenProcess
 // directory. For a runc container that is the root of the init process. A
 // gVisor sandbox process does not run in the container's root filesystem, so
 // for a gVisor container it is the rootfs path in the bundle, which the gVisor
-// gofer serves to the sandbox.
+// gofer serves to the sandbox. That path is a plain host path, so nothing may
+// resolve a path below it with host path resolution.
 func (r *RunContainerd) processRootfsPath(log lager.Logger, containerID string, bundle goci.Bndl, gvisor bool) (string, error) {
 	if gvisor {
 		if bundle.Spec.Root == nil || bundle.Spec.Root.Path == "" {

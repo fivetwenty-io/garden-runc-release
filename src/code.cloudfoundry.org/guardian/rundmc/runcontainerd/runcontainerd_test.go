@@ -35,19 +35,20 @@ import (
 
 var _ = Describe("Runcontainerd", func() {
 	var (
-		logger           lager.Logger
-		containerManager *runcontainerdfakes.FakeContainerManager
-		backingProcess   *runcontainerdfakes.FakeBackingProcess
-		processManager   *runcontainerdfakes.FakeProcessManager
-		runContainerd    *runcontainerd.RunContainerd
-		execer           *runcontainerdfakes.FakeExecer
-		statser          *runcontainerdfakes.FakeStatser
-		processBuilder   *runcontainerdfakes.FakeProcessBuilder
-		userLookupper    *usersfakes.FakeUserLookupper
-		cgroupManager    *runcontainerdfakes.FakeCgroupManager
-		mkdirer          *runcontainerdfakes.FakeMkdirer
-		peaHandlesGetter *runcontainerdfakes.FakePeaHandlesGetter
-		runtimeStopper   *runcontainerdfakes.FakeRuntimeStopper
+		logger             lager.Logger
+		containerManager   *runcontainerdfakes.FakeContainerManager
+		backingProcess     *runcontainerdfakes.FakeBackingProcess
+		processManager     *runcontainerdfakes.FakeProcessManager
+		runContainerd      *runcontainerd.RunContainerd
+		execer             *runcontainerdfakes.FakeExecer
+		statser            *runcontainerdfakes.FakeStatser
+		processBuilder     *runcontainerdfakes.FakeProcessBuilder
+		userLookupper      *usersfakes.FakeUserLookupper
+		imageUserLookupper *usersfakes.FakeUserLookupper
+		cgroupManager      *runcontainerdfakes.FakeCgroupManager
+		mkdirer            *runcontainerdfakes.FakeMkdirer
+		peaHandlesGetter   *runcontainerdfakes.FakePeaHandlesGetter
+		runtimeStopper     *runcontainerdfakes.FakeRuntimeStopper
 	)
 
 	BeforeEach(func() {
@@ -59,13 +60,14 @@ var _ = Describe("Runcontainerd", func() {
 		statser = new(runcontainerdfakes.FakeStatser)
 		processBuilder = new(runcontainerdfakes.FakeProcessBuilder)
 		userLookupper = new(usersfakes.FakeUserLookupper)
+		imageUserLookupper = new(usersfakes.FakeUserLookupper)
 		cgroupManager = new(runcontainerdfakes.FakeCgroupManager)
 		mkdirer = new(runcontainerdfakes.FakeMkdirer)
 		runtimeStopper = new(runcontainerdfakes.FakeRuntimeStopper)
 
 		processManager.GetProcessReturns(backingProcess, nil)
 
-		runContainerd = runcontainerd.New(containerManager, processManager, processBuilder, userLookupper, execer, statser, false, cgroupManager, mkdirer, nil, false, runtimeStopper, runcontainerd.WithBackendDispatch())
+		runContainerd = runcontainerd.New(containerManager, processManager, processBuilder, userLookupper, execer, statser, false, cgroupManager, mkdirer, nil, false, runtimeStopper, runcontainerd.WithBackendDispatch(), runcontainerd.WithImageUserLookupper(imageUserLookupper))
 	})
 
 	Describe("Create", func() {
@@ -430,7 +432,20 @@ var _ = Describe("Runcontainerd", func() {
 		})
 
 		JustBeforeEach(func() {
-			execProcess, execErr = runContainerd.Exec(logger, containerID, processSpec, processIO)
+			type execResult struct {
+				process garden.Process
+				err     error
+			}
+			done := make(chan execResult, 1)
+			go func() {
+				defer GinkgoRecover()
+				p, err := runContainerd.Exec(logger, containerID, processSpec, processIO)
+				done <- execResult{p, err}
+			}()
+
+			var result execResult
+			Eventually(done, "10s").Should(Receive(&result), "Exec did not return")
+			execProcess, execErr = result.process, result.err
 		})
 
 		It("gets the bundle", func() {
@@ -495,7 +510,7 @@ var _ = Describe("Runcontainerd", func() {
 				bundle.Spec.Annotations = map[string]string{backend.AnnotationKey: string(backend.OCIGvisor)}
 				bundle.Spec.Root = &specs.Root{Path: "/path/to/rootfs"}
 
-				userLookupper.LookupReturns(&users.ExecUser{Uid: 1000, Gid: 1001, Home: "/home/testuser"}, nil)
+				imageUserLookupper.LookupReturns(&users.ExecUser{Uid: 1000, Gid: 1001, Home: "/home/testuser"}, nil)
 				containerManager.ExecReturns(backingProcess, nil)
 			})
 
@@ -508,11 +523,15 @@ var _ = Describe("Runcontainerd", func() {
 					Expect(containerManager.GetContainerPIDCallCount()).To(BeZero())
 				})
 
-				It("resolves the user from the bundle rootfs", func() {
-					Expect(userLookupper.LookupCallCount()).To(Equal(1))
-					passedRootfs, passedUserID := userLookupper.LookupArgsForCall(0)
+				It("resolves the user from the bundle rootfs with the confined image lookup", func() {
+					Expect(imageUserLookupper.LookupCallCount()).To(Equal(1))
+					passedRootfs, passedUserID := imageUserLookupper.LookupArgsForCall(0)
 					Expect(passedRootfs).To(Equal("/path/to/rootfs"))
 					Expect(passedUserID).To(Equal("testuser"))
+				})
+
+				It("does not use the host-path user lookup", func() {
+					Expect(userLookupper.LookupCallCount()).To(BeZero())
 				})
 
 				It("creates the working directory in the bundle rootfs", func() {
@@ -546,10 +565,86 @@ var _ = Describe("Runcontainerd", func() {
 
 			Context("when use_containerd_for_processes is enabled", func() {
 				BeforeEach(func() {
-					runContainerd = runcontainerd.New(containerManager, processManager, processBuilder, userLookupper, execer, statser, true, cgroupManager, mkdirer, nil, false, runtimeStopper, runcontainerd.WithBackendDispatch())
+					runContainerd = runcontainerd.New(containerManager, processManager, processBuilder, userLookupper, execer, statser, true, cgroupManager, mkdirer, nil, false, runtimeStopper, runcontainerd.WithBackendDispatch(), runcontainerd.WithImageUserLookupper(imageUserLookupper))
 				})
 
 				itRunsTheProcessThroughContainerd()
+			})
+
+			Context("with the default image user lookup", func() {
+				var (
+					imageRootFS string
+					hostDir     string
+				)
+
+				writeImageFile := func(path, contents string) {
+					full := filepath.Join(imageRootFS, path)
+					Expect(os.MkdirAll(filepath.Dir(full), 0755)).To(Succeed())
+					Expect(os.WriteFile(full, []byte(contents), 0644)).To(Succeed())
+				}
+
+				BeforeEach(func() {
+					imageRootFS = GinkgoT().TempDir()
+					hostDir = GinkgoT().TempDir()
+					bundle.Spec.Root = &specs.Root{Path: imageRootFS}
+
+					// No WithImageUserLookupper, so Exec uses users.LookupImageUser.
+					runContainerd = runcontainerd.New(containerManager, processManager, processBuilder, userLookupper, execer, statser, false, cgroupManager, mkdirer, nil, false, runtimeStopper, runcontainerd.WithBackendDispatch())
+				})
+
+				Context("when the image passwd file is a regular file", func() {
+					BeforeEach(func() {
+						writeImageFile("etc/passwd", "testuser:x:1002:1003:test:/home/testuser:/bin/sh\n")
+						writeImageFile("etc/group", "testgroup:x:1003:\nextra:x:1005:testuser\n")
+					})
+
+					It("resolves the user from the image and runs the process", func() {
+						Expect(execErr).NotTo(HaveOccurred())
+						Expect(userLookupper.LookupCallCount()).To(BeZero())
+
+						Expect(processBuilder.BuildProcessCallCount()).To(Equal(1))
+						_, _, resolvedUser := processBuilder.BuildProcessArgsForCall(0)
+						Expect(resolvedUser).To(Equal(&users.ExecUser{Uid: 1002, Gid: 1003, Home: "/home/testuser", Sgids: []int{1005}}))
+
+						Expect(mkdirer.MkdirAsCallCount()).To(Equal(1))
+						rootfsPath, hostUID, hostGID, _, _, _ := mkdirer.MkdirAsArgsForCall(0)
+						Expect(rootfsPath).To(Equal(imageRootFS))
+						Expect(hostUID).To(Equal(2002))
+						Expect(hostGID).To(Equal(2003))
+
+						Expect(containerManager.ExecCallCount()).To(Equal(1))
+					})
+				})
+
+				Context("when the image passwd file is an absolute symlink to a host file", func() {
+					BeforeEach(func() {
+						hostPasswd := filepath.Join(hostDir, "passwd")
+						Expect(os.WriteFile(hostPasswd, []byte("testuser:x:0:0:host:/host-home:/bin/sh\n"), 0600)).To(Succeed())
+						Expect(os.MkdirAll(filepath.Join(imageRootFS, "etc"), 0755)).To(Succeed())
+						Expect(os.Symlink(hostPasswd, filepath.Join(imageRootFS, "etc", "passwd"))).To(Succeed())
+					})
+
+					It("does not read the host file and runs nothing", func() {
+						Expect(execErr).To(MatchError(ContainSubstring("no matching entries in passwd file")))
+						Expect(processBuilder.BuildProcessCallCount()).To(BeZero())
+						Expect(mkdirer.MkdirAsCallCount()).To(BeZero())
+						Expect(containerManager.ExecCallCount()).To(BeZero())
+					})
+				})
+
+				Context("when the image passwd file is a FIFO", func() {
+					BeforeEach(func() {
+						Expect(os.MkdirAll(filepath.Join(imageRootFS, "etc"), 0755)).To(Succeed())
+						makeFifo(filepath.Join(imageRootFS, "etc", "passwd"))
+					})
+
+					// JustBeforeEach gives Exec a deadline, so a lookup that
+					// blocks on the FIFO fails the spec instead of hanging it.
+					It("fails and runs nothing", func() {
+						Expect(execErr).To(MatchError(ContainSubstring("not a regular file")))
+						Expect(containerManager.ExecCallCount()).To(BeZero())
+					})
+				})
 			})
 
 			Context("when the spec has no root", func() {
@@ -560,6 +655,7 @@ var _ = Describe("Runcontainerd", func() {
 				It("returns an error and runs nothing", func() {
 					Expect(execErr).To(MatchError(ContainSubstring("container container-id has no rootfs path")))
 					Expect(userLookupper.LookupCallCount()).To(BeZero())
+					Expect(imageUserLookupper.LookupCallCount()).To(BeZero())
 					Expect(containerManager.ExecCallCount()).To(BeZero())
 				})
 			})
@@ -577,7 +673,7 @@ var _ = Describe("Runcontainerd", func() {
 
 			Context("when the user lookup fails", func() {
 				BeforeEach(func() {
-					userLookupper.LookupReturns(nil, errors.New("user-lookup-failure"))
+					imageUserLookupper.LookupReturns(nil, errors.New("user-lookup-failure"))
 				})
 
 				It("returns the error", func() {

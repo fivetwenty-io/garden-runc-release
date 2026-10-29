@@ -210,7 +210,7 @@ func (p *ProcBuilder) BuildProcess(bndl goci.Bndl, spec garden.ProcessSpec, user
 			AdditionalGids: additionalGIDs,
 			Username:       spec.User,
 		},
-		Cwd:             getRootDir(bndl.RootFS(), spec.Dir, user.Home),
+		Cwd:             getRootDir(bndl.RootFS(), spec.Dir, user.Home, backend.IsGvisor(backend.FromBundle(bndl))),
 		Capabilities:    capabilities,
 		Rlimits:         toRlimits(spec.Limits),
 		Terminal:        spec.TTY != nil,
@@ -337,7 +337,13 @@ func toUint32Slice(slice []int) []uint32 {
 	return result
 }
 
-func getRootDir(rootFS, specDir, home string) string {
+// getRootDir returns the working directory of a process: the spec's
+// directory, else the user's home, else "/" when the chosen directory does not
+// exist in the root filesystem. When confined is set, the directory is looked
+// up with every symlink resolved inside rootFS, so an image symlink cannot make
+// the result depend on the host's filesystem. gVisor containers use it,
+// because their rootFS is a host path that the image controls.
+func getRootDir(rootFS, specDir, home string, confined bool) string {
 	dir := specDir
 	if dir == "" {
 		dir = home
@@ -345,6 +351,14 @@ func getRootDir(rootFS, specDir, home string) string {
 
 	if dir == "" {
 		return "/"
+	}
+
+	if confined {
+		if err := statInRoot(rootFS, dir); errors.Is(err, os.ErrNotExist) {
+			return "/"
+		}
+
+		return dir
 	}
 
 	fullPath := filepath.Join(rootFS, dir)
