@@ -178,9 +178,7 @@ func (f *LinuxFactory) WireContainerd(processBuilder *processes.ProcBuilder, use
 		statser = runcontainerd.NewContainerdStatser(nerd)
 	}
 
-	// Exec through containerd reads the user from the image rootfs in the
-	// bundle, so it resolves the image's passwd and group files inside it.
-	containerdManager := runcontainerd.New(nerd, nerd, processBuilder, users.LookupFunc(users.LookupImageUser), wireExecer(pidGetter), statser, f.config.Containerd.UseContainerdForProcesses, cgroupManager, f.WireMkdirer(), peaHandlesGetter, f.config.Containers.CleanupProcessDirsOnWait, nerdStopper, f.config.wiredBackends.runContainerdOptions(runcontainerd.NewContainerdStatser(nerd))...)
+	containerdManager := runcontainerd.New(nerd, nerd, processBuilder, userLookupper, wireExecer(pidGetter), statser, f.config.Containerd.UseContainerdForProcesses, cgroupManager, f.WireMkdirer(), peaHandlesGetter, f.config.Containers.CleanupProcessDirsOnWait, nerdStopper, f.config.wiredBackends.runContainerdOptions(runcontainerd.NewContainerdStatser(nerd))...)
 	f.taskPids = &containerdTaskPids{client: containerdClient, context: ctx}
 
 	peaRunner := runcontainerd.NewRunContainerPea(containerdManager, nerd, volumizer)

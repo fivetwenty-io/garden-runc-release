@@ -383,8 +383,98 @@ var _ = Describe("Runcontainerd", func() {
 		})
 
 		JustBeforeEach(func() {
-			execProcess, execErr = runContainerd.Exec(logger, containerID, processSpec, processIO)
+			type execResult struct {
+				process garden.Process
+				err     error
+			}
+			done := make(chan execResult, 1)
+			go func() {
+				defer GinkgoRecover()
+				p, err := runContainerd.Exec(logger, containerID, processSpec, processIO)
+				done <- execResult{p, err}
+			}()
+
+			var result execResult
+			Eventually(done, "10s").Should(Receive(&result), "Exec did not return")
+			execProcess, execErr = result.process, result.err
 		})
+
+		// describeImageLookup covers Exec with the lookup that guardiancmd wires
+		// for processes that run through containerd, which reads the user from
+		// inside the image root.
+		describeImageLookup := func(useContainerdForProcesses bool) {
+			Context("with the image user lookup", func() {
+				var imageRootFS string
+
+				writeImageFile := func(path, contents string) {
+					full := filepath.Join(imageRootFS, path)
+					Expect(os.MkdirAll(filepath.Dir(full), 0755)).To(Succeed())
+					Expect(os.WriteFile(full, []byte(contents), 0644)).To(Succeed())
+				}
+
+				BeforeEach(func() {
+					imageRootFS = GinkgoT().TempDir()
+					bundle.Spec.Root = &specs.Root{Path: imageRootFS}
+					userLookupper.LookupReturns(nil, errors.New("the fake lookup must not be used"))
+					containerManager.ExecReturns(backingProcess, nil)
+
+					runContainerd = runcontainerd.New(containerManager, processManager, processBuilder, users.LookupFunc(users.LookupImageUser), execer, statser, useContainerdForProcesses, cgroupManager, mkdirer, nil, false, runtimeStopper, runcontainerd.WithBackendDispatch(gvisorStatser))
+				})
+
+				Context("when the image passwd file is a regular file", func() {
+					BeforeEach(func() {
+						writeImageFile("etc/passwd", "testuser:x:1002:1003:test:/home/testuser:/bin/sh\n")
+						writeImageFile("etc/group", "testgroup:x:1003:\nextra:x:1005:testuser\n")
+					})
+
+					It("resolves the user from the image and runs the process", func() {
+						Expect(execErr).NotTo(HaveOccurred())
+
+						Expect(processBuilder.BuildProcessCallCount()).To(Equal(1))
+						_, _, resolvedUser := processBuilder.BuildProcessArgsForCall(0)
+						Expect(resolvedUser).To(Equal(&users.ExecUser{Uid: 1002, Gid: 1003, Home: "/home/testuser", Sgids: []int{1005}}))
+
+						Expect(mkdirer.MkdirAsCallCount()).To(Equal(1))
+						rootfsPath, hostUID, hostGID, _, _, _ := mkdirer.MkdirAsArgsForCall(0)
+						Expect(rootfsPath).To(Equal(imageRootFS))
+						Expect(hostUID).To(Equal(2002))
+						Expect(hostGID).To(Equal(2003))
+
+						Expect(containerManager.ExecCallCount()).To(Equal(1))
+					})
+				})
+
+				Context("when the image passwd file is an absolute symlink to a file on the host", func() {
+					BeforeEach(func() {
+						hostPasswd := filepath.Join(GinkgoT().TempDir(), "passwd")
+						Expect(os.WriteFile(hostPasswd, []byte("testuser:x:0:0:host:/host-home:/bin/sh\n"), 0600)).To(Succeed())
+						Expect(os.MkdirAll(filepath.Join(imageRootFS, "etc"), 0755)).To(Succeed())
+						Expect(os.Symlink(hostPasswd, filepath.Join(imageRootFS, "etc", "passwd"))).To(Succeed())
+					})
+
+					It("resolves the link inside the image and runs nothing", func() {
+						Expect(execErr).To(MatchError(ContainSubstring("no matching entries in passwd file")))
+						Expect(processBuilder.BuildProcessCallCount()).To(BeZero())
+						Expect(mkdirer.MkdirAsCallCount()).To(BeZero())
+						Expect(containerManager.ExecCallCount()).To(BeZero())
+					})
+				})
+
+				Context("when the image passwd file is a FIFO", func() {
+					BeforeEach(func() {
+						Expect(os.MkdirAll(filepath.Join(imageRootFS, "etc"), 0755)).To(Succeed())
+						makeFifo(filepath.Join(imageRootFS, "etc", "passwd"))
+					})
+
+					// JustBeforeEach gives Exec a deadline, so a lookup that
+					// blocks on the FIFO fails the spec instead of hanging it.
+					It("fails and runs nothing", func() {
+						Expect(execErr).To(MatchError(ContainSubstring("not a regular file")))
+						Expect(containerManager.ExecCallCount()).To(BeZero())
+					})
+				})
+			})
+		}
 
 		It("gets the bundle", func() {
 			Expect(containerManager.SpecCallCount()).To(Equal(1))
@@ -504,6 +594,8 @@ var _ = Describe("Runcontainerd", func() {
 
 				itRunsTheProcessThroughContainerd()
 			})
+
+			describeImageLookup(false)
 
 			Context("when the spec has no root", func() {
 				BeforeEach(func() {
@@ -641,6 +733,8 @@ var _ = Describe("Runcontainerd", func() {
 				Expect(shouldRecreate).To(BeFalse())
 				Expect(workDir).To(ConsistOf(processSpec.Dir))
 			})
+
+			describeImageLookup(true)
 
 			Context("when processSpec.ID is not set", func() {
 				BeforeEach(func() {

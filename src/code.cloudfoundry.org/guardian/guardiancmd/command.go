@@ -709,7 +709,9 @@ func (cmd *CommonCommand) wireContainerizer(
 
 		var nerdPidGetter PidGetter
 		var runContainerd *runcontainerd.RunContainerd
-		runContainerd, peaRunner, nerdPidGetter, privilegeChecker, peaBundleLoader, runtimePolicy, err = factory.WireContainerd(processBuilder, userLookupper, wireExecerFunc, statser, log, volumizer, peaHandlesGetter, metricsProvider)
+		// Exec through containerd reads the user from the image rootfs in the
+		// bundle, so it resolves the image's passwd and group files inside it.
+		runContainerd, peaRunner, nerdPidGetter, privilegeChecker, peaBundleLoader, runtimePolicy, err = factory.WireContainerd(processBuilder, users.LookupFunc(users.LookupImageUser), wireExecerFunc, statser, log, volumizer, peaHandlesGetter, metricsProvider)
 		if err != nil {
 			return nil, nil, err
 		}
