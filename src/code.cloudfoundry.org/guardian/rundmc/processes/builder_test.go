@@ -3,6 +3,7 @@ package processes_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 
 	"code.cloudfoundry.org/garden"
 	"code.cloudfoundry.org/guardian/backend"
@@ -857,8 +858,14 @@ var _ = Describe("ProcBuilder", func() {
 			Expect(os.RemoveAll(tmpRootFS)).To(Succeed())
 		})
 
+		var cwdBuilderOpts []processes.Option
+
+		BeforeEach(func() {
+			cwdBuilderOpts = nil
+		})
+
 		JustBeforeEach(func() {
-			procBuilder = processes.NewBuilder(envDeterminer, nonRootMaxCaps)
+			procBuilder = processes.NewBuilder(envDeterminer, nonRootMaxCaps, cwdBuilderOpts...)
 			preparedProc = procBuilder.BuildProcess(bndl, processSpec, user)
 		})
 
@@ -915,6 +922,103 @@ var _ = Describe("ProcBuilder", func() {
 
 			It("falls back to '/'", func() {
 				Expect(preparedProc.Cwd).To(Equal("/"))
+			})
+		})
+
+		Context("when the container runs under gVisor", func() {
+			var outsideDir string
+
+			BeforeEach(func() {
+				bndl.Spec.Annotations = map[string]string{backend.AnnotationKey: string(backend.OCIGvisor)}
+				outsideDir = GinkgoT().TempDir()
+				processSpec.Dir = "/app"
+			})
+
+			Context("and the directory exists in the rootfs", func() {
+				BeforeEach(func() {
+					Expect(os.MkdirAll(filepath.Join(tmpRootFS, "app"), 0755)).To(Succeed())
+				})
+
+				It("uses spec.Dir as Cwd", func() {
+					Expect(preparedProc.Cwd).To(Equal("/app"))
+				})
+			})
+
+			Context("and the directory is a symlink to a directory in the rootfs", func() {
+				BeforeEach(func() {
+					Expect(os.MkdirAll(filepath.Join(tmpRootFS, "real-app"), 0755)).To(Succeed())
+					Expect(os.Symlink("/real-app", filepath.Join(tmpRootFS, "app"))).To(Succeed())
+				})
+
+				It("resolves the symlink in the rootfs and uses spec.Dir as Cwd", func() {
+					Expect(preparedProc.Cwd).To(Equal("/app"))
+				})
+			})
+
+			Context("and the directory does not exist", func() {
+				It("falls back to '/'", func() {
+					Expect(preparedProc.Cwd).To(Equal("/"))
+				})
+			})
+
+			Context("and the directory is an absolute symlink outside the rootfs", func() {
+				BeforeEach(func() {
+					Expect(os.Symlink(outsideDir, filepath.Join(tmpRootFS, "app"))).To(Succeed())
+				})
+
+				It("resolves it inside the rootfs and falls back to '/'", func() {
+					Expect(preparedProc.Cwd).To(Equal("/"))
+				})
+			})
+
+			Context("and the directory is a relative symlink that climbs out of the rootfs", func() {
+				BeforeEach(func() {
+					target := strings.Repeat("../", 32) + strings.TrimPrefix(outsideDir, "/")
+					Expect(os.Symlink(target, filepath.Join(tmpRootFS, "app"))).To(Succeed())
+				})
+
+				It("resolves it inside the rootfs and falls back to '/'", func() {
+					Expect(preparedProc.Cwd).To(Equal("/"))
+				})
+			})
+
+			Context("and the home directory is used and exists in the rootfs", func() {
+				BeforeEach(func() {
+					processSpec.Dir = ""
+					user.Home = "/home/robot"
+					Expect(os.MkdirAll(filepath.Join(tmpRootFS, "home", "robot"), 0755)).To(Succeed())
+				})
+
+				It("uses the home directory as Cwd", func() {
+					Expect(preparedProc.Cwd).To(Equal("/home/robot"))
+				})
+			})
+		})
+
+		Context("when the builder confines every working directory", func() {
+			BeforeEach(func() {
+				cwdBuilderOpts = []processes.Option{processes.WithConfinedRootDir()}
+				processSpec.Dir = "/app"
+			})
+
+			Context("and the directory exists in the rootfs", func() {
+				BeforeEach(func() {
+					Expect(os.MkdirAll(filepath.Join(tmpRootFS, "app"), 0755)).To(Succeed())
+				})
+
+				It("uses spec.Dir as Cwd", func() {
+					Expect(preparedProc.Cwd).To(Equal("/app"))
+				})
+			})
+
+			Context("and the directory is an absolute symlink outside the rootfs of a runc container", func() {
+				BeforeEach(func() {
+					Expect(os.Symlink(GinkgoT().TempDir(), filepath.Join(tmpRootFS, "app"))).To(Succeed())
+				})
+
+				It("resolves it inside the rootfs and falls back to '/'", func() {
+					Expect(preparedProc.Cwd).To(Equal("/"))
+				})
 			})
 		})
 	})

@@ -103,6 +103,9 @@ type ProcBuilder struct {
 	envDeterminer  EnvDeterminer
 	nonRootMaxCaps []string
 	kvmGid         uint32
+	// confinedRootDir resolves every working directory inside the image
+	// root, not only those of gVisor containers.
+	confinedRootDir bool
 }
 
 // Option customises a ProcBuilder.
@@ -116,6 +119,15 @@ type Option func(*ProcBuilder)
 func WithKVMGid(gid uint32) Option {
 	return func(p *ProcBuilder) {
 		p.kvmGid = gid
+	}
+}
+
+// WithConfinedRootDir makes BuildProcess resolve the working directory of
+// every process inside the image root, as it does for gVisor containers. A
+// cell that runs all of its containers under runsc uses it.
+func WithConfinedRootDir() Option {
+	return func(p *ProcBuilder) {
+		p.confinedRootDir = true
 	}
 }
 
@@ -210,7 +222,7 @@ func (p *ProcBuilder) BuildProcess(bndl goci.Bndl, spec garden.ProcessSpec, user
 			AdditionalGids: additionalGIDs,
 			Username:       spec.User,
 		},
-		Cwd:             getRootDir(bndl.RootFS(), spec.Dir, user.Home),
+		Cwd:             getRootDir(bndl.RootFS(), spec.Dir, user.Home, p.confinedRootDir || backend.IsGvisor(backend.FromBundle(bndl))),
 		Capabilities:    capabilities,
 		Rlimits:         toRlimits(spec.Limits),
 		Terminal:        spec.TTY != nil,
@@ -337,7 +349,11 @@ func toUint32Slice(slice []int) []uint32 {
 	return result
 }
 
-func getRootDir(rootFS, specDir, home string) string {
+// getRootDir returns the working directory of a process: the spec's
+// directory, else the user's home, else "/" when the chosen directory does not
+// exist in the root filesystem. When confined is set, the directory is looked
+// up with every symlink resolved inside rootFS, the way the container sees it.
+func getRootDir(rootFS, specDir, home string, confined bool) string {
 	dir := specDir
 	if dir == "" {
 		dir = home
@@ -345,6 +361,14 @@ func getRootDir(rootFS, specDir, home string) string {
 
 	if dir == "" {
 		return "/"
+	}
+
+	if confined {
+		if err := statInRoot(rootFS, dir); errors.Is(err, os.ErrNotExist) {
+			return "/"
+		}
+
+		return dir
 	}
 
 	fullPath := filepath.Join(rootFS, dir)

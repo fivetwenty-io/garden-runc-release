@@ -651,6 +651,9 @@ func (cmd *CommonCommand) wireContainerizer(
 	if backends.kvmGid != 0 {
 		processBuilderOpts = append(processBuilderOpts, processes.WithKVMGid(backends.kvmGid))
 	}
+	if cmd.runscCell() {
+		processBuilderOpts = append(processBuilderOpts, processes.WithConfinedRootDir())
+	}
 	processBuilder := processes.NewBuilder(wireEnvFunc(), nonRootMaxCaps, processBuilderOpts...)
 
 	cmdRunner := factory.CommandRunner()
