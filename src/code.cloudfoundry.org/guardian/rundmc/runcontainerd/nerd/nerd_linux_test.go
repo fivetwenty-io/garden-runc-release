@@ -75,6 +75,9 @@ func (rpc *fixtureContainersServer) Update(_ context.Context, request *container
 	if rpc.stored != nil && request.Container.Runtime.GetName() == "" {
 		request.Container.Runtime = rpc.stored.Runtime
 	}
+	if rpc.stored != nil && request.Container.Spec == nil {
+		request.Container.Spec = rpc.stored.Spec
+	}
 	rpc.stored = request.Container
 	return &containersapi.UpdateContainerResponse{Container: request.Container}, nil
 }
@@ -1338,4 +1341,215 @@ func randomString(len int) string {
 
 func int64ptr(i int64) *int64 {
 	return &i
+}
+
+// startTasksServer is a TaskService fixture that records the Start and CloseIO
+// requests of a task without running a process.
+type startTasksServer struct {
+	tasksapi.UnimplementedTasksServer
+	started chan string
+	closed  chan string
+	killed  atomic.Bool
+	kills   atomic.Int32
+}
+
+func (rpc *startTasksServer) Create(_ context.Context, request *tasksapi.CreateTaskRequest) (*tasksapi.CreateTaskResponse, error) {
+	return &tasksapi.CreateTaskResponse{ContainerID: request.ContainerID, Pid: ^uint32(0)}, nil
+}
+
+func (rpc *startTasksServer) Start(_ context.Context, request *tasksapi.StartRequest) (*tasksapi.StartResponse, error) {
+	rpc.started <- request.ContainerID
+	return &tasksapi.StartResponse{Pid: ^uint32(0)}, nil
+}
+
+func (rpc *startTasksServer) CloseIO(_ context.Context, request *tasksapi.CloseIORequest) (*emptypb.Empty, error) {
+	rpc.closed <- request.ContainerID
+	return &emptypb.Empty{}, nil
+}
+
+func (rpc *startTasksServer) Get(_ context.Context, request *tasksapi.GetRequest) (*tasksapi.GetResponse, error) {
+	processStatus := tasktypes.Status_CREATED
+	if rpc.killed.Load() {
+		processStatus = tasktypes.Status_STOPPED
+	}
+	return &tasksapi.GetResponse{Process: &tasktypes.Process{
+		ContainerID: request.ContainerID, ID: request.ContainerID, Pid: ^uint32(0), Status: processStatus,
+	}}, nil
+}
+
+func (rpc *startTasksServer) Delete(context.Context, *tasksapi.DeleteTaskRequest) (*tasksapi.DeleteResponse, error) {
+	return &tasksapi.DeleteResponse{}, nil
+}
+
+func (rpc *startTasksServer) Kill(context.Context, *tasksapi.KillRequest) (*emptypb.Empty, error) {
+	rpc.kills.Add(1)
+	rpc.killed.Store(true)
+	return &emptypb.Empty{}, nil
+}
+
+func (rpc *startTasksServer) Wait(context.Context, *tasksapi.WaitRequest) (*tasksapi.WaitResponse, error) {
+	return &tasksapi.WaitResponse{}, nil
+}
+
+func TestNerdTaskStartDeferral(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		runtimeType  string
+		annotations  map[string]string
+		wantDeferred bool
+	}{
+		{name: "stock container on a stock cell", wantDeferred: false},
+		{name: "oci-runc container", annotations: map[string]string{"garden.execution-backend": "oci-runc"}, wantDeferred: false},
+		{name: "vm-qemu container", annotations: map[string]string{"garden.execution-backend": "vm-qemu"}, wantDeferred: false},
+		{name: "vm-firecracker container", annotations: map[string]string{"garden.execution-backend": "vm-firecracker"}, wantDeferred: false},
+		{name: "oci-gvisor container on a stock cell", annotations: map[string]string{"garden.execution-backend": "oci-gvisor"}, wantDeferred: true},
+		{name: "any container on a runsc cell", runtimeType: "io.containerd.runsc.v1", wantDeferred: true},
+		{name: "pea on a stock cell", annotations: map[string]string{"container-type": "pea", "sandbox-container": "parent"}, wantDeferred: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			listener, err := net.Listen("unix", filepath.Join(dir, "containerd.sock"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := grpc.NewServer()
+			defer server.Stop()
+			rpc := &startTasksServer{started: make(chan string, 2), closed: make(chan string, 2)}
+			containersapi.RegisterContainersServer(server, &fixtureContainersServer{created: make(chan *containersapi.Container, 1)})
+			tasksapi.RegisterTasksServer(server, rpc)
+			go func() { _ = server.Serve(listener) }()
+			c, err := client.New(listener.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			policy, err := runcontainerd.ResolveRuntimePolicy(test.runtimeType)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(namespaces.WithNamespace(context.Background(), "start-deferral"), 5*time.Second)
+			defer cancel()
+			ctx = leases.WithLease(ctx, "fixture-no-lease")
+			log := lagertest.NewTestLogger("start-deferral")
+			n := nerd.New(c, ctx, dir, metrics.NewMetricsProvider(log, dir), policy)
+			spec := &specs.Spec{Version: specs.Version, Process: &specs.Process{Args: []string{"/unused"}, Cwd: "/"}, Annotations: test.annotations}
+			if err := n.Create(log, "start-container", spec, 0, 0, func() (io.Reader, io.Writer, io.Writer) { return nil, nil, nil }); err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := n.Delete(log, "start-container"); err != nil {
+					t.Error(err)
+				}
+			}()
+
+			if test.wantDeferred {
+				select {
+				case <-rpc.started:
+					t.Fatal("Create started a task that Start should start")
+				default:
+				}
+			} else {
+				select {
+				case id := <-rpc.started:
+					if id != "start-container" {
+						t.Errorf("started container = %q", id)
+					}
+				default:
+					t.Fatal("Create did not start the task")
+				}
+				select {
+				case id := <-rpc.closed:
+					if id != "start-container" {
+						t.Errorf("closed stdin of container = %q", id)
+					}
+				default:
+					t.Fatal("Create did not close the stdin of the task it started")
+				}
+			}
+
+			if err := n.Start(log, "start-container"); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-rpc.started:
+				if !test.wantDeferred {
+					t.Error("Start started a task that Create had already started")
+				}
+			default:
+				if test.wantDeferred {
+					t.Error("Start did not start the deferred task")
+				}
+			}
+		})
+	}
+}
+
+// failingStatusTasksServer answers the first Get, which loads the task, and
+// fails every Get after it, which is what a task Status call sends.
+type failingStatusTasksServer struct {
+	startTasksServer
+	gets atomic.Int32
+}
+
+func (rpc *failingStatusTasksServer) Get(ctx context.Context, request *tasksapi.GetRequest) (*tasksapi.GetResponse, error) {
+	if rpc.gets.Add(1) > 1 {
+		return nil, status.Error(codes.Unavailable, "status fixture failure")
+	}
+	return rpc.startTasksServer.Get(ctx, request)
+}
+
+func TestNerdDeleteReadsTaskStatusOnlyForRunsc(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		annotations map[string]string
+		wantKill    bool
+	}{
+		{name: "stock container", wantKill: true},
+		{name: "oci-runc container", annotations: map[string]string{"garden.execution-backend": "oci-runc"}, wantKill: true},
+		{name: "vm-qemu container", annotations: map[string]string{"garden.execution-backend": "vm-qemu"}, wantKill: true},
+		{name: "oci-gvisor container", annotations: map[string]string{"garden.execution-backend": "oci-gvisor"}, wantKill: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			listener, err := net.Listen("unix", filepath.Join(dir, "containerd.sock"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := grpc.NewServer()
+			defer server.Stop()
+			rpc := &failingStatusTasksServer{startTasksServer: startTasksServer{started: make(chan string, 2), closed: make(chan string, 2)}}
+			containersapi.RegisterContainersServer(server, &fixtureContainersServer{created: make(chan *containersapi.Container, 1)})
+			tasksapi.RegisterTasksServer(server, rpc)
+			go func() { _ = server.Serve(listener) }()
+			c, err := client.New(listener.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			ctx, cancel := context.WithTimeout(namespaces.WithNamespace(context.Background(), "delete-status"), 5*time.Second)
+			defer cancel()
+			ctx = leases.WithLease(ctx, "fixture-no-lease")
+			log := lagertest.NewTestLogger("delete-status")
+			n := nerd.New(c, ctx, dir, metrics.NewMetricsProvider(log, dir), runcontainerd.StockRuntime)
+			spec := &specs.Spec{Version: specs.Version, Process: &specs.Process{Args: []string{"/unused"}, Cwd: "/"}, Annotations: test.annotations}
+			if err := n.Create(log, "status-container", spec, 0, 0, func() (io.Reader, io.Writer, io.Writer) { return nil, nil, nil }); err != nil {
+				t.Fatal(err)
+			}
+			rpc.gets.Store(0)
+
+			// A stock task goes straight to task.Delete, which kills it and
+			// carries on past a failed Status call. A runsc task reads its
+			// Status first, so that failure ends Delete before any kill.
+			err = n.Delete(log, "status-container")
+			if test.wantKill && err != nil {
+				t.Fatalf("Delete error = %v, want none from a failed Status call", err)
+			}
+			if !test.wantKill && (err == nil || !strings.Contains(err.Error(), "status fixture failure")) {
+				t.Fatalf("Delete error = %v, want the failed Status call", err)
+			}
+			if got := rpc.kills.Load() > 0; got != test.wantKill {
+				t.Errorf("Delete reached the task kill = %v, want %v", got, test.wantKill)
+			}
+		})
+	}
 }

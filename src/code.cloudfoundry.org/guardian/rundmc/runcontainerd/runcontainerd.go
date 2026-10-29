@@ -192,6 +192,8 @@ func (r *RunContainerd) Create(log lager.Logger, id string, bundle goci.Bndl, pi
 	return nil
 }
 
+// Start starts a container whose task Create deferred, and leaves one that
+// Create already started as it is.
 func (r *RunContainerd) Start(log lager.Logger, id string) error {
 	return r.containerManager.Start(log, id)
 }

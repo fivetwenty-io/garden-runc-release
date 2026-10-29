@@ -68,6 +68,8 @@ func (n *Nerd) runsc(spec *specs.Spec) bool {
 	return n.policy == runcontainerd.RunscRuntime || backend.Kind(spec.Annotations[backend.AnnotationKey]) == backend.OCIGvisor
 }
 
+// Create creates the container and its init task. It starts the task, except
+// where defersStart says that Start does.
 func (n *Nerd) Create(log lager.Logger, containerID string, spec *specs.Spec, hostUID, hostGID uint32, pio func() (io.Reader, io.Writer, io.Writer)) (result error) {
 	log.Debug("creating-container", lager.Data{"containerID": containerID})
 	runsc := n.runsc(spec)
@@ -135,13 +137,33 @@ func (n *Nerd) Create(log lager.Logger, containerID string, spec *specs.Spec, ho
 		}
 	}
 	task, err := container.NewTask(n.context, cio.NewCreator(withProcessIO(processIO, n.ioFifoDir)), taskOpts...)
-	if err == nil && isPea {
+	if err != nil {
+		return err
+	}
+	if isPea {
 		ctx, cancel := context.WithCancel(n.context)
 		n.peaIOMu.Lock()
 		n.peaTasks[containerID] = &peaTask{task: task, stdinDone: inputDone, terminal: spec.Process != nil && spec.Process.Terminal, context: ctx, cancel: cancel}
 		n.peaIOMu.Unlock()
 	}
-	return err
+	if defersStart(runsc, spec) {
+		log.Debug("deferring-task-start", lager.Data{"containerID": containerID})
+		return nil
+	}
+
+	log.Debug("starting-task", lager.Data{"containerID": containerID})
+	if err := task.Start(n.context); err != nil {
+		return err
+	}
+	return task.CloseIO(n.context, client.WithStdinCloser)
+}
+
+// defersStart reports whether Create leaves the task of a container with spec
+// in the Created state for Start. runsc snapshots the network when it starts
+// the sandbox, and a pea's input is released only once it is attached, so both
+// start after Create. Every other container starts in Create.
+func defersStart(runsc bool, spec *specs.Spec) bool {
+	return runsc || spec.Annotations["container-type"] == "pea"
 }
 
 func runscRuntimeOptions() *anypb.Any {
@@ -150,11 +172,25 @@ func runscRuntimeOptions() *anypb.Any {
 	return &anypb.Any{TypeUrl: "runtimeoptions.v1.Options", Value: configPath}
 }
 
-// Start starts a task created by Create. Keeping the two phases separate lets
-// Garden configure networking after the task's namespaces exist but before its
-// init process runs, which runtimes that snapshot the network at start need.
+// Start starts a task that Create deferred. Keeping the two phases separate
+// lets Garden configure networking after the task's namespaces exist but before
+// its init process runs, which runtimes that snapshot the network at start
+// need. A container whose task Create already started is left as it is.
 func (n *Nerd) Start(log lager.Logger, containerID string) error {
-	_, task, err := n.loadContainerAndTask(log, containerID)
+	container, err := n.loadContainer(log, containerID)
+	if err != nil {
+		return err
+	}
+	spec, err := container.Spec(n.context)
+	if err != nil {
+		return err
+	}
+	if !defersStart(n.runsc(spec), spec) {
+		log.Debug("task-already-started", lager.Data{"containerID": containerID})
+		return nil
+	}
+
+	task, err := n.tryToGetTask(log, container)
 	if err != nil {
 		return err
 	}
