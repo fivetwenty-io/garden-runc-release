@@ -419,9 +419,9 @@ var _ = Describe("guest network", func() {
 		nw := &network{port: 8080}
 
 		It("adds a user-mode NIC that forwards PORT to QEMU", func() {
-			argv, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/tmp/w/initrd.cpio.gz", nw, "")
+			argv, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/tmp/w/initrd.cpio.gz", 128, nw, "")
 			Expect(err).NotTo(HaveOccurred())
-			plain, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/tmp/w/initrd.cpio.gz", nil, "")
+			plain, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/tmp/w/initrd.cpio.gz", 128, nil, "")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(argv).To(Equal(append(plain,
 				"-netdev", "user,id=n0,net=10.0.2.0/24,hostfwd=tcp:0.0.0.0:8080-10.0.2.15:8080",
@@ -431,7 +431,7 @@ var _ = Describe("guest network", func() {
 
 		It("attaches the Firecracker guest to garden's tap device", func() {
 			work := GinkgoT().TempDir()
-			argv, err := hypervisorArgv(backend.VMFirecracker, art, work, work+"/initrd.cpio.gz", nw, "")
+			argv, err := hypervisorArgv(backend.VMFirecracker, art, work, work+"/initrd.cpio.gz", 128, nw, "")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(argv).To(Equal([]string{art + "/firecracker/firecracker", "--no-api", "--config-file", work + "/fc.json"}))
 

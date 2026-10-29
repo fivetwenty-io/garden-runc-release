@@ -18,6 +18,9 @@ import (
 const (
 	goldenArt    = "/opt/garden-vm/artifacts"
 	goldenInitrd = "/w/initrd.cpio.gz"
+	// goldenMemMiB is the guest size the golden strings embed, the floor
+	// every guest had before its size came from MEMORY_LIMIT.
+	goldenMemMiB = 128
 
 	goldenFCPlain = `{"boot-source":{"kernel_image_path":"/opt/garden-vm/artifacts/kernel/vmlinux","initrd_path":"/w/initrd.cpio.gz","boot_args":"console=ttyS0 reboot=k panic=1 rdinit=/init quiet"},"drives":[],"machine-config":{"vcpu_count":1,"mem_size_mib":128}}`
 	goldenFCNet   = `{"boot-source":{"kernel_image_path":"/opt/garden-vm/artifacts/kernel/vmlinux","initrd_path":"/w/initrd.cpio.gz","boot_args":"console=ttyS0 reboot=k panic=1 rdinit=/init quiet"},"drives":[],"machine-config":{"vcpu_count":1,"mem_size_mib":128},"network-interfaces":[{"iface_id":"eth0","guest_mac":"06:00:a9:fe:64:02","host_dev_name":"tap0"}]}`
@@ -63,26 +66,26 @@ var _ = Describe("hypervisor volume drive", func() {
 	})
 
 	It("keeps the QEMU command line without a volume byte for byte", func() {
-		Expect(qemuArgv(goldenArt, goldenInitrd, nil, "")).To(Equal(goldenQEMUPlain))
-		Expect(qemuArgv(goldenArt, goldenInitrd, nw, "")).To(Equal(concat(goldenQEMUPlain, goldenQEMUNetdev)))
+		Expect(qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, nil, "")).To(Equal(goldenQEMUPlain))
+		Expect(qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, nw, "")).To(Equal(concat(goldenQEMUPlain, goldenQEMUNetdev)))
 	})
 
 	It("keeps the Firecracker configuration without a volume byte for byte", func() {
-		plain, err := firecrackerConfigJSON(goldenArt, goldenInitrd, nil, "")
+		plain, err := firecrackerConfigJSON(goldenArt, goldenInitrd, goldenMemMiB, nil, "")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(string(plain)).To(Equal(goldenFCPlain))
-		networked, err := firecrackerConfigJSON(goldenArt, goldenInitrd, nw, "")
+		networked, err := firecrackerConfigJSON(goldenArt, goldenInitrd, goldenMemMiB, nw, "")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(string(networked)).To(Equal(goldenFCNet))
 	})
 
 	It("attaches the image to QEMU as one raw virtio-blk drive, after the NIC", func() {
-		Expect(qemuArgv(goldenArt, goldenInitrd, nil, volumeDrivePath())).To(Equal(concat(goldenQEMUPlain, goldenQEMUDrive)))
-		Expect(qemuArgv(goldenArt, goldenInitrd, nw, volumeDrivePath())).To(Equal(concat(goldenQEMUPlain, goldenQEMUNetdev, goldenQEMUDrive)))
+		Expect(qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, nil, volumeDrivePath())).To(Equal(concat(goldenQEMUPlain, goldenQEMUDrive)))
+		Expect(qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, nw, volumeDrivePath())).To(Equal(concat(goldenQEMUPlain, goldenQEMUNetdev, goldenQEMUDrive)))
 	})
 
 	It("pins the QEMU drive to raw, reported errors, and no QEMU locking", func() {
-		opts := qemuArgv(goldenArt, goldenInitrd, nil, volumeDrivePath())
+		opts := qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, nil, volumeDrivePath())
 		drive := opts[len(opts)-3]
 		for _, o := range []string{"format=raw", "werror=report", "rerror=report", "file.locking=off", "cache=writeback"} {
 			Expect(strings.Split(drive, ",")).To(ContainElement(o))
@@ -94,7 +97,7 @@ var _ = Describe("hypervisor volume drive", func() {
 
 	It("gives Firecracker the image as its only drive", func() {
 		for _, n := range []*network{nil, nw} {
-			raw, err := firecrackerConfigJSON(goldenArt, goldenInitrd, n, volumeDrivePath())
+			raw, err := firecrackerConfigJSON(goldenArt, goldenInitrd, goldenMemMiB, n, volumeDrivePath())
 			Expect(err).NotTo(HaveOccurred())
 			golden := goldenFCPlain
 			if n != nil {
@@ -117,14 +120,14 @@ var _ = Describe("hypervisor volume drive", func() {
 
 	It("writes the Firecracker drive into the config file hypervisorArgv makes", func() {
 		work := GinkgoT().TempDir()
-		argv, err := hypervisorArgv(backend.VMFirecracker, goldenArt, work, goldenInitrd, nil, volumeDrivePath())
+		argv, err := hypervisorArgv(backend.VMFirecracker, goldenArt, work, goldenInitrd, goldenMemMiB, nil, volumeDrivePath())
 		Expect(err).NotTo(HaveOccurred())
 		Expect(argv).To(Equal([]string{goldenArt + "/firecracker/firecracker", "--no-api", "--config-file", work + "/fc.json"}))
 		raw, err := os.ReadFile(filepath.Join(work, "fc.json"))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(string(raw)).To(ContainSubstring(goldenFCDrive))
 
-		qemu, err := hypervisorArgv(backend.VMQemu, goldenArt, work, goldenInitrd, nil, volumeDrivePath())
+		qemu, err := hypervisorArgv(backend.VMQemu, goldenArt, work, goldenInitrd, goldenMemMiB, nil, volumeDrivePath())
 		Expect(err).NotTo(HaveOccurred())
 		Expect(qemu).To(Equal(concat(goldenQEMUPlain, goldenQEMUDrive)))
 	})

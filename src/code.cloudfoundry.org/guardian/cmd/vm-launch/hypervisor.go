@@ -12,7 +12,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -32,11 +34,54 @@ const (
 	artQEMUShareDir = "qemu/share"
 )
 
-// Guest shape. Every VM gets the same size.
+// Guest shape. Every VM has one vCPU. Its memory comes from the container's
+// MEMORY_LIMIT (see guestMemory).
+const guestVCPUs = 1
+
+// Guest memory sizing. The guest gets MEMORY_LIMIT less a reserve for what
+// else the container holds, which is the hypervisor itself, vm-launch, the
+// initramfs, sshd sessions, and the health check, clamped to a floor and a
+// ceiling. The floor is the size every guest had before it was derived from
+// MEMORY_LIMIT, so a container below floor plus reserve keeps that size.
 const (
-	guestVCPUs     = 1
-	guestMemoryMiB = 128
+	guestMemoryReserveMiB = 192
+	minGuestMemoryMiB     = 128
+	maxGuestMemoryMiB     = 16384
 )
+
+// memoryLimitPattern is the form Cloud Controller gives MEMORY_LIMIT: whole
+// megabytes with a lowercase m. Seven digits is far beyond any cell and keeps
+// the arithmetic small.
+var memoryLimitPattern = regexp.MustCompile(`^[1-9][0-9]{0,6}m$`)
+
+// guestMemory returns the guest memory size in MiB from MEMORY_LIMIT. A
+// missing or malformed value gives the floor, and so does a container too
+// small to hold the floor and the reserve; each of those logs one line, so an
+// operator who sees the hypervisor killed for memory can find the cause. The
+// lines name the limit only once it has parsed as a number.
+func guestMemory(lookupEnv func(string) (string, bool), logger *log.Logger) int {
+	value, ok := lookupEnv("MEMORY_LIMIT")
+	if !ok {
+		logger.Printf("MEMORY_LIMIT is not set; the guest gets %d MiB", minGuestMemoryMiB)
+		return minGuestMemoryMiB
+	}
+	limit, err := strconv.Atoi(strings.TrimSuffix(value, "m"))
+	if !memoryLimitPattern.MatchString(value) || err != nil {
+		logger.Printf("MEMORY_LIMIT is not a whole number of megabytes such as 512m; the guest gets %d MiB", minGuestMemoryMiB)
+		return minGuestMemoryMiB
+	}
+	guest := limit - guestMemoryReserveMiB
+	switch {
+	case guest < minGuestMemoryMiB:
+		logger.Printf("MEMORY_LIMIT %dm is below the %dm a guest of %d MiB needs with the %d MiB the container keeps for the hypervisor; the guest gets %d MiB and may be killed for memory, so give the app at least %dM",
+			limit, minGuestMemoryMiB+guestMemoryReserveMiB, minGuestMemoryMiB, guestMemoryReserveMiB, minGuestMemoryMiB, minGuestMemoryMiB+guestMemoryReserveMiB)
+		return minGuestMemoryMiB
+	case guest > maxGuestMemoryMiB:
+		logger.Printf("MEMORY_LIMIT %dm leaves more than the %d MiB a guest may have; the guest gets %d MiB", limit, maxGuestMemoryMiB, maxGuestMemoryMiB)
+		return maxGuestMemoryMiB
+	}
+	return guest
+}
 
 // Kernel command lines. QEMU exits on guest reboot because of -no-reboot, so
 // it uses a triple-fault reboot and reboots at once on panic. Firecracker
@@ -89,8 +134,9 @@ func checkArtifacts(kind backend.Kind, root string) error {
 	return nil
 }
 
-// qemuArgv returns the QEMU command line. The microvm binary needs a newer
-// glibc than the app rootfs has, so it runs through its bundled loader.
+// qemuArgv returns the QEMU command line for a guest of memMiB MiB. The
+// microvm binary needs a newer glibc than the app rootfs has, so it runs
+// through its bundled loader.
 //
 // With a network, the guest gets a virtio-net NIC on QEMU's user-mode
 // network, and QEMU itself listens on the container's PORT and forwards each
@@ -104,7 +150,7 @@ func checkArtifacts(kind backend.Kind, root string) error {
 // I/O errors, ENOSPC and EDQUOT included, reach the guest as errors instead
 // of pausing the VM. QEMU's own image locking is off because vm-launch holds
 // the flock that decides who writes the image.
-func qemuArgv(root, initrd string, nw *network, drivePath string) []string {
+func qemuArgv(root, initrd string, memMiB int, nw *network, drivePath string) []string {
 	art := func(rel string) string { return filepath.Join(root, rel) }
 	argv := []string{
 		art(artQEMULoader),
@@ -114,7 +160,7 @@ func qemuArgv(root, initrd string, nw *network, drivePath string) []string {
 		"-M", "microvm,accel=kvm",
 		"-cpu", "host",
 		"-smp", strconv.Itoa(guestVCPUs),
-		"-m", strconv.Itoa(guestMemoryMiB),
+		"-m", strconv.Itoa(memMiB),
 		"-nodefaults",
 		"-no-user-config",
 		"-nographic",
@@ -200,10 +246,10 @@ type firecrackerNetworkInterface struct {
 	HostDevName string `json:"host_dev_name"`
 }
 
-// firecrackerConfigJSON returns the --config-file content: the volume image
-// as the only drive when drivePath is set, and a network interface on
-// Garden's tap device only when there is a network.
-func firecrackerConfigJSON(root, initrd string, nw *network, drivePath string) ([]byte, error) {
+// firecrackerConfigJSON returns the --config-file content for a guest of
+// memMiB MiB: the volume image as the only drive when drivePath is set, and a
+// network interface on Garden's tap device only when there is a network.
+func firecrackerConfigJSON(root, initrd string, memMiB int, nw *network, drivePath string) ([]byte, error) {
 	cfg := firecrackerConfig{
 		BootSource: firecrackerBootSource{
 			KernelImagePath: filepath.Join(root, artVmlinux),
@@ -211,7 +257,7 @@ func firecrackerConfigJSON(root, initrd string, nw *network, drivePath string) (
 			BootArgs:        firecrackerKernelArgs,
 		},
 		Drives:        []firecrackerDrive{},
-		MachineConfig: firecrackerMachineConfig{VCPUCount: guestVCPUs, MemSizeMiB: guestMemoryMiB},
+		MachineConfig: firecrackerMachineConfig{VCPUCount: guestVCPUs, MemSizeMiB: memMiB},
 	}
 	if drivePath != "" {
 		cfg.Drives = []firecrackerDrive{{
@@ -235,14 +281,15 @@ func firecrackerArgv(root, configPath string) []string {
 
 // hypervisorArgv returns the command line for kind, writing any config file
 // it needs into workDir. workDir holds only data files; nothing runs from it.
-// drivePath is the volume image path the hypervisor opens, or empty without
-// a volume.
-func hypervisorArgv(kind backend.Kind, root, workDir, initrd string, nw *network, drivePath string) ([]string, error) {
+// memMiB is the guest memory size from guestMemory, which keeps it between
+// the floor and the ceiling, and drivePath is the volume image path the
+// hypervisor opens, or empty without a volume.
+func hypervisorArgv(kind backend.Kind, root, workDir, initrd string, memMiB int, nw *network, drivePath string) ([]string, error) {
 	switch kind {
 	case backend.VMQemu:
-		return qemuArgv(root, initrd, nw, drivePath), nil
+		return qemuArgv(root, initrd, memMiB, nw, drivePath), nil
 	case backend.VMFirecracker:
-		cfg, err := firecrackerConfigJSON(root, initrd, nw, drivePath)
+		cfg, err := firecrackerConfigJSON(root, initrd, memMiB, nw, drivePath)
 		if err != nil {
 			return nil, fmt.Errorf("encoding firecracker config: %w", err)
 		}

@@ -460,7 +460,7 @@ var _ = Describe("hypervisor command lines", func() {
 	const art = "/opt/garden-vm/artifacts"
 
 	It("builds the QEMU microvm command line through the bundled loader", func() {
-		argv, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/tmp/w/initrd.cpio.gz", nil, "")
+		argv, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/tmp/w/initrd.cpio.gz", 128, nil, "")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(argv).To(Equal([]string{
 			art + "/qemu/ld-linux-x86-64.so.2", "--library-path", art + "/qemu/lib",
@@ -474,7 +474,7 @@ var _ = Describe("hypervisor command lines", func() {
 
 	It("writes the Firecracker config and builds its command line", func() {
 		work := GinkgoT().TempDir()
-		argv, err := hypervisorArgv(backend.VMFirecracker, art, work, work+"/initrd.cpio.gz", nil, "")
+		argv, err := hypervisorArgv(backend.VMFirecracker, art, work, work+"/initrd.cpio.gz", 128, nil, "")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(argv).To(Equal([]string{art + "/firecracker/firecracker", "--no-api", "--config-file", work + "/fc.json"}))
 
@@ -494,7 +494,7 @@ var _ = Describe("hypervisor command lines", func() {
 	})
 
 	It("rejects other backends", func() {
-		_, err := hypervisorArgv(backend.OCIRunc, art, "/w", "/w/i", nil, "")
+		_, err := hypervisorArgv(backend.OCIRunc, art, "/w", "/w/i", 128, nil, "")
 		Expect(err).To(MatchError(ContainSubstring("unsupported backend")))
 	})
 

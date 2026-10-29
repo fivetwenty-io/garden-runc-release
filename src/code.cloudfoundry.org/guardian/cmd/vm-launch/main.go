@@ -54,6 +54,13 @@
 // formatted. A VM app supports one read-write volume mount, and
 // VCAP_SERVICES itself never reaches the guest.
 //
+// Memory: the guest gets MEMORY_LIMIT less 192 MiB, which the container
+// keeps for the hypervisor and everything else it runs, with a floor of 128
+// MiB and a ceiling of 16 GiB. MEMORY_LIMIT must be whole megabytes, such as
+// 512m. When it is missing or malformed, or below the 320m that the floor
+// and the reserve need, the guest gets 128 MiB and vm-launch logs a line
+// that says so.
+//
 // The guest's console output, stdout and stderr merged, is written to stdout
 // as it arrives. Kernel boot messages and the status marker are dropped.
 //
@@ -169,6 +176,7 @@ func run(argv []string, logger *log.Logger) int {
 		logger.Print(err)
 		return exitLaunchError
 	}
+	memMiB := guestMemory(os.LookupEnv, logger)
 
 	workDir, err := os.MkdirTemp("", "vm-launch-")
 	if err != nil {
@@ -205,7 +213,7 @@ func run(argv []string, logger *log.Logger) int {
 		logger.Print(err)
 		return exitLaunchError
 	}
-	hvArgv, err := hypervisorArgv(cfg.backend, cfg.artifacts, workDir, initrd, nw, drivePath)
+	hvArgv, err := hypervisorArgv(cfg.backend, cfg.artifacts, workDir, initrd, memMiB, nw, drivePath)
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError

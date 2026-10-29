@@ -105,7 +105,7 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 
 	It("accepts the drive option string vm-launch generates", func() {
 		qemu := realQEMU()
-		drive := driveOption(qemuArgv(goldenArt, goldenInitrd, nil, volumeDrivePath()))
+		drive := driveOption(qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, nil, volumeDrivePath()))
 		code, stderr := parseDrive(qemu, noMachine, "-drive", drive)
 		Expect(code).To(Equal(0), "QEMU rejected -drive %s: %s", drive, stderr)
 	})
@@ -113,7 +113,7 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 	It("accepts the -drive and -device pair vm-launch generates on a microvm machine", func() {
 		qemu := realQEMU()
 		requireMicrovm(qemu)
-		argv := qemuArgv(goldenArt, goldenInitrd, nil, volumeDrivePath())
+		argv := qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, nil, volumeDrivePath())
 		drive, device := driveOption(argv), deviceOption(argv)
 		Expect(device).To(ContainSubstring("drive=vol0"))
 		code, stderr := parseDrive(qemu, microvm, "-drive", drive, "-device", device)
@@ -123,7 +123,7 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 	It("rejects a -device that names a drive that does not exist, so the pair check above can fail", func() {
 		qemu := realQEMU()
 		requireMicrovm(qemu)
-		argv := qemuArgv(goldenArt, goldenInitrd, nil, volumeDrivePath())
+		argv := qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, nil, volumeDrivePath())
 		device := strings.Replace(deviceOption(argv), "drive=vol0", "drive=vol9", 1)
 		code, stderr := parseDrive(qemu, microvm, "-drive", driveOption(argv), "-device", device)
 		Expect(code).NotTo(Equal(0))
@@ -132,7 +132,7 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 
 	It("rejects the unprefixed locking option, so the check above can fail", func() {
 		qemu := realQEMU()
-		drive := strings.Replace(driveOption(qemuArgv(goldenArt, goldenInitrd, nil, volumeDrivePath())), "file.locking=off", "locking=off", 1)
+		drive := strings.Replace(driveOption(qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, nil, volumeDrivePath())), "file.locking=off", "locking=off", 1)
 		Expect(drive).To(ContainSubstring(",locking=off,"))
 		code, stderr := parseDrive(qemu, noMachine, "-drive", drive)
 		Expect(code).NotTo(Equal(0))
