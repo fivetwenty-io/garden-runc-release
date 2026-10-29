@@ -13,9 +13,11 @@ import (
 	. "github.com/onsi/gomega"
 )
 
-// The hypervisor command lines and Firecracker configuration of cf68f18,
-// from before volume support, for the artifacts below, with the initramfs
-// passed as file descriptor 3, as it is without a volume.
+// The hypervisor command lines and Firecracker configuration without a
+// volume, for the artifacts below, with the initramfs passed as file
+// descriptor 3, as it is without a volume. Apart from the initramfs path and
+// QEMU's dump-guest-core=off, they are those of cf68f18, from before volume
+// support.
 const (
 	goldenArt    = "/opt/garden-vm/artifacts"
 	goldenInitrd = "/proc/self/fd/3"
@@ -37,7 +39,7 @@ var (
 	goldenQEMUPlain = []string{
 		"/opt/garden-vm/artifacts/qemu/ld-linux-x86-64.so.2", "--library-path", "/opt/garden-vm/artifacts/qemu/lib",
 		"/opt/garden-vm/artifacts/qemu/qemu-system-x86_64-microvm", "-L", "/opt/garden-vm/artifacts/qemu/share",
-		"-M", "microvm,accel=kvm", "-cpu", "host", "-smp", "1", "-m", "128",
+		"-M", "microvm,accel=kvm,dump-guest-core=off", "-cpu", "host", "-smp", "1", "-m", "128",
 		"-nodefaults", "-no-user-config", "-nographic", "-serial", "stdio", "-no-reboot",
 		"-kernel", "/opt/garden-vm/artifacts/kernel/bzImage", "-initrd", "/proc/self/fd/3",
 		"-append", "console=ttyS0 reboot=t panic=-1 rdinit=/init pci=off quiet",

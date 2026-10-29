@@ -112,6 +112,25 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 	noMachine := []string{"-machine", "none"}
 	microvm := []string{"-M", "microvm,accel=tcg"}
 
+	It("accepts the machine option vm-launch generates, with TCG in place of KVM", func() {
+		qemu := realQEMU()
+		requireMicrovm(qemu)
+		machine := optionAfter(qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, nil, ""), "-M", "microvm")
+		Expect(strings.Split(machine, ",")).To(ContainElement("dump-guest-core=off"))
+		code, stderr := parseDrive(qemu, []string{"-M", strings.Replace(machine, "accel=kvm", "accel=tcg", 1)})
+		Expect(code).To(Equal(0), "QEMU rejected -M %s: %s", machine, stderr)
+	})
+
+	It("rejects a dump-guest-core value it does not know, so the machine check above can fail", func() {
+		qemu := realQEMU()
+		requireMicrovm(qemu)
+		machine := optionAfter(qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, nil, ""), "-M", "microvm")
+		machine = strings.Replace(strings.Replace(machine, "accel=kvm", "accel=tcg", 1), "dump-guest-core=off", "dump-guest-core=maybe", 1)
+		code, stderr := parseDrive(qemu, []string{"-M", machine})
+		Expect(code).NotTo(Equal(0))
+		Expect(stderr).To(ContainSubstring("dump-guest-core"))
+	})
+
 	It("accepts the drive option string vm-launch generates", func() {
 		qemu := realQEMU()
 		drive := driveOption(qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, nil, volumeDrivePath()))

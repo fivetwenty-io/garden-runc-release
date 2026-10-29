@@ -613,7 +613,7 @@ var _ = Describe("hypervisor command lines", func() {
 		Expect(argv).To(Equal([]string{
 			art + "/qemu/ld-linux-x86-64.so.2", "--library-path", art + "/qemu/lib",
 			art + "/qemu/qemu-system-x86_64-microvm", "-L", art + "/qemu/share",
-			"-M", "microvm,accel=kvm", "-cpu", "host", "-smp", "1", "-m", "128",
+			"-M", "microvm,accel=kvm,dump-guest-core=off", "-cpu", "host", "-smp", "1", "-m", "128",
 			"-nodefaults", "-no-user-config", "-nographic", "-serial", "stdio", "-no-reboot",
 			"-kernel", art + "/kernel/bzImage", "-initrd", "/proc/self/fd/3",
 			"-append", "console=ttyS0 reboot=t panic=-1 rdinit=/init pci=off quiet",

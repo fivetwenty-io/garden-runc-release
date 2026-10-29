@@ -66,6 +66,14 @@
 // file descriptor after the volume image's, 3 without a volume and 4 with
 // one, and vm-launch closes its own copy once the hypervisor has started.
 //
+// Core dumps: vm-launch sets its RLIMIT_CORE to zero, soft and hard, and its
+// coredump_filter to zero before it does anything else, and the hypervisor
+// inherits both. A pipe core handler takes a dump despite the limit, but the
+// kernel applies the filter to that dump too, so it holds none of the
+// process's memory mappings except the vDSO. QEMU also runs with
+// dump-guest-core=off, which keeps guest RAM out of a dump of QEMU even if
+// something raises the filter again.
+//
 // The guest's console output, stdout and stderr merged, is written to stdout
 // as it arrives. Kernel boot messages and the status marker are dropped.
 //
@@ -77,15 +85,15 @@
 //	124    the hypervisor failed: it exited non-zero before the guest reported a
 //	       status, as QEMU does when PORT is already in use in the container
 //	       or when it cannot open the volume image
-//	125    vm-launch could not start the guest: bad arguments, a missing
-//	       artifact, a work file or initramfs it could not write, a
-//	       hypervisor it could not run, (Firecracker) PORT already in use in
-//	       the container, or a volume it cannot use: VCAP_SERVICES that is
-//	       not valid JSON, more than one volume mount, a read-only mount, a
-//	       bad volume path, CF_INSTANCE_INDEX, application_id, or
-//	       process_type, a task with a volume, an image that fails a check
-//	       or cannot be created, or an image another instance still holds
-//	       after 30 seconds
+//	125    vm-launch could not start the guest: core dumps it could not
+//	       disable, bad arguments, a missing artifact, a work file or
+//	       initramfs it could not write, a hypervisor it could not run,
+//	       (Firecracker) PORT already in use in the container, or a volume
+//	       it cannot use: VCAP_SERVICES that is not valid JSON, more than
+//	       one volume mount, a read-only mount, a bad volume path,
+//	       CF_INSTANCE_INDEX, application_id, or process_type, a task with
+//	       a volume, an image that fails a check or cannot be created, or
+//	       an image another instance still holds after 30 seconds
 //	128+N  vm-launch received signal N (SIGTERM or SIGINT), or the hypervisor
 //	       died from signal N, before the guest reported a status; this
 //	       includes a signal while vm-launch waits for the volume image
@@ -115,6 +123,7 @@ import (
 	"time"
 
 	"code.cloudfoundry.org/guardian/backend"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -143,7 +152,50 @@ func main() {
 	os.Exit(run(os.Args[1:], logger))
 }
 
+// coreDumpFilterPath is the file that holds vm-launch's coredump_filter.
+// Specs point it elsewhere to make the write fail.
+var coreDumpFilterPath = "/proc/self/coredump_filter"
+
+// disableCoreDumps sets vm-launch's RLIMIT_CORE to zero, soft and hard, and
+// then its coredump_filter to zero. Specs replace it to make it fail.
+var disableCoreDumps = func() error {
+	if err := unix.Setrlimit(unix.RLIMIT_CORE, &unix.Rlimit{Cur: 0, Max: 0}); err != nil {
+		return err
+	}
+	return writeCoreDumpFilter(coreDumpFilterPath)
+}
+
+// writeCoreDumpFilter writes a filter of zero to path. Its error names the
+// path and the errno, and nothing else.
+func writeCoreDumpFilter(path string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err == nil {
+		_, err = f.WriteString("0")
+		if closeErr := f.Close(); err == nil {
+			err = closeErr
+		}
+	}
+	if err != nil {
+		var pathErr *os.PathError
+		if errors.As(err, &pathErr) {
+			err = pathErr.Err
+		}
+		return fmt.Errorf("writing %s: %w", path, err)
+	}
+	return nil
+}
+
 func run(argv []string, logger *log.Logger) int {
+	// Guest RAM holds what vm-launch puts in the guest, and a core dump of
+	// the hypervisor would write that to disk. The hypervisor inherits the
+	// limit, and with a hard limit of zero it cannot raise it again. A pipe
+	// core handler ignores a limit of zero, so the hypervisor also inherits
+	// a coredump_filter of zero, which leaves its memory out of any dump.
+	if err := disableCoreDumps(); err != nil {
+		logger.Printf("disabling core dumps: %v", err)
+		return exitLaunchError
+	}
+
 	// The guest's output goes to stdout, which a dying reader can break. Go
 	// kills a process whose write to fd 1 or 2 hits a broken pipe, unless SIGPIPE
 	// is caught or ignored. Ignoring it turns that into an EPIPE error that the

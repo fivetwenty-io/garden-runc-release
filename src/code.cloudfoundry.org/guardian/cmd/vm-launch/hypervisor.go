@@ -83,6 +83,10 @@ func guestMemory(lookupEnv func(string) (string, bool), logger *log.Logger) int 
 	return guest
 }
 
+// qemuMachine is QEMU's -M option: the microvm machine under KVM, with guest
+// RAM left out of any core dump of QEMU.
+const qemuMachine = "microvm,accel=kvm,dump-guest-core=off"
+
 // Kernel command lines. QEMU exits on guest reboot because of -no-reboot, so
 // it uses a triple-fault reboot and reboots at once on panic. Firecracker
 // exits on a keyboard-controller reboot.
@@ -136,7 +140,8 @@ func checkArtifacts(kind backend.Kind, root string) error {
 
 // qemuArgv returns the QEMU command line for a guest of memMiB MiB. The
 // microvm binary needs a newer glibc than the app rootfs has, so it runs
-// through its bundled loader.
+// through its bundled loader. dump-guest-core=off marks guest RAM as
+// excluded from QEMU's core dumps.
 //
 // With a network, the guest gets a virtio-net NIC on QEMU's user-mode
 // network, and QEMU itself listens on the container's PORT and forwards each
@@ -157,7 +162,7 @@ func qemuArgv(root, initrd string, memMiB int, nw *network, drivePath string) []
 		"--library-path", art(artQEMULibDir),
 		art(artQEMUBinary),
 		"-L", art(artQEMUShareDir),
-		"-M", "microvm,accel=kvm",
+		"-M", qemuMachine,
 		"-cpu", "host",
 		"-smp", strconv.Itoa(guestVCPUs),
 		"-m", strconv.Itoa(memMiB),
