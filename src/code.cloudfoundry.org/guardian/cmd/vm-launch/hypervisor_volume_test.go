@@ -15,9 +15,11 @@ import (
 
 // The hypervisor command lines and Firecracker configuration without a
 // volume, for the artifacts below, with the initramfs passed as file
-// descriptor 3, as it is without a volume. Apart from the initramfs path and
-// QEMU's dump-guest-core=off, they are those of cf68f18, from before volume
-// support.
+// descriptor 3, as it is without a volume. Apart from the initramfs path,
+// QEMU's dump-guest-core=off, and a task's NIC, they are those of cf68f18,
+// from before volume support. Every guest has a NIC, so goldenQEMUBase is a
+// full command line only with a netdev after it, and goldenFCNet is the
+// configuration of a task and of an LRP alike.
 const (
 	goldenArt    = "/opt/garden-vm/artifacts"
 	goldenInitrd = "/proc/self/fd/3"
@@ -28,15 +30,14 @@ const (
 	// every guest had before its size came from MEMORY_LIMIT.
 	goldenMemMiB = 128
 
-	goldenFCPlain = `{"boot-source":{"kernel_image_path":"/opt/garden-vm/artifacts/kernel/vmlinux","initrd_path":"/proc/self/fd/3","boot_args":"console=ttyS0 reboot=k panic=1 rdinit=/init quiet"},"drives":[],"machine-config":{"vcpu_count":1,"mem_size_mib":128}}`
-	goldenFCNet   = `{"boot-source":{"kernel_image_path":"/opt/garden-vm/artifacts/kernel/vmlinux","initrd_path":"/proc/self/fd/3","boot_args":"console=ttyS0 reboot=k panic=1 rdinit=/init quiet"},"drives":[],"machine-config":{"vcpu_count":1,"mem_size_mib":128},"network-interfaces":[{"iface_id":"eth0","guest_mac":"06:00:a9:fe:64:02","host_dev_name":"tap0"}]}`
+	goldenFCNet = `{"boot-source":{"kernel_image_path":"/opt/garden-vm/artifacts/kernel/vmlinux","initrd_path":"/proc/self/fd/3","boot_args":"console=ttyS0 reboot=k panic=1 rdinit=/init quiet"},"drives":[],"machine-config":{"vcpu_count":1,"mem_size_mib":128},"network-interfaces":[{"iface_id":"eth0","guest_mac":"06:00:a9:fe:64:02","host_dev_name":"tap0"}]}`
 
 	// goldenFCDrive is the drives entry a volume adds.
 	goldenFCDrive = `"drives":[{"drive_id":"vol0","path_on_host":"/proc/self/fd/3","is_root_device":false,"is_read_only":false,"cache_type":"Writeback","io_engine":"Sync"}]`
 )
 
 var (
-	goldenQEMUPlain = []string{
+	goldenQEMUBase = []string{
 		"/opt/garden-vm/artifacts/qemu/ld-linux-x86-64.so.2", "--library-path", "/opt/garden-vm/artifacts/qemu/lib",
 		"/opt/garden-vm/artifacts/qemu/qemu-system-x86_64-microvm", "-L", "/opt/garden-vm/artifacts/qemu/share",
 		"-M", "microvm,accel=kvm,dump-guest-core=off", "-cpu", "host", "-smp", "1", "-m", "128",
@@ -44,8 +45,14 @@ var (
 		"-kernel", "/opt/garden-vm/artifacts/kernel/bzImage", "-initrd", "/proc/self/fd/3",
 		"-append", "console=ttyS0 reboot=t panic=-1 rdinit=/init pci=off quiet",
 	}
+	// goldenQEMUNetdev is the NIC of an LRP on PORT 8080, which QEMU forwards.
 	goldenQEMUNetdev = []string{
 		"-netdev", "user,id=n0,net=10.0.2.0/24,hostfwd=tcp:0.0.0.0:8080-10.0.2.15:8080",
+		"-device", "virtio-net-device,netdev=n0",
+	}
+	// goldenQEMUTaskNetdev is the NIC of a task, which has no port to forward.
+	goldenQEMUTaskNetdev = []string{
+		"-netdev", "user,id=n0,net=10.0.2.0/24",
 		"-device", "virtio-net-device,netdev=n0",
 	}
 	// goldenQEMUDrive is what a volume adds to the QEMU command line.
@@ -86,6 +93,7 @@ func concat(parts ...[]string) []string {
 
 var _ = Describe("hypervisor volume drive", func() {
 	nw := &network{port: 8080}
+	task := &network{}
 
 	It("passes the image as file descriptor 3 by its /proc/self/fd path", func() {
 		Expect(volumeDriveFD).To(Equal(3))
@@ -124,26 +132,25 @@ var _ = Describe("hypervisor volume drive", func() {
 	})
 
 	It("keeps the QEMU command line without a volume byte for byte", func() {
-		Expect(qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, nil, "")).To(Equal(goldenQEMUPlain))
-		Expect(qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, nw, "")).To(Equal(concat(goldenQEMUPlain, goldenQEMUNetdev)))
+		Expect(qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, task, "")).To(Equal(concat(goldenQEMUBase, goldenQEMUTaskNetdev)))
+		Expect(qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, nw, "")).To(Equal(concat(goldenQEMUBase, goldenQEMUNetdev)))
 	})
 
-	It("keeps the Firecracker configuration without a volume byte for byte", func() {
-		plain, err := firecrackerConfigJSON(goldenArt, goldenInitrd, goldenMemMiB, nil, "")
-		Expect(err).NotTo(HaveOccurred())
-		Expect(string(plain)).To(Equal(goldenFCPlain))
-		networked, err := firecrackerConfigJSON(goldenArt, goldenInitrd, goldenMemMiB, nw, "")
-		Expect(err).NotTo(HaveOccurred())
-		Expect(string(networked)).To(Equal(goldenFCNet))
+	It("keeps the Firecracker configuration without a volume byte for byte, for a task and an LRP alike", func() {
+		for _, n := range []*network{task, nw} {
+			raw, err := firecrackerConfigJSON(goldenArt, goldenInitrd, goldenMemMiB, n, "")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(raw)).To(Equal(goldenFCNet), "port %d", n.port)
+		}
 	})
 
 	It("attaches the image to QEMU as one raw virtio-blk drive, after the NIC", func() {
-		Expect(qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, nil, volumeDrivePath())).To(Equal(concat(withInitrd(goldenQEMUPlain, goldenVolumeInitrd), goldenQEMUDrive)))
-		Expect(qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, nw, volumeDrivePath())).To(Equal(concat(withInitrd(goldenQEMUPlain, goldenVolumeInitrd), goldenQEMUNetdev, goldenQEMUDrive)))
+		Expect(qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, task, volumeDrivePath())).To(Equal(concat(withInitrd(goldenQEMUBase, goldenVolumeInitrd), goldenQEMUTaskNetdev, goldenQEMUDrive)))
+		Expect(qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, nw, volumeDrivePath())).To(Equal(concat(withInitrd(goldenQEMUBase, goldenVolumeInitrd), goldenQEMUNetdev, goldenQEMUDrive)))
 	})
 
 	It("pins the QEMU drive to raw, reported errors, and no QEMU locking", func() {
-		opts := qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, nil, volumeDrivePath())
+		opts := qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, task, volumeDrivePath())
 		drive := opts[len(opts)-3]
 		for _, o := range []string{"format=raw", "werror=report", "rerror=report", "file.locking=off", "cache=writeback"} {
 			Expect(strings.Split(drive, ",")).To(ContainElement(o))
@@ -154,14 +161,10 @@ var _ = Describe("hypervisor volume drive", func() {
 	})
 
 	It("gives Firecracker the image as its only drive", func() {
-		for _, n := range []*network{nil, nw} {
+		for _, n := range []*network{task, nw} {
 			raw, err := firecrackerConfigJSON(goldenArt, goldenVolumeInitrd, goldenMemMiB, n, volumeDrivePath())
 			Expect(err).NotTo(HaveOccurred())
-			golden := goldenFCPlain
-			if n != nil {
-				golden = goldenFCNet
-			}
-			Expect(string(raw)).To(Equal(strings.Replace(fcWithInitrd(golden, goldenVolumeInitrd), `"drives":[]`, goldenFCDrive, 1)))
+			Expect(string(raw)).To(Equal(strings.Replace(fcWithInitrd(goldenFCNet, goldenVolumeInitrd), `"drives":[]`, goldenFCDrive, 1)))
 
 			var cfg map[string]any
 			Expect(json.Unmarshal(raw, &cfg)).To(Succeed())
@@ -178,7 +181,7 @@ var _ = Describe("hypervisor volume drive", func() {
 
 	It("writes the Firecracker drive into the config file hypervisorArgv makes", func() {
 		work := GinkgoT().TempDir()
-		argv, err := hypervisorArgv(backend.VMFirecracker, goldenArt, work, goldenVolumeInitrd, goldenMemMiB, nil, volumeDrivePath())
+		argv, err := hypervisorArgv(backend.VMFirecracker, goldenArt, work, goldenVolumeInitrd, goldenMemMiB, task, volumeDrivePath())
 		Expect(err).NotTo(HaveOccurred())
 		Expect(argv).To(Equal([]string{goldenArt + "/firecracker/firecracker", "--no-api", "--config-file", work + "/fc.json"}))
 		raw, err := os.ReadFile(filepath.Join(work, "fc.json"))
@@ -186,8 +189,8 @@ var _ = Describe("hypervisor volume drive", func() {
 		Expect(string(raw)).To(ContainSubstring(goldenFCDrive))
 		Expect(string(raw)).To(ContainSubstring(`"initrd_path":"` + goldenVolumeInitrd + `"`))
 
-		qemu, err := hypervisorArgv(backend.VMQemu, goldenArt, work, goldenVolumeInitrd, goldenMemMiB, nil, volumeDrivePath())
+		qemu, err := hypervisorArgv(backend.VMQemu, goldenArt, work, goldenVolumeInitrd, goldenMemMiB, task, volumeDrivePath())
 		Expect(err).NotTo(HaveOccurred())
-		Expect(qemu).To(Equal(concat(withInitrd(goldenQEMUPlain, goldenVolumeInitrd), goldenQEMUDrive)))
+		Expect(qemu).To(Equal(concat(withInitrd(goldenQEMUBase, goldenVolumeInitrd), goldenQEMUTaskNetdev, goldenQEMUDrive)))
 	})
 })

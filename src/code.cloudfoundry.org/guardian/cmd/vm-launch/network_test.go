@@ -121,10 +121,28 @@ var _ = Describe("guest network", func() {
 	Describe("networkFor", func() {
 		const resolv = "# silk\nnameserver 169.254.0.2\nsearch service.cf.internal apps.internal\noptions ndots:1\n"
 
-		It("gives a process without PORT no network", func() {
-			nw, err := networkFor(backend.VMFirecracker, envMap(map[string]string{"CF_INSTANCE_GUID": "g"}), "/nonexistent", fixedMTU(1450), logger)
+		It("gives a QEMU process without PORT the full guest network with port 0", func() {
+			nw, err := networkFor(backend.VMQemu, envMap(map[string]string{"CF_INSTANCE_GUID": "g"}), writeTempFile("resolv.conf", resolv), fixedMTU(1450), logger)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(nw).To(BeNil())
+			Expect(*nw).To(Equal(network{
+				address:    "10.0.2.15/24",
+				gateway:    "10.0.2.2",
+				resolvConf: "search service.cf.internal apps.internal\nnameserver 10.0.2.3\n",
+				env:        "export CF_INSTANCE_GUID='g'\n",
+			}))
+			Expect(logBuf.String()).To(BeEmpty())
+		})
+
+		It("gives a Firecracker process without PORT the full guest network with port 0", func() {
+			nw, err := networkFor(backend.VMFirecracker, envMap(map[string]string{"CF_INSTANCE_GUID": "g"}), writeTempFile("resolv.conf", resolv), fixedMTU(1450), logger)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(*nw).To(Equal(network{
+				address:    "169.254.100.2/30",
+				gateway:    "169.254.100.1",
+				resolvConf: "search service.cf.internal apps.internal\nnameserver 169.254.0.2\n",
+				env:        "export CF_INSTANCE_GUID='g'\n",
+				mtu:        1450,
+			}))
 			Expect(logBuf.String()).To(BeEmpty())
 		})
 
@@ -325,11 +343,11 @@ var _ = Describe("guest network", func() {
 			Expect(string(byName["rvm/env"].data)).To(Equal("export PORT='8080'\n"))
 			Expect(string(byName["etc/resolv.conf"].data)).To(Equal("nameserver 10.0.2.3\n"))
 			Expect(byName["etc/resolv.conf"].mode).To(Equal(uint32(0o100644)))
-			Expect(string(byName["init"].data)).To(Equal(initScript(testNonce, true, false)))
+			Expect(string(byName["init"].data)).To(Equal(initScript(testNonce, false)))
 		})
 
 		It("configures the network and environment before the start tag", func() {
-			script := initScript(testNonce, true, false)
+			script := initScript(testNonce, false)
 			start := strings.Index(script, "echo RVM_START_"+testNonce)
 			Expect(start).To(BeNumerically(">", 0))
 			for _, step := range []string{
@@ -349,13 +367,13 @@ var _ = Describe("guest network", func() {
 		})
 
 		It("sets the mtu of eth0 only when /rvm/net names one, and before it brings eth0 up", func() {
-			script := initScript(testNonce, true, false)
+			script := initScript(testNonce, false)
 			Expect(script).To(ContainSubstring("\nif [ -n \"${RVM_MTU:-}\" ]; then\n\tip link set eth0 mtu \"$RVM_MTU\" || echo \"vm-launch guest setup: setting the mtu of eth0 to $RVM_MTU failed; keeping the default mtu\"\nfi\n"))
 			Expect(strings.Index(script, `mtu "$RVM_MTU"`)).To(BeNumerically("<", strings.Index(script, "ip link set eth0 up")))
 		})
 
 		It("keeps booting with the default mtu when the guest rejects the mtu, and still fails on the other network steps", func() {
-			script := initScript(testNonce, true, false)
+			script := initScript(testNonce, false)
 			Expect(script).NotTo(ContainSubstring(`mtu "$RVM_MTU" || rvm_fail`))
 
 			// Run the real network setup with an ip that fails the mtu step only.
@@ -386,18 +404,30 @@ var _ = Describe("guest network", func() {
 			Expect(string(calls)).To(Equal("link set lo up\nlink set eth0 mtu 9001\nlink set eth0 up\naddr add 10.0.2.15/24 dev eth0\nroute add default via 10.0.2.2 dev eth0\n"))
 		})
 
-		It("leaves the init of a guest without network unchanged", func() {
-			script := initScript(testNonce, false, false)
-			Expect(script).NotTo(ContainSubstring("/rvm/net"))
-			Expect(script).NotTo(ContainSubstring("/rvm/env"))
-			Expect(script).NotTo(ContainSubstring("ip "))
+		It("gives a task the same archive and network setup as an LRP", func() {
+			task := &network{address: qemuGuestCIDR, gateway: qemuGateway, resolvConf: "nameserver 10.0.2.3\n"}
+			names, byName := archiveEntries(buildInitramfs([]byte("busybox"), "true", task, nil))
+			lrpNames, lrp := archiveEntries(buildInitramfs([]byte("busybox"), "true", nw, nil))
+			Expect(names).To(Equal(lrpNames))
+			Expect(byName["init"].data).To(Equal(lrp["init"].data))
+			Expect(byName["rvm/net"].data).To(Equal(lrp["rvm/net"].data))
+			Expect(byName["etc/resolv.conf"].data).To(Equal(lrp["etc/resolv.conf"].data))
+			Expect(byName["rvm/env"].data).To(BeEmpty())
+		})
+
+		It("defines rvm_fail before any step uses it", func() {
+			for _, volume := range []bool{false, true} {
+				script := initScript(testNonce, volume)
+				def := strings.Index(script, "rvm_fail() {")
+				Expect(def).To(BeNumerically(">", 0))
+				Expect(strings.Index(script, "rvm_fail")).To(Equal(def), "volume %v", volume)
+				Expect(strings.Index(script, ". /rvm/net")).To(BeNumerically(">", def))
+			}
 		})
 
 		It("is valid shell", func() {
-			for _, networked := range []bool{false, true} {
-				out, err := exec.Command("/bin/sh", "-n", "-c", initScript(testNonce, networked, false)).CombinedOutput()
-				Expect(err).NotTo(HaveOccurred(), string(out))
-			}
+			out, err := exec.Command("/bin/sh", "-n", "-c", initScript(testNonce, false)).CombinedOutput()
+			Expect(err).NotTo(HaveOccurred(), string(out))
 		})
 	})
 
@@ -405,33 +435,41 @@ var _ = Describe("guest network", func() {
 		const art = "/opt/garden-vm/artifacts"
 		nw := &network{port: 8080}
 
-		It("adds a user-mode NIC that forwards PORT to QEMU", func() {
+		It("adds a user-mode NIC that forwards PORT to QEMU, and the same NIC without a forward for a task", func() {
 			argv, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/proc/self/fd/3", 128, nw, "")
 			Expect(err).NotTo(HaveOccurred())
-			plain, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/proc/self/fd/3", 128, nil, "")
+			task, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/proc/self/fd/3", 128, &network{}, "")
 			Expect(err).NotTo(HaveOccurred())
-			Expect(argv).To(Equal(append(plain,
+			Expect(argv[:len(argv)-4]).To(Equal(task[:len(task)-4]))
+			Expect(argv[len(argv)-4:]).To(Equal([]string{
 				"-netdev", "user,id=n0,net=10.0.2.0/24,hostfwd=tcp:0.0.0.0:8080-10.0.2.15:8080",
 				"-device", "virtio-net-device,netdev=n0",
-			)))
+			}))
+			Expect(task[len(task)-4:]).To(Equal([]string{
+				"-netdev", "user,id=n0,net=10.0.2.0/24",
+				"-device", "virtio-net-device,netdev=n0",
+			}))
+			Expect(strings.Join(task, " ")).NotTo(ContainSubstring("hostfwd"))
 		})
 
-		It("attaches the Firecracker guest to garden's tap device", func() {
-			work := GinkgoT().TempDir()
-			argv, err := hypervisorArgv(backend.VMFirecracker, art, work, "/proc/self/fd/3", 128, nw, "")
-			Expect(err).NotTo(HaveOccurred())
-			Expect(argv).To(Equal([]string{art + "/firecracker/firecracker", "--no-api", "--config-file", work + "/fc.json"}))
+		It("attaches the Firecracker guest of an LRP and of a task to garden's tap device", func() {
+			for _, n := range []*network{nw, {}} {
+				work := GinkgoT().TempDir()
+				argv, err := hypervisorArgv(backend.VMFirecracker, art, work, "/proc/self/fd/3", 128, n, "")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(argv).To(Equal([]string{art + "/firecracker/firecracker", "--no-api", "--config-file", work + "/fc.json"}))
 
-			raw, err := os.ReadFile(filepath.Join(work, "fc.json"))
-			Expect(err).NotTo(HaveOccurred())
-			var cfg map[string]any
-			Expect(json.Unmarshal(raw, &cfg)).To(Succeed())
-			Expect(cfg["network-interfaces"]).To(Equal([]any{map[string]any{
-				"iface_id":      "eth0",
-				"guest_mac":     "06:00:a9:fe:64:02",
-				"host_dev_name": "tap0",
-			}}))
-			Expect(cfg["boot-source"]).To(HaveKeyWithValue("boot_args", "console=ttyS0 reboot=k panic=1 rdinit=/init quiet"))
+				raw, err := os.ReadFile(filepath.Join(work, "fc.json"))
+				Expect(err).NotTo(HaveOccurred())
+				var cfg map[string]any
+				Expect(json.Unmarshal(raw, &cfg)).To(Succeed())
+				Expect(cfg["network-interfaces"]).To(Equal([]any{map[string]any{
+					"iface_id":      "eth0",
+					"guest_mac":     "06:00:a9:fe:64:02",
+					"host_dev_name": "tap0",
+				}}), "port %d", n.port)
+				Expect(cfg["boot-source"]).To(HaveKeyWithValue("boot_args", "console=ttyS0 reboot=k panic=1 rdinit=/init quiet"))
+			}
 		})
 	})
 })
@@ -471,6 +509,20 @@ echo "RVM_EXIT_$nonce=0"
 	return argvFile
 }
 
+// vmLaunchListeners is fake hypervisor shell that sets $listening to the
+// inodes of the listening TCP sockets its parent, vm-launch, holds open.
+const vmLaunchListeners = `listening=
+for l in /proc/$PPID/fd/*; do
+	t=$(readlink "$l") || continue
+	case "$t" in socket:\[*\]) ;; *) continue ;; esac
+	i=${t#socket:[}
+	i=${i%]}
+	if cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk -v i="$i" '$4 == "0A" && $10 == i { f = 1 } END { exit !f }'; then
+		listening="$listening $i"
+	fi
+done
+`
+
 var _ = Describe("run with PORT", func() {
 	var (
 		art    string
@@ -504,7 +556,7 @@ var _ = Describe("run with PORT", func() {
 		Expect(logBuf.String()).To(ContainSubstring(`PORT "99999" is not a TCP port number`))
 	})
 
-	It("gives QEMU a forwarding NIC only when PORT is set", func() {
+	It("gives QEMU a NIC that forwards only when PORT is set", func() {
 		argvFile := fakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
 		GinkgoT().Setenv("PORT", "8080")
 		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
@@ -516,8 +568,28 @@ var _ = Describe("run with PORT", func() {
 		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
 		withoutPort, err := os.ReadFile(argvFile)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(string(withoutPort)).NotTo(ContainSubstring("-netdev"))
+		Expect(string(withoutPort)).To(ContainSubstring("\n-netdev\nuser,id=n0,net=10.0.2.0/24\n-device\nvirtio-net-device,netdev=n0\n"))
+		Expect(string(withoutPort)).NotTo(ContainSubstring("hostfwd"))
 		Expect(os.ReadDir(tmp)).To(BeEmpty())
+	})
+
+	It("gives a Firecracker task its NIC and opens no port in the container", func() {
+		fcCopy := filepath.Join(art, "fc-copy.json")
+		fakeHypervisor(filepath.Join(art, "firecracker/firecracker"),
+			`p=; for a in "$@"; do [ "$p" = --config-file ] && cp "$a" `+shellQuote(fcCopy)+`; p=$a; done
+`+vmLaunchListeners+`[ -z "$listening" ] || { echo "vm-launch listens on socket$listening" >&2; exit 1; }
+`)
+		Expect(runVM(backend.VMFirecracker)).To(Equal(0), logBuf.String())
+		Expect(os.ReadFile(fcCopy)).To(ContainSubstring(`"network-interfaces":[{"iface_id":"eth0","guest_mac":"06:00:a9:fe:64:02","host_dev_name":"tap0"}]`))
+		Expect(logBuf.String()).NotTo(ContainSubstring("listening"))
+	})
+
+	It("sees the Firecracker port proxy with the same check, so the task spec above can fail", func() {
+		fakeHypervisor(filepath.Join(art, "firecracker/firecracker"),
+			vmLaunchListeners+`[ -n "$listening" ] || { echo "no listener found" >&2; exit 1; }
+`)
+		GinkgoT().Setenv("PORT", strconv.Itoa(freePort()))
+		Expect(runVM(backend.VMFirecracker)).To(Equal(0), logBuf.String())
 	})
 
 	It("listens on PORT for Firecracker before the hypervisor starts and closes it after", func() {

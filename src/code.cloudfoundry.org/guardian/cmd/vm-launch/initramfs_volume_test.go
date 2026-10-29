@@ -12,11 +12,11 @@ import (
 	. "github.com/onsi/gomega"
 )
 
-// The /init scripts of cf68f18, from before volume support, for testNonce.
-// A guest without a volume must keep getting exactly these.
+// The /init script of a guest without a volume, for testNonce. It is the
+// networked /init of cf68f18, from before volume support, which every guest
+// now gets, a task's included. A guest without a volume must keep getting
+// exactly this.
 const (
-	goldenInitPlain = "#!/bin/busybox sh\n/bin/busybox --install -s /bin\nexport PATH=/bin\nmount -t proc proc /proc\nmount -t sysfs sys /sys\nmount -t devtmpfs dev /dev 2>/dev/null\necho RVM_START_0123456789abcdef\nsh /rvm/cmd </dev/null\necho RVM_EXIT_0123456789abcdef=$?\nreboot -f\n"
-
 	goldenInitNet = "#!/bin/busybox sh\n/bin/busybox --install -s /bin\nexport PATH=/bin\nmount -t proc proc /proc\nmount -t sysfs sys /sys\nmount -t devtmpfs dev /dev 2>/dev/null\nrvm_fail() { echo \"vm-launch guest setup: $1\"; reboot -f; exit 1; }\n. /rvm/net\nip link set lo up || rvm_fail \"bringing up lo failed\"\nn=0\nwhile [ ! -e /sys/class/net/eth0 ]; do\n\tn=$((n + 1))\n\t[ \"$n\" -gt 5 ] && rvm_fail \"no eth0 network device\"\n\tsleep 1\ndone\nif [ -n \"${RVM_MTU:-}\" ]; then\n\tip link set eth0 mtu \"$RVM_MTU\" || echo \"vm-launch guest setup: setting the mtu of eth0 to $RVM_MTU failed; keeping the default mtu\"\nfi\nip link set eth0 up || rvm_fail \"bringing up eth0 failed\"\nip addr add \"$RVM_ADDRESS\" dev eth0 || rvm_fail \"adding $RVM_ADDRESS to eth0 failed\"\nip route add default via \"$RVM_GATEWAY\" dev eth0 || rvm_fail \"adding the default route via $RVM_GATEWAY failed\"\n. /rvm/env\necho RVM_START_0123456789abcdef\nsh /rvm/cmd </dev/null\necho RVM_EXIT_0123456789abcdef=$?\nreboot -f\n"
 )
 
@@ -35,29 +35,29 @@ func archiveEntries(raw []byte) ([]string, map[string]cpioEntry) {
 var _ = Describe("guest volume initramfs", func() {
 	vol := &guestVolume{ContainerDir: "/data/it's $here", ImageName: "rvm-disk-3.img"}
 	nw := &network{port: 8080, address: qemuGuestCIDR, gateway: qemuGateway, resolvConf: "nameserver 10.0.2.3\n", env: "export PORT='8080'\n"}
+	task := taskNetwork()
 
 	writeArchive := func(nw *network, vol *guestVolume) []byte {
 		return buildInitramfs([]byte("busybox"), "true", nw, vol)
 	}
 
 	It("keeps the /init of a guest without a volume byte for byte", func() {
-		Expect(initScript(testNonce, false, false)).To(Equal(goldenInitPlain))
-		Expect(initScript(testNonce, true, false)).To(Equal(goldenInitNet))
+		Expect(initScript(testNonce, false)).To(Equal(goldenInitNet))
 
-		_, plain := archiveEntries(writeArchive(nil, nil))
-		Expect(string(plain["init"].data)).To(Equal(goldenInitPlain))
-		_, networked := archiveEntries(writeArchive(nw, nil))
-		Expect(string(networked["init"].data)).To(Equal(goldenInitNet))
+		for _, n := range []*network{task, nw} {
+			_, byName := archiveEntries(writeArchive(n, nil))
+			Expect(string(byName["init"].data)).To(Equal(goldenInitNet), "port %d", n.port)
+		}
 	})
 
 	It("adds /rvm/mounts with the device, the quoted path, and the image name", func() {
-		names, byName := archiveEntries(writeArchive(nil, vol))
-		Expect(names).To(Equal([]string{"bin", "dev", "dev/console", "dev/null", "proc", "sys", "tmp", "rvm",
-			"bin/busybox", "rvm/cmd", "rvm/mounts", "init", cpioTrailer}))
+		names, byName := archiveEntries(writeArchive(task, vol))
+		Expect(names).To(Equal([]string{"bin", "dev", "dev/console", "dev/null", "etc", "proc", "sys", "tmp", "rvm",
+			"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "etc/resolv.conf", "rvm/mounts", "init", cpioTrailer}))
 		Expect(string(byName["rvm/mounts"].data)).To(Equal(
 			"RVM_VOLUME_DEVICE=/dev/vda\nRVM_VOLUME_PATH='/data/it'\\''s $here'\nRVM_VOLUME_IMAGE='rvm-disk-3.img'\n"))
 		Expect(byName["rvm/mounts"].mode).To(Equal(uint32(0o100644)))
-		Expect(string(byName["init"].data)).To(Equal(initScript(testNonce, false, true)))
+		Expect(string(byName["init"].data)).To(Equal(initScript(testNonce, true)))
 
 		path := writeTempFile("mounts", mountsFile(vol))
 		out, err := exec.Command("/bin/sh", "-c", `. "$1"; printf '%s|%s|%s' "$RVM_VOLUME_DEVICE" "$RVM_VOLUME_PATH" "$RVM_VOLUME_IMAGE"`, "sh", path).Output()
@@ -65,30 +65,26 @@ var _ = Describe("guest volume initramfs", func() {
 		Expect(string(out)).To(Equal("/dev/vda|/data/it's $here|rvm-disk-3.img"))
 	})
 
-	It("adds /rvm/mounts after the network files of a networked guest", func() {
+	It("adds /rvm/mounts after the network files of an LRP", func() {
 		names, byName := archiveEntries(writeArchive(nw, vol))
 		Expect(names).To(Equal([]string{"bin", "dev", "dev/console", "dev/null", "etc", "proc", "sys", "tmp", "rvm",
 			"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "etc/resolv.conf", "rvm/mounts", "init", cpioTrailer}))
-		Expect(string(byName["init"].data)).To(Equal(initScript(testNonce, true, true)))
+		Expect(string(byName["init"].data)).To(Equal(initScript(testNonce, true)))
 	})
 
 	It("mounts the volume before the start tag and unmounts it after the command, before the exit tag", func() {
-		for _, networked := range []bool{false, true} {
-			script := initScript(testNonce, networked, true)
-			start := strings.Index(script, "\necho RVM_START_"+testNonce+"\n")
-			Expect(start).To(BeNumerically(">", 0))
-			Expect(strings.Count(script, "rvm_fail() {")).To(Equal(1))
-			Expect(strings.Index(script, "rvm_fail() {")).To(BeNumerically("<", strings.Index(script, "rvm_fail \"")))
+		script := initScript(testNonce, true)
+		start := strings.Index(script, "\necho RVM_START_"+testNonce+"\n")
+		Expect(start).To(BeNumerically(">", 0))
+		Expect(strings.Count(script, "rvm_fail() {")).To(Equal(1))
+		Expect(strings.Index(script, "rvm_fail() {")).To(BeNumerically("<", strings.Index(script, "rvm_fail \"")))
 
-			setup := strings.Index(script, guestVolumeSetup)
-			Expect(setup).To(BeNumerically(">", 0))
-			Expect(setup + len(guestVolumeSetup)).To(BeNumerically("<=", start+1))
-			if networked {
-				Expect(strings.Index(script, ". /rvm/env\n")).To(BeNumerically("<", strings.Index(script, ". /rvm/mounts\n")))
-			}
-			Expect(script).To(HaveSuffix("\necho RVM_START_" + testNonce + "\nsh /rvm/cmd </dev/null\n" + guestVolumeTeardown +
-				"echo RVM_EXIT_" + testNonce + "=$rvm_status\nreboot -f\n"))
-		}
+		setup := strings.Index(script, guestVolumeSetup)
+		Expect(setup).To(BeNumerically(">", 0))
+		Expect(setup + len(guestVolumeSetup)).To(BeNumerically("<=", start+1))
+		Expect(strings.Index(script, ". /rvm/env\n")).To(BeNumerically("<", strings.Index(script, ". /rvm/mounts\n")))
+		Expect(script).To(HaveSuffix("\necho RVM_START_" + testNonce + "\nsh /rvm/cmd </dev/null\n" + guestVolumeTeardown +
+			"echo RVM_EXIT_" + testNonce + "=$rvm_status\nreboot -f\n"))
 	})
 
 	It("formats only after a blank check, and mounts synchronously with the ext4 driver", func() {
@@ -107,12 +103,10 @@ var _ = Describe("guest volume initramfs", func() {
 		}
 	})
 
-	It("is valid shell with and without a network and a volume", func() {
-		for _, networked := range []bool{false, true} {
-			for _, volume := range []bool{false, true} {
-				out, err := exec.Command("/bin/sh", "-n", "-c", initScript(testNonce, networked, volume)).CombinedOutput()
-				Expect(err).NotTo(HaveOccurred(), "networked=%v volume=%v: %s", networked, volume, out)
-			}
+	It("is valid shell with and without a volume", func() {
+		for _, volume := range []bool{false, true} {
+			out, err := exec.Command("/bin/sh", "-n", "-c", initScript(testNonce, volume)).CombinedOutput()
+			Expect(err).NotTo(HaveOccurred(), "volume=%v: %s", volume, out)
 		}
 	})
 

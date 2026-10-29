@@ -111,20 +111,16 @@ func exitTag(nonce string) string  { return "RVM_EXIT_" + nonce + "=" }
 // the console, and reboots: with -no-reboot (QEMU) or reboot=k (Firecracker)
 // that ends the hypervisor. poweroff -f hangs Firecracker, so it is not used.
 //
-// A networked guest first brings up lo and eth0 from /rvm/net and exports
-// /rvm/env. A guest with a volume then formats the volume image when it is
-// blank and mounts it, and after the command it syncs and unmounts it before
-// it reports the status. When a setup step fails, /init reboots before the
-// start tag, so vm-launch reports a guest that never started its command and
-// shows the console output, which ends with the failed step.
-func initScript(nonce string, networked, volume bool) string {
-	setup := ""
-	if networked || volume {
-		setup = guestFailFunc
-	}
-	if networked {
-		setup += guestNetworkSetup
-	}
+// Right after the mounts, /init defines rvm_fail, which every setup step
+// uses. It then brings up lo and eth0 from /rvm/net and exports /rvm/env,
+// for every guest, a task's included. A guest with a volume then formats the
+// volume image when it is blank and mounts it, and after the command it
+// syncs and unmounts it before it reports the status. When a setup step
+// fails, /init reboots before the start tag, so vm-launch reports a guest
+// that never started its command and shows the console output, which ends
+// with the failed step.
+func initScript(nonce string, volume bool) string {
+	setup := guestFailFunc + guestNetworkSetup
 	if volume {
 		setup += guestVolumeSetup
 	}
@@ -299,8 +295,9 @@ func addSeals(f *os.File, seals int) error {
 
 // writeInitramfs writes a gzip-compressed newc initramfs to dst holding a
 // static busybox, the console and null device nodes, the command script at
-// /rvm/cmd, and the /init that runs it. With a network it also holds
-// /rvm/net, /rvm/env, and /etc/resolv.conf, and with a volume /rvm/mounts.
+// /rvm/cmd, the guest network's /rvm/net, /rvm/env, and /etc/resolv.conf,
+// and the /init that runs it. With a volume it also holds /rvm/mounts. nw
+// is the guest network, which run always builds.
 func writeInitramfs(dst *os.File, busyboxPath, command, nonce string, nw *network, vol *guestVolume) error {
 	busybox, err := os.Open(busyboxPath)
 	if err != nil {
@@ -329,26 +326,22 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, co
 		return func() error { return cw.File(name, 0o644, int64(len(content)), strings.NewReader(content)) }
 	}
 
-	init := initScript(nonce, nw != nil, vol != nil)
+	init := initScript(nonce, vol != nil)
 	steps := []func() error{
 		func() error { return cw.Dir("bin", 0o755) },
 		func() error { return cw.Dir("dev", 0o755) },
 		func() error { return cw.CharDevice("dev/console", 0o600, 5, 1) },
 		func() error { return cw.CharDevice("dev/null", 0o666, 1, 3) },
-	}
-	if nw != nil {
-		steps = append(steps, func() error { return cw.Dir("etc", 0o755) })
-	}
-	steps = append(steps,
+		func() error { return cw.Dir("etc", 0o755) },
 		func() error { return cw.Dir("proc", 0o555) },
 		func() error { return cw.Dir("sys", 0o555) },
 		func() error { return cw.Dir("tmp", 0o1777) },
 		func() error { return cw.Dir("rvm", 0o755) },
 		func() error { return cw.File("bin/busybox", 0o755, busyboxSize, busybox) },
 		file("rvm/cmd", command),
-	)
-	if nw != nil {
-		steps = append(steps, file("rvm/net", netFile(nw)), file("rvm/env", nw.env), file("etc/resolv.conf", nw.resolvConf))
+		file("rvm/net", netFile(nw)),
+		file("rvm/env", nw.env),
+		file("etc/resolv.conf", nw.resolvConf),
 	}
 	if vol != nil {
 		steps = append(steps, file("rvm/mounts", mountsFile(vol)))

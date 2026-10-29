@@ -143,11 +143,12 @@ func checkArtifacts(kind backend.Kind, root string) error {
 // through its bundled loader. dump-guest-core=off marks guest RAM as
 // excluded from QEMU's core dumps.
 //
-// With a network, the guest gets a virtio-net NIC on QEMU's user-mode
-// network, and QEMU itself listens on the container's PORT and forwards each
-// connection to the guest. That needs no privileges, and guest egress leaves
-// from the container's network namespace, so application security groups
-// still apply.
+// The guest gets a virtio-net NIC on QEMU's user-mode network. That needs no
+// privileges, and guest egress leaves from the container's network
+// namespace, so application security groups still apply. With a port, QEMU
+// itself also listens on the container's PORT and forwards each connection
+// to the guest; without one, as for a task, nothing can connect to the
+// guest. nw must be set.
 //
 // With a volume, drivePath names the volume image, and the guest gets it as
 // its one virtio-blk drive. The format is pinned to raw, so QEMU never probes
@@ -175,13 +176,15 @@ func qemuArgv(root, initrd string, memMiB int, nw *network, drivePath string) []
 		"-initrd", initrd,
 		"-append", qemuKernelArgs,
 	}
-	if nw != nil {
+	netdev := "user,id=n0,net=" + qemuNetwork
+	if nw.port > 0 {
 		port := strconv.Itoa(nw.port)
-		argv = append(argv,
-			"-netdev", "user,id=n0,net="+qemuNetwork+",hostfwd=tcp:0.0.0.0:"+port+"-"+qemuGuestIP+":"+port,
-			"-device", "virtio-net-device,netdev=n0",
-		)
+		netdev += ",hostfwd=tcp:0.0.0.0:" + port + "-" + qemuGuestIP + ":" + port
 	}
+	argv = append(argv,
+		"-netdev", netdev,
+		"-device", "virtio-net-device,netdev=n0",
+	)
 	if drivePath != "" {
 		argv = append(argv,
 			"-drive", "if=none,id="+volumeDriveID+",file="+drivePath+
@@ -274,8 +277,11 @@ type firecrackerNetworkInterface struct {
 }
 
 // firecrackerConfigJSON returns the --config-file content for a guest of
-// memMiB MiB: the volume image as the only drive when drivePath is set, and a
-// network interface on Garden's tap device only when there is a network.
+// memMiB MiB: a network interface on Garden's tap device, which Garden
+// creates for every Firecracker container, with or without a port, and the
+// volume image as the only drive when drivePath is set. nw must be set; the
+// port does not change the configuration, because vm-launch itself, not
+// Firecracker, forwards PORT.
 func firecrackerConfigJSON(root, initrd string, memMiB int, nw *network, drivePath string) ([]byte, error) {
 	cfg := firecrackerConfig{
 		BootSource: firecrackerBootSource{
@@ -296,9 +302,7 @@ func firecrackerConfigJSON(root, initrd string, memMiB int, nw *network, drivePa
 			IOEngine:     fcDriveIOEngine,
 		}}
 	}
-	if nw != nil {
-		cfg.NetworkInterfaces = []firecrackerNetworkInterface{{IfaceID: "eth0", GuestMAC: fcGuestMAC, HostDevName: fcTapName}}
-	}
+	cfg.NetworkInterfaces = []firecrackerNetworkInterface{{IfaceID: "eth0", GuestMAC: fcGuestMAC, HostDevName: fcTapName}}
 	return json.Marshal(cfg)
 }
 
@@ -309,8 +313,9 @@ func firecrackerArgv(root, configPath string) []string {
 // hypervisorArgv returns the command line for kind, writing any config file
 // it needs into workDir. workDir holds only data files; nothing runs from it.
 // memMiB is the guest memory size from guestMemory, which keeps it between
-// the floor and the ceiling, and drivePath is the volume image path the
-// hypervisor opens, or empty without a volume.
+// the floor and the ceiling. nw is the guest network, which run always
+// builds, and drivePath is the volume image path the hypervisor opens, or
+// empty without a volume.
 func hypervisorArgv(kind backend.Kind, root, workDir, initrd string, memMiB int, nw *network, drivePath string) ([]string, error) {
 	switch kind {
 	case backend.VMQemu:

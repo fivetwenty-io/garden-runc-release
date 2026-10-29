@@ -94,6 +94,12 @@ func gunzip(b []byte) []byte {
 	return out
 }
 
+// taskNetwork returns the QEMU guest network of a process without PORT, such
+// as a task.
+func taskNetwork() *network {
+	return &network{address: qemuGuestCIDR, gateway: qemuGateway, resolvConf: "nameserver 10.0.2.3\n"}
+}
+
 // buildInitramfs builds an initramfs through newInitramfs, with busybox as
 // the busybox binary, and returns the archive.
 func buildInitramfs(busybox []byte, command string, nw *network, vol *guestVolume) []byte {
@@ -175,7 +181,7 @@ var _ = Describe("initramfs", func() {
 	})
 
 	writeArchive := func() []byte {
-		return buildInitramfs(busybox, "echo 'hi there'; exit 3\n", nil, nil)
+		return buildInitramfs(busybox, "echo 'hi there'; exit 3\n", taskNetwork(), nil)
 	}
 
 	It("writes a gzip newc archive with the guest layout", func() {
@@ -187,8 +193,8 @@ var _ = Describe("initramfs", func() {
 			names = append(names, e.name)
 			byName[e.name] = e
 		}
-		Expect(names).To(Equal([]string{"bin", "dev", "dev/console", "dev/null", "proc", "sys", "tmp", "rvm",
-			"bin/busybox", "rvm/cmd", "init", cpioTrailer}))
+		Expect(names).To(Equal([]string{"bin", "dev", "dev/console", "dev/null", "etc", "proc", "sys", "tmp", "rvm",
+			"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "etc/resolv.conf", "init", cpioTrailer}))
 
 		Expect(byName["bin"].mode).To(Equal(uint32(0o040755)))
 		Expect(byName["tmp"].mode).To(Equal(uint32(0o041777)))
@@ -199,11 +205,11 @@ var _ = Describe("initramfs", func() {
 		Expect(byName["bin/busybox"].data).To(Equal(busybox))
 		Expect(string(byName["rvm/cmd"].data)).To(Equal("echo 'hi there'; exit 3\n"))
 		Expect(byName["init"].mode).To(Equal(uint32(0o100755)))
-		Expect(string(byName["init"].data)).To(Equal(initScript(testNonce, false, false)))
+		Expect(string(byName["init"].data)).To(Equal(initScript(testNonce, false)))
 	})
 
 	It("writes an /init that brackets the command with nonce markers and reboots", func() {
-		script := initScript(testNonce, false, false)
+		script := initScript(testNonce, false)
 		Expect(script).To(HavePrefix("#!/bin/busybox sh\n"))
 		Expect(script).To(ContainSubstring("\necho RVM_START_" + testNonce + "\n"))
 		Expect(script).To(ContainSubstring("\nsh /rvm/cmd </dev/null\necho RVM_EXIT_" + testNonce + "=$?\nreboot -f\n"))
@@ -220,8 +226,8 @@ var _ = Describe("initramfs", func() {
 
 		list, err := exec.Command("sh", "-c", `"$0" -t --quiet < "$1"`, cpioBin, plain).CombinedOutput()
 		Expect(err).NotTo(HaveOccurred(), string(list))
-		Expect(strings.Fields(string(list))).To(Equal([]string{"bin", "dev", "dev/console", "dev/null", "proc", "sys", "tmp", "rvm",
-			"bin/busybox", "rvm/cmd", "init"}))
+		Expect(strings.Fields(string(list))).To(Equal([]string{"bin", "dev", "dev/console", "dev/null", "etc", "proc", "sys", "tmp", "rvm",
+			"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "etc/resolv.conf", "init"}))
 
 		if os.Geteuid() != 0 {
 			Skip("extracting device nodes needs root")
@@ -233,7 +239,7 @@ var _ = Describe("initramfs", func() {
 		Expect(err).NotTo(HaveOccurred(), string(out))
 
 		Expect(os.ReadFile(filepath.Join(dest, "bin/busybox"))).To(Equal(busybox))
-		Expect(os.ReadFile(filepath.Join(dest, "init"))).To(Equal([]byte(initScript(testNonce, false, false))))
+		Expect(os.ReadFile(filepath.Join(dest, "init"))).To(Equal([]byte(initScript(testNonce, false))))
 		Expect(os.ReadFile(filepath.Join(dest, "rvm/cmd"))).To(Equal([]byte("echo 'hi there'; exit 3\n")))
 		info, err := os.Stat(filepath.Join(dest, "init"))
 		Expect(err).NotTo(HaveOccurred())
@@ -252,7 +258,7 @@ var _ = Describe("initramfs", func() {
 			bb := filepath.Join(GinkgoT().TempDir(), "busybox")
 			Expect(os.WriteFile(bb, busybox, 0o755)).To(Succeed())
 			var err error
-			f, err = newInitramfs(bb, "true", testNonce, nil, nil)
+			f, err = newInitramfs(bb, "true", testNonce, taskNetwork(), nil)
 			Expect(err).NotTo(HaveOccurred())
 			DeferCleanup(func() { _ = f.Close() })
 		})
@@ -342,7 +348,7 @@ var _ = Describe("initramfs", func() {
 
 		It("asks for MFD_NOEXEC_SEAL first", func() {
 			kernel(nil)
-			f, err := newInitramfs(bb, "true", testNonce, nil, nil)
+			f, err := newInitramfs(bb, "true", testNonce, taskNetwork(), nil)
 			Expect(err).NotTo(HaveOccurred())
 			defer f.Close()
 			Expect(calls).To(Equal([]int{unix.MFD_CLOEXEC | unix.MFD_ALLOW_SEALING | unix.MFD_NOEXEC_SEAL}))
@@ -350,7 +356,7 @@ var _ = Describe("initramfs", func() {
 
 		It("falls back to the plain flags on a kernel that rejects MFD_NOEXEC_SEAL", func() {
 			kernel(unix.EINVAL)
-			f, err := newInitramfs(bb, "true", testNonce, nil, nil)
+			f, err := newInitramfs(bb, "true", testNonce, taskNetwork(), nil)
 			Expect(err).NotTo(HaveOccurred())
 			defer f.Close()
 			Expect(calls).To(Equal([]int{
@@ -366,7 +372,7 @@ var _ = Describe("initramfs", func() {
 		It("returns any other error without trying again, and holds no memfd", func() {
 			kernel(unix.EACCES)
 			held := heldInitramfs()
-			_, err := newInitramfs(bb, "true", testNonce, nil, nil)
+			_, err := newInitramfs(bb, "true", testNonce, taskNetwork(), nil)
 			Expect(err).To(MatchError("creating the initramfs memfd: permission denied"))
 			Expect(errors.Is(err, unix.EACCES)).To(BeTrue())
 			Expect(calls).To(HaveLen(1))
@@ -377,9 +383,9 @@ var _ = Describe("initramfs", func() {
 	It("fails when busybox is missing or not a regular file, and leaves no memfd behind", func() {
 		dir := GinkgoT().TempDir()
 		held := heldInitramfs()
-		_, err := newInitramfs(filepath.Join(dir, "nope"), "true", testNonce, nil, nil)
+		_, err := newInitramfs(filepath.Join(dir, "nope"), "true", testNonce, taskNetwork(), nil)
 		Expect(err).To(MatchError(ContainSubstring("opening busybox")))
-		_, err = newInitramfs(dir, "true", testNonce, nil, nil)
+		_, err = newInitramfs(dir, "true", testNonce, taskNetwork(), nil)
 		Expect(err).To(MatchError(ContainSubstring("not a regular file")))
 		Expect(heldInitramfs()).To(Equal(held))
 	})
@@ -390,7 +396,7 @@ var _ = Describe("initramfs", func() {
 		ro, err := os.Open(bb)
 		Expect(err).NotTo(HaveOccurred())
 		defer ro.Close()
-		Expect(writeInitramfs(ro, bb, "true", testNonce, nil, nil)).To(MatchError(ContainSubstring("writing the initramfs")))
+		Expect(writeInitramfs(ro, bb, "true", testNonce, taskNetwork(), nil)).To(MatchError(ContainSubstring("writing the initramfs")))
 	})
 
 	Describe("cpioWriter", func() {
@@ -608,7 +614,7 @@ var _ = Describe("hypervisor command lines", func() {
 	const art = "/opt/garden-vm/artifacts"
 
 	It("builds the QEMU microvm command line through the bundled loader", func() {
-		argv, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/proc/self/fd/3", 128, nil, "")
+		argv, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/proc/self/fd/3", 128, taskNetwork(), "")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(argv).To(Equal([]string{
 			art + "/qemu/ld-linux-x86-64.so.2", "--library-path", art + "/qemu/lib",
@@ -617,12 +623,13 @@ var _ = Describe("hypervisor command lines", func() {
 			"-nodefaults", "-no-user-config", "-nographic", "-serial", "stdio", "-no-reboot",
 			"-kernel", art + "/kernel/bzImage", "-initrd", "/proc/self/fd/3",
 			"-append", "console=ttyS0 reboot=t panic=-1 rdinit=/init pci=off quiet",
+			"-netdev", "user,id=n0,net=10.0.2.0/24", "-device", "virtio-net-device,netdev=n0",
 		}))
 	})
 
 	It("writes the Firecracker config and builds its command line", func() {
 		work := GinkgoT().TempDir()
-		argv, err := hypervisorArgv(backend.VMFirecracker, art, work, "/proc/self/fd/3", 128, nil, "")
+		argv, err := hypervisorArgv(backend.VMFirecracker, art, work, "/proc/self/fd/3", 128, taskNetwork(), "")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(argv).To(Equal([]string{art + "/firecracker/firecracker", "--no-api", "--config-file", work + "/fc.json"}))
 
@@ -638,11 +645,16 @@ var _ = Describe("hypervisor command lines", func() {
 			},
 			"drives":         []any{},
 			"machine-config": map[string]any{"vcpu_count": float64(1), "mem_size_mib": float64(128)},
+			"network-interfaces": []any{map[string]any{
+				"iface_id":      "eth0",
+				"guest_mac":     "06:00:a9:fe:64:02",
+				"host_dev_name": "tap0",
+			}},
 		}))
 	})
 
 	It("rejects other backends", func() {
-		_, err := hypervisorArgv(backend.OCIRunc, art, "/w", "/w/i", 128, nil, "")
+		_, err := hypervisorArgv(backend.OCIRunc, art, "/w", "/w/i", 128, taskNetwork(), "")
 		Expect(err).To(MatchError(ContainSubstring("unsupported backend")))
 	})
 

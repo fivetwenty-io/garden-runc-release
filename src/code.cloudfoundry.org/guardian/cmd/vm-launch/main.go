@@ -14,16 +14,19 @@
 // The guest has a busybox userland and none of the app's files. It has no
 // disk unless the app has a volume (see Volumes below).
 //
-// Without PORT in the environment, as for a task, the guest has no network
-// and none of the app's environment. With PORT, as for an LRP, the guest
-// gets a NIC, a default route, and DNS, its command sees PORT and the
-// instance's CF_INSTANCE_* and INSTANCE_* variables, and connections to PORT
-// on the container reach PORT in the guest. QEMU forwards them itself
-// (user-mode networking); for Firecracker, vm-launch listens on PORT and
-// proxies each connection to the guest over Garden's tap device. The
+// Every guest gets a NIC, a default route, and DNS, and its traffic leaves
+// from the container's network namespace with the container's address, so
+// network policies and application security groups apply as they do to the
+// container. The guest command sees the instance's PORT, CF_INSTANCE_*, and
+// INSTANCE_* variables that are set. With PORT, as for an LRP, connections
+// to PORT on the container also reach PORT in the guest. QEMU forwards them
+// itself (user-mode networking); for Firecracker, vm-launch listens on PORT
+// and proxies each connection to the guest over Garden's tap device. The
 // listener is up before the guest boots, and connections that arrive early
 // wait for the guest app to listen. At the first SIGTERM or SIGINT the
-// listener closes; open connections close when the guest stops.
+// listener closes; open connections close when the guest stops. Without
+// PORT, as for a task, nothing outside can connect to the guest, as for a
+// runc task.
 //
 // Volumes: when VCAP_SERVICES names a volume mount, as it does for an app
 // bound to a volume service, the guest gets that volume at the same path the
@@ -296,15 +299,16 @@ func run(argv []string, logger *log.Logger) int {
 
 	cmd := newHypervisorCmd(hvArgv, files)
 	// QEMU reports a port it cannot forward on its stderr and exits 1, so a
-	// networked QEMU run keeps the start of that stream to recognise it.
+	// QEMU run that forwards PORT keeps the start of that stream to
+	// recognise it.
 	var hvStderr *headBuffer
-	if nw != nil && cfg.backend == backend.VMQemu {
+	if nw.port > 0 && cfg.backend == backend.VMQemu {
 		hvStderr = &headBuffer{limit: maxBootLog}
 		cmd.Stderr = &stderrTee{capture: hvStderr, passthrough: os.Stderr}
 	}
 
 	sup := supervisor{stdout: os.Stdout, logger: logger, signals: sigs, grace: killGrace, started: closeInitrd}
-	if nw != nil && cfg.backend == backend.VMFirecracker {
+	if nw.port > 0 && cfg.backend == backend.VMFirecracker {
 		proxy, err := startProxy(nw.listenAddr(), nw.upstream(), upstreamDialPolicy, logger)
 		if err != nil {
 			logger.Print(err)

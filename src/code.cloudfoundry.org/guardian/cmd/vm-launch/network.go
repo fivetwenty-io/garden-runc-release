@@ -77,9 +77,14 @@ var guestEnvVars = []string{
 	"INSTANCE_INDEX",
 }
 
-// network is the guest network of a process that serves on PORT: an LRP. A
-// process started without PORT, such as a task, gets no network at all.
+// network is the guest network. Every guest has one. A process that serves
+// on PORT, an LRP, also gets connections to PORT forwarded to the guest. A
+// process started without PORT, such as a task, has port 0: its guest
+// reaches out exactly as an LRP's does, and nothing outside can connect to
+// it, as for a runc task.
 type network struct {
+	// port is the guest port that connections to PORT on the container reach,
+	// or 0 for a process without PORT.
 	port int
 	// address is the guest eth0 address in CIDR form, gateway its default route.
 	address string
@@ -95,18 +100,21 @@ type network struct {
 	mtu int
 }
 
-// upstream is the guest address the Firecracker port proxy connects to.
+// upstream is the guest address the Firecracker port proxy connects to. It
+// is meaningful only when port is set.
 func (n *network) upstream() string {
 	return net.JoinHostPort(fcGuestIP, strconv.Itoa(n.port))
 }
 
-// listenAddr is where the port proxy listens in the container.
+// listenAddr is where the port proxy listens in the container. It is
+// meaningful only when port is set.
 func (n *network) listenAddr() string {
 	return net.JoinHostPort("0.0.0.0", strconv.Itoa(n.port))
 }
 
-// networkFor returns the guest network for kind, or nil when PORT is not in
-// the environment. A PORT that is set but not a TCP port number is an error.
+// networkFor returns the guest network for kind. Without PORT in the
+// environment, as for a task, the network has port 0 and is otherwise the
+// same. A PORT that is set but not a TCP port number is an error.
 // The container resolver configuration supplies the guest's search domains
 // and, for Firecracker, its nameservers (QEMU's DNS proxy resolves through
 // the container's configuration itself). When it cannot be read, the guest
@@ -114,13 +122,13 @@ func (n *network) listenAddr() string {
 // The same holds for the container's eth0 MTU, which lookupMTU reads for the
 // Firecracker guest: without it the guest keeps the default MTU.
 func networkFor(kind backend.Kind, lookupEnv func(string) (string, bool), resolvConfPath string, lookupMTU func(name string) (int, error), logger *log.Logger) (*network, error) {
-	portValue, ok := lookupEnv("PORT")
-	if !ok {
-		return nil, nil
-	}
-	port, err := parsePort(portValue)
-	if err != nil {
-		return nil, err
+	port := 0
+	if portValue, ok := lookupEnv("PORT"); ok {
+		p, err := parsePort(portValue)
+		if err != nil {
+			return nil, err
+		}
+		port = p
 	}
 
 	data, err := os.ReadFile(resolvConfPath)
