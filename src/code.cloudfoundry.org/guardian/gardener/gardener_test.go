@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"code.cloudfoundry.org/garden"
+	"code.cloudfoundry.org/guardian/backend"
 	"code.cloudfoundry.org/guardian/gardener"
 	spec "code.cloudfoundry.org/guardian/gardener/container-spec"
 	fakes "code.cloudfoundry.org/guardian/gardener/gardenerfakes"
@@ -175,6 +176,177 @@ var _ = Describe("Gardener", func() {
 				Privileged: true,
 			})
 			Expect(err).To(MatchError("privileged container creation is disabled"))
+		})
+
+		Describe("execution backend", func() {
+			createdSpec := func() spec.DesiredContainerSpec {
+				Expect(containerizer.CreateCallCount()).To(Equal(1))
+				_, desired := containerizer.CreateArgsForCall(0)
+				return desired
+			}
+
+			for _, props := range []garden.Properties{
+				nil,
+				{backend.AnnotationKey: ""},
+				{backend.AnnotationKey: "oci-runc"},
+			} {
+				props := props
+				It(fmt.Sprintf("defaults to oci-runc with a nil registry and properties %v", props), func() {
+					_, err := gdnr.Create(garden.ContainerSpec{Handle: "some-ctr", Properties: props})
+					Expect(err).NotTo(HaveOccurred())
+					Expect(createdSpec().ExecutionBackend).To(Equal("oci-runc"))
+				})
+			}
+
+			Context("when the requested backend is allowed", func() {
+				BeforeEach(func() {
+					var err error
+					gdnr.Backends, err = backend.NewRegistry(backend.VMQemu)
+					Expect(err).NotTo(HaveOccurred())
+				})
+
+				It("sets the backend on the desired container spec", func() {
+					_, err := gdnr.Create(garden.ContainerSpec{
+						Handle:     "some-ctr",
+						Properties: garden.Properties{backend.AnnotationKey: "vm-qemu"},
+					})
+					Expect(err).NotTo(HaveOccurred())
+					Expect(createdSpec().ExecutionBackend).To(Equal("vm-qemu"))
+				})
+
+				It("still persists the property", func() {
+					_, err := gdnr.Create(garden.ContainerSpec{
+						Handle:     "some-ctr",
+						Properties: garden.Properties{backend.AnnotationKey: "vm-qemu"},
+					})
+					Expect(err).NotTo(HaveOccurred())
+					Expect(propertyManager.SetCallCount()).To(BeNumerically(">=", 1))
+					handle, name, value := propertyManager.SetArgsForCall(0)
+					Expect(handle).To(Equal("some-ctr"))
+					Expect(name).To(Equal(backend.AnnotationKey))
+					Expect(value).To(Equal("vm-qemu"))
+				})
+			})
+
+			DescribeTable("when the requested backend is rejected",
+				func(value string, expectedErr error) {
+					var err error
+					gdnr.Backends, err = backend.NewRegistry(backend.VMQemu)
+					Expect(err).NotTo(HaveOccurred())
+
+					_, err = gdnr.Create(garden.ContainerSpec{
+						Handle:     "some-ctr",
+						Properties: garden.Properties{backend.AnnotationKey: value, "owner": "some-owner"},
+					})
+					Expect(err).To(MatchError(expectedErr))
+
+					Expect(volumizer.GCCallCount()).To(Equal(0))
+					Expect(volumizer.CreateCallCount()).To(Equal(0))
+					Expect(propertyManager.SetCallCount()).To(Equal(0))
+					Expect(networker.SetupBindMountsCallCount()).To(Equal(0))
+					Expect(containerizer.CreateCallCount()).To(Equal(0))
+					Expect(networker.NetworkCallCount()).To(Equal(0))
+
+					By("not running the failed-create cleanup")
+					Expect(containerizer.DestroyCallCount()).To(Equal(0))
+					Expect(networker.DestroyCallCount()).To(Equal(0))
+					Expect(volumizer.DestroyCallCount()).To(Equal(0))
+					Expect(propertyManager.DestroyKeySpaceCallCount()).To(Equal(0))
+				},
+				Entry("unknown backend", "vm-bochs", backend.ErrUnknownBackend),
+				Entry("known backend that is not allowed", "oci-gvisor", backend.ErrBackendNotEnabled),
+			)
+
+			Context("when the backend is a VM backend", func() {
+				BeforeEach(func() {
+					var err error
+					gdnr.Backends, err = backend.NewRegistry(backend.VMQemu, backend.VMFirecracker, backend.OCIGvisor)
+					Expect(err).NotTo(HaveOccurred())
+				})
+
+				DescribeTable("when the image is not operator-installed",
+					func(kind string, image garden.ImageRef, rootFSPath string, expectedScheme string) {
+						_, err := gdnr.Create(garden.ContainerSpec{
+							Handle:     "some-ctr",
+							Image:      image,
+							RootFSPath: rootFSPath,
+							Properties: garden.Properties{backend.AnnotationKey: kind, "owner": "some-owner"},
+						})
+						Expect(err).To(MatchError(backend.ErrRootFSNotOperatorInstalled))
+						Expect(err).To(MatchError(fmt.Sprintf(
+							"execution backend %s requires an operator-installed rootfs; image scheme %s is not allowed", kind, expectedScheme)))
+
+						Expect(volumizer.GCCallCount()).To(Equal(0))
+						Expect(volumizer.CreateCallCount()).To(Equal(0))
+						Expect(propertyManager.SetCallCount()).To(Equal(0))
+						Expect(networker.SetupBindMountsCallCount()).To(Equal(0))
+						Expect(containerizer.CreateCallCount()).To(Equal(0))
+						Expect(networker.NetworkCallCount()).To(Equal(0))
+
+						By("not running the failed-create cleanup")
+						Expect(containerizer.DestroyCallCount()).To(Equal(0))
+						Expect(networker.DestroyCallCount()).To(Equal(0))
+						Expect(volumizer.DestroyCallCount()).To(Equal(0))
+						Expect(propertyManager.DestroyKeySpaceCallCount()).To(Equal(0))
+					},
+					Entry("a docker image on vm-qemu", "vm-qemu", garden.ImageRef{URI: "docker://some-user:some-secret@registry/some/image"}, "", "docker"),
+					Entry("a docker image on vm-firecracker", "vm-firecracker", garden.ImageRef{URI: "docker:///some/image"}, "", "docker"),
+					Entry("an oci image", "vm-qemu", garden.ImageRef{URI: "oci:///some/dir"}, "", "oci"),
+					Entry("a raw image", "vm-qemu", garden.ImageRef{URI: "raw:///some/dir"}, "", "raw"),
+					Entry("a docker rootfs path", "vm-qemu", garden.ImageRef{}, "docker:///some/image", "docker"),
+				)
+
+				It("does not echo credentials from the image URI", func() {
+					_, err := gdnr.Create(garden.ContainerSpec{
+						Handle:     "some-ctr",
+						Image:      garden.ImageRef{URI: "docker://some-user:some-secret@registry/some/image"},
+						Properties: garden.Properties{backend.AnnotationKey: "vm-qemu"},
+					})
+					Expect(err).To(HaveOccurred())
+					Expect(err.Error()).NotTo(ContainSubstring("some-secret"))
+				})
+
+				DescribeTable("when the image is operator-installed",
+					func(image garden.ImageRef, rootFSPath string) {
+						_, err := gdnr.Create(garden.ContainerSpec{
+							Handle:     "some-ctr",
+							Image:      image,
+							RootFSPath: rootFSPath,
+							Properties: garden.Properties{backend.AnnotationKey: "vm-qemu"},
+						})
+						Expect(err).NotTo(HaveOccurred())
+						Expect(createdSpec().ExecutionBackend).To(Equal("vm-qemu"))
+					},
+					Entry("no image", garden.ImageRef{}, ""),
+					Entry("a bare absolute path", garden.ImageRef{URI: "/var/vcap/packages/cflinuxfs4/rootfs.tar"}, ""),
+					Entry("a preloaded layer over an absolute path", garden.ImageRef{URI: "preloaded+layer:/var/vcap/packages/cflinuxfs4/rootfs.tar?layer=https://blobstore/layer.tgz&layer_path=/home/vcap&layer_digest=abc"}, ""),
+					Entry("a bare absolute rootfs path", garden.ImageRef{}, "/var/vcap/packages/cflinuxfs4/rootfs.tar"),
+				)
+
+				DescribeTable("when the backend is not a VM backend",
+					func(kind string, uri string) {
+						_, err := gdnr.Create(garden.ContainerSpec{
+							Handle:     "some-ctr",
+							Image:      garden.ImageRef{URI: uri},
+							Properties: garden.Properties{backend.AnnotationKey: kind},
+						})
+						Expect(err).NotTo(HaveOccurred())
+						Expect(createdSpec().ExecutionBackend).To(Equal(kind))
+					},
+					Entry("oci-gvisor with a docker image", "oci-gvisor", "docker:///some/image"),
+					Entry("oci-runc with a docker image", "oci-runc", "docker:///some/image"),
+					Entry("oci-runc with an oci image", "oci-runc", "oci:///some/dir"),
+				)
+			})
+
+			It("rejects every non-runc backend when no registry is set", func() {
+				_, err := gdnr.Create(garden.ContainerSpec{
+					Handle:     "some-ctr",
+					Properties: garden.Properties{backend.AnnotationKey: "vm-qemu"},
+				})
+				Expect(err).To(MatchError(backend.ErrBackendNotEnabled))
+				Expect(volumizer.CreateCallCount()).To(Equal(0))
+			})
 		})
 
 		Context("when privileged containers are allowed", func() {
@@ -430,6 +602,71 @@ var _ = Describe("Gardener", func() {
 				Handle: "bob",
 			}))
 			Expect(pid).To(Equal(42))
+		})
+
+		It("starts the container after the network is configured", func() {
+			var calls []string
+			networker.NetworkStub = func(lager.Logger, garden.ContainerSpec, int) error {
+				calls = append(calls, "network")
+				return nil
+			}
+			containerizer.StartStub = func(lager.Logger, string) error {
+				calls = append(calls, "start")
+				return nil
+			}
+
+			_, err := gdnr.Create(garden.ContainerSpec{Handle: "bob"})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(calls).To(Equal([]string{"network", "start"}))
+			Expect(containerizer.StartCallCount()).To(Equal(1))
+			_, handle := containerizer.StartArgsForCall(0)
+			Expect(handle).To(Equal("bob"))
+		})
+
+		Context("when the containerizer fails to start the container", func() {
+			BeforeEach(func() {
+				containerizer.StartReturns(errors.New("start-failed"))
+			})
+
+			It("errors", func() {
+				_, err := gdnr.Create(garden.ContainerSpec{Handle: "bob"})
+				Expect(err).To(MatchError("start-failed"))
+			})
+
+			It("cleans up the container like any other failed create", func() {
+				_, err := gdnr.Create(garden.ContainerSpec{Handle: "bob"})
+				Expect(err).To(HaveOccurred())
+
+				Expect(networker.DestroyCallCount()).To(Equal(1))
+				_, handle := networker.DestroyArgsForCall(0)
+				Expect(handle).To(Equal("bob"))
+
+				Expect(volumizer.DestroyCallCount()).To(Equal(1))
+				Expect(containerizer.DestroyCallCount()).To(Equal(1))
+				_, handle = containerizer.DestroyArgsForCall(0)
+				Expect(handle).To(Equal("bob"))
+			})
+
+			It("does not mark the container created", func() {
+				_, err := gdnr.Create(garden.ContainerSpec{Handle: "bob"})
+				Expect(err).To(HaveOccurred())
+
+				for i := 0; i < propertyManager.SetCallCount(); i++ {
+					_, name, value := propertyManager.SetArgsForCall(i)
+					Expect(name == "garden.state" && value == "created").To(BeFalse())
+				}
+			})
+		})
+
+		Context("when the network cannot be configured", func() {
+			It("does not start the container", func() {
+				networker.NetworkReturns(errors.New("network-failed"))
+
+				_, err := gdnr.Create(garden.ContainerSpec{Handle: "bob"})
+				Expect(err).To(HaveOccurred())
+				Expect(containerizer.StartCallCount()).To(Equal(0))
+			})
 		})
 
 		Context("when container info cannot be retrieved", func() {

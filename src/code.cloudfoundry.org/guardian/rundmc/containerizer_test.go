@@ -3,14 +3,18 @@ package rundmc_test
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
+	"syscall"
 	"time"
 
 	"code.cloudfoundry.org/garden"
 	"code.cloudfoundry.org/garden/gardenfakes"
+	"code.cloudfoundry.org/guardian/backend"
 	"code.cloudfoundry.org/guardian/gardener"
 	specpkg "code.cloudfoundry.org/guardian/gardener/container-spec"
 	"code.cloudfoundry.org/guardian/rundmc"
+	"code.cloudfoundry.org/guardian/rundmc/bundlerules"
 	gardencgroups "code.cloudfoundry.org/guardian/rundmc/cgroups"
 	"code.cloudfoundry.org/guardian/rundmc/depot"
 	"code.cloudfoundry.org/guardian/rundmc/event"
@@ -18,6 +22,7 @@ import (
 	fakes "code.cloudfoundry.org/guardian/rundmc/rundmcfakes"
 	"code.cloudfoundry.org/lager/v3"
 	"code.cloudfoundry.org/lager/v3/lagertest"
+	"github.com/eapache/go-resiliency/retrier"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/onsi/gomega/gbytes"
@@ -42,6 +47,24 @@ var _ = Describe("Rundmc", func() {
 		containerizer *rundmc.Containerizer
 		bundle        goci.Bndl
 	)
+
+	newContainerizer := func(opts ...rundmc.Option) *rundmc.Containerizer {
+		return rundmc.New(
+			fakeDepot,
+			fakeBundleGenerator,
+			fakeOCIRuntime,
+			fakeNstarRunner,
+			fakeProcessesStopper,
+			fakeEventStore,
+			fakeStateStore,
+			fakePeaCreator,
+			fakePeaUsernameResolver,
+			0,
+			fakeRuntimeStopper,
+			fakeCPUCgrouper,
+			opts...,
+		)
+	}
 
 	BeforeEach(func() {
 		fakeDepot = new(fakes.FakeDepot)
@@ -141,6 +164,26 @@ var _ = Describe("Rundmc", func() {
 
 			It("should return an error", func() {
 				Expect(containerizer.Create(logger, specpkg.DesiredContainerSpec{})).To(MatchError("banana"))
+			})
+		})
+	})
+
+	Describe("Start", func() {
+		It("should start the container with the given id", func() {
+			Expect(containerizer.Start(logger, "exuberant!")).To(Succeed())
+
+			Expect(fakeOCIRuntime.StartCallCount()).To(Equal(1))
+			_, actualId := fakeOCIRuntime.StartArgsForCall(0)
+			Expect(actualId).To(Equal("exuberant!"))
+		})
+
+		Context("when starting the container fails", func() {
+			BeforeEach(func() {
+				fakeOCIRuntime.StartReturns(errors.New("banana"))
+			})
+
+			It("should return the error", func() {
+				Expect(containerizer.Start(logger, "exuberant!")).To(MatchError("banana"))
 			})
 		})
 	})
@@ -398,6 +441,617 @@ var _ = Describe("Rundmc", func() {
 				Expect(fakeStateStore.StoreStoppedCallCount()).To(Equal(0))
 			})
 		})
+	})
+
+	Describe("running the CF launcher in a vm backend container", func() {
+		const (
+			launcher = "/tmp/lifecycle/launcher"
+			marker   = "__GARDEN_VM_LAUNCH_WRAPPED=1"
+		)
+
+		BeforeEach(func() {
+			containerizer = newContainerizer(rundmc.WithBackendDispatch())
+		})
+
+		bundleFor := func(annotations map[string]string) goci.Bndl {
+			return goci.Bndl{Spec: specs.Spec{Version: "test-version", Annotations: annotations}}
+		}
+
+		launcherSpec := func() garden.ProcessSpec {
+			return garden.ProcessSpec{
+				Path: launcher,
+				Args: []string{"app", "echo hi", ""},
+				Env:  []string{"A=b"},
+				User: "vcap",
+				Dir:  "/home/vcap",
+			}
+		}
+
+		for _, kind := range []backend.Kind{backend.VMQemu, backend.VMFirecracker} {
+			kind := kind
+
+			Context(fmt.Sprintf("with a %s bundle", kind), func() {
+				BeforeEach(func() {
+					fakeOCIRuntime.BundleInfoReturns("/bundle", bundleFor(map[string]string{backend.AnnotationKey: string(kind)}), nil)
+				})
+
+				It("wraps the launcher into vm-launch and leaves the rest of the spec alone", func() {
+					_, err := containerizer.Run(logger, "some-handle", launcherSpec(), garden.ProcessIO{})
+					Expect(err).NotTo(HaveOccurred())
+
+					Expect(fakeOCIRuntime.ExecCallCount()).To(Equal(1))
+					_, id, actual, _ := fakeOCIRuntime.ExecArgsForCall(0)
+					Expect(id).To(Equal("some-handle"))
+					Expect(actual.Path).To(Equal(bundlerules.VMLaunchMountPath))
+					Expect(actual.Args).To(Equal([]string{"--backend", string(kind), "--", launcher, "app", "echo hi", ""}))
+					Expect(actual.Env).To(Equal([]string{"A=b", marker}))
+					Expect(actual.User).To(Equal("vcap"))
+					Expect(actual.Dir).To(Equal("/home/vcap"))
+				})
+
+				It("wraps a launcher with no arguments", func() {
+					_, err := containerizer.Run(logger, "some-handle", garden.ProcessSpec{Path: launcher}, garden.ProcessIO{})
+					Expect(err).NotTo(HaveOccurred())
+
+					_, _, actual, _ := fakeOCIRuntime.ExecArgsForCall(0)
+					Expect(actual.Path).To(Equal(bundlerules.VMLaunchMountPath))
+					Expect(actual.Args).To(Equal([]string{"--backend", string(kind), "--", launcher}))
+				})
+
+				It("does not modify the caller's spec", func() {
+					spec := launcherSpec()
+					_, err := containerizer.Run(logger, "some-handle", spec, garden.ProcessIO{})
+					Expect(err).NotTo(HaveOccurred())
+
+					Expect(spec.Path).To(Equal(launcher))
+					Expect(spec.Args).To(Equal([]string{"app", "echo hi", ""}))
+					Expect(spec.Env).To(Equal([]string{"A=b"}))
+				})
+
+				It("replaces a marker the client sent with exactly one of its own", func() {
+					spec := launcherSpec()
+					spec.Env = []string{"A=b", "__GARDEN_VM_LAUNCH_WRAPPED=forged", marker}
+
+					_, err := containerizer.Run(logger, "some-handle", spec, garden.ProcessIO{})
+					Expect(err).NotTo(HaveOccurred())
+
+					_, _, actual, _ := fakeOCIRuntime.ExecArgsForCall(0)
+					Expect(actual.Env).To(Equal([]string{"A=b", marker}))
+				})
+
+				It("strips a client marker from a direct vm-launch run, which is not wrapped", func() {
+					spec := garden.ProcessSpec{Path: "/opt/garden-vm/vm-launch", Args: []string{"--backend", string(kind), "--", "/bin/sh"}, Env: []string{marker, "A=b"}}
+
+					_, err := containerizer.Run(logger, "some-handle", spec, garden.ProcessIO{})
+					Expect(err).NotTo(HaveOccurred())
+
+					_, _, actual, _ := fakeOCIRuntime.ExecArgsForCall(0)
+					Expect(actual.Path).To(Equal("/opt/garden-vm/vm-launch"))
+					Expect(actual.Args).To(Equal(spec.Args))
+					Expect(actual.Env).To(Equal([]string{"A=b"}))
+				})
+
+				It("strips a client marker from a pea", func() {
+					spec := garden.ProcessSpec{Path: "/opt/garden-vm/vm-launch", Env: []string{marker}, Image: garden.ImageRef{URI: "some-uri"}}
+
+					_, err := containerizer.Run(logger, "some-handle", spec, garden.ProcessIO{})
+					Expect(err).NotTo(HaveOccurred())
+
+					_, peaSpec, _, _ := fakePeaCreator.CreatePeaArgsForCall(0)
+					Expect(peaSpec.Env).To(BeEmpty())
+				})
+
+				It("does not wrap other processes", func() {
+					for _, path := range []string{"/bin/sh", "/tmp/lifecycle/diego-sshd", "/opt/garden-vm/vm-launch", "ls"} {
+						_, err := containerizer.Run(logger, "some-handle", garden.ProcessSpec{Path: path, Args: []string{"x"}}, garden.ProcessIO{})
+						Expect(err).NotTo(HaveOccurred())
+					}
+
+					Expect(fakeOCIRuntime.ExecCallCount()).To(Equal(4))
+					for i := 0; i < 4; i++ {
+						_, _, actual, _ := fakeOCIRuntime.ExecArgsForCall(i)
+						Expect(actual.Args).To(Equal([]string{"x"}))
+					}
+					_, _, first, _ := fakeOCIRuntime.ExecArgsForCall(0)
+					Expect(first.Path).To(Equal("/bin/sh"))
+				})
+
+				It("does not wrap a pea that runs the launcher path", func() {
+					spec := launcherSpec()
+					spec.Image = garden.ImageRef{URI: "some-uri"}
+
+					_, err := containerizer.Run(logger, "some-handle", spec, garden.ProcessIO{})
+					Expect(err).NotTo(HaveOccurred())
+
+					Expect(fakePeaCreator.CreatePeaCallCount()).To(Equal(1))
+					_, peaSpec, _, _ := fakePeaCreator.CreatePeaArgsForCall(0)
+					Expect(peaSpec.Path).To(Equal(launcher))
+					Expect(peaSpec.Args).To(Equal([]string{"app", "echo hi", ""}))
+					Expect(fakeOCIRuntime.ExecCallCount()).To(Equal(0))
+				})
+			})
+		}
+
+		for _, annotations := range []map[string]string{
+			nil,
+			{backend.AnnotationKey: string(backend.OCIRunc)},
+			{backend.AnnotationKey: string(backend.OCIGvisor)},
+		} {
+			annotations := annotations
+
+			Context(fmt.Sprintf("with a non-vm bundle annotated %v", annotations), func() {
+				BeforeEach(func() {
+					fakeOCIRuntime.BundleInfoReturns("/bundle", bundleFor(annotations), nil)
+				})
+
+				It("passes the launcher through unchanged", func() {
+					_, err := containerizer.Run(logger, "some-handle", launcherSpec(), garden.ProcessIO{})
+					Expect(err).NotTo(HaveOccurred())
+
+					_, _, actual, _ := fakeOCIRuntime.ExecArgsForCall(0)
+					Expect(actual).To(Equal(launcherSpec()))
+				})
+			})
+		}
+
+		Context("when the bundle cannot be read", func() {
+			BeforeEach(func() {
+				fakeOCIRuntime.BundleInfoReturns("", goci.Bndl{}, errors.New("no-bundle"))
+			})
+
+			It("fails the launcher without running it", func() {
+				_, err := containerizer.Run(logger, "some-handle", launcherSpec(), garden.ProcessIO{})
+				Expect(err).To(MatchError("no-bundle"))
+				Expect(fakeOCIRuntime.ExecCallCount()).To(Equal(0))
+			})
+
+			It("does not need the bundle for other processes", func() {
+				_, err := containerizer.Run(logger, "some-handle", garden.ProcessSpec{Path: "hello"}, garden.ProcessIO{})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(fakeOCIRuntime.BundleInfoCallCount()).To(Equal(0))
+			})
+		})
+	})
+
+	Describe("execution backend dispatch", func() {
+		var fakeTaskKiller *fakes.FakeTaskKiller
+
+		bundleFor := func(annotations map[string]string) goci.Bndl {
+			return goci.Bndl{Spec: specs.Spec{Version: "test-version", Annotations: annotations}}
+		}
+
+		BeforeEach(func() {
+			fakeTaskKiller = new(fakes.FakeTaskKiller)
+			containerizer = newContainerizer(
+				rundmc.WithBackendDispatch(),
+				rundmc.WithTaskKiller(fakeTaskKiller, retrier.New(retrier.ConstantBackoff(2, time.Millisecond), nil)),
+			)
+		})
+
+		for _, runcAnnotations := range []map[string]string{nil, {backend.AnnotationKey: string(backend.OCIRunc)}} {
+			Context(fmt.Sprintf("with a runc bundle annotated %v", runcAnnotations), func() {
+				BeforeEach(func() {
+					fakeOCIRuntime.BundleInfoReturns("/bundle", bundleFor(runcAnnotations), nil)
+					fakeOCIRuntime.StateReturns(rundmc.State{Pid: 12, Status: rundmc.RunningStatus}, nil)
+				})
+
+				It("streams in through nstar only", func() {
+					stream := gbytes.NewBuffer()
+					Expect(containerizer.StreamIn(logger, "some-handle", garden.StreamInSpec{Path: "p", User: "u", TarStream: stream})).To(Succeed())
+
+					Expect(fakeNstarRunner.StreamInCallCount()).To(Equal(1))
+					_, pid, path, user, actualStream := fakeNstarRunner.StreamInArgsForCall(0)
+					Expect(pid).To(Equal(12))
+					Expect(path).To(Equal("p"))
+					Expect(user).To(Equal("u"))
+					Expect(actualStream).To(Equal(stream))
+					Expect(fakeOCIRuntime.ExecCallCount()).To(Equal(0))
+					_, handle := fakeOCIRuntime.BundleInfoArgsForCall(0)
+					Expect(handle).To(Equal("some-handle"))
+				})
+
+				It("streams out through nstar only", func() {
+					_, err := containerizer.StreamOut(logger, "some-handle", garden.StreamOutSpec{Path: "p", User: "u"})
+					Expect(err).NotTo(HaveOccurred())
+
+					Expect(fakeNstarRunner.StreamOutCallCount()).To(Equal(1))
+					_, pid, path, user := fakeNstarRunner.StreamOutArgsForCall(0)
+					Expect(pid).To(Equal(12))
+					Expect(path).To(Equal("p"))
+					Expect(user).To(Equal("u"))
+					Expect(fakeOCIRuntime.ExecCallCount()).To(Equal(0))
+				})
+
+				It("creates peas through the pea creator", func() {
+					processSpec := garden.ProcessSpec{Path: "check", User: "vcap", Image: garden.ImageRef{URI: "some-uri"}}
+					fakePeaUsernameResolver.ResolveUserReturns(1, 2, nil)
+
+					_, err := containerizer.Run(logger, "some-handle", processSpec, garden.ProcessIO{})
+					Expect(err).NotTo(HaveOccurred())
+
+					Expect(fakePeaUsernameResolver.ResolveUserCallCount()).To(Equal(1))
+					Expect(fakePeaCreator.CreatePeaCallCount()).To(Equal(1))
+					_, peaSpec, _, handle := fakePeaCreator.CreatePeaArgsForCall(0)
+					Expect(peaSpec.Image).To(Equal(garden.ImageRef{URI: "some-uri"}))
+					Expect(peaSpec.User).To(Equal("1:2"))
+					Expect(handle).To(Equal("some-handle"))
+					Expect(fakeOCIRuntime.ExecCallCount()).To(Equal(0))
+				})
+
+				It("stops through the cgroup stopper, sparing init", func() {
+					Expect(containerizer.Stop(logger, "some-handle", false)).To(Succeed())
+
+					Expect(fakeProcessesStopper.StopAllCallCount()).To(Equal(1))
+					_, cgroupName, exceptions, kill := fakeProcessesStopper.StopAllArgsForCall(0)
+					Expect(cgroupName).To(Equal("some-handle"))
+					Expect(exceptions).To(ConsistOf(12))
+					Expect(kill).To(BeFalse())
+					Expect(fakeTaskKiller.KillAllCallCount()).To(Equal(0))
+					Expect(fakeStateStore.StoreStoppedCallCount()).To(Equal(1))
+				})
+			})
+		}
+
+		Context("when the bundle cannot be read", func() {
+			BeforeEach(func() {
+				fakeOCIRuntime.BundleInfoReturns("", goci.Bndl{}, errors.New("no-bundle"))
+			})
+
+			It("fails closed instead of assuming runc", func() {
+				Expect(containerizer.StreamIn(logger, "some-handle", garden.StreamInSpec{Path: "p"})).To(MatchError("stream-in: no-bundle"))
+
+				_, err := containerizer.StreamOut(logger, "some-handle", garden.StreamOutSpec{Path: "p"})
+				Expect(err).To(MatchError("stream-out: no-bundle"))
+
+				Expect(containerizer.Stop(logger, "some-handle", true)).To(MatchError("stop: no-bundle"))
+
+				_, err = containerizer.Run(logger, "some-handle", garden.ProcessSpec{Image: garden.ImageRef{URI: "some-uri"}}, garden.ProcessIO{})
+				Expect(err).To(MatchError("no-bundle"))
+
+				Expect(fakeNstarRunner.StreamInCallCount()).To(Equal(0))
+				Expect(fakeNstarRunner.StreamOutCallCount()).To(Equal(0))
+				Expect(fakeProcessesStopper.StopAllCallCount()).To(Equal(0))
+				Expect(fakeTaskKiller.KillAllCallCount()).To(Equal(0))
+				Expect(fakePeaCreator.CreatePeaCallCount()).To(Equal(0))
+				Expect(fakeOCIRuntime.ExecCallCount()).To(Equal(0))
+				Expect(fakeStateStore.StoreStoppedCallCount()).To(Equal(0))
+			})
+		})
+
+		Context("with a gvisor bundle", func() {
+			BeforeEach(func() {
+				fakeOCIRuntime.BundleInfoReturns("/bundle", bundleFor(map[string]string{backend.AnnotationKey: string(backend.OCIGvisor)}), nil)
+				fakeOCIRuntime.ExecReturns(new(gardenfakes.FakeProcess), nil)
+			})
+
+			It("streams in by executing tar in the container", func() {
+				Expect(containerizer.StreamIn(logger, "some-handle", garden.StreamInSpec{Path: "/dest", User: "vcap"})).To(Succeed())
+
+				Expect(fakeOCIRuntime.ExecCallCount()).To(Equal(2))
+				_, handle, spec, _ := fakeOCIRuntime.ExecArgsForCall(1)
+				Expect(handle).To(Equal("some-handle"))
+				Expect(spec.Path).To(Equal("/bin/tar"))
+				Expect(fakeNstarRunner.StreamInCallCount()).To(Equal(0))
+				Expect(fakeOCIRuntime.StateCallCount()).To(Equal(0))
+			})
+
+			It("streams out by executing tar in the container", func() {
+				_, err := containerizer.StreamOut(logger, "some-handle", garden.StreamOutSpec{Path: "/a/b"})
+				Expect(err).NotTo(HaveOccurred())
+
+				Expect(fakeOCIRuntime.ExecCallCount()).To(Equal(1))
+				_, _, spec, _ := fakeOCIRuntime.ExecArgsForCall(0)
+				Expect(spec.Path).To(Equal("/bin/tar"))
+				Expect(fakeNstarRunner.StreamOutCallCount()).To(Equal(0))
+			})
+
+			It("runs a pea as a process in the sandbox, dropping its image and bind mounts", func() {
+				processSpec := garden.ProcessSpec{
+					ID:         "pea-id",
+					Path:       "/etc/cf-assets/healthcheck/healthcheck",
+					Args:       []string{"-port", "8080"},
+					User:       "vcap",
+					Image:      garden.ImageRef{URI: "some-uri"},
+					BindMounts: []garden.BindMount{{SrcPath: "src", DstPath: "dst"}},
+				}
+				pio := garden.ProcessIO{Stdout: gbytes.NewBuffer()}
+
+				_, err := containerizer.Run(logger, "some-handle", processSpec, pio)
+				Expect(err).NotTo(HaveOccurred())
+
+				Expect(fakeOCIRuntime.ExecCallCount()).To(Equal(1))
+				_, handle, execSpec, execIO := fakeOCIRuntime.ExecArgsForCall(0)
+				Expect(handle).To(Equal("some-handle"))
+				Expect(execSpec.ID).To(Equal("pea-id"))
+				Expect(execSpec.Path).To(Equal(processSpec.Path))
+				Expect(execSpec.Args).To(Equal(processSpec.Args))
+				Expect(execSpec.User).To(Equal("vcap"))
+				Expect(execSpec.Image).To(Equal(garden.ImageRef{}))
+				Expect(execSpec.BindMounts).To(BeNil())
+				Expect(execIO).To(Equal(pio))
+				Expect(fakePeaCreator.CreatePeaCallCount()).To(Equal(0))
+				Expect(fakePeaUsernameResolver.ResolveUserCallCount()).To(Equal(0))
+			})
+
+			It("runs a non-pea process without consulting the bundle", func() {
+				_, err := containerizer.Run(logger, "some-handle", garden.ProcessSpec{Path: "hello"}, garden.ProcessIO{})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(fakeOCIRuntime.BundleInfoCallCount()).To(Equal(0))
+				Expect(fakeOCIRuntime.ExecCallCount()).To(Equal(1))
+			})
+
+			Describe("Stop", func() {
+				It("sends SIGTERM to the whole task and returns once it has stopped", func() {
+					fakeOCIRuntime.StateReturnsOnCall(0, rundmc.State{Pid: 12, Status: rundmc.RunningStatus}, nil)
+					fakeOCIRuntime.StateReturnsOnCall(1, rundmc.State{Pid: 12, Status: rundmc.StoppedStatus}, nil)
+
+					Expect(containerizer.Stop(logger, "some-handle", false)).To(Succeed())
+
+					Expect(fakeTaskKiller.KillAllCallCount()).To(Equal(1))
+					_, id, signal := fakeTaskKiller.KillAllArgsForCall(0)
+					Expect(id).To(Equal("some-handle"))
+					Expect(signal).To(Equal(syscall.SIGTERM))
+					Expect(fakeProcessesStopper.StopAllCallCount()).To(Equal(0))
+					Expect(fakeStateStore.StoreStoppedCallCount()).To(Equal(1))
+					Expect(fakeStateStore.StoreStoppedArgsForCall(0)).To(Equal("some-handle"))
+				})
+
+				It("escalates to SIGKILL when SIGTERM does not stop the task in time", func() {
+					fakeOCIRuntime.StateReturns(rundmc.State{Pid: 12, Status: rundmc.RunningStatus}, nil)
+					fakeTaskKiller.KillAllStub = func(_ lager.Logger, _ string, signal syscall.Signal) error {
+						if signal == syscall.SIGKILL {
+							fakeOCIRuntime.StateReturns(rundmc.State{Pid: 12, Status: rundmc.StoppedStatus}, nil)
+						}
+						return nil
+					}
+
+					Expect(containerizer.Stop(logger, "some-handle", false)).To(Succeed())
+
+					Expect(fakeTaskKiller.KillAllCallCount()).To(Equal(2))
+					_, _, first := fakeTaskKiller.KillAllArgsForCall(0)
+					_, _, second := fakeTaskKiller.KillAllArgsForCall(1)
+					Expect(first).To(Equal(syscall.SIGTERM))
+					Expect(second).To(Equal(syscall.SIGKILL))
+					Expect(fakeStateStore.StoreStoppedCallCount()).To(Equal(1))
+				})
+
+				It("escalates to SIGKILL when SIGTERM cannot be delivered", func() {
+					fakeOCIRuntime.StateReturns(rundmc.State{Pid: 12, Status: rundmc.RunningStatus}, nil)
+					fakeTaskKiller.KillAllStub = func(_ lager.Logger, _ string, signal syscall.Signal) error {
+						if signal == syscall.SIGTERM {
+							return errors.New("term-failed")
+						}
+						fakeOCIRuntime.StateReturns(rundmc.State{Pid: 12, Status: rundmc.StoppedStatus}, nil)
+						return nil
+					}
+
+					Expect(containerizer.Stop(logger, "some-handle", false)).To(Succeed())
+					Expect(fakeTaskKiller.KillAllCallCount()).To(Equal(2))
+				})
+
+				It("sends only SIGKILL when kill is requested", func() {
+					fakeOCIRuntime.StateReturnsOnCall(0, rundmc.State{Pid: 12, Status: rundmc.RunningStatus}, nil)
+					fakeOCIRuntime.StateReturnsOnCall(1, rundmc.State{Pid: 12, Status: rundmc.StoppedStatus}, nil)
+
+					Expect(containerizer.Stop(logger, "some-handle", true)).To(Succeed())
+
+					Expect(fakeTaskKiller.KillAllCallCount()).To(Equal(1))
+					_, _, signal := fakeTaskKiller.KillAllArgsForCall(0)
+					Expect(signal).To(Equal(syscall.SIGKILL))
+				})
+
+				It("does not signal a task that has already stopped", func() {
+					fakeOCIRuntime.StateReturns(rundmc.State{Pid: 12, Status: rundmc.StoppedStatus}, nil)
+
+					Expect(containerizer.Stop(logger, "some-handle", false)).To(Succeed())
+					Expect(fakeTaskKiller.KillAllCallCount()).To(Equal(0))
+					Expect(fakeStateStore.StoreStoppedCallCount()).To(Equal(1))
+				})
+
+				for _, kill := range []bool{false, true} {
+					kill := kill
+
+					It(fmt.Sprintf("succeeds without a signal for a task that was created but never started (kill %t)", kill), func() {
+						fakeOCIRuntime.StateReturns(rundmc.State{Pid: 12, Status: rundmc.CreatedStatus}, nil)
+						fakeTaskKiller.KillAllReturns(errors.New("runsc cannot signal a container that has not started"))
+
+						Expect(containerizer.Stop(logger, "some-handle", kill)).To(Succeed())
+						Expect(fakeTaskKiller.KillAllCallCount()).To(Equal(0))
+						Expect(fakeProcessesStopper.StopAllCallCount()).To(Equal(0))
+						Expect(fakeStateStore.StoreStoppedCallCount()).To(Equal(1))
+						Expect(fakeStateStore.StoreStoppedArgsForCall(0)).To(Equal("some-handle"))
+					})
+				}
+
+				It("treats a failed signal to a task that exited meanwhile as stopped", func() {
+					fakeOCIRuntime.StateReturnsOnCall(0, rundmc.State{Pid: 12, Status: rundmc.RunningStatus}, nil)
+					fakeOCIRuntime.StateReturnsOnCall(1, rundmc.State{Pid: 12, Status: rundmc.StoppedStatus}, nil)
+					fakeTaskKiller.KillAllReturns(errors.New("process already finished"))
+
+					Expect(containerizer.Stop(logger, "some-handle", true)).To(Succeed())
+					Expect(fakeStateStore.StoreStoppedCallCount()).To(Equal(1))
+				})
+
+				It("fails without recording a stop when SIGKILL cannot be delivered", func() {
+					fakeOCIRuntime.StateReturns(rundmc.State{Pid: 12, Status: rundmc.RunningStatus}, nil)
+					fakeTaskKiller.KillAllReturns(errors.New("kill-failed"))
+
+					err := containerizer.Stop(logger, "some-handle", true)
+					Expect(err).To(MatchError(ContainSubstring("kill-failed")))
+					Expect(err).To(MatchError(ContainSubstring("signal 9")))
+					Expect(fakeStateStore.StoreStoppedCallCount()).To(Equal(0))
+				})
+
+				It("fails without recording a stop when the task survives SIGKILL", func() {
+					fakeOCIRuntime.StateReturns(rundmc.State{Pid: 12, Status: rundmc.RunningStatus}, nil)
+
+					err := containerizer.Stop(logger, "some-handle", true)
+					Expect(err).To(MatchError(ContainSubstring("task still running after signal 9")))
+					Expect(fakeStateStore.StoreStoppedCallCount()).To(Equal(0))
+				})
+
+				It("fails without signalling when the task state cannot be read", func() {
+					fakeOCIRuntime.StateReturns(rundmc.State{}, errors.New("no-task"))
+
+					Expect(containerizer.Stop(logger, "some-handle", false)).To(MatchError(ContainSubstring("no-task")))
+					Expect(fakeTaskKiller.KillAllCallCount()).To(Equal(0))
+					Expect(fakeStateStore.StoreStoppedCallCount()).To(Equal(0))
+				})
+
+				It("fails when no task killer is configured", func() {
+					containerizer = newContainerizer(rundmc.WithBackendDispatch())
+
+					Expect(containerizer.Stop(logger, "some-handle", true)).To(MatchError("stop: no containerd task killer is configured to stop gvisor containers"))
+					Expect(fakeProcessesStopper.StopAllCallCount()).To(Equal(0))
+					Expect(fakeStateStore.StoreStoppedCallCount()).To(Equal(0))
+				})
+
+				Context("with a task pid lister", func() {
+					var fakePidLister *fakes.FakeTaskPidLister
+
+					BeforeEach(func() {
+						fakePidLister = new(fakes.FakeTaskPidLister)
+						containerizer = newContainerizer(
+							rundmc.WithBackendDispatch(),
+							rundmc.WithTaskKiller(fakeTaskKiller, retrier.New(retrier.ConstantBackoff(5, time.Millisecond), nil)),
+							rundmc.WithTaskPidLister(fakePidLister),
+						)
+						fakeOCIRuntime.StateReturns(rundmc.State{Pid: 12, Status: rundmc.RunningStatus}, nil)
+						fakeTaskKiller.KillAllStub = func(_ lager.Logger, _ string, signal syscall.Signal) error {
+							if signal == syscall.SIGKILL {
+								fakeOCIRuntime.StateReturns(rundmc.State{Pid: 12, Status: rundmc.StoppedStatus}, nil)
+							}
+							return nil
+						}
+					})
+
+					It("stops waiting after SIGTERM once only init is left, then SIGKILLs init", func() {
+						fakePidLister.TaskPidsReturnsOnCall(0, []uint32{1, 7, 9}, nil)
+						fakePidLister.TaskPidsReturnsOnCall(1, []uint32{1}, nil)
+
+						Expect(containerizer.Stop(logger, "some-handle", false)).To(Succeed())
+
+						Expect(fakePidLister.TaskPidsCallCount()).To(Equal(2))
+						_, id := fakePidLister.TaskPidsArgsForCall(0)
+						Expect(id).To(Equal("some-handle"))
+						Expect(fakeTaskKiller.KillAllCallCount()).To(Equal(2))
+						_, _, first := fakeTaskKiller.KillAllArgsForCall(0)
+						_, _, second := fakeTaskKiller.KillAllArgsForCall(1)
+						Expect(first).To(Equal(syscall.SIGTERM))
+						Expect(second).To(Equal(syscall.SIGKILL))
+						Expect(fakeStateStore.StoreStoppedCallCount()).To(Equal(1))
+					})
+
+					It("returns without SIGKILL when the task stops on SIGTERM", func() {
+						fakeTaskKiller.KillAllStub = func(_ lager.Logger, _ string, _ syscall.Signal) error {
+							fakeOCIRuntime.StateReturns(rundmc.State{Pid: 12, Status: rundmc.StoppedStatus}, nil)
+							return nil
+						}
+
+						Expect(containerizer.Stop(logger, "some-handle", false)).To(Succeed())
+						Expect(fakeTaskKiller.KillAllCallCount()).To(Equal(1))
+						Expect(fakePidLister.TaskPidsCallCount()).To(Equal(0))
+					})
+
+					It("keeps waiting the full SIGTERM budget while other processes remain", func() {
+						fakePidLister.TaskPidsReturns([]uint32{1, 7}, nil)
+
+						Expect(containerizer.Stop(logger, "some-handle", false)).To(Succeed())
+						Expect(fakePidLister.TaskPidsCallCount()).To(Equal(6))
+						Expect(fakeTaskKiller.KillAllCallCount()).To(Equal(2))
+					})
+
+					It("does not take a listing error or an empty list as only init left", func() {
+						fakePidLister.TaskPidsReturnsOnCall(0, nil, errors.New("list-failed"))
+						fakePidLister.TaskPidsReturns([]uint32{}, nil)
+
+						Expect(containerizer.Stop(logger, "some-handle", false)).To(Succeed())
+						Expect(fakePidLister.TaskPidsCallCount()).To(Equal(6))
+						Expect(fakeTaskKiller.KillAllCallCount()).To(Equal(2))
+					})
+
+					It("is not consulted when kill is requested", func() {
+						Expect(containerizer.Stop(logger, "some-handle", true)).To(Succeed())
+						Expect(fakePidLister.TaskPidsCallCount()).To(Equal(0))
+						Expect(fakeTaskKiller.KillAllCallCount()).To(Equal(1))
+					})
+
+					It("still fails when init survives SIGKILL", func() {
+						fakePidLister.TaskPidsReturns([]uint32{1}, nil)
+						fakeTaskKiller.KillAllStub = nil
+						fakeTaskKiller.KillAllReturns(nil)
+
+						err := containerizer.Stop(logger, "some-handle", false)
+						Expect(err).To(MatchError(ContainSubstring("task still running after signal 9")))
+						Expect(fakeStateStore.StoreStoppedCallCount()).To(Equal(0))
+					})
+				})
+			})
+		})
+	})
+
+	Describe("without backend dispatch", func() {
+		var fakeTaskKiller *fakes.FakeTaskKiller
+
+		for _, kind := range []backend.Kind{backend.OCIGvisor, backend.VMQemu, backend.VMFirecracker} {
+			kind := kind
+
+			Context(fmt.Sprintf("even for a bundle annotated %s", kind), func() {
+				BeforeEach(func() {
+					fakeTaskKiller = new(fakes.FakeTaskKiller)
+					containerizer = newContainerizer(rundmc.WithTaskKiller(fakeTaskKiller, retrier.New(retrier.ConstantBackoff(2, time.Millisecond), nil)))
+					fakeOCIRuntime.BundleInfoReturns("/bundle", goci.Bndl{Spec: specs.Spec{Annotations: map[string]string{backend.AnnotationKey: string(kind)}}}, nil)
+					fakeOCIRuntime.StateReturns(rundmc.State{Pid: 12, Status: rundmc.RunningStatus}, nil)
+				})
+
+				AfterEach(func() {
+					Expect(fakeOCIRuntime.BundleInfoCallCount()).To(Equal(0))
+					Expect(fakeTaskKiller.KillAllCallCount()).To(Equal(0))
+				})
+
+				It("runs the CF launcher unwrapped, passing the environment through", func() {
+					spec := garden.ProcessSpec{Path: "/tmp/lifecycle/launcher", Args: []string{"app"}, Env: []string{"__GARDEN_VM_LAUNCH_WRAPPED=1"}}
+					_, err := containerizer.Run(logger, "some-handle", spec, garden.ProcessIO{})
+					Expect(err).NotTo(HaveOccurred())
+
+					_, _, actual, _ := fakeOCIRuntime.ExecArgsForCall(0)
+					Expect(actual).To(Equal(spec))
+				})
+
+				It("creates peas through the pea creator", func() {
+					spec := garden.ProcessSpec{Path: "check", Image: garden.ImageRef{URI: "some-uri"}}
+					_, err := containerizer.Run(logger, "some-handle", spec, garden.ProcessIO{})
+					Expect(err).NotTo(HaveOccurred())
+
+					Expect(fakePeaCreator.CreatePeaCallCount()).To(Equal(1))
+					_, peaSpec, _, _ := fakePeaCreator.CreatePeaArgsForCall(0)
+					Expect(peaSpec).To(Equal(spec))
+					Expect(fakeOCIRuntime.ExecCallCount()).To(Equal(0))
+				})
+
+				It("streams through nstar with the stock errors", func() {
+					Expect(containerizer.StreamIn(logger, "some-handle", garden.StreamInSpec{Path: "p"})).To(Succeed())
+					_, err := containerizer.StreamOut(logger, "some-handle", garden.StreamOutSpec{Path: "p"})
+					Expect(err).NotTo(HaveOccurred())
+					Expect(fakeNstarRunner.StreamInCallCount()).To(Equal(1))
+					Expect(fakeNstarRunner.StreamOutCallCount()).To(Equal(1))
+					Expect(fakeOCIRuntime.ExecCallCount()).To(Equal(0))
+
+					fakeOCIRuntime.StateReturns(rundmc.State{}, errors.New("gone"))
+					Expect(containerizer.StreamIn(logger, "some-handle", garden.StreamInSpec{})).To(MatchError("stream-in: pid not found for container"))
+					_, err = containerizer.StreamOut(logger, "some-handle", garden.StreamOutSpec{})
+					Expect(err).To(MatchError("stream-out: pid not found for container"))
+				})
+
+				It("stops through the cgroup stopper, sparing init", func() {
+					Expect(containerizer.Stop(logger, "some-handle", false)).To(Succeed())
+
+					Expect(fakeProcessesStopper.StopAllCallCount()).To(Equal(1))
+					_, _, exceptions, _ := fakeProcessesStopper.StopAllArgsForCall(0)
+					Expect(exceptions).To(ConsistOf(12))
+				})
+			})
+		}
 	})
 
 	Describe("Destroy", func() {

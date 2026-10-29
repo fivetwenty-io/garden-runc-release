@@ -4,10 +4,13 @@ package runcontainerdfakes
 import (
 	"io"
 	"sync"
+	"syscall"
+	"time"
 
 	"code.cloudfoundry.org/guardian/rundmc/runcontainerd"
 	lager "code.cloudfoundry.org/lager/v3"
 	"github.com/containerd/containerd/api/events"
+	typeurl "github.com/containerd/typeurl/v2"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -84,6 +87,19 @@ type FakeContainerManager struct {
 		result1 uint32
 		result2 error
 	}
+	KillAllStub        func(lager.Logger, string, syscall.Signal) error
+	killAllMutex       sync.RWMutex
+	killAllArgsForCall []struct {
+		arg1 lager.Logger
+		arg2 string
+		arg3 syscall.Signal
+	}
+	killAllReturns struct {
+		result1 error
+	}
+	killAllReturnsOnCall map[int]struct {
+		result1 error
+	}
 	OOMEventsStub        func(lager.Logger) <-chan *events.TaskOOM
 	oOMEventsMutex       sync.RWMutex
 	oOMEventsArgsForCall []struct {
@@ -121,6 +137,18 @@ type FakeContainerManager struct {
 		result1 *specs.Spec
 		result2 error
 	}
+	StartStub        func(lager.Logger, string) error
+	startMutex       sync.RWMutex
+	startArgsForCall []struct {
+		arg1 lager.Logger
+		arg2 string
+	}
+	startReturns struct {
+		result1 error
+	}
+	startReturnsOnCall map[int]struct {
+		result1 error
+	}
 	StateStub        func(lager.Logger, string) (int, string, error)
 	stateMutex       sync.RWMutex
 	stateArgsForCall []struct {
@@ -135,6 +163,22 @@ type FakeContainerManager struct {
 	stateReturnsOnCall map[int]struct {
 		result1 int
 		result2 string
+		result3 error
+	}
+	TaskMetricsStub        func(lager.Logger, string) (typeurl.Any, time.Time, error)
+	taskMetricsMutex       sync.RWMutex
+	taskMetricsArgsForCall []struct {
+		arg1 lager.Logger
+		arg2 string
+	}
+	taskMetricsReturns struct {
+		result1 typeurl.Any
+		result2 time.Time
+		result3 error
+	}
+	taskMetricsReturnsOnCall map[int]struct {
+		result1 typeurl.Any
+		result2 time.Time
 		result3 error
 	}
 	invocations      map[string][][]interface{}
@@ -466,6 +510,69 @@ func (fake *FakeContainerManager) GetContainerPIDReturnsOnCall(i int, result1 ui
 	}{result1, result2}
 }
 
+func (fake *FakeContainerManager) KillAll(arg1 lager.Logger, arg2 string, arg3 syscall.Signal) error {
+	fake.killAllMutex.Lock()
+	ret, specificReturn := fake.killAllReturnsOnCall[len(fake.killAllArgsForCall)]
+	fake.killAllArgsForCall = append(fake.killAllArgsForCall, struct {
+		arg1 lager.Logger
+		arg2 string
+		arg3 syscall.Signal
+	}{arg1, arg2, arg3})
+	stub := fake.KillAllStub
+	fakeReturns := fake.killAllReturns
+	fake.recordInvocation("KillAll", []interface{}{arg1, arg2, arg3})
+	fake.killAllMutex.Unlock()
+	if stub != nil {
+		return stub(arg1, arg2, arg3)
+	}
+	if specificReturn {
+		return ret.result1
+	}
+	return fakeReturns.result1
+}
+
+func (fake *FakeContainerManager) KillAllCallCount() int {
+	fake.killAllMutex.RLock()
+	defer fake.killAllMutex.RUnlock()
+	return len(fake.killAllArgsForCall)
+}
+
+func (fake *FakeContainerManager) KillAllCalls(stub func(lager.Logger, string, syscall.Signal) error) {
+	fake.killAllMutex.Lock()
+	defer fake.killAllMutex.Unlock()
+	fake.KillAllStub = stub
+}
+
+func (fake *FakeContainerManager) KillAllArgsForCall(i int) (lager.Logger, string, syscall.Signal) {
+	fake.killAllMutex.RLock()
+	defer fake.killAllMutex.RUnlock()
+	argsForCall := fake.killAllArgsForCall[i]
+	return argsForCall.arg1, argsForCall.arg2, argsForCall.arg3
+}
+
+func (fake *FakeContainerManager) KillAllReturns(result1 error) {
+	fake.killAllMutex.Lock()
+	defer fake.killAllMutex.Unlock()
+	fake.KillAllStub = nil
+	fake.killAllReturns = struct {
+		result1 error
+	}{result1}
+}
+
+func (fake *FakeContainerManager) KillAllReturnsOnCall(i int, result1 error) {
+	fake.killAllMutex.Lock()
+	defer fake.killAllMutex.Unlock()
+	fake.KillAllStub = nil
+	if fake.killAllReturnsOnCall == nil {
+		fake.killAllReturnsOnCall = make(map[int]struct {
+			result1 error
+		})
+	}
+	fake.killAllReturnsOnCall[i] = struct {
+		result1 error
+	}{result1}
+}
+
 func (fake *FakeContainerManager) OOMEvents(arg1 lager.Logger) <-chan *events.TaskOOM {
 	fake.oOMEventsMutex.Lock()
 	ret, specificReturn := fake.oOMEventsReturnsOnCall[len(fake.oOMEventsArgsForCall)]
@@ -654,6 +761,68 @@ func (fake *FakeContainerManager) SpecReturnsOnCall(i int, result1 *specs.Spec, 
 	}{result1, result2}
 }
 
+func (fake *FakeContainerManager) Start(arg1 lager.Logger, arg2 string) error {
+	fake.startMutex.Lock()
+	ret, specificReturn := fake.startReturnsOnCall[len(fake.startArgsForCall)]
+	fake.startArgsForCall = append(fake.startArgsForCall, struct {
+		arg1 lager.Logger
+		arg2 string
+	}{arg1, arg2})
+	stub := fake.StartStub
+	fakeReturns := fake.startReturns
+	fake.recordInvocation("Start", []interface{}{arg1, arg2})
+	fake.startMutex.Unlock()
+	if stub != nil {
+		return stub(arg1, arg2)
+	}
+	if specificReturn {
+		return ret.result1
+	}
+	return fakeReturns.result1
+}
+
+func (fake *FakeContainerManager) StartCallCount() int {
+	fake.startMutex.RLock()
+	defer fake.startMutex.RUnlock()
+	return len(fake.startArgsForCall)
+}
+
+func (fake *FakeContainerManager) StartCalls(stub func(lager.Logger, string) error) {
+	fake.startMutex.Lock()
+	defer fake.startMutex.Unlock()
+	fake.StartStub = stub
+}
+
+func (fake *FakeContainerManager) StartArgsForCall(i int) (lager.Logger, string) {
+	fake.startMutex.RLock()
+	defer fake.startMutex.RUnlock()
+	argsForCall := fake.startArgsForCall[i]
+	return argsForCall.arg1, argsForCall.arg2
+}
+
+func (fake *FakeContainerManager) StartReturns(result1 error) {
+	fake.startMutex.Lock()
+	defer fake.startMutex.Unlock()
+	fake.StartStub = nil
+	fake.startReturns = struct {
+		result1 error
+	}{result1}
+}
+
+func (fake *FakeContainerManager) StartReturnsOnCall(i int, result1 error) {
+	fake.startMutex.Lock()
+	defer fake.startMutex.Unlock()
+	fake.StartStub = nil
+	if fake.startReturnsOnCall == nil {
+		fake.startReturnsOnCall = make(map[int]struct {
+			result1 error
+		})
+	}
+	fake.startReturnsOnCall[i] = struct {
+		result1 error
+	}{result1}
+}
+
 func (fake *FakeContainerManager) State(arg1 lager.Logger, arg2 string) (int, string, error) {
 	fake.stateMutex.Lock()
 	ret, specificReturn := fake.stateReturnsOnCall[len(fake.stateArgsForCall)]
@@ -722,6 +891,74 @@ func (fake *FakeContainerManager) StateReturnsOnCall(i int, result1 int, result2
 	}{result1, result2, result3}
 }
 
+func (fake *FakeContainerManager) TaskMetrics(arg1 lager.Logger, arg2 string) (typeurl.Any, time.Time, error) {
+	fake.taskMetricsMutex.Lock()
+	ret, specificReturn := fake.taskMetricsReturnsOnCall[len(fake.taskMetricsArgsForCall)]
+	fake.taskMetricsArgsForCall = append(fake.taskMetricsArgsForCall, struct {
+		arg1 lager.Logger
+		arg2 string
+	}{arg1, arg2})
+	stub := fake.TaskMetricsStub
+	fakeReturns := fake.taskMetricsReturns
+	fake.recordInvocation("TaskMetrics", []interface{}{arg1, arg2})
+	fake.taskMetricsMutex.Unlock()
+	if stub != nil {
+		return stub(arg1, arg2)
+	}
+	if specificReturn {
+		return ret.result1, ret.result2, ret.result3
+	}
+	return fakeReturns.result1, fakeReturns.result2, fakeReturns.result3
+}
+
+func (fake *FakeContainerManager) TaskMetricsCallCount() int {
+	fake.taskMetricsMutex.RLock()
+	defer fake.taskMetricsMutex.RUnlock()
+	return len(fake.taskMetricsArgsForCall)
+}
+
+func (fake *FakeContainerManager) TaskMetricsCalls(stub func(lager.Logger, string) (typeurl.Any, time.Time, error)) {
+	fake.taskMetricsMutex.Lock()
+	defer fake.taskMetricsMutex.Unlock()
+	fake.TaskMetricsStub = stub
+}
+
+func (fake *FakeContainerManager) TaskMetricsArgsForCall(i int) (lager.Logger, string) {
+	fake.taskMetricsMutex.RLock()
+	defer fake.taskMetricsMutex.RUnlock()
+	argsForCall := fake.taskMetricsArgsForCall[i]
+	return argsForCall.arg1, argsForCall.arg2
+}
+
+func (fake *FakeContainerManager) TaskMetricsReturns(result1 typeurl.Any, result2 time.Time, result3 error) {
+	fake.taskMetricsMutex.Lock()
+	defer fake.taskMetricsMutex.Unlock()
+	fake.TaskMetricsStub = nil
+	fake.taskMetricsReturns = struct {
+		result1 typeurl.Any
+		result2 time.Time
+		result3 error
+	}{result1, result2, result3}
+}
+
+func (fake *FakeContainerManager) TaskMetricsReturnsOnCall(i int, result1 typeurl.Any, result2 time.Time, result3 error) {
+	fake.taskMetricsMutex.Lock()
+	defer fake.taskMetricsMutex.Unlock()
+	fake.TaskMetricsStub = nil
+	if fake.taskMetricsReturnsOnCall == nil {
+		fake.taskMetricsReturnsOnCall = make(map[int]struct {
+			result1 typeurl.Any
+			result2 time.Time
+			result3 error
+		})
+	}
+	fake.taskMetricsReturnsOnCall[i] = struct {
+		result1 typeurl.Any
+		result2 time.Time
+		result3 error
+	}{result1, result2, result3}
+}
+
 func (fake *FakeContainerManager) Invocations() map[string][][]interface{} {
 	fake.invocationsMutex.RLock()
 	defer fake.invocationsMutex.RUnlock()
@@ -735,14 +972,20 @@ func (fake *FakeContainerManager) Invocations() map[string][][]interface{} {
 	defer fake.execMutex.RUnlock()
 	fake.getContainerPIDMutex.RLock()
 	defer fake.getContainerPIDMutex.RUnlock()
+	fake.killAllMutex.RLock()
+	defer fake.killAllMutex.RUnlock()
 	fake.oOMEventsMutex.RLock()
 	defer fake.oOMEventsMutex.RUnlock()
 	fake.removeBundleMutex.RLock()
 	defer fake.removeBundleMutex.RUnlock()
 	fake.specMutex.RLock()
 	defer fake.specMutex.RUnlock()
+	fake.startMutex.RLock()
+	defer fake.startMutex.RUnlock()
 	fake.stateMutex.RLock()
 	defer fake.stateMutex.RUnlock()
+	fake.taskMetricsMutex.RLock()
+	defer fake.taskMetricsMutex.RUnlock()
 	copiedInvocations := map[string][][]interface{}{}
 	for key, value := range fake.invocations {
 		copiedInvocations[key] = value

@@ -60,3 +60,9 @@ func New(
 		BundleManager: bundleManager,
 	}
 }
+
+// Start does nothing because runc starts the container during Create. gVisor
+// containers, the only ones that defer their start, require containerd mode.
+func (r *RunRunc) Start(_ lager.Logger, _ string) error {
+	return nil
+}

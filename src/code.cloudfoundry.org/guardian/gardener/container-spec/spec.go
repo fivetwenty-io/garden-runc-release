@@ -52,4 +52,7 @@ type DesiredContainerSpec struct {
 	Limits garden.Limits
 
 	BaseConfig specs.Spec
+
+	// ExecutionBackend is the resolved execution backend kind (e.g. "oci-runc", "vm-qemu")
+	ExecutionBackend string
 }

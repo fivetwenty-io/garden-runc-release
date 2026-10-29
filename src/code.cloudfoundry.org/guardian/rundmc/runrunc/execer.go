@@ -69,6 +69,11 @@ func (e *Execer) ExecWithBndl(log lager.Logger, sandboxHandle string, bundle goc
 		return nil, err
 	}
 
+	if err := e.processBuilder.CheckUser(bundle, spec, user); err != nil {
+		log.Error("user-check-failed", err)
+		return nil, err
+	}
+
 	hostUID := idmapper.MappingList(bundle.Spec.Linux.UIDMappings).Map(user.Uid)
 	hostGID := idmapper.MappingList(bundle.Spec.Linux.GIDMappings).Map(user.Gid)
 

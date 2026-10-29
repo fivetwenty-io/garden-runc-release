@@ -41,6 +41,9 @@ type ExecRunner interface {
 
 //counterfeiter:generate . ProcessBuilder
 type ProcessBuilder interface {
+	// CheckUser reports whether processSpec may run as user, the user that the
+	// exec path resolved from the container's image, in bndl.
+	CheckUser(bndl goci.Bndl, processSpec garden.ProcessSpec, user *users.ExecUser) error
 	BuildProcess(bndl goci.Bndl, processSpec garden.ProcessSpec, user *users.ExecUser) *specs.Process
 }
 

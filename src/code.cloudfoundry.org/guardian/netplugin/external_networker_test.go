@@ -5,10 +5,14 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 
 	"code.cloudfoundry.org/commandrunner/fake_command_runner"
 	"code.cloudfoundry.org/garden"
+	"code.cloudfoundry.org/guardian/backend"
 	"code.cloudfoundry.org/guardian/gardener"
 	"code.cloudfoundry.org/guardian/kawasaki"
 	"code.cloudfoundry.org/guardian/kawasaki/kawasakifakes"
@@ -142,6 +146,459 @@ var _ = Describe("ExternalNetworker", func() {
 					"log_config": "some-log-config"
 				}
 			}`))
+		})
+
+		Describe("loopback", func() {
+			loopbackCommands := func() []*exec.Cmd {
+				var cmds []*exec.Cmd
+				for _, cmd := range fakeCommandRunner.ExecutedCommands() {
+					if filepath.Base(cmd.Path) == "nsenter" {
+						cmds = append(cmds, cmd)
+					}
+				}
+				return cmds
+			}
+
+			Context("when the container backend is oci-gvisor", func() {
+				BeforeEach(func() {
+					containerSpec.Properties[backend.AnnotationKey] = string(backend.OCIGvisor)
+				})
+
+				It("brings up lo in the netns of the container pid after the plugin runs", func() {
+					Expect(plugin.Network(logger, containerSpec, 42)).To(Succeed())
+
+					cmds := fakeCommandRunner.ExecutedCommands()
+					Expect(cmds).To(HaveLen(2))
+					Expect(cmds[0].Path).To(Equal("some/path"))
+					Expect(cmds[1].Args[1:]).To(Equal([]string{"--net=/proc/42/ns/net", "--", "ip", "link", "set", "lo", "up"}))
+				})
+
+				It("does not pass the backend property to the plugin", func() {
+					Expect(plugin.Network(logger, containerSpec, 42)).To(Succeed())
+
+					pluginInput, err := io.ReadAll(fakeCommandRunner.ExecutedCommands()[0].Stdin)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(string(pluginInput)).NotTo(ContainSubstring(backend.AnnotationKey))
+				})
+
+				Context("when bringing up lo fails", func() {
+					BeforeEach(func() {
+						fakeCommandRunner.WhenRunning(fake_command_runner.CommandSpec{
+							Path: "nsenter",
+						}, func(cmd *exec.Cmd) error {
+							cmd.Stderr.Write([]byte("lo-stderr-bytes"))
+							return errors.New("nsenter-failed")
+						})
+					})
+
+					It("returns an error naming the pid, and logs the failure with stderr", func() {
+						err := plugin.Network(logger, containerSpec, 42)
+						Expect(err).To(MatchError(ContainSubstring("pid 42")))
+						Expect(err).To(MatchError(ContainSubstring("nsenter-failed")))
+
+						Expect(logger).To(gbytes.Say(`setup-loopback.failed.*lo-stderr-bytes`))
+					})
+
+					It("does not configure DNS", func() {
+						Expect(plugin.Network(logger, containerSpec, 42)).NotTo(Succeed())
+						Expect(resolvConfigurer.ConfigureCallCount()).To(Equal(0))
+					})
+				})
+
+				Context("when the plugin fails", func() {
+					BeforeEach(func() {
+						pluginErr = errors.New("plugin-failed")
+					})
+
+					It("does not attempt to bring up lo", func() {
+						Expect(plugin.Network(logger, containerSpec, 42)).NotTo(Succeed())
+						Expect(loopbackCommands()).To(BeEmpty())
+					})
+				})
+			})
+
+			Context("when the container backend is oci-runc", func() {
+				BeforeEach(func() {
+					containerSpec.Properties[backend.AnnotationKey] = string(backend.OCIRunc)
+				})
+
+				It("does not touch lo", func() {
+					Expect(plugin.Network(logger, containerSpec, 42)).To(Succeed())
+					Expect(loopbackCommands()).To(BeEmpty())
+				})
+			})
+
+			Context("when the container backend is a VM backend", func() {
+				BeforeEach(func() {
+					containerSpec.Properties[backend.AnnotationKey] = string(backend.VMQemu)
+				})
+
+				It("does not touch lo", func() {
+					Expect(plugin.Network(logger, containerSpec, 42)).To(Succeed())
+					Expect(loopbackCommands()).To(BeEmpty())
+				})
+			})
+
+			Context("when no backend is set", func() {
+				It("does not touch lo", func() {
+					Expect(plugin.Network(logger, containerSpec, 42)).To(Succeed())
+					Expect(loopbackCommands()).To(BeEmpty())
+				})
+			})
+		})
+
+		Describe("firecracker tap", func() {
+			var procRoot string
+
+			nsenterArgs := func(args ...string) []string {
+				return append([]string{"--net=/proc/42/ns/net", "--"}, args...)
+			}
+
+			writeGIDMap := func(contents string) {
+				Expect(os.MkdirAll(filepath.Join(procRoot, "42"), 0o755)).To(Succeed())
+				Expect(os.WriteFile(filepath.Join(procRoot, "42", "gid_map"), []byte(contents), 0o644)).To(Succeed())
+			}
+
+			newPlugin := func(opts ...netplugin.Option) {
+				plugin = netplugin.New(
+					fakeCommandRunner,
+					configStore,
+					net.ParseIP("1.2.3.4"),
+					dnsServers,
+					additionalDNSServers,
+					resolvConfigurer,
+					"some/path",
+					[]string{"arg1", "arg2", "arg3"},
+					networkDepot,
+					append([]netplugin.Option{netplugin.WithProcRoot(procRoot)}, opts...)...,
+				)
+			}
+
+			// The one callback behind the ip link query inside the netns prints
+			// eth0Link, or fails with eth0Err.
+			var (
+				eth0Link string
+				eth0Err  error
+			)
+			answerEth0Link := func(link string) { eth0Link = link }
+
+			BeforeEach(func() {
+				procRoot = GinkgoT().TempDir()
+				writeGIDMap("         0 4294967294          1\n         1          1 4294967293\n")
+				newPlugin(netplugin.WithTapGroup(991), netplugin.WithIPTablesBin("/var/vcap/data/gdn/assets/sbin/iptables"))
+				eth0Err = nil
+				fakeCommandRunner.WhenRunning(fake_command_runner.CommandSpec{
+					Path: "nsenter",
+					Args: nsenterArgs("ip", "-o", "link", "show", "dev", "eth0"),
+				}, func(cmd *exec.Cmd) error {
+					if eth0Err != nil {
+						cmd.Stderr.Write([]byte("Device \"eth0\" does not exist."))
+						return eth0Err
+					}
+					_, err := cmd.Stdout.Write([]byte(eth0Link))
+					return err
+				})
+				answerEth0Link("2: eth0@if7: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue state UP mode DEFAULT group default \\    link/ether 02:42:0a:ff:00:02 brd ff:ff:ff:ff:ff:ff link-netnsid 0\n")
+			})
+
+			Context("when the container backend is vm-firecracker", func() {
+				BeforeEach(func() {
+					containerSpec.Properties[backend.AnnotationKey] = string(backend.VMFirecracker)
+				})
+
+				It("creates tap0 for the group, filters the guest, then raises it, enables forwarding and masquerades egress, in order", func() {
+					Expect(plugin.Network(logger, containerSpec, 42)).To(Succeed())
+
+					cmds := fakeCommandRunner.ExecutedCommands()
+					Expect(cmds).To(HaveLen(11))
+					Expect(cmds[0].Path).To(Equal("some/path"))
+
+					iptables := "/var/vcap/data/gdn/assets/sbin/iptables"
+					var got [][]string
+					for _, cmd := range cmds[1:] {
+						Expect(filepath.Base(cmd.Path)).To(Equal("nsenter"))
+						got = append(got, cmd.Args[1:])
+					}
+					Expect(got).To(Equal([][]string{
+						nsenterArgs("ip", "-o", "link", "show", "dev", "eth0"),
+						nsenterArgs("ip", "tuntap", "add", "dev", "tap0", "mode", "tap", "group", "991"),
+						nsenterArgs("ip", "link", "set", "tap0", "mtu", "1450"),
+						nsenterArgs(iptables, "-A", "FORWARD", "-i", "tap0", "!", "-s", "169.254.100.2/32", "-j", "DROP"),
+						nsenterArgs(iptables, "-A", "INPUT", "-i", "tap0", "!", "-s", "169.254.100.2/32", "-j", "DROP"),
+						nsenterArgs(iptables, "-A", "FORWARD", "-o", "tap0", "-m", "conntrack", "!", "--ctstate", "ESTABLISHED,RELATED", "-j", "DROP"),
+						nsenterArgs("ip", "addr", "add", "169.254.100.1/30", "dev", "tap0"),
+						nsenterArgs("ip", "link", "set", "tap0", "up"),
+						nsenterArgs("sysctl", "-w", "net.ipv4.ip_forward=1"),
+						nsenterArgs(iptables, "-t", "nat", "-A", "POSTROUTING", "-s", "169.254.100.2/32", "-o", "eth0", "-j", "MASQUERADE"),
+					}))
+				})
+
+				It("sets no per-device reverse path filter, which the inherited all setting would override", func() {
+					Expect(plugin.Network(logger, containerSpec, 42)).To(Succeed())
+
+					for _, cmd := range fakeCommandRunner.ExecutedCommands() {
+						Expect(strings.Join(cmd.Args, " ")).NotTo(ContainSubstring("rp_filter"))
+					}
+				})
+
+				It("never owns tap0 by user", func() {
+					Expect(plugin.Network(logger, containerSpec, 42)).To(Succeed())
+
+					for _, cmd := range fakeCommandRunner.ExecutedCommands() {
+						Expect(cmd.Args).NotTo(ContainElement("user"))
+					}
+				})
+
+				It("has the filters in place before the link is up and forwarding is on", func() {
+					Expect(plugin.Network(logger, containerSpec, 42)).To(Succeed())
+
+					// The command each nsenter runs, after "--".
+					var inNetns []string
+					for _, cmd := range fakeCommandRunner.ExecutedCommands()[1:] {
+						inNetns = append(inNetns, strings.Join(cmd.Args[3:], " "))
+					}
+					indexOf := func(command string) int {
+						for i, c := range inNetns {
+							if c == command {
+								return i
+							}
+						}
+						Fail("not run in the netns: " + command)
+						return -1
+					}
+
+					iptables := "/var/vcap/data/gdn/assets/sbin/iptables"
+					up := indexOf("ip link set tap0 up")
+					forward := indexOf("sysctl -w net.ipv4.ip_forward=1")
+					for _, guard := range []string{
+						iptables + " -A FORWARD -i tap0 ! -s 169.254.100.2/32 -j DROP",
+						iptables + " -A INPUT -i tap0 ! -s 169.254.100.2/32 -j DROP",
+						iptables + " -A FORWARD -o tap0 -m conntrack ! --ctstate ESTABLISHED,RELATED -j DROP",
+					} {
+						Expect(indexOf(guard)).To(BeNumerically("<", up), guard)
+						Expect(indexOf(guard)).To(BeNumerically("<", forward), guard)
+					}
+				})
+
+				It("uses the host gid of an unprivileged mapping that does not start at 0", func() {
+					writeGIDMap("0 100000 65536\n")
+					Expect(plugin.Network(logger, containerSpec, 42)).To(Succeed())
+
+					Expect(fakeCommandRunner.ExecutedCommands()[2].Args).To(ContainElements("group", "100991"))
+				})
+
+				It("honours a configured tap group", func() {
+					newPlugin(netplugin.WithTapGroup(1))
+					Expect(plugin.Network(logger, containerSpec, 42)).To(Succeed())
+
+					Expect(fakeCommandRunner.ExecutedCommands()[2].Args).To(ContainElements("group", "1"))
+				})
+
+				It("defaults to iptables from the gdn default path", func() {
+					newPlugin(netplugin.WithTapGroup(991))
+					Expect(plugin.Network(logger, containerSpec, 42)).To(Succeed())
+
+					cmds := fakeCommandRunner.ExecutedCommands()
+					Expect(cmds[4].Args).To(ContainElement("/sbin/iptables"))
+					Expect(cmds[5].Args).To(ContainElement("/sbin/iptables"))
+					Expect(cmds[6].Args).To(ContainElement("/sbin/iptables"))
+					Expect(cmds[10].Args).To(ContainElement("/sbin/iptables"))
+				})
+
+				It("does not pass the backend property to the plugin", func() {
+					Expect(plugin.Network(logger, containerSpec, 42)).To(Succeed())
+
+					pluginInput, err := io.ReadAll(fakeCommandRunner.ExecutedCommands()[0].Stdin)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(string(pluginInput)).NotTo(ContainSubstring(backend.AnnotationKey))
+				})
+
+				It("keeps the tap subnet clear of the silk veth gateway", func() {
+					_, tapNet, err := net.ParseCIDR(netplugin.FirecrackerTapCIDR)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(tapNet.Contains(net.ParseIP("169.254.0.1"))).To(BeFalse())
+					Expect(tapNet.Contains(net.ParseIP(netplugin.FirecrackerGuestIP))).To(BeTrue())
+				})
+
+				Context("when no tap group is configured", func() {
+					BeforeEach(func() {
+						newPlugin()
+					})
+
+					It("fails with a clear error before the plugin or the netns is touched", func() {
+						err := plugin.Network(logger, containerSpec, 42)
+						Expect(err).To(MatchError(ContainSubstring("no tap group is configured")))
+						Expect(err).To(MatchError(ContainSubstring(containerSpec.Handle)))
+						Expect(fakeCommandRunner.ExecutedCommands()).To(BeEmpty())
+						Expect(resolvConfigurer.ConfigureCallCount()).To(Equal(0))
+					})
+				})
+
+				Context("when the eth0 mtu differs", func() {
+					It("uses the mtu eth0 reports", func() {
+						answerEth0Link("2: eth0@if9: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 9001 qdisc noqueue state UP\n")
+						Expect(plugin.Network(logger, containerSpec, 42)).To(Succeed())
+
+						Expect(fakeCommandRunner.ExecutedCommands()[3].Args).To(Equal(append([]string{"nsenter"}, nsenterArgs("ip", "link", "set", "tap0", "mtu", "9001")...)))
+					})
+				})
+
+				DescribeTable("when the eth0 mtu cannot be used",
+					func(link string, expected string) {
+						answerEth0Link(link)
+						err := plugin.Network(logger, containerSpec, 42)
+						Expect(err).To(MatchError(ContainSubstring("reading the eth0 mtu in container netns of pid 42")))
+						Expect(err).To(MatchError(ContainSubstring(expected)))
+						// The plugin and the query ran; tap0 was never created.
+						Expect(fakeCommandRunner.ExecutedCommands()).To(HaveLen(2))
+						Expect(resolvConfigurer.ConfigureCallCount()).To(Equal(0))
+					},
+					Entry("no mtu in the output", "2: eth0: <BROADCAST> qdisc noqueue\n", "no mtu in"),
+					Entry("empty output", "", "no mtu in"),
+					Entry("mtu below the IPv4 minimum", "2: eth0: <UP> mtu 67 qdisc noqueue\n", "outside 68 to 65535"),
+					Entry("mtu above what a tap accepts", "2: eth0: <UP> mtu 65536 qdisc noqueue\n", "outside 68 to 65535"),
+				)
+
+				Context("when the eth0 query fails", func() {
+					BeforeEach(func() {
+						eth0Err = errors.New("eth0-failed")
+					})
+
+					It("returns a wrapped error, logs stderr and creates nothing", func() {
+						err := plugin.Network(logger, containerSpec, 42)
+						Expect(err).To(MatchError(ContainSubstring("reading the eth0 mtu in container netns of pid 42")))
+						Expect(err).To(MatchError(ContainSubstring("eth0-failed")))
+						Expect(logger).To(gbytes.Say(`setup-firecracker-tap.failed.*does not exist`))
+						Expect(fakeCommandRunner.ExecutedCommands()).To(HaveLen(2))
+					})
+				})
+
+				Context("when the group is not mapped", func() {
+					BeforeEach(func() {
+						writeGIDMap("0 1000 500\n")
+					})
+
+					It("fails before changing the netns", func() {
+						err := plugin.Network(logger, containerSpec, 42)
+						Expect(err).To(MatchError(ContainSubstring("pid 42")))
+						Expect(err).To(MatchError(ContainSubstring("container gid 991 is not mapped")))
+						Expect(fakeCommandRunner.ExecutedCommands()).To(HaveLen(1))
+						Expect(resolvConfigurer.ConfigureCallCount()).To(Equal(0))
+					})
+				})
+
+				Context("when gid_map cannot be read", func() {
+					BeforeEach(func() {
+						Expect(os.RemoveAll(filepath.Join(procRoot, "42"))).To(Succeed())
+					})
+
+					It("returns an error", func() {
+						err := plugin.Network(logger, containerSpec, 42)
+						Expect(err).To(MatchError(ContainSubstring("resolving tap group")))
+						Expect(fakeCommandRunner.ExecutedCommands()).To(HaveLen(1))
+					})
+				})
+
+				Context("when a step fails", func() {
+					BeforeEach(func() {
+						fakeCommandRunner.WhenRunning(fake_command_runner.CommandSpec{
+							Path: "nsenter",
+							Args: nsenterArgs("ip", "addr", "add", "169.254.100.1/30", "dev", "tap0"),
+						}, func(cmd *exec.Cmd) error {
+							cmd.Stderr.Write([]byte("addr-stderr-bytes"))
+							return errors.New("addr-failed")
+						})
+					})
+
+					It("returns a wrapped error, logs stderr, runs no later step and skips DNS", func() {
+						err := plugin.Network(logger, containerSpec, 42)
+						Expect(err).To(MatchError(ContainSubstring("addressing tap0 in container netns of pid 42")))
+						Expect(err).To(MatchError(ContainSubstring("addr-failed")))
+						Expect(logger).To(gbytes.Say(`setup-firecracker-tap.failed.*addr-stderr-bytes`))
+
+						Expect(fakeCommandRunner.ExecutedCommands()).To(HaveLen(8))
+						Expect(resolvConfigurer.ConfigureCallCount()).To(Equal(0))
+					})
+				})
+
+				DescribeTable("when a guard step fails",
+					func(args []string, description string, executed int) {
+						fakeCommandRunner.WhenRunning(fake_command_runner.CommandSpec{
+							Path: "nsenter",
+							Args: nsenterArgs(args...),
+						}, func(cmd *exec.Cmd) error {
+							return errors.New("guard-failed")
+						})
+
+						err := plugin.Network(logger, containerSpec, 42)
+						Expect(err).To(MatchError(ContainSubstring(description + " in container netns of pid 42")))
+						// Forwarding is never enabled behind a guard that did not apply.
+						Expect(fakeCommandRunner.ExecutedCommands()).To(HaveLen(executed))
+						for _, cmd := range fakeCommandRunner.ExecutedCommands() {
+							Expect(cmd.Args).NotTo(ContainElement("net.ipv4.ip_forward=1"))
+						}
+					},
+					Entry("spoofed source drop", []string{"/var/vcap/data/gdn/assets/sbin/iptables", "-A", "FORWARD", "-i", "tap0", "!", "-s", "169.254.100.2/32", "-j", "DROP"}, "dropping spoofed guest sources", 5),
+					Entry("spoofed source drop to the container", []string{"/var/vcap/data/gdn/assets/sbin/iptables", "-A", "INPUT", "-i", "tap0", "!", "-s", "169.254.100.2/32", "-j", "DROP"}, "dropping spoofed guest sources to the container", 6),
+					Entry("inbound new drop", []string{"/var/vcap/data/gdn/assets/sbin/iptables", "-A", "FORWARD", "-o", "tap0", "-m", "conntrack", "!", "--ctstate", "ESTABLISHED,RELATED", "-j", "DROP"}, "dropping connections opened towards the guest", 7),
+					Entry("mtu", []string{"ip", "link", "set", "tap0", "mtu", "1450"}, "setting the mtu of tap0", 4),
+				)
+
+				Context("when the plugin fails", func() {
+					BeforeEach(func() {
+						pluginErr = errors.New("plugin-failed")
+					})
+
+					It("does not touch the netns", func() {
+						Expect(plugin.Network(logger, containerSpec, 42)).NotTo(Succeed())
+						Expect(fakeCommandRunner.ExecutedCommands()).To(HaveLen(1))
+					})
+				})
+			})
+
+			DescribeTable("other backends",
+				func(kind string, expectedCommands int) {
+					if kind != "" {
+						containerSpec.Properties[backend.AnnotationKey] = kind
+					}
+					// None of them needs a tap group.
+					newPlugin()
+					Expect(plugin.Network(logger, containerSpec, 42)).To(Succeed())
+
+					cmds := fakeCommandRunner.ExecutedCommands()
+					Expect(cmds).To(HaveLen(expectedCommands))
+					for _, cmd := range cmds {
+						Expect(cmd.Args).NotTo(ContainElement("tap0"))
+					}
+				},
+				Entry("oci-runc", string(backend.OCIRunc), 1),
+				Entry("oci-gvisor only brings up lo", string(backend.OCIGvisor), 2),
+				Entry("vm-qemu", string(backend.VMQemu), 1),
+				Entry("no backend", "", 1),
+			)
+
+			DescribeTable("HostGID",
+				func(gidMap string, gid uint32, expected uint32, expectedErr string) {
+					got, err := netplugin.HostGID(gidMap, gid)
+					if expectedErr != "" {
+						Expect(err).To(MatchError(ContainSubstring(expectedErr)))
+						return
+					}
+					Expect(err).NotTo(HaveOccurred())
+					Expect(got).To(Equal(expected))
+				},
+				Entry("unprivileged", "0 4294967294 1\n1 1 4294967293\n", uint32(991), uint32(991), ""),
+				Entry("unprivileged, space padded as in /proc", "         0 4294967294          1\n         1          1 4294967293\n", uint32(991), uint32(991), ""),
+				Entry("privileged", "0 0 4294967295\n", uint32(991), uint32(991), ""),
+				Entry("offset range", "0 100000 65536", uint32(991), uint32(100991), ""),
+				Entry("last gid in range", "0 5000 992", uint32(991), uint32(5991), ""),
+				Entry("gid mapped by a later line", "0 100000 500\n500 200000 2000\n", uint32(991), uint32(200491), ""),
+				Entry("gid just past the range", "0 100000 991", uint32(991), uint32(0), "container gid 991 is not mapped"),
+				Entry("empty map", "", uint32(991), uint32(0), "container gid 991 is not mapped"),
+				Entry("host id beyond the gid range", "0 4294967295 4000", uint32(991), uint32(0), "beyond the gid range"),
+				Entry("wrong field count", "0 0\n", uint32(991), uint32(0), "malformed gid_map line"),
+				Entry("non-numeric field", "0 zero 1\n", uint32(991), uint32(0), "malformed gid_map line"),
+			)
 		})
 
 		Context("when there are NetOut rules provided", func() {

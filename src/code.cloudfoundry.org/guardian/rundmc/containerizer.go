@@ -3,22 +3,27 @@
 package rundmc
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 
 	"code.cloudfoundry.org/garden"
+	"code.cloudfoundry.org/guardian/backend"
 	"code.cloudfoundry.org/guardian/gardener"
 	spec "code.cloudfoundry.org/guardian/gardener/container-spec"
 	"code.cloudfoundry.org/guardian/rundmc/event"
 	"code.cloudfoundry.org/guardian/rundmc/goci"
+	"code.cloudfoundry.org/guardian/rundmc/processes"
 	"code.cloudfoundry.org/lager/v3"
 	"github.com/cloudfoundry/dropsonde/metrics"
+	"github.com/eapache/go-resiliency/retrier"
 )
 
 //go:generate go run github.com/maxbrunsfeld/counterfeiter/v6 -generate
@@ -32,6 +37,8 @@ import (
 //counterfeiter:generate . PeaUsernameResolver
 //counterfeiter:generate . RuntimeStopper
 //counterfeiter:generate . CPUCgrouper
+//counterfeiter:generate . TaskKiller
+//counterfeiter:generate . TaskPidLister
 
 type Depot interface {
 	Destroy(log lager.Logger, handle string) error
@@ -55,6 +62,7 @@ type State struct {
 
 type OCIRuntime interface {
 	Create(log lager.Logger, id string, bundle goci.Bndl, io garden.ProcessIO) error
+	Start(log lager.Logger, id string) error
 	Exec(log lager.Logger, id string, spec garden.ProcessSpec, io garden.ProcessIO) (garden.Process, error)
 	Attach(log lager.Logger, id, processId string, io garden.ProcessIO) (garden.Process, error)
 	Delete(log lager.Logger, id string) error
@@ -84,6 +92,21 @@ type RuntimeStopper interface {
 	Stop() error
 }
 
+// TaskKiller signals every process of a container's containerd task, init
+// included. gVisor containers are stopped through it, because their processes
+// are not visible in a host cgroup the ProcessesStopper could walk.
+// Implementations return nil when the task has already exited.
+type TaskKiller interface {
+	KillAll(log lager.Logger, id string, signal syscall.Signal) error
+}
+
+// TaskPidLister lists the processes of a container's containerd task, init
+// included. A graceful gVisor Stop uses it to see when only init is left,
+// because garden-init does not exit on SIGTERM.
+type TaskPidLister interface {
+	TaskPids(log lager.Logger, id string) ([]uint32, error)
+}
+
 type EventStore interface {
 	OnEvent(id string, event string) error
 	Events(id string) []string
@@ -110,7 +133,8 @@ type Containerizer struct {
 	bundler                BundleGenerator
 	runtime                OCIRuntime
 	processesStopper       ProcessesStopper
-	nstar                  NstarRunner
+	nstarStreamer          *NstarStreamer
+	execStreamer           *ExecStreamer
 	events                 EventStore
 	states                 StateStore
 	peaCreator             PeaCreator
@@ -118,6 +142,43 @@ type Containerizer struct {
 	cpuEntitlementPerShare float64
 	runtimeStopper         RuntimeStopper
 	cpuCgrouper            CPUCgrouper
+	taskKiller             TaskKiller
+	taskExitRetrier        *retrier.Retrier
+	taskPidLister          TaskPidLister
+	backendDispatch        bool
+}
+
+// Option configures a Containerizer collaborator that only some deployments need.
+type Option func(*Containerizer)
+
+// WithTaskKiller lets the Containerizer stop gVisor containers. exitRetrier
+// bounds how long Stop waits for the task to exit after each signal before it
+// escalates or gives up. Without this option, stopping a gVisor container fails.
+func WithTaskKiller(killer TaskKiller, exitRetrier *retrier.Retrier) Option {
+	return func(c *Containerizer) {
+		c.taskKiller = killer
+		c.taskExitRetrier = exitRetrier
+	}
+}
+
+// WithTaskPidLister lets a graceful gVisor Stop end its SIGTERM wait as soon as
+// only the init process is left, instead of waiting for the whole exit retrier.
+// Without it, the wait ends only when the task has stopped.
+func WithTaskPidLister(lister TaskPidLister) Option {
+	return func(c *Containerizer) {
+		c.taskPidLister = lister
+	}
+}
+
+// WithBackendDispatch makes the Containerizer read each container's bundle to
+// route peas, tar streaming, Stop, and the CF launcher by execution backend.
+// Without it every container is handled as runc and no bundle is read for
+// those calls, which is the behaviour from before execution backends existed.
+// Pass it only when a backend other than oci-runc is enabled.
+func WithBackendDispatch() Option {
+	return func(c *Containerizer) {
+		c.backendDispatch = true
+	}
 }
 
 func New(
@@ -133,12 +194,14 @@ func New(
 	cpuEntitlementPerShare float64,
 	runtimeStopper RuntimeStopper,
 	cpuCgrouper CPUCgrouper,
+	opts ...Option,
 ) *Containerizer {
 	containerizer := &Containerizer{
 		depot:                  depot,
 		bundler:                bundler,
 		runtime:                runtime,
-		nstar:                  nstarRunner,
+		nstarStreamer:          NewNstarStreamer(runtime, nstarRunner),
+		execStreamer:           NewExecStreamer(runtime),
 		processesStopper:       processesStopper,
 		events:                 events,
 		states:                 states,
@@ -147,6 +210,9 @@ func New(
 		cpuEntitlementPerShare: cpuEntitlementPerShare,
 		runtimeStopper:         runtimeStopper,
 		cpuCgrouper:            cpuCgrouper,
+	}
+	for _, opt := range opts {
+		opt(containerizer)
 	}
 	return containerizer
 }
@@ -194,6 +260,22 @@ func (c *Containerizer) Create(log lager.Logger, spec spec.DesiredContainerSpec)
 	return nil
 }
 
+// Start starts the init process of a container whose runtime defers it past
+// Create. Runtimes that start the init process in Create treat it as a no-op.
+func (c *Containerizer) Start(log lager.Logger, handle string) error {
+	log = log.Session("containerizer-start", lager.Data{"handle": handle})
+
+	log.Info("start")
+	defer log.Info("finished")
+
+	if err := c.runtime.Start(log, handle); err != nil {
+		log.Error("runtime-start-failed", err)
+		return err
+	}
+
+	return nil
+}
+
 // Run runs a process inside a running container
 func (c *Containerizer) Run(log lager.Logger, handle string, spec garden.ProcessSpec, io garden.ProcessIO) (garden.Process, error) {
 	log = log.Session("run", lager.Data{"handle": handle, "path": spec.Path})
@@ -201,7 +283,23 @@ func (c *Containerizer) Run(log lager.Logger, handle string, spec garden.Process
 	log.Info("started")
 	defer log.Info("finished")
 
+	if c.backendDispatch {
+		// Only wrapVMLauncher may mark a process as the wrapped vm-launch.
+		spec, _ = processes.UnmarkVMLaunch(spec)
+	}
+
 	if isPea(spec) {
+		if c.backendDispatch {
+			gvisor, err := c.isGvisor(log, handle)
+			if err != nil {
+				return nil, err
+			}
+
+			if gvisor {
+				return c.runPeaAsExec(log, handle, spec, io)
+			}
+		}
+
 		if shouldResolveUsername(spec.User) {
 			resolvedUID, resolvedGID, err := c.peaUsernameResolver.ResolveUser(log, handle, spec.Image, spec.User)
 			if err != nil {
@@ -220,8 +318,64 @@ func (c *Containerizer) Run(log lager.Logger, handle string, spec garden.Process
 		return nil, err
 	}
 
+	if c.backendDispatch && spec.Path == cfLauncherPath {
+		wrapped, err := c.wrapVMLauncher(log, handle, spec)
+		if err != nil {
+			return nil, err
+		}
+
+		spec = wrapped
+	}
+
 	return c.runtime.Exec(log, handle, spec, io)
 }
+
+// wrapVMLauncher rewrites the CF launcher process of a vm-* container so that
+// it runs through vm-launch, which boots the workload inside a microVM, and
+// marks it so that the process builder grants it the kvm gid. Every other
+// process, and every container on another backend, is returned as is.
+func (c *Containerizer) wrapVMLauncher(log lager.Logger, handle string, spec garden.ProcessSpec) (garden.ProcessSpec, error) {
+	_, bundle, err := c.runtime.BundleInfo(log, handle)
+	if err != nil {
+		log.Error("bundle-info-failed", err)
+		return spec, err
+	}
+
+	kind := backend.FromBundle(bundle)
+	if !backend.IsVM(kind) {
+		return spec, nil
+	}
+
+	log.Info("vm-wrap-launcher", lager.Data{"backend": string(kind)})
+
+	args := make([]string, 0, len(spec.Args)+4)
+	args = append(args, "--backend", string(kind), "--", spec.Path)
+	args = append(args, spec.Args...)
+
+	spec.Path = processes.VMLaunchPath
+	spec.Args = args
+
+	return processes.MarkVMLaunch(spec), nil
+}
+
+// runPeaAsExec runs a pea's process inside the sandbox container itself. A
+// gVisor sandbox cannot share its namespaces with a sibling container, so the
+// pea's image and bind mounts are dropped and its binary must already be
+// present in the sandbox, as the CF healthcheck and assets are.
+func (c *Containerizer) runPeaAsExec(log lager.Logger, handle string, spec garden.ProcessSpec, io garden.ProcessIO) (garden.Process, error) {
+	log.Info("gvisor-pea-as-exec", lager.Data{"image": spec.Image.URI, "bind-mounts": len(spec.BindMounts)})
+
+	spec.Image = garden.ImageRef{}
+	spec.BindMounts = nil
+
+	return c.runtime.Exec(log, handle, spec, io)
+}
+
+const (
+	// cfLauncherPath is the CF buildpack launcher, the entrypoint of every app
+	// and task process Diego starts.
+	cfLauncherPath = "/tmp/lifecycle/launcher"
+)
 
 func isPea(spec garden.ProcessSpec) bool {
 	return spec.Image != (garden.ImageRef{})
@@ -250,18 +404,16 @@ func (c *Containerizer) StreamIn(log lager.Logger, handle string, spec garden.St
 		_ = metrics.SendValue("StreamInDuration", float64(time.Since(startedAt).Nanoseconds()), "nanos")
 	}(time.Now())
 
-	state, err := c.runtime.State(log, handle)
+	if !c.backendDispatch {
+		return c.nstarStreamer.StreamIn(log, handle, spec)
+	}
+
+	streamer, err := c.streamerFor(log, handle)
 	if err != nil {
-		log.Error("check-pid-failed", err)
-		return fmt.Errorf("stream-in: pid not found for container")
+		return fmt.Errorf("stream-in: %w", err)
 	}
 
-	if err := c.nstar.StreamIn(log, state.Pid, spec.Path, spec.User, spec.TarStream); err != nil {
-		log.Error("nstar-failed", err)
-		return fmt.Errorf("stream-in: nstar: %s", err)
-	}
-
-	return nil
+	return streamer.StreamIn(log, handle, spec)
 }
 
 // StreamOut stream files from the container
@@ -271,19 +423,43 @@ func (c *Containerizer) StreamOut(log lager.Logger, handle string, spec garden.S
 	log.Info("started")
 	defer log.Info("finished")
 
-	state, err := c.runtime.State(log, handle)
-	if err != nil {
-		log.Error("check-pid-failed", err)
-		return nil, fmt.Errorf("stream-out: pid not found for container")
+	if !c.backendDispatch {
+		return c.nstarStreamer.StreamOut(log, handle, spec)
 	}
 
-	stream, err := c.nstar.StreamOut(log, state.Pid, spec.Path, spec.User)
+	streamer, err := c.streamerFor(log, handle)
 	if err != nil {
-		log.Error("nstar-failed", err)
-		return nil, fmt.Errorf("stream-out: nstar: %s", err)
+		return nil, fmt.Errorf("stream-out: %w", err)
 	}
 
-	return stream, nil
+	return streamer.StreamOut(log, handle, spec)
+}
+
+func (c *Containerizer) streamerFor(log lager.Logger, handle string) (tarStreamer, error) {
+	gvisor, err := c.isGvisor(log, handle)
+	if err != nil {
+		return nil, err
+	}
+
+	if gvisor {
+		return c.execStreamer, nil
+	}
+
+	return c.nstarStreamer, nil
+}
+
+// isGvisor reports whether the container's bundle selects the gVisor backend.
+// A bundle that cannot be read is an error rather than a runc default, because
+// sending nstar or the cgroup stopper at a gVisor sandbox would act on the
+// sandbox's host processes instead of the container.
+func (c *Containerizer) isGvisor(log lager.Logger, handle string) (bool, error) {
+	_, bundle, err := c.runtime.BundleInfo(log, handle)
+	if err != nil {
+		log.Error("bundle-info-failed", err)
+		return false, err
+	}
+
+	return backend.IsGvisor(backend.FromBundle(bundle)), nil
 }
 
 // Stop stops all the processes other than the init process in the container
@@ -292,6 +468,23 @@ func (c *Containerizer) Stop(log lager.Logger, handle string, kill bool) error {
 
 	log.Info("started")
 	defer log.Info("finished")
+
+	if c.backendDispatch {
+		gvisor, err := c.isGvisor(log, handle)
+		if err != nil {
+			return fmt.Errorf("stop: %w", err)
+		}
+
+		if gvisor {
+			if err := c.stopTask(log, handle, kill); err != nil {
+				log.Error("stop-task-failed", err)
+				return fmt.Errorf("stop: %w", err)
+			}
+
+			c.states.StoreStopped(handle)
+			return nil
+		}
+	}
 
 	state, err := c.runtime.State(log, handle)
 	if err != nil {
@@ -305,6 +498,116 @@ func (c *Containerizer) Stop(log lager.Logger, handle string, kill bool) error {
 	}
 
 	c.states.StoreStopped(handle)
+	return nil
+}
+
+var errNoTaskKiller = errors.New("no containerd task killer is configured to stop gvisor containers")
+
+// stopTask stops a gVisor container through its containerd task. It mirrors
+// the cgroup stopper: SIGTERM and a bounded wait unless kill is set, then
+// SIGKILL. Unlike the cgroup stopper it also stops the init process, because
+// containerd can only signal the whole task. garden-init has no SIGTERM
+// handler, so as the init of a pid namespace it ignores SIGTERM. The SIGTERM
+// wait therefore also ends once init is the only process left, and SIGKILL
+// then stops init. A task that is stopped, or that was created and never
+// started, has nothing to stop, and stopTask returns nil without a signal.
+func (c *Containerizer) stopTask(log lager.Logger, handle string, kill bool) error {
+	if c.taskKiller == nil || c.taskExitRetrier == nil {
+		return errNoTaskKiller
+	}
+
+	state, err := c.runtime.State(log, handle)
+	if err != nil {
+		log.Error("check-state-failed", err)
+		return fmt.Errorf("task state not found for container: %s", err)
+	}
+
+	switch state.Status {
+	case StoppedStatus:
+		log.Info("task-already-stopped")
+		return nil
+	case CreatedStatus:
+		// The task was created but never started, so no process runs in it,
+		// and runsc refuses to signal such a container. Stopping a runc
+		// container whose init is the only process also succeeds without
+		// signalling anything.
+		log.Info("task-never-started")
+		return nil
+	}
+
+	if !kill {
+		onlyInitLeft := false
+		err := c.signalTaskAndWait(log, handle, syscall.SIGTERM, func() error {
+			stoppedErr := c.taskStopped(log, handle)
+			if stoppedErr == nil {
+				return nil
+			}
+			if c.onlyInitLeft(log, handle) {
+				onlyInitLeft = true
+				return nil
+			}
+			return stoppedErr
+		})
+
+		switch {
+		case err != nil:
+			log.Info("escalating-to-sigkill", lager.Data{"reason": err.Error()})
+		case onlyInitLeft:
+			log.Info("only-init-left-stopping-it")
+		default:
+			return nil
+		}
+	}
+
+	return c.signalTaskAndWait(log, handle, syscall.SIGKILL, func() error { return c.taskStopped(log, handle) })
+}
+
+// onlyInitLeft reports whether the task's init is its only process. A listing
+// error or an empty list is not proof of that, so both report false and the
+// caller keeps waiting for the task to stop.
+func (c *Containerizer) onlyInitLeft(log lager.Logger, handle string) bool {
+	if c.taskPidLister == nil {
+		return false
+	}
+
+	pids, err := c.taskPidLister.TaskPids(log, handle)
+	if err != nil {
+		log.Debug("list-task-pids-failed", lager.Data{"error": err.Error()})
+		return false
+	}
+
+	return len(pids) == 1
+}
+
+// signalTaskAndWait signals every process of the task and then retries done
+// until it returns nil or the exit retrier gives up.
+func (c *Containerizer) signalTaskAndWait(log lager.Logger, handle string, signal syscall.Signal, done func() error) error {
+	if err := c.taskKiller.KillAll(log, handle, signal); err != nil {
+		// The task can exit between the state check and the signal.
+		if c.taskStopped(log, handle) == nil {
+			return nil
+		}
+
+		return fmt.Errorf("kill-all with signal %d: %w", signal, err)
+	}
+
+	if err := c.taskExitRetrier.Run(done); err != nil {
+		return fmt.Errorf("task still running after signal %d: %w", signal, err)
+	}
+
+	return nil
+}
+
+func (c *Containerizer) taskStopped(log lager.Logger, handle string) error {
+	state, err := c.runtime.State(log, handle)
+	if err != nil {
+		return err
+	}
+
+	if state.Status != StoppedStatus {
+		return fmt.Errorf("task status is %q", state.Status)
+	}
+
 	return nil
 }
 

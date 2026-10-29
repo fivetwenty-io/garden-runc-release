@@ -11,6 +11,7 @@ import (
 	"github.com/opencontainers/runtime-spec/specs-go"
 
 	"code.cloudfoundry.org/garden"
+	"code.cloudfoundry.org/guardian/backend"
 	spec "code.cloudfoundry.org/guardian/gardener/container-spec"
 	"code.cloudfoundry.org/lager/v3"
 	"github.com/hashicorp/go-multierror"
@@ -50,6 +51,7 @@ type SysInfoProvider interface {
 
 type Containerizer interface {
 	Create(log lager.Logger, desiredContainerSpec spec.DesiredContainerSpec) error
+	Start(log lager.Logger, handle string) error
 	Handles() ([]string, error)
 
 	StreamIn(log lager.Logger, handle string, streamInSpec garden.StreamInSpec) error
@@ -178,6 +180,10 @@ type Gardener struct {
 	AllowPrivilgedContainers bool
 
 	ContainerNetworkMetricsProvider ContainerNetworkMetricsProvider
+
+	// Backends decides which execution backends this cell allows. A nil
+	// registry allows only oci-runc.
+	Backends *backend.Registry
 }
 
 func New(
@@ -232,6 +238,23 @@ func (g *Gardener) Create(containerSpec garden.ContainerSpec) (ctr garden.Contai
 
 	if !g.AllowPrivilgedContainers && containerSpec.Privileged {
 		return nil, errors.New("privileged container creation is disabled")
+	}
+
+	// Resolve the backend before the cleanup defer below is armed and before
+	// any property, volume, or network state exists, so a rejection leaves
+	// nothing behind.
+	executionBackend, err := g.Backends.Resolve(containerSpec.Properties)
+	if err != nil {
+		log.Error("resolve-execution-backend-failed", err)
+		return nil, err
+	}
+
+	// A VM backend runs its hypervisor inside the image's mount namespace, so
+	// it only accepts operator-installed images. This is the same fail-closed
+	// position as the allowlist check above.
+	if err := backend.CheckRootFS(executionBackend, containerSpec); err != nil {
+		log.Error("check-execution-backend-rootfs-failed", err)
+		return nil, err
 	}
 
 	knownHandles, err := g.Containerizer.Handles()
@@ -299,6 +322,8 @@ func (g *Gardener) Create(containerSpec garden.ContainerSpec) (ctr garden.Contai
 		BindMounts: append(containerSpec.BindMounts, networkBindMounts...),
 		Limits:     containerSpec.Limits,
 		BaseConfig: runtimeSpec,
+
+		ExecutionBackend: string(executionBackend),
 	}
 
 	if err := g.Containerizer.Create(log, desiredSpec); err != nil {
@@ -317,6 +342,11 @@ func (g *Gardener) Create(containerSpec garden.ContainerSpec) (ctr garden.Contai
 	}
 
 	if err = g.Networker.Network(log, containerSpec, actualSpec.Pid); err != nil {
+		return nil, err
+	}
+
+	if err = g.Containerizer.Start(log, containerSpec.Handle); err != nil {
+		log.Error("containerizer-start-failed", err)
 		return nil, err
 	}
 

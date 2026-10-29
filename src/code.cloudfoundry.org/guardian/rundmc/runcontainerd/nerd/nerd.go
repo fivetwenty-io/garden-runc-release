@@ -13,15 +13,20 @@ import (
 	"syscall"
 	"time"
 
+	"code.cloudfoundry.org/guardian/backend"
 	"code.cloudfoundry.org/guardian/metrics"
+	"code.cloudfoundry.org/guardian/rundmc/goci"
 	"code.cloudfoundry.org/guardian/rundmc/runcontainerd"
 	"code.cloudfoundry.org/lager/v3"
 	apievents "github.com/containerd/containerd/api/events"
+	"github.com/containerd/containerd/api/services/tasks/v1"
 	v2types "github.com/containerd/containerd/api/types/runc/options"
+	runtimeoptions "github.com/containerd/containerd/api/types/runtimeoptions/v1"
 	"github.com/containerd/containerd/v2/client"
 	ctrdevents "github.com/containerd/containerd/v2/core/events"
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/errdefs"
+	"github.com/containerd/errdefs/pkg/errgrpc"
 	"github.com/containerd/typeurl/v2"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -32,20 +37,48 @@ type Nerd struct {
 	context   context.Context
 	ioFifoDir string
 	mp        *metrics.MetricsProvider
+
+	runtimeConfigPath string
 }
 
-func New(client *client.Client, context context.Context, ioFifoDir string, mp *metrics.MetricsProvider) *Nerd {
-	return &Nerd{
+// Option configures a Nerd.
+type Option func(*Nerd)
+
+// WithRuntimeConfigPath sets the runtime options file that containerd passes
+// to the runsc shim for gVisor containers. An empty path sends no runtime
+// options, which is the default.
+func WithRuntimeConfigPath(path string) Option {
+	return func(n *Nerd) {
+		n.runtimeConfigPath = path
+	}
+}
+
+func New(client *client.Client, context context.Context, ioFifoDir string, mp *metrics.MetricsProvider, opts ...Option) *Nerd {
+	n := &Nerd{
 		client:    client,
 		context:   context,
 		ioFifoDir: ioFifoDir,
 		mp:        mp,
 	}
+	for _, opt := range opts {
+		opt(n)
+	}
+	return n
 }
 
+// RuntimeRunsc is the containerd runtime that runs a container under gVisor.
+// containerd resolves it to the containerd-shim-runsc-v1 binary on its PATH.
+const RuntimeRunsc = "io.containerd.runsc.v1"
+
+// Create creates the container and its init task. For runc containers it also
+// starts the task. For gVisor containers, selected by the execution backend
+// annotation on the spec, the task is left in the Created state so that the
+// network can be set up before the sandbox starts; Start starts it.
 func (n *Nerd) Create(log lager.Logger, containerID string, spec *specs.Spec, hostUID, hostGID uint32, pio func() (io.Reader, io.Writer, io.Writer)) error {
 	log.Debug("creating-container", lager.Data{"containerID": containerID})
-	container, err := n.client.NewContainer(n.context, containerID, client.WithSpec(spec))
+	gvisor := backend.IsGvisor(backend.FromBundle(goci.Bndl{Spec: *spec}))
+	containerOpts, taskOpts := createOpts(spec, gvisor, n.runtimeConfigPath, hostUID, hostGID)
+	container, err := n.client.NewContainer(n.context, containerID, containerOpts...)
 	if err != nil {
 		return err
 	}
@@ -58,14 +91,56 @@ func (n *Nerd) Create(log lager.Logger, containerID string, spec *specs.Spec, ho
 	}
 
 	log.Debug("creating-task", lager.Data{"containerID": containerID})
-	task, err := container.NewTask(n.context, cio.NewCreator(withProcessIO(noTTYProcessIO(pio), n.ioFifoDir)), client.WithNoNewKeyring, WithUIDAndGID(hostUID, hostGID))
+	task, err := container.NewTask(n.context, cio.NewCreator(withProcessIO(noTTYProcessIO(pio), n.ioFifoDir)), taskOpts...)
 	if err != nil {
 		return err
+	}
+
+	if gvisor {
+		log.Debug("deferring-task-start", lager.Data{"containerID": containerID, "runtime": RuntimeRunsc})
+		return nil
 	}
 
 	log.Debug("starting-task", lager.Data{"containerID": containerID})
 	err = task.Start(n.context)
 	if err != nil {
+		return err
+	}
+
+	return task.CloseIO(n.context, client.WithStdinCloser)
+}
+
+// createOpts returns the container and task options for Create. runc
+// containers get the default runtime with the runc task options. gVisor
+// containers get the runsc runtime and no runc task options, because runsc
+// manages its own keyring and IO ownership, and their spec loses the Windows
+// section, which runsc rejects. When runtimeConfigPath is set, the runsc
+// runtime gets it as the ConfigPath of its runtime options, which the stock
+// shim needs to find its runsc binary and flags; otherwise it gets none.
+func createOpts(spec *specs.Spec, gvisor bool, runtimeConfigPath string, hostUID, hostGID uint32) ([]client.NewContainerOpts, []client.NewTaskOpts) {
+	if !gvisor {
+		return []client.NewContainerOpts{client.WithSpec(spec)},
+			[]client.NewTaskOpts{client.WithNoNewKeyring, WithUIDAndGID(hostUID, hostGID)}
+	}
+
+	spec.Windows = nil
+	var runtimeOptions any
+	if runtimeConfigPath != "" {
+		runtimeOptions = &runtimeoptions.Options{ConfigPath: runtimeConfigPath}
+	}
+	return []client.NewContainerOpts{client.WithSpec(spec), client.WithRuntime(RuntimeRunsc, runtimeOptions)}, nil
+}
+
+// Start starts an init task that Create left in the Created state and then
+// closes its stdin, as Create does for tasks it starts itself.
+func (n *Nerd) Start(log lager.Logger, containerID string) error {
+	_, task, err := n.loadContainerAndTask(log, containerID)
+	if err != nil {
+		return err
+	}
+
+	log.Debug("starting-task", lager.Data{"containerID": containerID})
+	if err := task.Start(n.context); err != nil {
 		return err
 	}
 
@@ -107,7 +182,7 @@ func withProcessKillLogging(log lager.Logger, mp *metrics.MetricsProvider) func(
 }
 
 func (n *Nerd) Delete(log lager.Logger, containerID string) error {
-	_, task, err := n.loadContainerAndTask(log, containerID)
+	container, task, err := n.loadContainerAndTask(log, containerID)
 	if err != nil {
 		switch err.(type) {
 		case runcontainerd.ContainerNotFoundError:
@@ -120,9 +195,66 @@ func (n *Nerd) Delete(log lager.Logger, containerID string) error {
 		return err
 	}
 
+	// The metadata was fetched by loadContainerAndTask, so this makes no call
+	// to containerd.
+	info, err := container.Info(n.context, client.WithoutRefreshedMetadata)
+	if err != nil {
+		return err
+	}
+
+	direct, err := needsDirectDelete(n.context, info.Runtime.Name, task)
+	if err != nil {
+		return fmt.Errorf("getting status of task %s: %w", containerID, err)
+	}
+	if direct {
+		log.Info("deleting-created-task", lager.Data{"containerID": containerID, "runtime": info.Runtime.Name})
+		return n.deleteCreatedTask(log, task)
+	}
+
 	log.Debug("deleting-task", lager.Data{"containerID": containerID})
 	_, err = task.Delete(n.context, withProcessKillLogging(log, n.mp))
 	return err
+}
+
+// needsDirectDelete reports whether a task cannot go through the client's
+// kill-then-delete path. runsc refuses to signal a container that was created
+// but never started, and the client refuses to delete a Created task with a
+// non-zero pid, so a Created runsc task is deleted through the task service. A
+// Created runc task is killable and keeps the usual path, and the task status
+// is only fetched for runsc tasks.
+func needsDirectDelete(ctx context.Context, runtime string, task client.Task) (bool, error) {
+	if runtime != RuntimeRunsc {
+		return false, nil
+	}
+
+	status, err := task.Status(ctx)
+	if err != nil {
+		return false, err
+	}
+	return status.Status == client.Created, nil
+}
+
+// deleteCreatedTask deletes a task through the task service, which makes the
+// shim delete the never-started container. It releases the task's IO in the
+// same order as the client's own Delete, and like it treats a failure to close
+// the IO as non-fatal once the task is gone.
+func (n *Nerd) deleteCreatedTask(log lager.Logger, task client.Task) error {
+	taskIO := task.IO()
+	if taskIO != nil {
+		taskIO.Cancel()
+		taskIO.Wait()
+	}
+
+	if _, err := n.client.TaskService().Delete(n.context, &tasks.DeleteTaskRequest{ContainerID: task.ID()}); err != nil {
+		return errgrpc.ToNative(err)
+	}
+
+	if taskIO != nil {
+		if err := taskIO.Close(); err != nil {
+			log.Error("closing-created-task-io-failed", err, lager.Data{"containerID": task.ID()})
+		}
+	}
+	return nil
 }
 
 func (n *Nerd) State(log lager.Logger, containerID string) (int, string, error) {
@@ -300,6 +432,59 @@ func (n *Nerd) GetContainerPID(log lager.Logger, containerID string) (uint32, er
 	}
 
 	return task.Pid(), nil
+}
+
+// KillAll sends signal to every process in the container's task, not only to
+// its init process, and returns without waiting for them to exit. A task whose
+// processes have all exited already is not an error. A missing container is.
+func (n *Nerd) KillAll(log lager.Logger, containerID string, signal syscall.Signal) error {
+	_, task, err := n.loadContainerAndTask(log, containerID)
+	if err != nil {
+		return err
+	}
+
+	log.Debug("killing-all-task-processes", lager.Data{"containerID": containerID, "signal": signal.String()})
+	if err := task.Kill(n.context, signal, client.WithKillAll); err != nil {
+		if taskAlreadyExited(err) {
+			log.Debug("task-processes-already-exited", lager.Data{"containerID": containerID})
+			return nil
+		}
+		return fmt.Errorf("killing all processes of task %s: %w", containerID, err)
+	}
+
+	return nil
+}
+
+// taskAlreadyExited reports whether a kill error means that no process was
+// left to signal. Both the runc and the runsc shims report that as NotFound.
+// The message check covers an error that reaches us without its NotFound code.
+func taskAlreadyExited(err error) bool {
+	return errdefs.IsNotFound(err) || strings.Contains(err.Error(), "process already finished")
+}
+
+// TaskMetrics returns the metrics the shim reports for the container's task,
+// still encoded, together with the time containerd created the container.
+func (n *Nerd) TaskMetrics(log lager.Logger, containerID string) (typeurl.Any, time.Time, error) {
+	container, task, err := n.loadContainerAndTask(log, containerID)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+
+	log.Debug("getting-task-metrics", lager.Data{"containerID": containerID})
+	metric, err := task.Metrics(n.context)
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("getting metrics of task %s: %w", containerID, err)
+	}
+	if metric.Data == nil {
+		return nil, time.Time{}, fmt.Errorf("task %s reported no metrics data", containerID)
+	}
+
+	info, err := container.Info(n.context, client.WithoutRefreshedMetadata)
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("getting info of container %s: %w", containerID, err)
+	}
+
+	return metric.Data, info.CreatedAt, nil
 }
 
 func (n *Nerd) loadContainer(log lager.Logger, containerID string) (client.Container, error) {

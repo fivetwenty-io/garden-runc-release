@@ -17,6 +17,13 @@ pushd src/code.cloudfoundry.org/guardian
   go install ./cmd/execas
 popd
 
+# vm-launch runs inside the container's rootfs, so it must be a static binary
+# that does not depend on any shared library there. GOARCH is left to the
+# compile environment, as for gdn above, so the binary matches the stemcell.
+pushd src/code.cloudfoundry.org/guardian
+  CGO_ENABLED=0 GOOS=linux go build -o "${BOSH_INSTALL_TARGET}/bin/vm-launch" ./cmd/vm-launch
+popd
+
 pushd src/code.cloudfoundry.org/guardian/rundmc/nstar
   make
   mv nstar "${BOSH_INSTALL_TARGET}/bin/nstar"

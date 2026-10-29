@@ -173,6 +173,7 @@ github.com/containerd/containerd/api/services/transfer/v1
 github.com/containerd/containerd/api/services/version/v1
 github.com/containerd/containerd/api/types
 github.com/containerd/containerd/api/types/runc/options
+github.com/containerd/containerd/api/types/runtimeoptions/v1
 github.com/containerd/containerd/api/types/task
 github.com/containerd/containerd/api/types/transfer
 # github.com/containerd/containerd/v2 v2.4.1

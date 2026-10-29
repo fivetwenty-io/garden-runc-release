@@ -253,6 +253,26 @@ properties:
     description: "Use containerd for container lifecycle management. NOTE: cannot be used in combination with bpm"
     default: true
 
+  garden.execution_backends:
+    description: |
+      Execution backends garden offers in addition to the always-available
+      oci-runc. Allowed entries are oci-gvisor (OCI containers run under
+      gVisor), vm-qemu (the app runs in a QEMU microvm), and vm-firecracker
+      (the app runs in a Firecracker microvm). A container selects its
+      backend with the garden.execution-backend container property; without
+      one it runs under oci-runc. oci-gvisor requires garden.containerd_mode.
+      The vm-* backends read hypervisors and kernels from
+      garden.vm_artifacts_dir, which this release does not populate.
+      Every cell in a foundation should enable the same set.
+    default: []
+
+  garden.vm_artifacts_dir:
+    description: |
+      Host directory holding the VM kernels, hypervisors, and busybox. It is
+      bound read-only into vm-* containers at /opt/garden-vm/artifacts. Only
+      used when at least one vm-* entry is listed in garden.execution_backends.
+    default: /var/vcap/data/vm-runtime/artifacts
+
   garden.tcp_keepalive_time:
     description: Sets the `net.ipv4.tcp_keepalive_time` kernel parameter in containers. If not specified, the value from the linux init_net namespace is used.
 
