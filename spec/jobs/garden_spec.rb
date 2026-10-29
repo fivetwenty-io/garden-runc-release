@@ -360,6 +360,177 @@ describe 'garden' do
       #   expect {template.render(properties)}.to raise_error(IPAddr::InvalidAddressError)
       # end
     end
+
+    context 'execution backends' do
+      let(:garden_properties) { {} }
+      let(:properties) { { 'garden' => garden_properties } }
+      let(:raw_template) { template.render(properties) }
+      let(:server) { IniParse.parse(raw_template)['server'] }
+      let(:vm_keys) { %w[execution-backend vm-artifacts-dir vm-launch-bin vm-kvm-gid gvisor-runtime-config] }
+
+      context 'by default' do
+        it 'renders none of the execution backend keys' do
+          vm_keys.each do |key|
+            expect(server[key]).to be_nil, "expected #{key} to be absent"
+          end
+          expect(raw_template).not_to include('execution backends')
+          expect(raw_template).not_to include('vm-')
+        end
+      end
+
+      context 'when the list is explicitly empty' do
+        let(:garden_properties) { { 'execution_backends' => [] } }
+
+        it 'renders none of the execution backend keys' do
+          vm_keys.each do |key|
+            expect(server[key]).to be_nil, "expected #{key} to be absent"
+          end
+        end
+
+        it 'renders the same as when the property is unset' do
+          expect(raw_template).to eql(template.render({ 'garden' => {} }))
+        end
+      end
+
+      context 'when vm backends are listed' do
+        let(:garden_properties) { { 'execution_backends' => %w[vm-qemu vm-firecracker] } }
+
+        it 'renders one execution-backend key per entry' do
+          expect(server['execution-backend']).to eql(%w[vm-qemu vm-firecracker])
+        end
+
+        it 'renders the default artifacts dir' do
+          expect(server['vm-artifacts-dir']).to eql('/var/vcap/data/vm-runtime/artifacts')
+        end
+
+        it 'renders the packaged vm-launch binary' do
+          expect(server['vm-launch-bin']).to eql('/var/vcap/packages/guardian/bin/vm-launch')
+        end
+
+        it 'leaves the kvm gid and gvisor runtime config to the gdn defaults' do
+          expect(server['vm-kvm-gid']).to be_nil
+          expect(server['gvisor-runtime-config']).to be_nil
+        end
+
+        context 'with a custom artifacts dir' do
+          let(:garden_properties) { { 'execution_backends' => ['vm-qemu'], 'vm_artifacts_dir' => '/var/vcap/store/vm/artifacts' } }
+
+          it 'renders the custom artifacts dir' do
+            expect(server['vm-artifacts-dir']).to eql('/var/vcap/store/vm/artifacts')
+          end
+        end
+
+        context 'with a relative artifacts dir' do
+          let(:garden_properties) { { 'execution_backends' => ['vm-qemu'], 'vm_artifacts_dir' => 'artifacts' } }
+
+          it 'raises' do
+            expect { raw_template }.to raise_error(/vm_artifacts_dir must be an absolute path/)
+          end
+        end
+      end
+
+      context 'when a single vm backend is listed' do
+        let(:garden_properties) { { 'execution_backends' => ['vm-firecracker'] } }
+
+        it 'renders a single execution-backend value' do
+          expect(server['execution-backend']).to eql('vm-firecracker')
+          expect(server['vm-launch-bin']).to eql('/var/vcap/packages/guardian/bin/vm-launch')
+        end
+      end
+
+      context 'when only oci-gvisor is listed' do
+        let(:garden_properties) { { 'execution_backends' => ['oci-gvisor'] } }
+
+        it 'renders the execution-backend key' do
+          expect(server['execution-backend']).to eql('oci-gvisor')
+        end
+
+        it 'does not render the vm-only keys' do
+          expect(server['vm-artifacts-dir']).to be_nil
+          expect(server['vm-launch-bin']).to be_nil
+        end
+
+        it 'keeps the containerd socket that oci-gvisor needs' do
+          expect(server['containerd-socket']).to eql('/var/vcap/sys/run/containerd/containerd.sock')
+        end
+
+        context 'when containerd mode is off' do
+          let(:garden_properties) { { 'execution_backends' => ['oci-gvisor'], 'containerd_mode' => false } }
+
+          it 'raises' do
+            expect { raw_template }.to raise_error(/requires garden.containerd_mode/)
+          end
+        end
+      end
+
+      context 'when all backends are listed' do
+        let(:garden_properties) { { 'execution_backends' => %w[oci-gvisor vm-qemu vm-firecracker] } }
+
+        it 'renders every backend and the vm keys' do
+          expect(server['execution-backend']).to eql(%w[oci-gvisor vm-qemu vm-firecracker])
+          expect(server['vm-artifacts-dir']).to eql('/var/vcap/data/vm-runtime/artifacts')
+          expect(server['vm-launch-bin']).to eql('/var/vcap/packages/guardian/bin/vm-launch')
+        end
+      end
+
+      context 'when an entry is repeated' do
+        let(:garden_properties) { { 'execution_backends' => %w[vm-qemu vm-qemu] } }
+
+        it 'renders it once' do
+          expect(server['execution-backend']).to eql('vm-qemu')
+        end
+      end
+
+      context 'when vm backends are listed with containerd mode off' do
+        let(:garden_properties) { { 'execution_backends' => ['vm-qemu'], 'containerd_mode' => false } }
+
+        it 'renders (the vm backends do not need containerd)' do
+          expect(server['execution-backend']).to eql('vm-qemu')
+          expect(server['containerd-socket']).to be_nil
+        end
+      end
+
+      context 'when an unknown backend is listed' do
+        let(:garden_properties) { { 'execution_backends' => %w[vm-qemu vm-bochs] } }
+
+        it 'raises naming the entry and the allowed set' do
+          expect { raw_template }.to raise_error(/Invalid garden.execution_backends entry "vm-bochs".*oci-gvisor, vm-qemu, vm-firecracker/)
+        end
+      end
+
+      context 'when oci-runc is listed' do
+        let(:garden_properties) { { 'execution_backends' => ['oci-runc'] } }
+
+        it 'raises because oci-runc is implicit' do
+          expect { raw_template }.to raise_error(/must not list 'oci-runc'/)
+        end
+      end
+
+      context 'when the property is not a list' do
+        let(:garden_properties) { { 'execution_backends' => 'vm-qemu' } }
+
+        it 'raises' do
+          expect { raw_template }.to raise_error(/must be a list/)
+        end
+      end
+
+      context 'when the cell runs every container under runsc' do
+        let(:garden_properties) { { 'execution_backends' => ['oci-gvisor'], 'containerd_runtime_type' => 'io.containerd.runsc.v1' } }
+
+        it 'raises' do
+          expect { raw_template }.to raise_error(/cannot be combined with garden.containerd_runtime_type "io.containerd.runsc.v1"/)
+        end
+      end
+
+      context 'when the cell names the stock runc runtime' do
+        let(:garden_properties) { { 'execution_backends' => ['oci-gvisor'], 'containerd_runtime_type' => 'io.containerd.runc.v2' } }
+
+        it 'renders the backends' do
+          expect(server['execution-backend']).to eql('oci-gvisor')
+          expect(server['containerd-runtime-type']).to eql('io.containerd.runc.v2')
+        end
+      end
+    end
   end
 
   context 'bin/grootfs-utils' do

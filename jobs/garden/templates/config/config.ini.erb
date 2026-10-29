@@ -262,3 +262,45 @@ end -%>
   use-containerd-for-processes = true
 <% end -%>
 <% end -%>
+<%
+  allowed_execution_backends = %w[oci-gvisor vm-qemu vm-firecracker]
+  execution_backends = p("garden.execution_backends")
+  unless execution_backends.is_a?(Array)
+    raise "garden.execution_backends must be a list, got #{execution_backends.inspect}"
+  end
+  execution_backends.each do |backend|
+    if backend == "oci-runc"
+      raise "garden.execution_backends must not list 'oci-runc': it is always enabled"
+    end
+    unless allowed_execution_backends.include?(backend)
+      raise "Invalid garden.execution_backends entry #{backend.inspect}: must be one of #{allowed_execution_backends.join(', ')}"
+    end
+  end
+  execution_backends = execution_backends.uniq
+  vm_backend_enabled = execution_backends.any? { |backend| backend.start_with?("vm-") }
+
+  if execution_backends.include?("oci-gvisor") && !p("garden.containerd_mode")
+    raise "garden.execution_backends includes 'oci-gvisor', which requires garden.containerd_mode to be true: without containerd the container would run under runc instead of gVisor"
+  end
+
+  containerd_runtime_type = p("garden.containerd_runtime_type")
+  unless execution_backends.empty? || ["", "io.containerd.runc.v2"].include?(containerd_runtime_type)
+    raise "garden.execution_backends cannot be combined with garden.containerd_runtime_type #{containerd_runtime_type.inspect}, because that runtime already runs every container"
+  end
+
+  vm_artifacts_dir = p("garden.vm_artifacts_dir")
+  if vm_backend_enabled && !vm_artifacts_dir.to_s.start_with?("/")
+    raise "garden.vm_artifacts_dir must be an absolute path when a vm-* execution backend is enabled, got #{vm_artifacts_dir.inspect}"
+  end
+-%>
+<% unless execution_backends.empty? -%>
+
+; execution backends
+<% execution_backends.each do |backend| -%>
+  execution-backend = <%= backend %>
+<% end -%>
+<% if vm_backend_enabled -%>
+  vm-artifacts-dir = <%= vm_artifacts_dir %>
+  vm-launch-bin = /var/vcap/packages/guardian/bin/vm-launch
+<% end -%>
+<% end -%>
