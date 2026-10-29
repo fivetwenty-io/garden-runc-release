@@ -5,14 +5,18 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
+	"syscall"
 
 	"code.cloudfoundry.org/guardian/rundmc"
 
 	"code.cloudfoundry.org/garden"
 	"code.cloudfoundry.org/garden/gardenfakes"
+	"code.cloudfoundry.org/guardian/backend"
 	"code.cloudfoundry.org/guardian/gardener"
 	"code.cloudfoundry.org/guardian/rundmc/event"
 	"code.cloudfoundry.org/guardian/rundmc/goci"
+	"code.cloudfoundry.org/guardian/rundmc/processes"
 	"code.cloudfoundry.org/guardian/rundmc/runcontainerd"
 	"code.cloudfoundry.org/guardian/rundmc/runcontainerd/runcontainerdfakes"
 	"code.cloudfoundry.org/guardian/rundmc/users"
@@ -35,6 +39,7 @@ var _ = Describe("Runcontainerd", func() {
 		runContainerd    *runcontainerd.RunContainerd
 		execer           *runcontainerdfakes.FakeExecer
 		statser          *runcontainerdfakes.FakeStatser
+		gvisorStatser    *runcontainerdfakes.FakeStatser
 		processBuilder   *runcontainerdfakes.FakeProcessBuilder
 		userLookupper    *usersfakes.FakeUserLookupper
 		cgroupManager    *runcontainerdfakes.FakeCgroupManager
@@ -50,6 +55,7 @@ var _ = Describe("Runcontainerd", func() {
 		processManager = new(runcontainerdfakes.FakeProcessManager)
 		execer = new(runcontainerdfakes.FakeExecer)
 		statser = new(runcontainerdfakes.FakeStatser)
+		gvisorStatser = new(runcontainerdfakes.FakeStatser)
 		processBuilder = new(runcontainerdfakes.FakeProcessBuilder)
 		userLookupper = new(usersfakes.FakeUserLookupper)
 		cgroupManager = new(runcontainerdfakes.FakeCgroupManager)
@@ -58,7 +64,7 @@ var _ = Describe("Runcontainerd", func() {
 
 		processManager.GetProcessReturns(backingProcess, nil)
 
-		runContainerd = runcontainerd.New(containerManager, processManager, processBuilder, userLookupper, execer, statser, false, cgroupManager, mkdirer, nil, false, runtimeStopper)
+		runContainerd = runcontainerd.New(containerManager, processManager, processBuilder, userLookupper, execer, statser, false, cgroupManager, mkdirer, nil, false, runtimeStopper, runcontainerd.WithBackendDispatch(gvisorStatser))
 	})
 
 	Describe("Create", func() {
@@ -167,7 +173,7 @@ var _ = Describe("Runcontainerd", func() {
 
 		Context("when using containerd for processes", func() {
 			BeforeEach(func() {
-				runContainerd = runcontainerd.New(containerManager, processManager, processBuilder, userLookupper, execer, statser, true, cgroupManager, mkdirer, nil, false, runtimeStopper)
+				runContainerd = runcontainerd.New(containerManager, processManager, processBuilder, userLookupper, execer, statser, true, cgroupManager, mkdirer, nil, false, runtimeStopper, runcontainerd.WithBackendDispatch(gvisorStatser))
 			})
 
 			It("sets the container to use the memory hierarchy", func() {
@@ -195,6 +201,37 @@ var _ = Describe("Runcontainerd", func() {
 						Expect(containerManager.RemoveBundleCallCount()).To(BeZero())
 					})
 				})
+			})
+
+			Context("when the container runs under gVisor", func() {
+				BeforeEach(func() {
+					bundle.Spec.Annotations[backend.AnnotationKey] = string(backend.OCIGvisor)
+				})
+
+				It("creates the container", func() {
+					Expect(createErr).NotTo(HaveOccurred())
+					Expect(containerManager.CreateCallCount()).To(Equal(1))
+				})
+
+				It("sets the container to use the memory hierarchy, which tolerates the missing runc state", func() {
+					Expect(cgroupManager.SetUseMemoryHierarchyCallCount()).To(Equal(1))
+				})
+			})
+		})
+
+		Context("when the container runs under gVisor", func() {
+			BeforeEach(func() {
+				bundle.Spec.Annotations[backend.AnnotationKey] = string(backend.OCIGvisor)
+			})
+
+			It("passes the backend annotation to the container manager", func() {
+				Expect(containerManager.CreateCallCount()).To(Equal(1))
+				_, _, actualSpec, _, _, _ := containerManager.CreateArgsForCall(0)
+				Expect(actualSpec.Annotations).To(HaveKeyWithValue(backend.AnnotationKey, string(backend.OCIGvisor)))
+			})
+
+			It("does not start the container", func() {
+				Expect(containerManager.StartCallCount()).To(BeZero())
 			})
 		})
 	})
@@ -376,6 +413,14 @@ var _ = Describe("Runcontainerd", func() {
 			})
 		})
 
+		It("does not run the process through containerd", func() {
+			Expect(containerManager.GetContainerPIDCallCount()).To(BeZero())
+			Expect(userLookupper.LookupCallCount()).To(BeZero())
+			Expect(mkdirer.MkdirAsCallCount()).To(BeZero())
+			Expect(processBuilder.BuildProcessCallCount()).To(BeZero())
+			Expect(containerManager.ExecCallCount()).To(BeZero())
+		})
+
 		Context("when the execer fails", func() {
 			BeforeEach(func() {
 				execer.ExecWithBndlReturns(nil, errors.New("execer-failed"))
@@ -383,6 +428,136 @@ var _ = Describe("Runcontainerd", func() {
 
 			It("returns the execer error", func() {
 				Expect(execErr).To(MatchError("execer-failed"))
+			})
+		})
+
+		Context("when the container explicitly selects runc", func() {
+			BeforeEach(func() {
+				bundle.Spec.Annotations = map[string]string{backend.AnnotationKey: string(backend.OCIRunc)}
+			})
+
+			It("delegates to execer", func() {
+				Expect(execErr).NotTo(HaveOccurred())
+				Expect(execer.ExecWithBndlCallCount()).To(Equal(1))
+				Expect(containerManager.ExecCallCount()).To(BeZero())
+			})
+		})
+
+		Context("when the container runs under gVisor", func() {
+			BeforeEach(func() {
+				bundle.Spec.Annotations = map[string]string{backend.AnnotationKey: string(backend.OCIGvisor)}
+				bundle.Spec.Root = &specs.Root{Path: "/path/to/rootfs"}
+
+				userLookupper.LookupReturns(&users.ExecUser{Uid: 1000, Gid: 1001, Home: "/home/testuser"}, nil)
+				containerManager.ExecReturns(backingProcess, nil)
+			})
+
+			itRunsTheProcessThroughContainerd := func() {
+				It("does not delegate to execer", func() {
+					Expect(execer.ExecWithBndlCallCount()).To(BeZero())
+				})
+
+				It("does not look up the init process, because it does not run in the container rootfs", func() {
+					Expect(containerManager.GetContainerPIDCallCount()).To(BeZero())
+				})
+
+				It("resolves the user from the bundle rootfs", func() {
+					Expect(userLookupper.LookupCallCount()).To(Equal(1))
+					passedRootfs, passedUserID := userLookupper.LookupArgsForCall(0)
+					Expect(passedRootfs).To(Equal("/path/to/rootfs"))
+					Expect(passedUserID).To(Equal("testuser"))
+				})
+
+				It("creates the working directory in the bundle rootfs", func() {
+					Expect(mkdirer.MkdirAsCallCount()).To(Equal(1))
+					rootfsPath, hostUID, hostGID, mode, shouldRecreate, workDir := mkdirer.MkdirAsArgsForCall(0)
+					Expect(rootfsPath).To(Equal("/path/to/rootfs"))
+					Expect(hostUID).To(Equal(2000))
+					Expect(hostGID).To(Equal(2001))
+					Expect(mode).To(Equal(os.FileMode(0755)))
+					Expect(shouldRecreate).To(BeFalse())
+					Expect(workDir).To(ConsistOf(processSpec.Dir))
+				})
+
+				It("runs the process through containerd", func() {
+					Expect(execErr).NotTo(HaveOccurred())
+					Expect(containerManager.ExecCallCount()).To(Equal(1))
+					_, actualContainerID, actualProcessID, actualProcessSpec, _ := containerManager.ExecArgsForCall(0)
+					Expect(actualContainerID).To(Equal(containerID))
+					Expect(actualProcessID).To(Equal(processSpec.ID))
+					Expect(actualProcessSpec.Args).To(Equal([]string{"test-binary"}))
+				})
+
+				It("returns a process wired to the containerd process", func() {
+					_, err := execProcess.Wait()
+					Expect(err).NotTo(HaveOccurred())
+					Expect(backingProcess.WaitCallCount()).To(Equal(1))
+				})
+			}
+
+			itRunsTheProcessThroughContainerd()
+
+			Context("when use_containerd_for_processes is enabled", func() {
+				BeforeEach(func() {
+					runContainerd = runcontainerd.New(containerManager, processManager, processBuilder, userLookupper, execer, statser, true, cgroupManager, mkdirer, nil, false, runtimeStopper, runcontainerd.WithBackendDispatch(gvisorStatser))
+				})
+
+				itRunsTheProcessThroughContainerd()
+			})
+
+			Context("when the spec has no root", func() {
+				BeforeEach(func() {
+					bundle.Spec.Root = nil
+				})
+
+				It("returns an error and runs nothing", func() {
+					Expect(execErr).To(MatchError(ContainSubstring("container container-id has no rootfs path")))
+					Expect(userLookupper.LookupCallCount()).To(BeZero())
+					Expect(containerManager.ExecCallCount()).To(BeZero())
+				})
+			})
+
+			Context("when the spec root has no path", func() {
+				BeforeEach(func() {
+					bundle.Spec.Root = &specs.Root{}
+				})
+
+				It("returns an error and runs nothing", func() {
+					Expect(execErr).To(MatchError(ContainSubstring("has no rootfs path")))
+					Expect(containerManager.ExecCallCount()).To(BeZero())
+				})
+			})
+
+			Context("when the user lookup fails", func() {
+				BeforeEach(func() {
+					userLookupper.LookupReturns(nil, errors.New("user-lookup-failure"))
+				})
+
+				It("returns the error", func() {
+					Expect(execErr).To(MatchError("user-lookup-failure"))
+					Expect(containerManager.ExecCallCount()).To(BeZero())
+				})
+			})
+
+			Context("when creating the working directory fails", func() {
+				BeforeEach(func() {
+					mkdirer.MkdirAsReturns(errors.New("mkdir-failure"))
+				})
+
+				It("returns the error", func() {
+					Expect(execErr).To(MatchError("mkdir-failure"))
+					Expect(containerManager.ExecCallCount()).To(BeZero())
+				})
+			})
+
+			Context("when containerd fails to run the process", func() {
+				BeforeEach(func() {
+					containerManager.ExecReturns(nil, errors.New("error-execing"))
+				})
+
+				It("returns the error", func() {
+					Expect(execErr).To(MatchError("error-execing"))
+				})
 			})
 		})
 
@@ -398,7 +573,7 @@ var _ = Describe("Runcontainerd", func() {
 
 				containerManager.GetContainerPIDReturns(1234, nil)
 				containerManager.ExecReturns(nil, nil)
-				runContainerd = runcontainerd.New(containerManager, processManager, processBuilder, userLookupper, execer, statser, true, cgroupManager, mkdirer, nil, false, runtimeStopper)
+				runContainerd = runcontainerd.New(containerManager, processManager, processBuilder, userLookupper, execer, statser, true, cgroupManager, mkdirer, nil, false, runtimeStopper, runcontainerd.WithBackendDispatch(gvisorStatser))
 			})
 
 			It("passes the logger through", func() {
@@ -529,6 +704,109 @@ var _ = Describe("Runcontainerd", func() {
 				})
 			})
 
+			It("checks the resolved user against the bundle", func() {
+				Expect(processBuilder.CheckUserCallCount()).To(Equal(1))
+				passedBundle, passedSpec, passedUser := processBuilder.CheckUserArgsForCall(0)
+				Expect(passedBundle).To(Equal(bundle))
+				Expect(passedSpec).To(Equal(processSpec))
+				Expect(passedUser.Gid).To(Equal(1001))
+				Expect(passedUser.Sgids).To(Equal([]int{2000, 3000, 5000}))
+			})
+
+			Context("when the resolved user is refused", func() {
+				BeforeEach(func() {
+					processBuilder.CheckUserReturns(errors.New("user-refused"))
+				})
+
+				It("returns the error before touching the container", func() {
+					Expect(execErr).To(MatchError("user-refused"))
+					Expect(mkdirer.MkdirAsCallCount()).To(BeZero())
+					Expect(processBuilder.BuildProcessCallCount()).To(BeZero())
+					Expect(containerManager.ExecCallCount()).To(BeZero())
+				})
+			})
+
+			Context("with the kvm gid in the image's user and group data in a vm container", func() {
+				const kvmGid = 991
+
+				var imageRootFS string
+
+				writeImageFiles := func(passwd, group string) {
+					Expect(os.WriteFile(filepath.Join(imageRootFS, "etc", "passwd"), []byte(passwd), 0644)).To(Succeed())
+					Expect(os.WriteFile(filepath.Join(imageRootFS, "etc", "group"), []byte(group), 0644)).To(Succeed())
+				}
+
+				execedProcess := func() *specs.Process {
+					Expect(containerManager.ExecCallCount()).To(Equal(1))
+					_, _, _, proc, _ := containerManager.ExecArgsForCall(0)
+					return proc
+				}
+
+				BeforeEach(func() {
+					var err error
+					imageRootFS, err = os.MkdirTemp("", "runcontainerd-image")
+					Expect(err).NotTo(HaveOccurred())
+					Expect(os.MkdirAll(filepath.Join(imageRootFS, "etc"), 0755)).To(Succeed())
+
+					userLookupper.LookupStub = func(_, name string) (*users.ExecUser, error) {
+						return users.LookupUser(imageRootFS, name)
+					}
+
+					bundle = bundle.WithProcess(specs.Process{ApparmorProfile: "garden-default"}).WithRootFS(imageRootFS)
+					bundle.Spec.Annotations = map[string]string{backend.AnnotationKey: string(backend.VMQemu)}
+					containerManager.SpecReturns(&bundle.Spec, nil)
+
+					processSpec.User = "vcap"
+					processSpec.Path = "/tmp/lifecycle/diego-sshd"
+
+					builder := processes.NewBuilder(processes.EnvFunc(func(goci.Bndl, garden.ProcessSpec, int) []string { return nil }), nil, processes.WithKVMGid(kvmGid))
+					runContainerd = runcontainerd.New(containerManager, processManager, builder, userLookupper, execer, statser, true, cgroupManager, mkdirer, nil, false, runtimeStopper, runcontainerd.WithBackendDispatch(gvisorStatser))
+				})
+
+				AfterEach(func() {
+					Expect(os.RemoveAll(imageRootFS)).To(Succeed())
+				})
+
+				Context("when the group file makes vcap a member of the kvm group", func() {
+					BeforeEach(func() {
+						writeImageFiles("vcap:x:2000:2000::/home/vcap:/bin/sh\n", "vcap:x:2000:\nkvm:x:991:vcap\n")
+					})
+
+					It("runs the process without the kvm gid", func() {
+						Expect(execErr).NotTo(HaveOccurred())
+						proc := execedProcess()
+						Expect(proc.User.GID).To(Equal(uint32(2000)))
+						Expect(proc.User.AdditionalGids).NotTo(ContainElement(uint32(kvmGid)))
+					})
+
+					Context("and the process is the wrapped vm-launch process", func() {
+						BeforeEach(func() {
+							processSpec.Path = processes.VMLaunchPath
+							processSpec = processes.MarkVMLaunch(processSpec)
+						})
+
+						It("runs it with the kvm gid and the unconfined AppArmor profile", func() {
+							Expect(execErr).NotTo(HaveOccurred())
+							proc := execedProcess()
+							Expect(proc.User.AdditionalGids).To(ContainElement(uint32(kvmGid)))
+							Expect(proc.ApparmorProfile).To(Equal("unconfined"))
+						})
+					})
+				})
+
+				Context("when the passwd file gives vcap the kvm gid as its primary gid", func() {
+					BeforeEach(func() {
+						writeImageFiles("vcap:x:2000:991::/home/vcap:/bin/sh\n", "vcap:x:2000:\n")
+					})
+
+					It("refuses the process before preparing or running it", func() {
+						Expect(execErr).To(MatchError(processes.ErrKVMPrimaryGid))
+						Expect(mkdirer.MkdirAsCallCount()).To(BeZero())
+						Expect(containerManager.ExecCallCount()).To(BeZero())
+					})
+				})
+			})
+
 			Context("when containerManager returns an error", func() {
 				BeforeEach(func() {
 					containerManager.ExecReturns(nil, errors.New("error-execing"))
@@ -560,12 +838,15 @@ var _ = Describe("Runcontainerd", func() {
 
 			attachProcess garden.Process
 			attachError   error
+			spec          *specs.Spec
 		)
 
 		BeforeEach(func() {
 			io = garden.ProcessIO{}
 			process = new(gardenfakes.FakeProcess)
 			execer.AttachReturns(process, nil)
+			spec = &specs.Spec{}
+			containerManager.SpecReturns(spec, nil)
 		})
 
 		JustBeforeEach(func() {
@@ -584,6 +865,16 @@ var _ = Describe("Runcontainerd", func() {
 			Expect(actualIO).To(Equal(io))
 		})
 
+		It("looks up the container spec to pick the backend", func() {
+			Expect(containerManager.SpecCallCount()).To(Equal(1))
+			_, actualID := containerManager.SpecArgsForCall(0)
+			Expect(actualID).To(Equal("some-id"))
+		})
+
+		It("does not attach through containerd", func() {
+			Expect(processManager.GetProcessCallCount()).To(BeZero())
+		})
+
 		Context("when the execer fails", func() {
 			BeforeEach(func() {
 				execer.AttachReturns(nil, errors.New("execer-failed"))
@@ -594,9 +885,58 @@ var _ = Describe("Runcontainerd", func() {
 			})
 		})
 
+		Context("when looking up the container spec fails", func() {
+			BeforeEach(func() {
+				containerManager.SpecReturns(nil, errors.New("spec-failed"))
+			})
+
+			It("returns the error and attaches to nothing", func() {
+				Expect(attachError).To(MatchError("spec-failed"))
+				Expect(execer.AttachCallCount()).To(BeZero())
+				Expect(processManager.GetProcessCallCount()).To(BeZero())
+			})
+		})
+
+		Context("when the container runs under gVisor", func() {
+			BeforeEach(func() {
+				spec.Annotations = map[string]string{backend.AnnotationKey: string(backend.OCIGvisor)}
+			})
+
+			It("does not delegate to execer", func() {
+				Expect(execer.AttachCallCount()).To(BeZero())
+			})
+
+			It("attaches to the process through containerd", func() {
+				Expect(attachError).NotTo(HaveOccurred())
+				Expect(processManager.GetProcessCallCount()).To(Equal(1))
+				_, actualContainerID, actualProcessID := processManager.GetProcessArgsForCall(0)
+				Expect(actualContainerID).To(Equal("some-id"))
+				Expect(actualProcessID).To(Equal("some-proc-id"))
+
+				_, err := attachProcess.Wait()
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backingProcess.WaitCallCount()).To(Equal(1))
+			})
+
+			Context("when the process does not exist", func() {
+				BeforeEach(func() {
+					processManager.GetProcessReturns(nil, runcontainerd.ProcessNotFoundError{Handle: "some-id", ID: "some-proc-id"})
+				})
+
+				It("returns a garden not found error", func() {
+					Expect(attachError).To(MatchError(garden.ProcessNotFoundError{ProcessID: "some-proc-id"}))
+				})
+			})
+		})
+
 		Context("when using containerd for processes", func() {
 			BeforeEach(func() {
-				runContainerd = runcontainerd.New(containerManager, processManager, processBuilder, userLookupper, execer, statser, true, cgroupManager, mkdirer, nil, false, runtimeStopper)
+				runContainerd = runcontainerd.New(containerManager, processManager, processBuilder, userLookupper, execer, statser, true, cgroupManager, mkdirer, nil, false, runtimeStopper, runcontainerd.WithBackendDispatch(gvisorStatser))
+			})
+
+			It("does not look up the container spec, because every process runs through containerd", func() {
+				Expect(containerManager.SpecCallCount()).To(BeZero())
+				Expect(execer.AttachCallCount()).To(BeZero())
 			})
 
 			It("returns a process wired to the process manager", func() {
@@ -632,6 +972,7 @@ var _ = Describe("Runcontainerd", func() {
 		var (
 			metrics    gardener.StatsContainerMetrics
 			metricsErr error
+			spec       *specs.Spec
 		)
 
 		BeforeEach(func() {
@@ -640,6 +981,8 @@ var _ = Describe("Runcontainerd", func() {
 					Usage: 123,
 				},
 			}, nil)
+			spec = &specs.Spec{}
+			containerManager.SpecReturns(spec, nil)
 		})
 
 		JustBeforeEach(func() {
@@ -661,6 +1004,63 @@ var _ = Describe("Runcontainerd", func() {
 			Expect(metrics.CPU.Usage).To(Equal(uint64(123)))
 		})
 
+		It("does not ask containerd for task metrics", func() {
+			Expect(gvisorStatser.StatsCallCount()).To(BeZero())
+		})
+
+		Context("when looking up the container spec fails", func() {
+			BeforeEach(func() {
+				containerManager.SpecReturns(nil, errors.New("spec-failed"))
+			})
+
+			It("returns the error and reads no metrics", func() {
+				Expect(metricsErr).To(MatchError("spec-failed"))
+				Expect(statser.StatsCallCount()).To(BeZero())
+				Expect(gvisorStatser.StatsCallCount()).To(BeZero())
+			})
+		})
+
+		Context("when the process is not a containerd container", func() {
+			BeforeEach(func() {
+				containerManager.SpecReturns(nil, runcontainerd.ContainerNotFoundError{Handle: "some-id"})
+			})
+
+			It("reads the metrics from the runc statser", func() {
+				Expect(metricsErr).NotTo(HaveOccurred())
+				Expect(statser.StatsCallCount()).To(Equal(1))
+				_, actualID := statser.StatsArgsForCall(0)
+				Expect(actualID).To(Equal("some-id"))
+				Expect(metrics.CPU.Usage).To(Equal(uint64(123)))
+				Expect(gvisorStatser.StatsCallCount()).To(BeZero())
+			})
+
+			Context("and the runc statser fails", func() {
+				BeforeEach(func() {
+					statser.StatsReturns(gardener.StatsContainerMetrics{}, errors.New("statser-failure"))
+				})
+
+				It("returns the statser error", func() {
+					Expect(metricsErr).To(MatchError("statser-failure"))
+				})
+			})
+		})
+
+		Context("when the container runs under gVisor", func() {
+			BeforeEach(func() {
+				spec.Annotations = map[string]string{backend.AnnotationKey: string(backend.OCIGvisor)}
+				gvisorStatser.StatsReturns(gardener.StatsContainerMetrics{CPU: garden.ContainerCPUStat{Usage: 7000}}, nil)
+			})
+
+			It("reads the metrics from the gVisor statser instead of the runc statser", func() {
+				Expect(metricsErr).NotTo(HaveOccurred())
+				Expect(statser.StatsCallCount()).To(BeZero())
+				Expect(gvisorStatser.StatsCallCount()).To(Equal(1))
+				_, actualID := gvisorStatser.StatsArgsForCall(0)
+				Expect(actualID).To(Equal("some-id"))
+				Expect(metrics.CPU.Usage).To(Equal(uint64(7000)))
+			})
+		})
+
 		Context("statser fails", func() {
 			BeforeEach(func() {
 				statser.StatsReturns(gardener.StatsContainerMetrics{}, errors.New("statser-failure"))
@@ -668,6 +1068,111 @@ var _ = Describe("Runcontainerd", func() {
 
 			It("returns the statser error", func() {
 				Expect(metricsErr).To(MatchError("statser-failure"))
+			})
+		})
+	})
+
+	Describe("without backend dispatch", func() {
+		var peaID string
+
+		BeforeEach(func() {
+			peaID = "pea-id"
+			containerManager.SpecReturns(&specs.Spec{
+				Annotations: map[string]string{backend.AnnotationKey: string(backend.OCIGvisor)},
+				Root:        &specs.Root{Path: "/path/to/rootfs"},
+				Linux:       &specs.Linux{},
+			}, nil)
+			statser.StatsReturns(gardener.StatsContainerMetrics{CPU: garden.ContainerCPUStat{Usage: 123}}, nil)
+			execer.ExecWithBndlReturns(new(gardenfakes.FakeProcess), nil)
+			execer.AttachReturns(new(gardenfakes.FakeProcess), nil)
+
+			runContainerd = runcontainerd.New(containerManager, processManager, processBuilder, userLookupper, execer, statser, false, cgroupManager, mkdirer, nil, false, runtimeStopper)
+		})
+
+		Describe("Exec", func() {
+			It("always runs the process through the runc execer", func() {
+				_, err := runContainerd.Exec(logger, "container-id", garden.ProcessSpec{Path: "/bin/true"}, garden.ProcessIO{})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(execer.ExecWithBndlCallCount()).To(Equal(1))
+				Expect(containerManager.ExecCallCount()).To(BeZero())
+			})
+
+			It("returns the unchanged error when the bundle lookup fails", func() {
+				containerManager.SpecReturns(nil, runcontainerd.ContainerNotFoundError{Handle: "container-id"})
+				_, err := runContainerd.Exec(logger, "container-id", garden.ProcessSpec{Path: "/bin/true"}, garden.ProcessIO{})
+				Expect(err).To(Equal(runcontainerd.ContainerNotFoundError{Handle: "container-id"}))
+			})
+		})
+
+		Describe("Attach", func() {
+			It("delegates to the runc execer without looking up the container", func() {
+				_, err := runContainerd.Attach(logger, "container-id", "proc-id", garden.ProcessIO{})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(containerManager.SpecCallCount()).To(BeZero())
+				Expect(execer.AttachCallCount()).To(Equal(1))
+				Expect(processManager.GetProcessCallCount()).To(BeZero())
+			})
+		})
+
+		Describe("Stats", func() {
+			It("reads the metrics from the runc statser without looking up the container", func() {
+				metrics, err := runContainerd.Stats(logger, peaID)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(metrics.CPU.Usage).To(Equal(uint64(123)))
+				Expect(containerManager.SpecCallCount()).To(BeZero())
+				Expect(gvisorStatser.StatsCallCount()).To(BeZero())
+			})
+
+			It("returns the runc statser error unchanged", func() {
+				statser.StatsReturns(gardener.StatsContainerMetrics{}, errors.New("statser-failure"))
+				_, err := runContainerd.Stats(logger, peaID)
+				Expect(err).To(MatchError("statser-failure"))
+			})
+		})
+
+		Describe("KillAll", func() {
+			It("signals through containerd without looking up the container", func() {
+				Expect(runContainerd.KillAll(logger, "container-id", syscall.SIGTERM)).To(Succeed())
+				Expect(containerManager.KillAllCallCount()).To(Equal(1))
+				Expect(containerManager.SpecCallCount()).To(BeZero())
+			})
+		})
+
+		Describe("Create", func() {
+			It("sets the memory hierarchy when containerd runs processes", func() {
+				runContainerd = runcontainerd.New(containerManager, processManager, processBuilder, userLookupper, execer, statser, true, cgroupManager, mkdirer, nil, false, runtimeStopper)
+				bundle := goci.Bndl{Spec: specs.Spec{
+					Annotations: map[string]string{backend.AnnotationKey: string(backend.OCIGvisor)},
+					Linux:       &specs.Linux{},
+				}}
+				Expect(runContainerd.Create(logger, "container-id", bundle, garden.ProcessIO{})).To(Succeed())
+				Expect(cgroupManager.SetUseMemoryHierarchyCallCount()).To(Equal(1))
+			})
+		})
+	})
+
+	Describe("KillAll", func() {
+		var killErr error
+
+		JustBeforeEach(func() {
+			killErr = runContainerd.KillAll(logger, "some-id", syscall.SIGTERM)
+		})
+
+		It("signals every process of the container through containerd", func() {
+			Expect(killErr).NotTo(HaveOccurred())
+			Expect(containerManager.KillAllCallCount()).To(Equal(1))
+			_, actualID, actualSignal := containerManager.KillAllArgsForCall(0)
+			Expect(actualID).To(Equal("some-id"))
+			Expect(actualSignal).To(Equal(syscall.SIGTERM))
+		})
+
+		Context("when killing fails", func() {
+			BeforeEach(func() {
+				containerManager.KillAllReturns(errors.New("kill-failed"))
+			})
+
+			It("returns the error", func() {
+				Expect(killErr).To(MatchError("kill-failed"))
 			})
 		})
 	})

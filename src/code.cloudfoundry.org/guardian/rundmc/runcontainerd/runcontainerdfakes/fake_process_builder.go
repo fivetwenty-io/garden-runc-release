@@ -25,6 +25,19 @@ type FakeProcessBuilder struct {
 	buildProcessReturnsOnCall map[int]struct {
 		result1 *specs.Process
 	}
+	CheckUserStub        func(goci.Bndl, garden.ProcessSpec, *users.ExecUser) error
+	checkUserMutex       sync.RWMutex
+	checkUserArgsForCall []struct {
+		arg1 goci.Bndl
+		arg2 garden.ProcessSpec
+		arg3 *users.ExecUser
+	}
+	checkUserReturns struct {
+		result1 error
+	}
+	checkUserReturnsOnCall map[int]struct {
+		result1 error
+	}
 	invocations      map[string][][]interface{}
 	invocationsMutex sync.RWMutex
 }
@@ -92,11 +105,76 @@ func (fake *FakeProcessBuilder) BuildProcessReturnsOnCall(i int, result1 *specs.
 	}{result1}
 }
 
+func (fake *FakeProcessBuilder) CheckUser(arg1 goci.Bndl, arg2 garden.ProcessSpec, arg3 *users.ExecUser) error {
+	fake.checkUserMutex.Lock()
+	ret, specificReturn := fake.checkUserReturnsOnCall[len(fake.checkUserArgsForCall)]
+	fake.checkUserArgsForCall = append(fake.checkUserArgsForCall, struct {
+		arg1 goci.Bndl
+		arg2 garden.ProcessSpec
+		arg3 *users.ExecUser
+	}{arg1, arg2, arg3})
+	stub := fake.CheckUserStub
+	fakeReturns := fake.checkUserReturns
+	fake.recordInvocation("CheckUser", []interface{}{arg1, arg2, arg3})
+	fake.checkUserMutex.Unlock()
+	if stub != nil {
+		return stub(arg1, arg2, arg3)
+	}
+	if specificReturn {
+		return ret.result1
+	}
+	return fakeReturns.result1
+}
+
+func (fake *FakeProcessBuilder) CheckUserCallCount() int {
+	fake.checkUserMutex.RLock()
+	defer fake.checkUserMutex.RUnlock()
+	return len(fake.checkUserArgsForCall)
+}
+
+func (fake *FakeProcessBuilder) CheckUserCalls(stub func(goci.Bndl, garden.ProcessSpec, *users.ExecUser) error) {
+	fake.checkUserMutex.Lock()
+	defer fake.checkUserMutex.Unlock()
+	fake.CheckUserStub = stub
+}
+
+func (fake *FakeProcessBuilder) CheckUserArgsForCall(i int) (goci.Bndl, garden.ProcessSpec, *users.ExecUser) {
+	fake.checkUserMutex.RLock()
+	defer fake.checkUserMutex.RUnlock()
+	argsForCall := fake.checkUserArgsForCall[i]
+	return argsForCall.arg1, argsForCall.arg2, argsForCall.arg3
+}
+
+func (fake *FakeProcessBuilder) CheckUserReturns(result1 error) {
+	fake.checkUserMutex.Lock()
+	defer fake.checkUserMutex.Unlock()
+	fake.CheckUserStub = nil
+	fake.checkUserReturns = struct {
+		result1 error
+	}{result1}
+}
+
+func (fake *FakeProcessBuilder) CheckUserReturnsOnCall(i int, result1 error) {
+	fake.checkUserMutex.Lock()
+	defer fake.checkUserMutex.Unlock()
+	fake.CheckUserStub = nil
+	if fake.checkUserReturnsOnCall == nil {
+		fake.checkUserReturnsOnCall = make(map[int]struct {
+			result1 error
+		})
+	}
+	fake.checkUserReturnsOnCall[i] = struct {
+		result1 error
+	}{result1}
+}
+
 func (fake *FakeProcessBuilder) Invocations() map[string][][]interface{} {
 	fake.invocationsMutex.RLock()
 	defer fake.invocationsMutex.RUnlock()
 	fake.buildProcessMutex.RLock()
 	defer fake.buildProcessMutex.RUnlock()
+	fake.checkUserMutex.RLock()
+	defer fake.checkUserMutex.RUnlock()
 	copiedInvocations := map[string][][]interface{}{}
 	for key, value := range fake.invocations {
 		copiedInvocations[key] = value

@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"code.cloudfoundry.org/clock"
 	"code.cloudfoundry.org/commandrunner"
+	"code.cloudfoundry.org/guardian/backend"
 	"code.cloudfoundry.org/guardian/gardener"
 	"code.cloudfoundry.org/guardian/guardiancmd/cpuentitlement"
 	"code.cloudfoundry.org/guardian/idmapper"
@@ -84,6 +87,11 @@ type Service interface {
 
 type CommonCommand struct {
 	Logger LagerFlag
+
+	// wiredBackends is the outcome of wireExecutionBackends. createWiring sets
+	// it before any factory wiring runs, so that factory methods whose
+	// signature cannot carry it, such as WireContainerd, can read it.
+	wiredBackends *executionBackends
 
 	Server struct {
 		BindIP   IPFlag `long:"bind-ip"   description:"Bind with TCP on the given IP."`
@@ -199,6 +207,13 @@ type CommonCommand struct {
 		RuntimeType               string `long:"containerd-runtime-type" description:"Containerd runtime type (e.g. io.containerd.runc.v2 or io.containerd.runsc.v1)."`
 	} `group:"Containerd"`
 
+	ExecutionBackends struct {
+		Enabled        []string `long:"execution-backend" description:"Execution backend to enable: oci-gvisor, vm-qemu, or vm-firecracker. oci-runc is always enabled. Can be specified multiple times. Cannot be combined with an alternative --containerd-runtime-type."`
+		VMArtifactsDir string   `long:"vm-artifacts-dir" default:"/var/vcap/data/vm-runtime/artifacts" description:"Host directory with the VM kernels and hypervisors, bound read-only into vm-* containers at /opt/garden-vm/artifacts."`
+		VMLaunchBin    string   `long:"vm-launch-bin" description:"Host path of the static vm-launch binary, bound read-only into vm-* containers at /opt/garden-vm/vm-launch. Required when a vm-* backend is enabled."`
+		VMKVMGid       uint32   `long:"vm-kvm-gid" description:"Host gid that owns /dev/kvm, added to the vm-launch process. Resolved from the host kvm group when not set."`
+	} `group:"Execution Backends"`
+
 	CPUThrottling struct {
 		Enabled       bool   `long:"enable-cpu-throttling" description:"Enable CPU throttling."`
 		CheckInterval uint32 `long:"cpu-throttling-check-interval" default:"15" description:"How often to check which apps need to get CPU throttled or not."`
@@ -227,10 +242,11 @@ type commandWiring struct {
 	Logger                          lager.Logger
 	CpuEntitlementPerShare          float64
 	ContainerNetworkMetricsProvider gardener.ContainerNetworkMetricsProvider
+	Backends                        *backend.Registry
 }
 
 func (cmd *CommonCommand) createGardener(wiring *commandWiring) *gardener.Gardener {
-	return gardener.New(wiring.UidGenerator,
+	gdnr := gardener.New(wiring.UidGenerator,
 		wiring.Starter,
 		wiring.SysInfoProvider,
 		wiring.Networker,
@@ -244,9 +260,19 @@ func (cmd *CommonCommand) createGardener(wiring *commandWiring) *gardener.Garden
 		!cmd.Containers.DisablePrivilgedContainers,
 		wiring.ContainerNetworkMetricsProvider,
 	)
+	gdnr.Backends = wiring.Backends
+
+	return gdnr
 }
 
 func (cmd *CommonCommand) createWiring(logger lager.Logger, metricsProvider *metrics.MetricsProvider) (*commandWiring, error) {
+	backends, err := cmd.wireExecutionBackends(logger)
+	if err != nil {
+		logger.Error("invalid-execution-backend-flags", err)
+		return nil, err
+	}
+	cmd.wiredBackends = backends
+
 	factory := cmd.NewGardenFactory()
 
 	propManager, err := cmd.loadProperties(logger, cmd.Containers.PropertiesPath)
@@ -265,7 +291,7 @@ func (cmd *CommonCommand) createWiring(logger lager.Logger, metricsProvider *met
 		wireBindMountSourceCreator(uidMappings, gidMappings),
 	)
 
-	networker, iptablesStarter, err := cmd.wireNetworker(logger, factory, propManager, portPool, networkDepot)
+	networker, iptablesStarter, err := cmd.wireNetworker(logger, factory, propManager, portPool, networkDepot, backends)
 	if err != nil {
 		logger.Error("failed-to-wire-networker", err)
 		return nil, err
@@ -299,7 +325,7 @@ func (cmd *CommonCommand) createWiring(logger lager.Logger, metricsProvider *met
 		}
 	}
 
-	containerizer, peaCleaner, err := cmd.wireContainerizer(logger, factory, propManager, volumizer, cpuEntitlementPerShare, networkDepot, metricsProvider)
+	containerizer, peaCleaner, err := cmd.wireContainerizer(logger, factory, propManager, volumizer, cpuEntitlementPerShare, networkDepot, metricsProvider, backends)
 	if err != nil {
 		logger.Error("failed-to-wire-containerizer", err)
 		return nil, err
@@ -319,6 +345,7 @@ func (cmd *CommonCommand) createWiring(logger lager.Logger, metricsProvider *met
 		Logger:                          logger,
 		CpuEntitlementPerShare:          cpuEntitlementPerShare,
 		ContainerNetworkMetricsProvider: factory.WireContainerNetworkMetricsProvider(containerizer, propManager),
+		Backends:                        backends.registry,
 	}, nil
 }
 
@@ -391,7 +418,7 @@ func extractIPs(ipflags []IPFlag) []net.IP {
 	return ips
 }
 
-func (cmd *CommonCommand) wireNetworker(log lager.Logger, factory GardenFactory, propManager kawasaki.ConfigStore, portPool *ports.PortPool, networkDepot depot.NetworkDepot) (gardener.Networker, gardener.Starter, error) {
+func (cmd *CommonCommand) wireNetworker(log lager.Logger, factory GardenFactory, propManager kawasaki.ConfigStore, portPool *ports.PortPool, networkDepot depot.NetworkDepot, backends *executionBackends) (gardener.Networker, gardener.Starter, error) {
 	externalIP, err := defaultExternalIP(cmd.Network.ExternalIP)
 	if err != nil {
 		return nil, nil, err
@@ -402,6 +429,16 @@ func (cmd *CommonCommand) wireNetworker(log lager.Logger, factory GardenFactory,
 
 	if cmd.Network.Plugin.Path() != "" {
 		resolvConfigurer := factory.WireResolvConfigurer()
+		var networkerOpts []netplugin.Option
+		if cmd.Bin.IPTables.Path() != "" {
+			networkerOpts = append(networkerOpts, netplugin.WithIPTablesBin(cmd.Bin.IPTables.Path()))
+		}
+		if gid, ok := backends.tapGroup(); ok {
+			networkerOpts = append(networkerOpts, netplugin.WithTapGroup(gid))
+		}
+		if cmd.runscCell() {
+			networkerOpts = append(networkerOpts, netplugin.WithLoopbackRequired())
+		}
 		externalNetworker := netplugin.New(
 			factory.CommandRunner(),
 			propManager,
@@ -412,6 +449,7 @@ func (cmd *CommonCommand) wireNetworker(log lager.Logger, factory GardenFactory,
 			cmd.Network.Plugin.Path(),
 			cmd.Network.PluginExtraArgs,
 			networkDepot,
+			networkerOpts...,
 		)
 		return externalNetworker, externalNetworker, nil
 	}
@@ -495,6 +533,7 @@ func (cmd *CommonCommand) wireContainerizer(
 	cpuEntitlementPerShare float64,
 	networkDepot depot.NetworkDepot,
 	metricsProvider *metrics.MetricsProvider,
+	backends *executionBackends,
 ) (*rundmc.Containerizer, gardener.PeaCleaner, error) {
 	initMount, initPath := initBindMountAndPath(cmd.Bin.Init.Path())
 
@@ -595,13 +634,24 @@ func (cmd *CommonCommand) wireContainerizer(
 
 	bundleRules = append(bundleRules, cmd.wireKernelParams()...)
 
+	// Registered last so that no earlier rule can undo its device and mount
+	// additions, and only when a backend other than oci-runc is enabled so
+	// that a cell without backend flags builds the same bundles as before.
+	if backends.dispatch() {
+		bundleRules = append(bundleRules, bundlerules.NewExecutionBackend(cmd.ExecutionBackends.VMArtifactsDir, cmd.ExecutionBackends.VMLaunchBin, backends.kvmGid))
+	}
+
 	template := &rundmc.BundleTemplate{Rules: bundleRules}
 
 	bundleSaver := &goci.BundleSaver{}
 	bndlLoader := &goci.BndlLoader{}
 	depot := cmd.wireDepot(bundleSaver, bndlLoader)
 
-	processBuilder := processes.NewBuilder(wireEnvFunc(), nonRootMaxCaps)
+	var processBuilderOpts []processes.Option
+	if backends.kvmGid != 0 {
+		processBuilderOpts = append(processBuilderOpts, processes.WithKVMGid(backends.kvmGid))
+	}
+	processBuilder := processes.NewBuilder(wireEnvFunc(), nonRootMaxCaps, processBuilderOpts...)
 
 	cmdRunner := factory.CommandRunner()
 	runcLogRunner := runrunc.NewLogRunner(cmdRunner, runrunc.LogDir(os.TempDir()).GenerateLogFile)
@@ -642,6 +692,7 @@ func (cmd *CommonCommand) wireContainerizer(
 	// value instead of re-resolving from the config string.
 	runtimePolicy := runcontainerd.StockRuntime
 	var imageBackedPeas peas.ImageBackedPeas
+	var containerizerOpts []rundmc.Option
 
 	if cmd.useContainerd() {
 		var err error
@@ -663,6 +714,12 @@ func (cmd *CommonCommand) wireContainerizer(
 		peasBundleLoader = peaBundleLoader
 		containersPidGetter = nerdPidGetter
 		runtimeStopper = runContainerd
+		containerizerOpts = append(containerizerOpts, rundmc.WithTaskKiller(runContainerd, retrier.New(retrier.ConstantBackoff(10, 1*time.Second), nil)))
+		if lister, ok := factory.(taskPidListerFactory); ok {
+			if taskPids := lister.WireTaskPidLister(); taskPids != nil {
+				containerizerOpts = append(containerizerOpts, rundmc.WithTaskPidLister(taskPids))
+			}
+		}
 
 		if cmd.Containerd.UseContainerdForProcesses {
 			peaPidGetter = nerdPidGetter
@@ -670,6 +727,8 @@ func (cmd *CommonCommand) wireContainerizer(
 		}
 		if runtimePolicy.IsAlternative() {
 			imageBackedPeas = runContainerd
+			// The cgroup stopper reads runc state, which runsc does not write.
+			containerizerOpts = append(containerizerOpts, rundmc.WithTaskStop())
 		}
 
 	} else {
@@ -734,8 +793,207 @@ func (cmd *CommonCommand) wireContainerizer(
 		streamer = rundmc.NewNstarStreamer(ociRuntime, nstar)
 	}
 
-	containerizer := rundmc.New(depot, template, ociRuntime, streamer, processesStopper, eventStore, stateStore, peaCreator, peaUsernameResolver, cpuEntitlementPerShare, runtimeStopper, cpuCgrouper, runtimePolicy.IsAlternative())
+	containerizerOpts = append(containerizerOpts, backends.containerizerOptions(ociRuntime)...)
+
+	containerizer := rundmc.New(depot, template, ociRuntime, streamer, processesStopper, eventStore, stateStore, peaCreator, peaUsernameResolver, cpuEntitlementPerShare, runtimeStopper, cpuCgrouper, runtimePolicy.IsAlternative(), containerizerOpts...)
 	return containerizer, peaCleaner, nil
+}
+
+// executionBackends is the outcome of validating the execution backend flags.
+type executionBackends struct {
+	// registry holds the enabled backends. It is nil when none beyond oci-runc
+	// is enabled, which keeps the Gardener on its runc-only behaviour.
+	registry *backend.Registry
+
+	// kvmGid is the host gid to add to vm-launch processes, or 0 when no vm-*
+	// backend is enabled.
+	kvmGid uint32
+}
+
+// taskPidListerFactory is implemented by factories that can list the processes
+// of a containerd task. WireTaskPidLister returns nil until WireContainerd has
+// run.
+type taskPidListerFactory interface {
+	WireTaskPidLister() rundmc.TaskPidLister
+}
+
+// dispatch reports whether any backend other than oci-runc is enabled. Only
+// then do the containerizer and the containerd runtime look up a container's
+// backend; otherwise both keep their stock code paths.
+func (b *executionBackends) dispatch() bool {
+	return b != nil && b.registry != nil
+}
+
+// containerizerOptions returns the Containerizer options the enabled backends
+// need. gVisor containers stream files through runtime exec.
+func (b *executionBackends) containerizerOptions(runtime rundmc.OCIRuntime) []rundmc.Option {
+	if !b.dispatch() {
+		return nil
+	}
+	return []rundmc.Option{rundmc.WithBackendDispatch(rundmc.NewExecStreamer(runtime))}
+}
+
+// runContainerdOptions returns the RunContainerd options the enabled backends
+// need. It must enable dispatch exactly when containerizerOptions does, so
+// that a gVisor container streams, executes, and reports metrics through
+// containerd on both layers. gVisor metrics come from gvisorStatser.
+func (b *executionBackends) runContainerdOptions(gvisorStatser runcontainerd.Statser) []runcontainerd.Option {
+	if !b.dispatch() {
+		return nil
+	}
+	return []runcontainerd.Option{runcontainerd.WithBackendDispatch(gvisorStatser)}
+}
+
+// tapGroup returns the gid that owns the tap device of a vm-firecracker
+// container, which is the kvm gid that vm-launch carries. It reports false when
+// vm-firecracker is not enabled.
+func (b *executionBackends) tapGroup() (uint32, bool) {
+	if !b.dispatch() || !b.registry.Allowed(backend.VMFirecracker) || b.kvmGid == 0 {
+		return 0, false
+	}
+	return b.kvmGid, true
+}
+
+// lookupKVMGroup resolves the host group that owns /dev/kvm. Tests replace it.
+var lookupKVMGroup = user.LookupGroup
+
+// kvmGroupName is the host group that owns /dev/kvm.
+const kvmGroupName = "kvm"
+
+// wireExecutionBackends validates the execution backend flags and builds the
+// backend registry from them. It returns an error, which stops gdn, when a
+// backend name is unknown, when a backend is enabled on a cell whose
+// containerd runtime type is runsc, when oci-gvisor is enabled without
+// containerd, or when a vm-* backend is enabled and the vm-launch binary is
+// not executable.
+// A vm-* backend whose kvm gid cannot be determined is left out of the
+// registry and logged, and gdn keeps serving the remaining backends. The
+// artifacts directory is not inspected, because a missing artifact fails the
+// container create instead.
+func (cmd *CommonCommand) wireExecutionBackends(log lager.Logger) (*executionBackends, error) {
+	log = log.Session("execution-backends")
+
+	kinds := make([]backend.Kind, 0, len(cmd.ExecutionBackends.Enabled))
+	for _, name := range cmd.ExecutionBackends.Enabled {
+		kind := backend.Kind(name)
+		if !backend.IsKnown(kind) {
+			return nil, fmt.Errorf("%w: %q for --execution-backend", backend.ErrUnknownBackend, name)
+		}
+		if kind != backend.OCIRunc {
+			kinds = append(kinds, kind)
+		}
+	}
+
+	if len(kinds) == 0 {
+		return &executionBackends{}, nil
+	}
+
+	// A runsc cell already runs every container under gVisor with its own
+	// streaming, metrics, and pea paths, so per-container selection on top of
+	// it is not supported.
+	if cmd.runscCell() {
+		return nil, fmt.Errorf("--execution-backend cannot be combined with --containerd-runtime-type %s", cmd.Containerd.RuntimeType)
+	}
+
+	vmEnabled := false
+	for _, kind := range kinds {
+		if backend.IsGvisor(kind) && !cmd.useContainerd() {
+			return nil, fmt.Errorf("--execution-backend %s requires --containerd-socket: without containerd the container would run under runc instead of gVisor", kind)
+		}
+		if backend.IsVM(kind) {
+			vmEnabled = true
+		}
+	}
+
+	var kvmGid uint32
+	if vmEnabled {
+		if err := checkExecutable(cmd.ExecutionBackends.VMLaunchBin); err != nil {
+			return nil, fmt.Errorf("--vm-launch-bin is required to be an executable file when a vm-* backend is enabled: %w", err)
+		}
+
+		var err error
+		kvmGid, err = cmd.resolveKVMGid()
+		if err != nil {
+			log.Error("kvm-gid-unresolved-disabling-vm-backends", err)
+			kinds = withoutVMBackends(kinds)
+			kvmGid = 0
+		}
+	}
+
+	if len(kinds) == 0 {
+		return &executionBackends{}, nil
+	}
+
+	registry, err := backend.NewRegistry(kinds...)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Info("enabled", lager.Data{"backends": kinds, "kvm-gid": kvmGid})
+
+	return &executionBackends{registry: registry, kvmGid: kvmGid}, nil
+}
+
+func (cmd *CommonCommand) resolveKVMGid() (uint32, error) {
+	if cmd.ExecutionBackends.VMKVMGid != 0 {
+		return cmd.ExecutionBackends.VMKVMGid, nil
+	}
+
+	group, err := lookupKVMGroup(kvmGroupName)
+	if err != nil {
+		return 0, fmt.Errorf("--vm-kvm-gid not set and host group %q not found: %w", kvmGroupName, err)
+	}
+
+	gid, err := strconv.ParseUint(group.Gid, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("host group %q has gid %q: %w", kvmGroupName, group.Gid, err)
+	}
+	if gid == 0 {
+		return 0, fmt.Errorf("host group %q has gid 0, refusing to grant root group to vm-launch", kvmGroupName)
+	}
+
+	// #nosec G115 - ParseUint above bounds the value to 32 bits
+	return uint32(gid), nil
+}
+
+func withoutVMBackends(kinds []backend.Kind) []backend.Kind {
+	kept := make([]backend.Kind, 0, len(kinds))
+	for _, kind := range kinds {
+		if !backend.IsVM(kind) {
+			kept = append(kept, kind)
+		}
+	}
+	return kept
+}
+
+func checkExecutable(path string) error {
+	if path == "" {
+		return errors.New("no path given")
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", path)
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		return fmt.Errorf("%s is not executable", path)
+	}
+
+	return nil
+}
+
+// runscCell reports whether containerd runs every container of the cell
+// under runsc. An invalid runtime type reports false here and fails
+// WireContainerd instead.
+func (cmd *CommonCommand) runscCell() bool {
+	if !cmd.useContainerd() {
+		return false
+	}
+	policy, err := runcontainerd.ResolveRuntimePolicy(cmd.Containerd.RuntimeType)
+	return err == nil && policy.IsAlternative()
 }
 
 func (cmd *CommonCommand) useContainerd() bool {

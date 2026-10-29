@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"code.cloudfoundry.org/garden"
+	"code.cloudfoundry.org/guardian/backend"
 	"code.cloudfoundry.org/guardian/metrics"
 	"code.cloudfoundry.org/guardian/rundmc/runcontainerd"
 	"code.cloudfoundry.org/lager/v3"
@@ -60,9 +61,17 @@ func New(containerdClient *client.Client, context context.Context, ioFifoDir str
 	}
 }
 
+// runsc reports whether a container with spec runs under runsc: every
+// container when that is the cell's policy, otherwise one whose execution
+// backend annotation selects gVisor.
+func (n *Nerd) runsc(spec *specs.Spec) bool {
+	return n.policy == runcontainerd.RunscRuntime || backend.Kind(spec.Annotations[backend.AnnotationKey]) == backend.OCIGvisor
+}
+
 func (n *Nerd) Create(log lager.Logger, containerID string, spec *specs.Spec, hostUID, hostGID uint32, pio func() (io.Reader, io.Writer, io.Writer)) (result error) {
 	log.Debug("creating-container", lager.Data{"containerID": containerID})
-	if n.policy == runcontainerd.RunscRuntime {
+	runsc := n.runsc(spec)
+	if runsc {
 		spec.Windows = nil // runsc rejects the Windows section
 		if spec.Annotations == nil {
 			spec.Annotations = make(map[string]string)
@@ -81,7 +90,7 @@ func (n *Nerd) Create(log lager.Logger, containerID string, spec *specs.Spec, ho
 		}
 	}
 	containerOpts := []client.NewContainerOpts{client.WithSpec(spec)}
-	if n.policy == runcontainerd.RunscRuntime {
+	if runsc {
 		containerOpts = append(containerOpts, client.WithRuntime(runcontainerd.SupportedRuntimeType, runscRuntimeOptions()))
 	}
 	container, err := n.client.NewContainer(n.context, containerID, containerOpts...)
@@ -110,7 +119,7 @@ func (n *Nerd) Create(log lager.Logger, containerID string, spec *specs.Spec, ho
 
 	log.Debug("creating-task", lager.Data{"containerID": containerID})
 	var taskOpts []client.NewTaskOpts
-	if n.policy == runcontainerd.StockRuntime {
+	if !runsc {
 		// Stock runc needs explicit keyring and UID/GID task options;
 		// runsc manages its own keyring and UID/GID via the OCI spec.
 		taskOpts = append(taskOpts, client.WithNoNewKeyring, WithUIDAndGID(hostUID, hostGID))
@@ -222,7 +231,7 @@ func (n *Nerd) Delete(log lager.Logger, containerID string) (result error) {
 			result = n.releasePeaIO(containerID)
 		}
 	}()
-	_, task, err := n.loadContainerAndTask(log, containerID)
+	container, task, err := n.loadContainerAndTask(log, containerID)
 	if err != nil {
 		switch err.(type) {
 		case runcontainerd.ContainerNotFoundError:
@@ -239,8 +248,18 @@ func (n *Nerd) Delete(log lager.Logger, containerID string) (result error) {
 
 	log.Debug("deleting-task", lager.Data{"containerID": containerID})
 	// Only runsc needs the status: a stock task goes straight to Delete, so a
-	// dead shim cannot block it with a failed Status call.
-	if n.policy == runcontainerd.RunscRuntime {
+	// dead shim cannot block it with a failed Status call. On a stock cell a
+	// gVisor container is recognised by its runtime, which is read from the
+	// metadata loadContainerAndTask fetched.
+	runsc := n.policy == runcontainerd.RunscRuntime
+	if !runsc {
+		info, err := container.Info(n.context, client.WithoutRefreshedMetadata)
+		if err != nil {
+			return err
+		}
+		runsc = info.Runtime.Name == runcontainerd.SupportedRuntimeType
+	}
+	if runsc {
 		status, err := task.Status(n.context)
 		if err != nil {
 			return err
@@ -478,6 +497,34 @@ func (n *Nerd) GetContainerPID(log lager.Logger, containerID string) (uint32, er
 	}
 
 	return task.Pid(), nil
+}
+
+// KillAll sends signal to every process in the container's task, not only to
+// its init process, and returns without waiting for them to exit. A task whose
+// processes have all exited already is not an error. A missing container is.
+func (n *Nerd) KillAll(log lager.Logger, containerID string, signal syscall.Signal) error {
+	_, task, err := n.loadContainerAndTask(log, containerID)
+	if err != nil {
+		return err
+	}
+
+	log.Debug("killing-all-task-processes", lager.Data{"containerID": containerID, "signal": signal.String()})
+	if err := task.Kill(n.context, signal, client.WithKillAll); err != nil {
+		if taskAlreadyExited(err) {
+			log.Debug("task-processes-already-exited", lager.Data{"containerID": containerID})
+			return nil
+		}
+		return fmt.Errorf("killing all processes of task %s: %w", containerID, err)
+	}
+
+	return nil
+}
+
+// taskAlreadyExited reports whether a kill error means that no process was
+// left to signal. Both the runc and the runsc shims report that as NotFound.
+// The message check covers an error that reaches us without its NotFound code.
+func taskAlreadyExited(err error) bool {
+	return errdefs.IsNotFound(err) || strings.Contains(err.Error(), "process already finished")
 }
 
 func (n *Nerd) loadContainer(log lager.Logger, containerID string) (client.Container, error) {

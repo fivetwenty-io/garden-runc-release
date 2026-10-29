@@ -4,6 +4,7 @@ package runcontainerdfakes
 import (
 	"io"
 	"sync"
+	"syscall"
 
 	"code.cloudfoundry.org/guardian/rundmc/runcontainerd"
 	lager "code.cloudfoundry.org/lager/v3"
@@ -83,6 +84,19 @@ type FakeContainerManager struct {
 	getContainerPIDReturnsOnCall map[int]struct {
 		result1 uint32
 		result2 error
+	}
+	KillAllStub        func(lager.Logger, string, syscall.Signal) error
+	killAllMutex       sync.RWMutex
+	killAllArgsForCall []struct {
+		arg1 lager.Logger
+		arg2 string
+		arg3 syscall.Signal
+	}
+	killAllReturns struct {
+		result1 error
+	}
+	killAllReturnsOnCall map[int]struct {
+		result1 error
 	}
 	OOMEventsStub        func(lager.Logger) <-chan *events.TaskOOM
 	oOMEventsMutex       sync.RWMutex
@@ -478,6 +492,69 @@ func (fake *FakeContainerManager) GetContainerPIDReturnsOnCall(i int, result1 ui
 	}{result1, result2}
 }
 
+func (fake *FakeContainerManager) KillAll(arg1 lager.Logger, arg2 string, arg3 syscall.Signal) error {
+	fake.killAllMutex.Lock()
+	ret, specificReturn := fake.killAllReturnsOnCall[len(fake.killAllArgsForCall)]
+	fake.killAllArgsForCall = append(fake.killAllArgsForCall, struct {
+		arg1 lager.Logger
+		arg2 string
+		arg3 syscall.Signal
+	}{arg1, arg2, arg3})
+	stub := fake.KillAllStub
+	fakeReturns := fake.killAllReturns
+	fake.recordInvocation("KillAll", []interface{}{arg1, arg2, arg3})
+	fake.killAllMutex.Unlock()
+	if stub != nil {
+		return stub(arg1, arg2, arg3)
+	}
+	if specificReturn {
+		return ret.result1
+	}
+	return fakeReturns.result1
+}
+
+func (fake *FakeContainerManager) KillAllCallCount() int {
+	fake.killAllMutex.RLock()
+	defer fake.killAllMutex.RUnlock()
+	return len(fake.killAllArgsForCall)
+}
+
+func (fake *FakeContainerManager) KillAllCalls(stub func(lager.Logger, string, syscall.Signal) error) {
+	fake.killAllMutex.Lock()
+	defer fake.killAllMutex.Unlock()
+	fake.KillAllStub = stub
+}
+
+func (fake *FakeContainerManager) KillAllArgsForCall(i int) (lager.Logger, string, syscall.Signal) {
+	fake.killAllMutex.RLock()
+	defer fake.killAllMutex.RUnlock()
+	argsForCall := fake.killAllArgsForCall[i]
+	return argsForCall.arg1, argsForCall.arg2, argsForCall.arg3
+}
+
+func (fake *FakeContainerManager) KillAllReturns(result1 error) {
+	fake.killAllMutex.Lock()
+	defer fake.killAllMutex.Unlock()
+	fake.KillAllStub = nil
+	fake.killAllReturns = struct {
+		result1 error
+	}{result1}
+}
+
+func (fake *FakeContainerManager) KillAllReturnsOnCall(i int, result1 error) {
+	fake.killAllMutex.Lock()
+	defer fake.killAllMutex.Unlock()
+	fake.KillAllStub = nil
+	if fake.killAllReturnsOnCall == nil {
+		fake.killAllReturnsOnCall = make(map[int]struct {
+			result1 error
+		})
+	}
+	fake.killAllReturnsOnCall[i] = struct {
+		result1 error
+	}{result1}
+}
+
 func (fake *FakeContainerManager) OOMEvents(arg1 lager.Logger) <-chan *events.TaskOOM {
 	fake.oOMEventsMutex.Lock()
 	ret, specificReturn := fake.oOMEventsReturnsOnCall[len(fake.oOMEventsArgsForCall)]
@@ -809,6 +886,8 @@ func (fake *FakeContainerManager) Invocations() map[string][][]interface{} {
 	defer fake.execMutex.RUnlock()
 	fake.getContainerPIDMutex.RLock()
 	defer fake.getContainerPIDMutex.RUnlock()
+	fake.killAllMutex.RLock()
+	defer fake.killAllMutex.RUnlock()
 	fake.oOMEventsMutex.RLock()
 	defer fake.oOMEventsMutex.RUnlock()
 	fake.removeBundleMutex.RLock()

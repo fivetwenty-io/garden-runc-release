@@ -6,10 +6,12 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"syscall"
 
 	"code.cloudfoundry.org/guardian/rundmc"
 
 	"code.cloudfoundry.org/garden"
+	"code.cloudfoundry.org/guardian/backend"
 	"code.cloudfoundry.org/guardian/gardener"
 	"code.cloudfoundry.org/guardian/idmapper"
 	"code.cloudfoundry.org/guardian/rundmc/event"
@@ -27,6 +29,7 @@ type ContainerManager interface {
 	Start(log lager.Logger, containerID string) error
 	Delete(log lager.Logger, containerID string) error
 	Exec(log lager.Logger, containerID, processID string, spec *specs.Process, processIO func() (io.Reader, io.Writer, io.Writer, bool)) (BackingProcess, error)
+	KillAll(log lager.Logger, containerID string, signal syscall.Signal) error
 	State(log lager.Logger, containerID string) (int, string, error)
 	GetContainerPID(log lager.Logger, containerID string) (uint32, error)
 	OOMEvents(log lager.Logger) <-chan *apievents.TaskOOM
@@ -48,6 +51,9 @@ type ProcessManager interface {
 
 //counterfeiter:generate . ProcessBuilder
 type ProcessBuilder interface {
+	// CheckUser reports whether spec may run as user, the user that Exec
+	// resolved from the container's image, in bndl.
+	CheckUser(bndl goci.Bndl, spec garden.ProcessSpec, user *users.ExecUser) error
 	BuildProcess(bndl goci.Bndl, spec garden.ProcessSpec, user *users.ExecUser) *specs.Process
 }
 
@@ -92,6 +98,23 @@ type RunContainerd struct {
 	cleanupProcessDirsOnWait  bool
 	runtimeStopper            RuntimeStopper
 	peaRunner                 *RunContainerPea
+	backendDispatch           bool
+	gvisorStatser             Statser
+}
+
+// Option configures a RunContainerd.
+type Option func(*RunContainerd)
+
+// WithBackendDispatch makes RunContainerd look up which execution backend a
+// container uses before it executes in, attaches to, or reads metrics from
+// that container. A gVisor container then always runs its processes through
+// containerd and reports metrics through gvisorStatser, whatever the cell's
+// defaults are. Without it every container takes the cell's paths.
+func WithBackendDispatch(gvisorStatser Statser) Option {
+	return func(r *RunContainerd) {
+		r.backendDispatch = true
+		r.gvisorStatser = gvisorStatser
+	}
 }
 
 func New(containerManager ContainerManager,
@@ -105,8 +128,9 @@ func New(containerManager ContainerManager,
 	mkdirer Mkdirer,
 	peaHandlesGetter PeaHandlesGetter,
 	cleanupProcessDirsOnWait bool,
-	runtimeStopper RuntimeStopper) *RunContainerd {
-	return &RunContainerd{
+	runtimeStopper RuntimeStopper,
+	opts ...Option) *RunContainerd {
+	r := &RunContainerd{
 		containerManager:          containerManager,
 		processManager:            processManager,
 		processBuilder:            processBuilder,
@@ -120,6 +144,17 @@ func New(containerManager ContainerManager,
 		cleanupProcessDirsOnWait:  cleanupProcessDirsOnWait,
 		runtimeStopper:            runtimeStopper,
 	}
+
+	for _, opt := range opts {
+		opt(r)
+	}
+
+	return r
+}
+
+// isGvisor reports whether backend dispatch is on and bndl selects gVisor.
+func (r *RunContainerd) isGvisor(bndl goci.Bndl) bool {
+	return r.backendDispatch && backend.IsGvisor(backend.FromBundle(bndl))
 }
 
 func (r *RunContainerd) Create(log lager.Logger, id string, bundle goci.Bndl, pio garden.ProcessIO) error {
@@ -176,20 +211,34 @@ func updateAnnotationsIfNeeded(bundle *goci.Bndl) {
 	}
 }
 
+// Exec runs a process in the container. Processes in gVisor containers always
+// run through containerd, because runc cannot exec into a container that runsc
+// runs. Other processes run through containerd only when
+// useContainerdForProcesses is set, and through the runc execer otherwise.
 func (r *RunContainerd) Exec(log lager.Logger, containerID string, gardenProcessSpec garden.ProcessSpec, gardenIO garden.ProcessIO) (garden.Process, error) {
 	bundle, err := r.getBundle(log, containerID)
 	if err != nil {
 		return nil, err
 	}
 
-	if !r.useContainerdForProcesses {
+	if !r.useContainerdForProcesses && !r.isGvisor(bundle) {
 		return r.execer.ExecWithBndl(log, containerID, bundle, gardenProcessSpec, gardenIO)
 	}
 
+	if bundle.Spec.Root == nil || bundle.Spec.Root.Path == "" {
+		err := fmt.Errorf("container %s has no rootfs path in its spec", containerID)
+		log.Error("rootfs-path-missing", err)
+		return nil, err
+	}
 	rootfsPath := bundle.Spec.Root.Path
 
 	resolvedUser, err := r.userLookupper.Lookup(rootfsPath, gardenProcessSpec.User)
 	if err != nil {
+		return nil, err
+	}
+
+	if err := r.processBuilder.CheckUser(bundle, gardenProcessSpec, resolvedUser); err != nil {
+		log.Error("user-check-failed", err)
 		return nil, err
 	}
 
@@ -269,7 +318,17 @@ func (r *RunContainerd) Attach(log lager.Logger, sandboxID, processID string, io
 		}
 	}
 	if !r.useContainerdForProcesses {
-		return r.execer.Attach(log, sandboxID, processID, io)
+		gvisor := false
+		if r.backendDispatch {
+			bundle, err := r.getBundle(log, sandboxID)
+			if err != nil {
+				return nil, err
+			}
+			gvisor = r.isGvisor(bundle)
+		}
+		if !gvisor {
+			return r.execer.Attach(log, sandboxID, processID, io)
+		}
 	}
 
 	var process BackingProcess
@@ -324,8 +383,36 @@ func (r *RunContainerd) State(log lager.Logger, id string) (rundmc.State, error)
 	return rundmc.State{Pid: pid, Status: rundmc.Status(status)}, nil
 }
 
+// Stats reads the container's metrics. With backend dispatch, a gVisor
+// container reports them through the gVisor statser, because runc knows
+// nothing of containers that runsc runs. A process that has no bundle in
+// containerd, such as a pea that runc runs, goes to the cell's statser.
 func (r *RunContainerd) Stats(log lager.Logger, id string) (gardener.StatsContainerMetrics, error) {
+	if !r.backendDispatch {
+		return r.statser.Stats(log, id)
+	}
+
+	bundle, err := r.getBundle(log, id)
+	if err != nil {
+		if isNotFound(err) {
+			return r.statser.Stats(log, id)
+		}
+		return gardener.StatsContainerMetrics{}, err
+	}
+
+	if r.isGvisor(bundle) {
+		return r.gvisorStatser.Stats(log, id)
+	}
+
 	return r.statser.Stats(log, id)
+}
+
+// KillAll sends signal to every process in the container through containerd.
+// Stopping a gVisor container uses it, because the cgroup-based stopper finds
+// container processes through runc state, which runsc does not write.
+func (r *RunContainerd) KillAll(log lager.Logger, id string, signal syscall.Signal) error {
+	log.Debug("killing-all-processes", lager.Data{"id": id, "signal": signal.String()})
+	return r.containerManager.KillAll(log, id, signal)
 }
 
 func (r *RunContainerd) Events(log lager.Logger) (<-chan event.Event, error) {

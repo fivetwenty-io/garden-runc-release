@@ -69,7 +69,7 @@ func TestContainerizerWithoutContainerdUsesStockStrategies(t *testing.T) {
 			cmd.Containers.Dir = t.TempDir()
 			cmd.Containerd.RuntimeType = runtimeType
 			factory := runtimeWiringFactory{LinuxFactory: &LinuxFactory{config: cmd}}
-			containerizer, _, err := cmd.wireContainerizer(lager.NewLogger("runtime-wiring"), factory, nil, nil, 1, depot.NetworkDepot{}, nil)
+			containerizer, _, err := cmd.wireContainerizer(lager.NewLogger("runtime-wiring"), factory, nil, nil, 1, depot.NetworkDepot{}, nil, &executionBackends{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -127,7 +127,7 @@ func TestContainerizerWithContainerdUsesValidatedStrategies(t *testing.T) {
 					}
 				})
 				factory := runtimeWiringFactory{LinuxFactory: &LinuxFactory{config: cmd}}
-				containerizer, cleaner, err := cmd.wireContainerizer(lager.NewLogger("runtime-wiring"), factory, nil, nil, 1, depot.NetworkDepot{}, nil)
+				containerizer, cleaner, err := cmd.wireContainerizer(lager.NewLogger("runtime-wiring"), factory, nil, nil, 1, depot.NetworkDepot{}, nil, &executionBackends{})
 				wantError := ""
 				if test.wantError {
 					wantError = "unsupported containerd runtime type"

@@ -70,6 +70,11 @@ func (rpc *fixtureContainersServer) Get(context.Context, *containersapi.GetConta
 }
 
 func (rpc *fixtureContainersServer) Update(_ context.Context, request *containersapi.UpdateContainerRequest) (*containersapi.UpdateContainerResponse, error) {
+	// SetLabels sends only the labels under a field mask, so keep the rest of
+	// the stored container the way containerd does.
+	if rpc.stored != nil && request.Container.Runtime.GetName() == "" {
+		request.Container.Runtime = rpc.stored.Runtime
+	}
 	rpc.stored = request.Container
 	return &containersapi.UpdateContainerResponse{Container: request.Container}, nil
 }
@@ -299,6 +304,9 @@ func TestNerdRuntimePolicyCreatePayload(t *testing.T) {
 		{runtimeType: "io.containerd.runsc.v1", wantRuntime: "io.containerd.runsc.v1", annotations: map[string]string{"container-type": "pea", "sandbox-container": "garden-parent", "sentinel": "retained"}, wantContainerType: "container", wantSandboxID: "garden-parent"},
 		{runtimeType: "io.containerd.runsc.v1", wantRuntime: "io.containerd.runsc.v1", annotations: map[string]string{"container-type": "pea", "sandbox-container": "garden-parent"}, wantContainerType: "container", wantSandboxID: "garden-parent", wantTTY: true},
 		{runtimeType: "io.containerd.runc.v2", wantRuntime: "io.containerd.runc.v2", wantWindows: true, wantOptions: true, annotations: map[string]string{"container-type": "pea", "sandbox-container": "garden-parent"}, wantTTY: true},
+		{wantRuntime: "io.containerd.runsc.v1", annotations: map[string]string{"garden.execution-backend": "oci-gvisor"}, wantContainerType: "sandbox"},
+		{runtimeType: "io.containerd.runc.v2", wantRuntime: "io.containerd.runsc.v1", annotations: map[string]string{"garden.execution-backend": "oci-gvisor", "container-type": "pea", "sandbox-container": "garden-parent"}, wantContainerType: "container", wantSandboxID: "garden-parent"},
+		{wantRuntime: "io.containerd.runc.v2", wantWindows: true, wantOptions: true, annotations: map[string]string{"garden.execution-backend": "oci-runc"}},
 	} {
 		t.Run(test.runtimeType, func(t *testing.T) {
 			socketDir, err := os.MkdirTemp("", "nerd-policy-")

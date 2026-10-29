@@ -9,7 +9,9 @@ import (
 	"path/filepath"
 
 	"code.cloudfoundry.org/garden"
+	"code.cloudfoundry.org/guardian/backend"
 	"code.cloudfoundry.org/guardian/rundmc/goci"
+	"code.cloudfoundry.org/guardian/rundmc/processes"
 	"code.cloudfoundry.org/guardian/rundmc/runrunc"
 	fakes "code.cloudfoundry.org/guardian/rundmc/runrunc/runruncfakes"
 	"code.cloudfoundry.org/guardian/rundmc/users"
@@ -206,6 +208,27 @@ var _ = Describe("Execer", func() {
 			})
 		})
 
+		It("checks the resolved user against the bundle", func() {
+			Expect(processBuilder.CheckUserCallCount()).To(Equal(1))
+			actualBundle, actualProcessSpec, actualUser := processBuilder.CheckUserArgsForCall(0)
+			Expect(actualBundle).To(Equal(bndl))
+			Expect(actualProcessSpec).To(Equal(spec))
+			Expect(actualUser).To(Equal(user))
+		})
+
+		Context("when the resolved user is refused", func() {
+			BeforeEach(func() {
+				processBuilder.CheckUserReturns(errors.New("user-refused"))
+			})
+
+			It("returns the error before touching the container", func() {
+				Expect(execErr).To(MatchError("user-refused"))
+				Expect(mkdirer.MkdirAsCallCount()).To(Equal(0))
+				Expect(processBuilder.BuildProcessCallCount()).To(Equal(0))
+				Expect(execRunner.RunCallCount()).To(Equal(0))
+			})
+		})
+
 		Context("when preparing the working directory fails", func() {
 			BeforeEach(func() {
 				mkdirer.MkdirAsReturns(errors.New("mkdir"))
@@ -257,5 +280,93 @@ var _ = Describe("Execer", func() {
 		})
 
 		testExec()
+	})
+
+	Describe("the kvm gid from the image's user and group data in a vm container", func() {
+		const kvmGid = 991
+
+		var (
+			imageRootFS string
+			vmBndl      goci.Bndl
+		)
+
+		writeImageFiles := func(passwd, group string) {
+			Expect(os.WriteFile(filepath.Join(imageRootFS, "etc", "passwd"), []byte(passwd), 0644)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(imageRootFS, "etc", "group"), []byte(group), 0644)).To(Succeed())
+		}
+
+		builtProcess := func() specs.Process {
+			Expect(execRunner.RunCallCount()).To(Equal(1))
+			_, _, _, _, _, procJSON, _ := execRunner.RunArgsForCall(0)
+			var proc specs.Process
+			Expect(json.NewDecoder(procJSON).Decode(&proc)).To(Succeed())
+			return proc
+		}
+
+		BeforeEach(func() {
+			var err error
+			imageRootFS, err = os.MkdirTemp("", "execer-image")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(os.MkdirAll(filepath.Join(imageRootFS, "etc"), 0755)).To(Succeed())
+
+			userLookupper.LookupStub = func(_, name string) (*users.ExecUser, error) {
+				return users.LookupUser(imageRootFS, name)
+			}
+
+			vmBndl = bndl.WithProcess(specs.Process{ApparmorProfile: "garden-default"})
+			vmBndl.Spec.Annotations = map[string]string{backend.AnnotationKey: string(backend.VMQemu)}
+
+			builder := processes.NewBuilder(processes.EnvFunc(func(goci.Bndl, garden.ProcessSpec, int) []string { return nil }), nil, processes.WithKVMGid(kvmGid))
+			execer = runrunc.NewExecer(bundleLoader, builder, mkdirer, userLookupper, execRunner, pidGetter)
+
+			spec = garden.ProcessSpec{ID: "some-process-id", Path: "/tmp/lifecycle/diego-sshd", User: "vcap"}
+		})
+
+		AfterEach(func() {
+			Expect(os.RemoveAll(imageRootFS)).To(Succeed())
+		})
+
+		JustBeforeEach(func() {
+			_, execErr = execer.ExecWithBndl(logger, id, vmBndl, spec, pio)
+		})
+
+		Context("when the group file makes vcap a member of the kvm group", func() {
+			BeforeEach(func() {
+				writeImageFiles("vcap:x:2000:2000::/home/vcap:/bin/sh\n", "vcap:x:2000:\nkvm:x:991:vcap\n")
+			})
+
+			It("runs the process without the kvm gid", func() {
+				Expect(execErr).NotTo(HaveOccurred())
+				proc := builtProcess()
+				Expect(proc.User.GID).To(Equal(uint32(2000)))
+				Expect(proc.User.AdditionalGids).NotTo(ContainElement(uint32(kvmGid)))
+			})
+
+			Context("and the process is the wrapped vm-launch process", func() {
+				BeforeEach(func() {
+					spec.Path = processes.VMLaunchPath
+					spec = processes.MarkVMLaunch(spec)
+				})
+
+				It("runs it with the kvm gid and the unconfined AppArmor profile", func() {
+					Expect(execErr).NotTo(HaveOccurred())
+					proc := builtProcess()
+					Expect(proc.User.AdditionalGids).To(ContainElement(uint32(kvmGid)))
+					Expect(proc.ApparmorProfile).To(Equal("unconfined"))
+				})
+			})
+		})
+
+		Context("when the passwd file gives vcap the kvm gid as its primary gid", func() {
+			BeforeEach(func() {
+				writeImageFiles("vcap:x:2000:991::/home/vcap:/bin/sh\n", "vcap:x:2000:\n")
+			})
+
+			It("refuses the process before preparing or running it", func() {
+				Expect(execErr).To(MatchError(processes.ErrKVMPrimaryGid))
+				Expect(mkdirer.MkdirAsCallCount()).To(Equal(0))
+				Expect(execRunner.RunCallCount()).To(Equal(0))
+			})
+		})
 	})
 })

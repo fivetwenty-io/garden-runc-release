@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 
 	"code.cloudfoundry.org/garden"
+	"code.cloudfoundry.org/guardian/backend"
+	"code.cloudfoundry.org/guardian/rundmc/bundlerules"
 	"code.cloudfoundry.org/guardian/rundmc/goci"
 	"code.cloudfoundry.org/guardian/rundmc/processes"
 	fakes "code.cloudfoundry.org/guardian/rundmc/processes/processesfakes"
@@ -85,6 +87,607 @@ var _ = Describe("ProcBuilder", func() {
 
 	AfterEach(func() {
 		Expect(os.RemoveAll(tmpRootFS)).To(Succeed())
+	})
+
+	Describe("the kvm gid of a vm-launch process", func() {
+		const kvmGid = 108
+
+		var (
+			builderOpts  []processes.Option
+			annotations  map[string]string
+			marked       bool
+			preparedProc *specs.Process
+		)
+
+		BeforeEach(func() {
+			builderOpts = []processes.Option{processes.WithKVMGid(kvmGid)}
+			annotations = map[string]string{backend.AnnotationKey: string(backend.VMQemu)}
+			processSpec.Path = bundlerules.VMLaunchMountPath
+			processSpec.Env = []string{"A=b"}
+			marked = true
+		})
+
+		JustBeforeEach(func() {
+			bndl.Spec.Annotations = annotations
+			if marked {
+				processSpec = processes.MarkVMLaunch(processSpec)
+			}
+			procBuilder = processes.NewBuilder(envDeterminer, nonRootMaxCaps, builderOpts...)
+			preparedProc = procBuilder.BuildProcess(bndl, processSpec, user)
+		})
+
+		for _, kind := range []backend.Kind{backend.VMQemu, backend.VMFirecracker} {
+			kind := kind
+
+			Context("with a "+string(kind)+" bundle", func() {
+				BeforeEach(func() {
+					annotations = map[string]string{backend.AnnotationKey: string(kind)}
+				})
+
+				It("appends the kvm gid after the user's own supplementary gids", func() {
+					Expect(preparedProc.User.AdditionalGids).To(Equal([]uint32{5, 6, 7, kvmGid}))
+				})
+
+				Context("when the user already has the kvm gid", func() {
+					BeforeEach(func() {
+						user.Sgids = []int{5, kvmGid}
+					})
+
+					It("does not add it twice", func() {
+						Expect(preparedProc.User.AdditionalGids).To(Equal([]uint32{5, kvmGid}))
+					})
+				})
+
+				Context("when the user has no supplementary gids", func() {
+					BeforeEach(func() {
+						user.Sgids = nil
+					})
+
+					It("carries only the kvm gid", func() {
+						Expect(preparedProc.User.AdditionalGids).To(Equal([]uint32{kvmGid}))
+					})
+				})
+
+				Context("when the process is not vm-launch", func() {
+					BeforeEach(func() {
+						processSpec.Path = "/tmp/lifecycle/launcher"
+					})
+
+					It("leaves the gids alone", func() {
+						Expect(preparedProc.User.AdditionalGids).To(Equal([]uint32{5, 6, 7}))
+					})
+
+					Context("and the user has the kvm gid as a supplementary gid", func() {
+						BeforeEach(func() {
+							user.Sgids = []int{5, kvmGid, 7, kvmGid}
+						})
+
+						It("removes every copy of it and keeps the other gids in order", func() {
+							Expect(preparedProc.User.AdditionalGids).To(Equal([]uint32{5, 7}))
+						})
+					})
+
+					Context("and a supplementary gid narrows to the kvm gid", func() {
+						BeforeEach(func() {
+							user.Sgids = []int{5, kvmGid + 1<<32}
+						})
+
+						It("removes it, because the runtime would receive the kvm gid", func() {
+							Expect(preparedProc.User.AdditionalGids).To(Equal([]uint32{5}))
+						})
+					})
+				})
+
+				It("removes the provenance marker before building the environment", func() {
+					Expect(envDeterminer.EnvForCallCount()).To(Equal(1))
+					_, envSpec, _ := envDeterminer.EnvForArgsForCall(0)
+					Expect(envSpec.Env).To(Equal([]string{"A=b"}))
+				})
+
+				Context("when vm-launch is run directly, without the containerizer's marker", func() {
+					BeforeEach(func() {
+						marked = false
+					})
+
+					It("gets no kvm gid", func() {
+						Expect(preparedProc.User.AdditionalGids).To(Equal([]uint32{5, 6, 7}))
+					})
+
+					It("keeps the bundle's AppArmor profile", func() {
+						Expect(preparedProc.ApparmorProfile).To(Equal("default-profile"))
+					})
+
+					Context("and the user has the kvm gid as a supplementary gid", func() {
+						BeforeEach(func() {
+							user.Sgids = []int{kvmGid, 6}
+						})
+
+						It("removes it", func() {
+							Expect(preparedProc.User.AdditionalGids).To(Equal([]uint32{6}))
+						})
+					})
+				})
+
+				Context("when the marker carries another value", func() {
+					BeforeEach(func() {
+						marked = false
+						processSpec.Env = append(processSpec.Env, "__GARDEN_VM_LAUNCH_WRAPPED=yes", "__GARDEN_VM_LAUNCH_WRAPPED")
+					})
+
+					It("gets no kvm gid and the variants are removed", func() {
+						Expect(preparedProc.User.AdditionalGids).To(Equal([]uint32{5, 6, 7}))
+						_, envSpec, _ := envDeterminer.EnvForArgsForCall(0)
+						Expect(envSpec.Env).To(Equal([]string{"A=b"}))
+					})
+
+					Context("and the user has the kvm gid as a supplementary gid", func() {
+						BeforeEach(func() {
+							user.Sgids = []int{5, kvmGid}
+						})
+
+						It("removes it", func() {
+							Expect(preparedProc.User.AdditionalGids).To(Equal([]uint32{5}))
+						})
+					})
+				})
+			})
+		}
+
+		Describe("the AppArmor profile of the wrapped vm-launch process", func() {
+			// runc applies the container's profile to an exec'd process unless
+			// the process names a non-empty profile, so an empty profile here
+			// would leave QEMU confined.
+			It("is set to unconfined in a vm-qemu bundle, so QEMU can signal its vCPU threads", func() {
+				Expect(preparedProc.ApparmorProfile).To(Equal("unconfined"))
+			})
+
+			Context("in a vm-qemu bundle without an AppArmor profile", func() {
+				BeforeEach(func() {
+					bndl = bndl.WithApparmorProfile("")
+				})
+
+				It("names no profile, because there is nothing to lift", func() {
+					Expect(preparedProc.ApparmorProfile).To(BeEmpty())
+				})
+			})
+
+			Context("in a vm-firecracker bundle", func() {
+				BeforeEach(func() {
+					annotations = map[string]string{backend.AnnotationKey: string(backend.VMFirecracker)}
+				})
+
+				It("keeps the bundle's profile", func() {
+					Expect(preparedProc.ApparmorProfile).To(Equal("default-profile"))
+				})
+			})
+
+			Context("for any other process in a vm-qemu bundle", func() {
+				BeforeEach(func() {
+					processSpec.Path = "/tmp/lifecycle/diego-sshd"
+				})
+
+				It("keeps the bundle's profile even when marked", func() {
+					Expect(preparedProc.ApparmorProfile).To(Equal("default-profile"))
+				})
+			})
+		})
+
+		for _, annotation := range []map[string]string{
+			nil,
+			{backend.AnnotationKey: string(backend.OCIRunc)},
+			{backend.AnnotationKey: string(backend.OCIGvisor)},
+		} {
+			annotation := annotation
+
+			Context("with a non-vm bundle annotated", func() {
+				BeforeEach(func() {
+					annotations = annotation
+				})
+
+				It("leaves the gids alone even for the vm-launch path", func() {
+					Expect(preparedProc.User.AdditionalGids).To(Equal([]uint32{5, 6, 7}))
+				})
+
+				Context("when the user has the kvm gid as a supplementary gid", func() {
+					BeforeEach(func() {
+						user.Sgids = []int{5, kvmGid}
+						processSpec.Path = "/tmp/lifecycle/launcher"
+					})
+
+					It("keeps it, because the container has no kvm device", func() {
+						Expect(preparedProc.User.AdditionalGids).To(Equal([]uint32{5, kvmGid}))
+					})
+				})
+			})
+		}
+
+		Context("when no kvm gid is configured", func() {
+			BeforeEach(func() {
+				builderOpts = nil
+			})
+
+			It("leaves the gids alone", func() {
+				Expect(preparedProc.User.AdditionalGids).To(Equal([]uint32{5, 6, 7}))
+			})
+
+			Context("and an unwrapped process has gid 0 as a supplementary gid", func() {
+				BeforeEach(func() {
+					user.Sgids = []int{0, 5}
+					processSpec.Path = "/tmp/lifecycle/launcher"
+				})
+
+				It("keeps it", func() {
+					Expect(preparedProc.User.AdditionalGids).To(Equal([]uint32{0, 5}))
+				})
+			})
+		})
+
+		Context("when the kvm gid is configured as zero", func() {
+			BeforeEach(func() {
+				builderOpts = []processes.Option{processes.WithKVMGid(0)}
+			})
+
+			It("leaves the gids alone", func() {
+				Expect(preparedProc.User.AdditionalGids).To(Equal([]uint32{5, 6, 7}))
+			})
+		})
+	})
+
+	Describe("confinement of every process in a vm-* bundle", func() {
+		var (
+			annotations  map[string]string
+			preparedProc *specs.Process
+		)
+
+		BeforeEach(func() {
+			bndl = bndl.WithCapabilities("CAP_FOO", "CAP_SETGID", "CAP_BAR")
+			user.Gid = 0
+			processSpec.Env = []string{"A=b", "__GARDEN_VM_LAUNCH_WRAPPED=1"}
+		})
+
+		JustBeforeEach(func() {
+			bndl.Spec.Annotations = annotations
+			procBuilder = processes.NewBuilder(envDeterminer, nonRootMaxCaps, processes.WithKVMGid(108))
+			preparedProc = procBuilder.BuildProcess(bndl, processSpec, user)
+		})
+
+		for _, kind := range []backend.Kind{backend.VMQemu, backend.VMFirecracker} {
+			kind := kind
+
+			Context("with a "+string(kind)+" bundle", func() {
+				BeforeEach(func() {
+					annotations = map[string]string{backend.AnnotationKey: string(kind)}
+				})
+
+				It("drops CAP_SETGID from every capability set, even for root", func() {
+					Expect(preparedProc.Capabilities.Bounding).To(Equal([]string{"CAP_FOO", "CAP_BAR"}))
+					Expect(preparedProc.Capabilities.Inheritable).To(Equal([]string{"CAP_FOO", "CAP_BAR"}))
+					Expect(preparedProc.Capabilities.Permitted).To(Equal([]string{"CAP_FOO", "CAP_BAR"}))
+					Expect(preparedProc.Capabilities.Effective).To(BeNil())
+					Expect(preparedProc.Capabilities.Ambient).To(BeNil())
+				})
+
+				It("sets NoNewPrivileges", func() {
+					Expect(preparedProc.NoNewPrivileges).To(BeTrue())
+				})
+
+				It("removes a marker from a process that is not vm-launch", func() {
+					_, envSpec, _ := envDeterminer.EnvForArgsForCall(0)
+					Expect(envSpec.Env).To(Equal([]string{"A=b"}))
+					Expect(preparedProc.User.AdditionalGids).To(Equal([]uint32{5, 6, 7}))
+				})
+			})
+		}
+
+		for _, annotation := range []map[string]string{
+			nil,
+			{backend.AnnotationKey: string(backend.OCIRunc)},
+			{backend.AnnotationKey: string(backend.OCIGvisor)},
+		} {
+			annotation := annotation
+
+			Context("with a non-vm bundle", func() {
+				BeforeEach(func() {
+					annotations = annotation
+				})
+
+				It("keeps CAP_SETGID", func() {
+					Expect(preparedProc.Capabilities.Bounding).To(Equal([]string{"CAP_FOO", "CAP_SETGID", "CAP_BAR"}))
+				})
+
+				It("passes NoNewPrivileges from the bundle", func() {
+					Expect(preparedProc.NoNewPrivileges).To(BeFalse())
+				})
+
+				It("passes the environment through unchanged", func() {
+					_, envSpec, _ := envDeterminer.EnvForArgsForCall(0)
+					Expect(envSpec.Env).To(Equal([]string{"A=b", "__GARDEN_VM_LAUNCH_WRAPPED=1"}))
+				})
+			})
+		}
+	})
+
+	Describe("CheckUser", func() {
+		const kvmGid = 991
+
+		var (
+			builderOpts []processes.Option
+			annotations map[string]string
+			checkErr    error
+		)
+
+		BeforeEach(func() {
+			builderOpts = []processes.Option{processes.WithKVMGid(kvmGid)}
+			annotations = map[string]string{backend.AnnotationKey: string(backend.VMQemu)}
+			processSpec.User = "vcap"
+			user.Gid = 2000
+			user.Sgids = []int{kvmGid}
+		})
+
+		JustBeforeEach(func() {
+			bndl.Spec.Annotations = annotations
+			procBuilder = processes.NewBuilder(envDeterminer, nonRootMaxCaps, builderOpts...)
+			checkErr = procBuilder.CheckUser(bndl, processSpec, user)
+		})
+
+		for _, kind := range []backend.Kind{backend.VMQemu, backend.VMFirecracker} {
+			kind := kind
+
+			Context("with a "+string(kind)+" bundle", func() {
+				BeforeEach(func() {
+					annotations = map[string]string{backend.AnnotationKey: string(kind)}
+				})
+
+				It("accepts a user that has the kvm gid only as a supplementary gid, which BuildProcess removes", func() {
+					Expect(checkErr).NotTo(HaveOccurred())
+				})
+
+				Context("when the user's primary gid is the kvm gid", func() {
+					BeforeEach(func() {
+						user.Gid = kvmGid
+					})
+
+					It("refuses the process and names the user, the gid, and the backend", func() {
+						Expect(checkErr).To(MatchError(processes.ErrKVMPrimaryGid))
+						Expect(checkErr.Error()).To(ContainSubstring(`process user "vcap" resolves to gid 991 in this ` + string(kind) + ` container`))
+					})
+
+					Context("and the process is the wrapped vm-launch process", func() {
+						BeforeEach(func() {
+							processSpec.Path = processes.VMLaunchPath
+							processSpec = processes.MarkVMLaunch(processSpec)
+						})
+
+						It("refuses it too", func() {
+							Expect(checkErr).To(MatchError(processes.ErrKVMPrimaryGid))
+						})
+					})
+				})
+
+				Context("when the user's primary gid narrows to the kvm gid", func() {
+					BeforeEach(func() {
+						user.Gid = kvmGid + 1<<32
+					})
+
+					It("refuses the process, because the runtime would receive the kvm gid", func() {
+						Expect(checkErr).To(MatchError(processes.ErrKVMPrimaryGid))
+					})
+				})
+			})
+		}
+
+		for _, annotation := range []map[string]string{
+			nil,
+			{backend.AnnotationKey: string(backend.OCIRunc)},
+			{backend.AnnotationKey: string(backend.OCIGvisor)},
+		} {
+			annotation := annotation
+
+			Context("with a non-vm bundle", func() {
+				BeforeEach(func() {
+					annotations = annotation
+					user.Gid = kvmGid
+				})
+
+				It("accepts the kvm gid as a primary gid, because the container has no kvm device", func() {
+					Expect(checkErr).NotTo(HaveOccurred())
+				})
+			})
+		}
+
+		Context("when no kvm gid is configured", func() {
+			BeforeEach(func() {
+				builderOpts = nil
+				user.Gid = 0
+			})
+
+			It("accepts every user, root included", func() {
+				Expect(checkErr).NotTo(HaveOccurred())
+			})
+		})
+
+		Context("when there is no resolved user", func() {
+			BeforeEach(func() {
+				user = nil
+			})
+
+			It("returns an error", func() {
+				Expect(checkErr).To(MatchError("check process user: no resolved user"))
+			})
+		})
+	})
+
+	Describe("the kvm gid in the image's /etc/passwd and /etc/group", func() {
+		const kvmGid = 991
+
+		var (
+			imageRootFS string
+			lookupName  string
+			lookedUp    *users.ExecUser
+			checkErr    error
+			prepared    *specs.Process
+		)
+
+		writeImageFile := func(name, content string) {
+			Expect(os.WriteFile(filepath.Join(imageRootFS, "etc", name), []byte(content), 0644)).To(Succeed())
+		}
+
+		BeforeEach(func() {
+			var err error
+			imageRootFS, err = os.MkdirTemp("", "image-rootfs")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(os.MkdirAll(filepath.Join(imageRootFS, "etc"), 0755)).To(Succeed())
+
+			writeImageFile("passwd", "root:x:0:0:root:/root:/bin/sh\nvcap:x:2000:2000::/home/vcap:/bin/sh\n")
+			writeImageFile("group", "root:x:0:\nvcap:x:2000:\nkvm:x:991:vcap\n")
+
+			bndl.Spec.Annotations = map[string]string{backend.AnnotationKey: string(backend.VMFirecracker)}
+			processSpec.User = "vcap"
+			processSpec.Path = "/tmp/lifecycle/diego-sshd"
+			lookupName = "vcap"
+		})
+
+		AfterEach(func() {
+			Expect(os.RemoveAll(imageRootFS)).To(Succeed())
+		})
+
+		JustBeforeEach(func() {
+			var err error
+			lookedUp, err = users.LookupUser(imageRootFS, lookupName)
+			Expect(err).NotTo(HaveOccurred())
+
+			procBuilder = processes.NewBuilder(envDeterminer, nonRootMaxCaps, processes.WithKVMGid(kvmGid))
+			checkErr = procBuilder.CheckUser(bndl, processSpec, lookedUp)
+			prepared = procBuilder.BuildProcess(bndl, processSpec, lookedUp)
+		})
+
+		Context("when the image's group file makes vcap a member of the kvm group", func() {
+			It("resolves the kvm gid as a supplementary gid", func() {
+				Expect(lookedUp.Sgids).To(ContainElement(kvmGid))
+			})
+
+			It("accepts the user but removes the kvm gid from a process that is not the wrapped vm-launch", func() {
+				Expect(checkErr).NotTo(HaveOccurred())
+				Expect(prepared.User.GID).To(Equal(uint32(2000)))
+				Expect(prepared.User.AdditionalGids).NotTo(ContainElement(uint32(kvmGid)))
+			})
+
+			Context("and the process is the wrapped vm-launch process", func() {
+				BeforeEach(func() {
+					processSpec.Path = processes.VMLaunchPath
+					processSpec = processes.MarkVMLaunch(processSpec)
+				})
+
+				It("still carries the kvm gid, once", func() {
+					Expect(checkErr).NotTo(HaveOccurred())
+					count := 0
+					for _, gid := range prepared.User.AdditionalGids {
+						if gid == kvmGid {
+							count++
+						}
+					}
+					Expect(count).To(Equal(1))
+				})
+			})
+		})
+
+		Context("when the image's passwd file gives vcap the kvm gid as its primary gid", func() {
+			BeforeEach(func() {
+				writeImageFile("passwd", "root:x:0:0:root:/root:/bin/sh\nvcap:x:2000:991::/home/vcap:/bin/sh\n")
+				writeImageFile("group", "root:x:0:\nvcap:x:2000:\n")
+			})
+
+			It("refuses the process", func() {
+				Expect(lookedUp.Gid).To(Equal(kvmGid))
+				Expect(checkErr).To(MatchError(processes.ErrKVMPrimaryGid))
+			})
+		})
+
+		Context("when the process user names the kvm gid as uid:gid", func() {
+			BeforeEach(func() {
+				lookupName = "2000:991"
+				processSpec.User = lookupName
+			})
+
+			It("refuses the process", func() {
+				Expect(lookedUp.Gid).To(Equal(kvmGid))
+				Expect(checkErr).To(MatchError(processes.ErrKVMPrimaryGid))
+			})
+		})
+
+		Context("when the image's root user has the kvm gid as its primary gid", func() {
+			BeforeEach(func() {
+				writeImageFile("passwd", "root:x:0:991:root:/root:/bin/sh\n")
+				lookupName = ""
+				processSpec.User = ""
+			})
+
+			It("refuses a process that runs as the default user", func() {
+				Expect(lookedUp.Uid).To(Equal(0))
+				Expect(lookedUp.Gid).To(Equal(kvmGid))
+				Expect(checkErr).To(MatchError(processes.ErrKVMPrimaryGid))
+			})
+		})
+	})
+
+	Describe("the vm-launch provenance marker", func() {
+		It("is added once by MarkVMLaunch and found by UnmarkVMLaunch", func() {
+			original := garden.ProcessSpec{Path: processes.VMLaunchPath, Env: []string{"A=b", "__GARDEN_VM_LAUNCH_WRAPPED=forged"}}
+
+			marked := processes.MarkVMLaunch(original)
+			Expect(marked.Env).To(Equal([]string{"A=b", "__GARDEN_VM_LAUNCH_WRAPPED=1"}))
+			Expect(original.Env).To(Equal([]string{"A=b", "__GARDEN_VM_LAUNCH_WRAPPED=forged"}))
+
+			unmarked, found := processes.UnmarkVMLaunch(marked)
+			Expect(found).To(BeTrue())
+			Expect(unmarked.Env).To(Equal([]string{"A=b"}))
+			Expect(marked.Env).To(Equal([]string{"A=b", "__GARDEN_VM_LAUNCH_WRAPPED=1"}))
+		})
+
+		It("reports no marker for variants but still removes them", func() {
+			spec, found := processes.UnmarkVMLaunch(garden.ProcessSpec{Env: []string{"__GARDEN_VM_LAUNCH_WRAPPED", "B=c", "__GARDEN_VM_LAUNCH_WRAPPED=0"}})
+			Expect(found).To(BeFalse())
+			Expect(spec.Env).To(Equal([]string{"B=c"}))
+		})
+
+		It("returns the spec as is when there is no marker", func() {
+			env := []string{"A=b"}
+			spec, found := processes.UnmarkVMLaunch(garden.ProcessSpec{Env: env})
+			Expect(found).To(BeFalse())
+			Expect(spec.Env).To(Equal(env))
+
+			spec, found = processes.UnmarkVMLaunch(garden.ProcessSpec{})
+			Expect(found).To(BeFalse())
+			Expect(spec.Env).To(BeNil())
+		})
+
+		It("does not treat a similarly named variable as the marker", func() {
+			spec, found := processes.UnmarkVMLaunch(garden.ProcessSpec{Env: []string{"__GARDEN_VM_LAUNCH_WRAPPED_X=1"}})
+			Expect(found).To(BeFalse())
+			Expect(spec.Env).To(Equal([]string{"__GARDEN_VM_LAUNCH_WRAPPED_X=1"}))
+		})
+	})
+
+	Describe("WithoutCapability", func() {
+		It("returns nil for nil", func() {
+			Expect(processes.WithoutCapability(nil, "CAP_SETGID")).To(BeNil())
+		})
+
+		It("removes the capability from every set without touching the input", func() {
+			shared := []string{"CAP_A", "CAP_SETGID"}
+			caps := &specs.LinuxCapabilities{Bounding: shared, Effective: shared, Inheritable: shared, Permitted: shared, Ambient: []string{"CAP_SETGID"}}
+
+			out := processes.WithoutCapability(caps, "CAP_SETGID")
+			Expect(out).To(Equal(&specs.LinuxCapabilities{
+				Bounding:    []string{"CAP_A"},
+				Effective:   []string{"CAP_A"},
+				Inheritable: []string{"CAP_A"},
+				Permitted:   []string{"CAP_A"},
+				Ambient:     []string{},
+			}))
+			Expect(shared).To(Equal([]string{"CAP_A", "CAP_SETGID"}))
+			Expect(caps.Ambient).To(Equal([]string{"CAP_SETGID"}))
+		})
 	})
 
 	Describe("the built process", func() {

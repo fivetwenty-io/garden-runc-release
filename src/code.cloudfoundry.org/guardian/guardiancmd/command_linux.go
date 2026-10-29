@@ -35,10 +35,12 @@ import (
 	"code.cloudfoundry.org/guardian/sysinfo"
 	"code.cloudfoundry.org/guardian/throttle"
 	"code.cloudfoundry.org/lager/v3"
+	"github.com/containerd/containerd/api/services/tasks/v1"
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/cmd/containerd-shim-runc-v2/process"
 	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/errdefs/pkg/errgrpc"
 	"github.com/opencontainers/cgroups"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
@@ -52,6 +54,10 @@ type LinuxFactory struct {
 	signallerFactory *signals.SignallerFactory
 	uidMappings      idmapper.MappingList
 	gidMappings      idmapper.MappingList
+
+	// taskPids lists the processes of a containerd task. WireContainerd sets
+	// it.
+	taskPids rundmc.TaskPidLister
 }
 
 func (cmd *CommonCommand) NewGardenFactory() GardenFactory {
@@ -172,7 +178,8 @@ func (f *LinuxFactory) WireContainerd(processBuilder *processes.ProcBuilder, use
 		statser = runcontainerd.NewContainerdStatser(nerd)
 	}
 
-	containerdManager := runcontainerd.New(nerd, nerd, processBuilder, userLookupper, wireExecer(pidGetter), statser, f.config.Containerd.UseContainerdForProcesses, cgroupManager, f.WireMkdirer(), peaHandlesGetter, f.config.Containers.CleanupProcessDirsOnWait, nerdStopper)
+	containerdManager := runcontainerd.New(nerd, nerd, processBuilder, userLookupper, wireExecer(pidGetter), statser, f.config.Containerd.UseContainerdForProcesses, cgroupManager, f.WireMkdirer(), peaHandlesGetter, f.config.Containers.CleanupProcessDirsOnWait, nerdStopper, f.config.wiredBackends.runContainerdOptions(runcontainerd.NewContainerdStatser(nerd))...)
+	f.taskPids = &containerdTaskPids{client: containerdClient, context: ctx}
 
 	peaRunner := runcontainerd.NewRunContainerPea(containerdManager, nerd, volumizer)
 	containerdManager.SetPeaRunner(peaRunner)
@@ -181,6 +188,32 @@ func (f *LinuxFactory) WireContainerd(processBuilder *processes.ProcBuilder, use
 	peaBundleLoader := runcontainerd.NewBndlLoader(nerd)
 
 	return containerdManager, peaRunner, pidGetter, privilegeChecker, peaBundleLoader, policy, nil
+}
+
+// WireTaskPidLister returns the lister of containerd task processes, or nil
+// when WireContainerd has not run.
+func (f *LinuxFactory) WireTaskPidLister() rundmc.TaskPidLister {
+	return f.taskPids
+}
+
+// containerdTaskPids lists the processes containerd reports for a task.
+type containerdTaskPids struct {
+	client  *client.Client
+	context context.Context
+}
+
+func (t *containerdTaskPids) TaskPids(log lager.Logger, id string) ([]uint32, error) {
+	resp, err := t.client.TaskService().ListPids(t.context, &tasks.ListPidsRequest{ContainerID: id})
+	if err != nil {
+		return nil, errgrpc.ToNative(err)
+	}
+
+	pids := make([]uint32, 0, len(resp.GetProcesses()))
+	for _, info := range resp.GetProcesses() {
+		pids = append(pids, info.GetPid())
+	}
+	log.Debug("listed-task-pids", lager.Data{"handle": id, "pids": pids})
+	return pids, nil
 }
 
 func (f *LinuxFactory) WireCPUCgrouper() (rundmc.CPUCgrouper, error) {
