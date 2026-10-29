@@ -322,7 +322,7 @@ var _ = Describe("guest network", func() {
 			bb := filepath.Join(dir, "busybox")
 			Expect(os.WriteFile(bb, []byte("busybox"), 0o755)).To(Succeed())
 			out := filepath.Join(dir, "initrd.cpio.gz")
-			Expect(writeInitramfs(out, bb, "httpd -f -p $PORT", testNonce, nw)).To(Succeed())
+			Expect(writeInitramfs(out, bb, "httpd -f -p $PORT", testNonce, nw, nil)).To(Succeed())
 
 			raw, err := os.ReadFile(out)
 			Expect(err).NotTo(HaveOccurred())
@@ -338,11 +338,11 @@ var _ = Describe("guest network", func() {
 			Expect(string(byName["rvm/env"].data)).To(Equal("export PORT='8080'\n"))
 			Expect(string(byName["etc/resolv.conf"].data)).To(Equal("nameserver 10.0.2.3\n"))
 			Expect(byName["etc/resolv.conf"].mode).To(Equal(uint32(0o100644)))
-			Expect(string(byName["init"].data)).To(Equal(initScript(testNonce, true)))
+			Expect(string(byName["init"].data)).To(Equal(initScript(testNonce, true, false)))
 		})
 
 		It("configures the network and environment before the start tag", func() {
-			script := initScript(testNonce, true)
+			script := initScript(testNonce, true, false)
 			start := strings.Index(script, "echo RVM_START_"+testNonce)
 			Expect(start).To(BeNumerically(">", 0))
 			for _, step := range []string{
@@ -362,13 +362,13 @@ var _ = Describe("guest network", func() {
 		})
 
 		It("sets the mtu of eth0 only when /rvm/net names one, and before it brings eth0 up", func() {
-			script := initScript(testNonce, true)
+			script := initScript(testNonce, true, false)
 			Expect(script).To(ContainSubstring("\nif [ -n \"${RVM_MTU:-}\" ]; then\n\tip link set eth0 mtu \"$RVM_MTU\" || echo \"vm-launch guest setup: setting the mtu of eth0 to $RVM_MTU failed; keeping the default mtu\"\nfi\n"))
 			Expect(strings.Index(script, `mtu "$RVM_MTU"`)).To(BeNumerically("<", strings.Index(script, "ip link set eth0 up")))
 		})
 
 		It("keeps booting with the default mtu when the guest rejects the mtu, and still fails on the other network steps", func() {
-			script := initScript(testNonce, true)
+			script := initScript(testNonce, true, false)
 			Expect(script).NotTo(ContainSubstring(`mtu "$RVM_MTU" || rvm_fail`))
 
 			// Run the real network setup with an ip that fails the mtu step only.
@@ -384,7 +384,7 @@ var _ = Describe("guest network", func() {
 				"/rvm/env", filepath.Join(dir, "env"),
 				"/sys/class/net/eth0", filepath.Join(dir, "sys/class/net/eth0"),
 				"reboot -f", "echo REBOOT",
-			).Replace(guestNetworkSetup)
+			).Replace(guestFailFunc + guestNetworkSetup)
 
 			cmd := exec.Command("/bin/sh", "-c", setup+"echo REACHED_START")
 			cmd.Env = []string{"PATH=" + dir + ":/bin:/usr/bin"}
@@ -400,7 +400,7 @@ var _ = Describe("guest network", func() {
 		})
 
 		It("leaves the init of a guest without network unchanged", func() {
-			script := initScript(testNonce, false)
+			script := initScript(testNonce, false, false)
 			Expect(script).NotTo(ContainSubstring("/rvm/net"))
 			Expect(script).NotTo(ContainSubstring("/rvm/env"))
 			Expect(script).NotTo(ContainSubstring("ip "))
@@ -408,7 +408,7 @@ var _ = Describe("guest network", func() {
 
 		It("is valid shell", func() {
 			for _, networked := range []bool{false, true} {
-				out, err := exec.Command("/bin/sh", "-n", "-c", initScript(testNonce, networked)).CombinedOutput()
+				out, err := exec.Command("/bin/sh", "-n", "-c", initScript(testNonce, networked, false)).CombinedOutput()
 				Expect(err).NotTo(HaveOccurred(), string(out))
 			}
 		})
@@ -419,9 +419,9 @@ var _ = Describe("guest network", func() {
 		nw := &network{port: 8080}
 
 		It("adds a user-mode NIC that forwards PORT to QEMU", func() {
-			argv, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/tmp/w/initrd.cpio.gz", nw)
+			argv, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/tmp/w/initrd.cpio.gz", nw, "")
 			Expect(err).NotTo(HaveOccurred())
-			plain, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/tmp/w/initrd.cpio.gz", nil)
+			plain, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/tmp/w/initrd.cpio.gz", nil, "")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(argv).To(Equal(append(plain,
 				"-netdev", "user,id=n0,net=10.0.2.0/24,hostfwd=tcp:0.0.0.0:8080-10.0.2.15:8080",
@@ -431,7 +431,7 @@ var _ = Describe("guest network", func() {
 
 		It("attaches the Firecracker guest to garden's tap device", func() {
 			work := GinkgoT().TempDir()
-			argv, err := hypervisorArgv(backend.VMFirecracker, art, work, work+"/initrd.cpio.gz", nw)
+			argv, err := hypervisorArgv(backend.VMFirecracker, art, work, work+"/initrd.cpio.gz", nw, "")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(argv).To(Equal([]string{art + "/firecracker/firecracker", "--no-api", "--config-file", work + "/fc.json"}))
 

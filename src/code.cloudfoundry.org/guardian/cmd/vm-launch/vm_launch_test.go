@@ -157,7 +157,7 @@ var _ = Describe("initramfs", func() {
 		bb := filepath.Join(dir, "busybox")
 		Expect(os.WriteFile(bb, busybox, 0o755)).To(Succeed())
 		out := filepath.Join(dir, "initrd.cpio.gz")
-		Expect(writeInitramfs(out, bb, "echo 'hi there'; exit 3\n", testNonce, nil)).To(Succeed())
+		Expect(writeInitramfs(out, bb, "echo 'hi there'; exit 3\n", testNonce, nil, nil)).To(Succeed())
 		return out
 	}
 
@@ -184,11 +184,11 @@ var _ = Describe("initramfs", func() {
 		Expect(byName["bin/busybox"].data).To(Equal(busybox))
 		Expect(string(byName["rvm/cmd"].data)).To(Equal("echo 'hi there'; exit 3\n"))
 		Expect(byName["init"].mode).To(Equal(uint32(0o100755)))
-		Expect(string(byName["init"].data)).To(Equal(initScript(testNonce, false)))
+		Expect(string(byName["init"].data)).To(Equal(initScript(testNonce, false, false)))
 	})
 
 	It("writes an /init that brackets the command with nonce markers and reboots", func() {
-		script := initScript(testNonce, false)
+		script := initScript(testNonce, false, false)
 		Expect(script).To(HavePrefix("#!/bin/busybox sh\n"))
 		Expect(script).To(ContainSubstring("\necho RVM_START_" + testNonce + "\n"))
 		Expect(script).To(ContainSubstring("\nsh /rvm/cmd </dev/null\necho RVM_EXIT_" + testNonce + "=$?\nreboot -f\n"))
@@ -221,7 +221,7 @@ var _ = Describe("initramfs", func() {
 		Expect(err).NotTo(HaveOccurred(), string(out))
 
 		Expect(os.ReadFile(filepath.Join(dest, "bin/busybox"))).To(Equal(busybox))
-		Expect(os.ReadFile(filepath.Join(dest, "init"))).To(Equal([]byte(initScript(testNonce, false))))
+		Expect(os.ReadFile(filepath.Join(dest, "init"))).To(Equal([]byte(initScript(testNonce, false, false))))
 		Expect(os.ReadFile(filepath.Join(dest, "rvm/cmd"))).To(Equal([]byte("echo 'hi there'; exit 3\n")))
 		info, err := os.Stat(filepath.Join(dest, "init"))
 		Expect(err).NotTo(HaveOccurred())
@@ -235,14 +235,14 @@ var _ = Describe("initramfs", func() {
 
 	It("refuses to overwrite an existing file", func() {
 		archive := writeArchive()
-		err := writeInitramfs(archive, filepath.Join(filepath.Dir(archive), "busybox"), "true", testNonce, nil)
+		err := writeInitramfs(archive, filepath.Join(filepath.Dir(archive), "busybox"), "true", testNonce, nil, nil)
 		Expect(err).To(MatchError(ContainSubstring("creating initramfs")))
 	})
 
 	It("fails when busybox is missing or not a regular file", func() {
 		dir := GinkgoT().TempDir()
-		Expect(writeInitramfs(filepath.Join(dir, "a"), filepath.Join(dir, "nope"), "true", testNonce, nil)).To(MatchError(ContainSubstring("opening busybox")))
-		Expect(writeInitramfs(filepath.Join(dir, "b"), dir, "true", testNonce, nil)).To(MatchError(ContainSubstring("not a regular file")))
+		Expect(writeInitramfs(filepath.Join(dir, "a"), filepath.Join(dir, "nope"), "true", testNonce, nil, nil)).To(MatchError(ContainSubstring("opening busybox")))
+		Expect(writeInitramfs(filepath.Join(dir, "b"), dir, "true", testNonce, nil, nil)).To(MatchError(ContainSubstring("not a regular file")))
 	})
 
 	Describe("cpioWriter", func() {
@@ -460,7 +460,7 @@ var _ = Describe("hypervisor command lines", func() {
 	const art = "/opt/garden-vm/artifacts"
 
 	It("builds the QEMU microvm command line through the bundled loader", func() {
-		argv, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/tmp/w/initrd.cpio.gz", nil)
+		argv, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/tmp/w/initrd.cpio.gz", nil, "")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(argv).To(Equal([]string{
 			art + "/qemu/ld-linux-x86-64.so.2", "--library-path", art + "/qemu/lib",
@@ -474,7 +474,7 @@ var _ = Describe("hypervisor command lines", func() {
 
 	It("writes the Firecracker config and builds its command line", func() {
 		work := GinkgoT().TempDir()
-		argv, err := hypervisorArgv(backend.VMFirecracker, art, work, work+"/initrd.cpio.gz", nil)
+		argv, err := hypervisorArgv(backend.VMFirecracker, art, work, work+"/initrd.cpio.gz", nil, "")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(argv).To(Equal([]string{art + "/firecracker/firecracker", "--no-api", "--config-file", work + "/fc.json"}))
 
@@ -494,7 +494,7 @@ var _ = Describe("hypervisor command lines", func() {
 	})
 
 	It("rejects other backends", func() {
-		_, err := hypervisorArgv(backend.OCIRunc, art, "/w", "/w/i", nil)
+		_, err := hypervisorArgv(backend.OCIRunc, art, "/w", "/w/i", nil, "")
 		Expect(err).To(MatchError(ContainSubstring("unsupported backend")))
 	})
 

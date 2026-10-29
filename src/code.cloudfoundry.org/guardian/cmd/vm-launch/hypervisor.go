@@ -97,7 +97,14 @@ func checkArtifacts(kind backend.Kind, root string) error {
 // connection to the guest. That needs no privileges, and guest egress leaves
 // from the container's network namespace, so application security groups
 // still apply.
-func qemuArgv(root, initrd string, nw *network) []string {
+//
+// With a volume, drivePath names the volume image, and the guest gets it as
+// its one virtio-blk drive. The format is pinned to raw, so QEMU never probes
+// the guest-written image for a format header such as a qcow2 backing file.
+// I/O errors, ENOSPC and EDQUOT included, reach the guest as errors instead
+// of pausing the VM. QEMU's own image locking is off because vm-launch holds
+// the flock that decides who writes the image.
+func qemuArgv(root, initrd string, nw *network, drivePath string) []string {
 	art := func(rel string) string { return filepath.Join(root, rel) }
 	argv := []string{
 		art(artQEMULoader),
@@ -117,19 +124,41 @@ func qemuArgv(root, initrd string, nw *network) []string {
 		"-initrd", initrd,
 		"-append", qemuKernelArgs,
 	}
-	if nw == nil {
-		return argv
+	if nw != nil {
+		port := strconv.Itoa(nw.port)
+		argv = append(argv,
+			"-netdev", "user,id=n0,net="+qemuNetwork+",hostfwd=tcp:0.0.0.0:"+port+"-"+qemuGuestIP+":"+port,
+			"-device", "virtio-net-device,netdev=n0",
+		)
 	}
-	port := strconv.Itoa(nw.port)
-	return append(argv,
-		"-netdev", "user,id=n0,net="+qemuNetwork+",hostfwd=tcp:0.0.0.0:"+port+"-"+qemuGuestIP+":"+port,
-		"-device", "virtio-net-device,netdev=n0",
-	)
+	if drivePath != "" {
+		argv = append(argv,
+			"-drive", "if=none,id="+volumeDriveID+",file="+drivePath+
+				",format=raw,cache=writeback,aio=threads,file.locking=off,werror=report,rerror=report,discard=ignore",
+			"-device", "virtio-blk-device,drive="+volumeDriveID,
+		)
+	}
+	return argv
+}
+
+// The volume drive. vm-launch hands the hypervisor the locked image as file
+// descriptor volumeDriveFD, and the hypervisor opens it through
+// /proc/self/fd, which reopens exactly the inode vm-launch checked. The
+// container path of the volume therefore never reaches a QEMU option
+// string or the Firecracker configuration.
+const (
+	volumeDriveFD = 3
+	volumeDriveID = "vol0"
+)
+
+// volumeDrivePath is the path the hypervisor opens the volume image by.
+func volumeDrivePath() string {
+	return "/proc/self/fd/" + strconv.Itoa(volumeDriveFD)
 }
 
 type firecrackerConfig struct {
 	BootSource        firecrackerBootSource         `json:"boot-source"`
-	Drives            []struct{}                    `json:"drives"`
+	Drives            []firecrackerDrive            `json:"drives"`
 	MachineConfig     firecrackerMachineConfig      `json:"machine-config"`
 	NetworkInterfaces []firecrackerNetworkInterface `json:"network-interfaces,omitempty"`
 }
@@ -145,23 +174,54 @@ type firecrackerMachineConfig struct {
 	MemSizeMiB int `json:"mem_size_mib"`
 }
 
+// firecrackerDrive is a Firecracker block device. Firecracker drives are
+// always raw.
+type firecrackerDrive struct {
+	DriveID      string `json:"drive_id"`
+	PathOnHost   string `json:"path_on_host"`
+	IsRootDevice bool   `json:"is_root_device"`
+	IsReadOnly   bool   `json:"is_read_only"`
+	CacheType    string `json:"cache_type"`
+	IOEngine     string `json:"io_engine"`
+}
+
+// Firecracker drive settings. Writeback passes guest flushes on to the
+// image; the default, Unsafe, drops them. The Sync engine is the supported
+// one. The volume is not the root device, so Firecracker adds no root= to
+// the kernel command line; the guest boots from the initramfs.
+const (
+	fcDriveCacheType = "Writeback"
+	fcDriveIOEngine  = "Sync"
+)
+
 type firecrackerNetworkInterface struct {
 	IfaceID     string `json:"iface_id"`
 	GuestMAC    string `json:"guest_mac"`
 	HostDevName string `json:"host_dev_name"`
 }
 
-// firecrackerConfigJSON returns the --config-file content: no drives, and a
-// network interface on Garden's tap device only when there is a network.
-func firecrackerConfigJSON(root, initrd string, nw *network) ([]byte, error) {
+// firecrackerConfigJSON returns the --config-file content: the volume image
+// as the only drive when drivePath is set, and a network interface on
+// Garden's tap device only when there is a network.
+func firecrackerConfigJSON(root, initrd string, nw *network, drivePath string) ([]byte, error) {
 	cfg := firecrackerConfig{
 		BootSource: firecrackerBootSource{
 			KernelImagePath: filepath.Join(root, artVmlinux),
 			InitrdPath:      initrd,
 			BootArgs:        firecrackerKernelArgs,
 		},
-		Drives:        []struct{}{},
+		Drives:        []firecrackerDrive{},
 		MachineConfig: firecrackerMachineConfig{VCPUCount: guestVCPUs, MemSizeMiB: guestMemoryMiB},
+	}
+	if drivePath != "" {
+		cfg.Drives = []firecrackerDrive{{
+			DriveID:      volumeDriveID,
+			PathOnHost:   drivePath,
+			IsRootDevice: false,
+			IsReadOnly:   false,
+			CacheType:    fcDriveCacheType,
+			IOEngine:     fcDriveIOEngine,
+		}}
 	}
 	if nw != nil {
 		cfg.NetworkInterfaces = []firecrackerNetworkInterface{{IfaceID: "eth0", GuestMAC: fcGuestMAC, HostDevName: fcTapName}}
@@ -175,12 +235,14 @@ func firecrackerArgv(root, configPath string) []string {
 
 // hypervisorArgv returns the command line for kind, writing any config file
 // it needs into workDir. workDir holds only data files; nothing runs from it.
-func hypervisorArgv(kind backend.Kind, root, workDir, initrd string, nw *network) ([]string, error) {
+// drivePath is the volume image path the hypervisor opens, or empty without
+// a volume.
+func hypervisorArgv(kind backend.Kind, root, workDir, initrd string, nw *network, drivePath string) ([]string, error) {
 	switch kind {
 	case backend.VMQemu:
-		return qemuArgv(root, initrd, nw), nil
+		return qemuArgv(root, initrd, nw, drivePath), nil
 	case backend.VMFirecracker:
-		cfg, err := firecrackerConfigJSON(root, initrd, nw)
+		cfg, err := firecrackerConfigJSON(root, initrd, nw, drivePath)
 		if err != nil {
 			return nil, fmt.Errorf("encoding firecracker config: %w", err)
 		}

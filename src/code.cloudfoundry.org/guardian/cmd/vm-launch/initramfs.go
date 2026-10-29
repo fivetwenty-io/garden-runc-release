@@ -110,13 +110,25 @@ func exitTag(nonce string) string  { return "RVM_EXIT_" + nonce + "=" }
 // that ends the hypervisor. poweroff -f hangs Firecracker, so it is not used.
 //
 // A networked guest first brings up lo and eth0 from /rvm/net and exports
-// /rvm/env. When that fails, /init reboots before the start tag, so
-// vm-launch reports a guest that never started its command and shows the
-// console output, which ends with the failed step.
-func initScript(nonce string, networked bool) string {
+// /rvm/env. A guest with a volume then formats the volume image when it is
+// blank and mounts it, and after the command it syncs and unmounts it before
+// it reports the status. When a setup step fails, /init reboots before the
+// start tag, so vm-launch reports a guest that never started its command and
+// shows the console output, which ends with the failed step.
+func initScript(nonce string, networked, volume bool) string {
 	setup := ""
+	if networked || volume {
+		setup = guestFailFunc
+	}
 	if networked {
-		setup = guestNetworkSetup
+		setup += guestNetworkSetup
+	}
+	if volume {
+		setup += guestVolumeSetup
+	}
+	run := "sh /rvm/cmd </dev/null\necho " + exitTag(nonce) + "$?\n"
+	if volume {
+		run = "sh /rvm/cmd </dev/null\n" + guestVolumeTeardown + "echo " + exitTag(nonce) + "$rvm_status\n"
 	}
 	return `#!/bin/busybox sh
 /bin/busybox --install -s /bin
@@ -124,18 +136,19 @@ export PATH=/bin
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev 2>/dev/null
-` + setup + `echo ` + startTag(nonce) + `
-sh /rvm/cmd </dev/null
-echo ` + exitTag(nonce) + `$?
-reboot -f
+` + setup + `echo ` + startTag(nonce) + "\n" + run + `reboot -f
 `
 }
+
+// guestFailFunc defines rvm_fail, which a setup step calls when it fails: it
+// names the step on the console and reboots before the start tag.
+const guestFailFunc = `rvm_fail() { echo "vm-launch guest setup: $1"; reboot -f; exit 1; }
+`
 
 // guestNetworkSetup configures the guest NIC. The virtio-net driver is built
 // into the kernel and normally has eth0 ready before /init runs; the wait
 // covers a late probe.
-const guestNetworkSetup = `rvm_fail() { echo "vm-launch guest setup: $1"; reboot -f; exit 1; }
-. /rvm/net
+const guestNetworkSetup = `. /rvm/net
 ip link set lo up || rvm_fail "bringing up lo failed"
 n=0
 while [ ! -e /sys/class/net/eth0 ]; do
@@ -152,11 +165,71 @@ ip route add default via "$RVM_GATEWAY" dev eth0 || rvm_fail "adding the default
 . /rvm/env
 `
 
+// guestVolumeDevice is the guest block device of the volume image. The guest
+// boots from the initramfs and has no other drive, so the image is the first
+// virtio-blk device.
+const guestVolumeDevice = "/dev/vda"
+
+// Guest scratch files of the blank check. They live under /rvm, which no
+// volume path may use, so that an app's container_dir can never collide with
+// them.
+const (
+	guestVolumeHead = "/rvm/volume-head"
+	guestVolumeUsed = "/rvm/volume-used"
+)
+
+// guestVolumeSetup formats and mounts the volume image. It formats only an
+// image whose first 64 KiB the guest itself reads as all zero, which is a new
+// image or one whose creator died before the first boot; the host never
+// tells it an image is new. A read error is a setup failure, never a blank
+// image. An image that is not blank and does not mount is never formatted:
+// that is a setup failure for an operator to look at. busybox mke2fs makes
+// ext2, which the kernel's ext4 driver mounts. The sync and dirsync options
+// put every completed write on the image before the syscall returns,
+// because the hypervisors stop at once on SIGTERM, without a guest shutdown.
+const guestVolumeSetup = `. /rvm/mounts
+n=0
+while [ ! -b "$RVM_VOLUME_DEVICE" ]; do
+	n=$((n + 1))
+	[ "$n" -gt 5 ] && rvm_fail "no $RVM_VOLUME_DEVICE block device for the volume"
+	sleep 1
+done
+mkdir -p "$RVM_VOLUME_PATH" || rvm_fail "creating $RVM_VOLUME_PATH failed"
+dd if="$RVM_VOLUME_DEVICE" of=` + guestVolumeHead + ` bs=4096 count=16 || rvm_fail "reading the start of $RVM_VOLUME_DEVICE failed"
+tr -d '\000' <` + guestVolumeHead + ` >` + guestVolumeUsed + ` || rvm_fail "checking whether $RVM_VOLUME_DEVICE is blank failed"
+rvm_blank=
+[ -s ` + guestVolumeHead + ` ] && [ ! -s ` + guestVolumeUsed + ` ] && rvm_blank=1
+rm -f ` + guestVolumeHead + ` ` + guestVolumeUsed + `
+if [ -n "$rvm_blank" ]; then
+	mke2fs -F -m 0 -L rvm-volume "$RVM_VOLUME_DEVICE" || rvm_fail "formatting the blank volume image $RVM_VOLUME_IMAGE failed"
+	mount -t ext4 -o sync,dirsync,noatime,errors=remount-ro "$RVM_VOLUME_DEVICE" "$RVM_VOLUME_PATH" || rvm_fail "mounting the newly formatted volume image $RVM_VOLUME_IMAGE at $RVM_VOLUME_PATH failed"
+else
+	mount -t ext4 -o sync,dirsync,noatime,errors=remount-ro "$RVM_VOLUME_DEVICE" "$RVM_VOLUME_PATH" || rvm_fail "mounting the volume image $RVM_VOLUME_IMAGE at $RVM_VOLUME_PATH failed; it is not blank, so vm-launch will not format it; inspect or delete $RVM_VOLUME_IMAGE on the volume"
+fi
+`
+
+// guestVolumeTeardown follows the command: it keeps the command's status,
+// flushes, and unmounts the volume. A failed unmount loses nothing, because
+// the mount is synchronous and sync has run, so it is reported and the
+// status stays the command's.
+const guestVolumeTeardown = `rvm_status=$?
+sync
+umount "$RVM_VOLUME_PATH" 2>/dev/null || echo "vm-launch guest: unmounting $RVM_VOLUME_PATH failed; data was already synced"
+`
+
+// mountsFile returns the guest /rvm/mounts, which /init sources before it
+// mounts the volume.
+func mountsFile(v *guestVolume) string {
+	return "RVM_VOLUME_DEVICE=" + guestVolumeDevice + "\n" +
+		"RVM_VOLUME_PATH=" + shellQuote(v.ContainerDir) + "\n" +
+		"RVM_VOLUME_IMAGE=" + shellQuote(v.ImageName) + "\n"
+}
+
 // writeInitramfs writes a gzip-compressed newc initramfs to dst holding a
 // static busybox, the console and null device nodes, the command script at
 // /rvm/cmd, and the /init that runs it. With a network it also holds
-// /rvm/net, /rvm/env, and /etc/resolv.conf.
-func writeInitramfs(dst, busyboxPath, command, nonce string, nw *network) error {
+// /rvm/net, /rvm/env, and /etc/resolv.conf, and with a volume /rvm/mounts.
+func writeInitramfs(dst, busyboxPath, command, nonce string, nw *network, vol *guestVolume) error {
 	busybox, err := os.Open(busyboxPath)
 	if err != nil {
 		return fmt.Errorf("opening busybox: %w", err)
@@ -174,7 +247,7 @@ func writeInitramfs(dst, busyboxPath, command, nonce string, nw *network) error 
 	if err != nil {
 		return fmt.Errorf("creating initramfs: %w", err)
 	}
-	if err := writeInitramfsArchive(out, busybox, info.Size(), command, nonce, nw); err != nil {
+	if err := writeInitramfsArchive(out, busybox, info.Size(), command, nonce, nw, vol); err != nil {
 		out.Close()
 		return fmt.Errorf("writing initramfs %s: %w", dst, err)
 	}
@@ -184,7 +257,7 @@ func writeInitramfs(dst, busyboxPath, command, nonce string, nw *network) error 
 	return nil
 }
 
-func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, command, nonce string, nw *network) error {
+func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, command, nonce string, nw *network, vol *guestVolume) error {
 	buf := bufio.NewWriter(w)
 	gz := gzip.NewWriter(buf)
 	cw := newCPIOWriter(gz)
@@ -192,7 +265,7 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, co
 		return func() error { return cw.File(name, 0o644, int64(len(content)), strings.NewReader(content)) }
 	}
 
-	init := initScript(nonce, nw != nil)
+	init := initScript(nonce, nw != nil, vol != nil)
 	steps := []func() error{
 		func() error { return cw.Dir("bin", 0o755) },
 		func() error { return cw.Dir("dev", 0o755) },
@@ -212,6 +285,9 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, co
 	)
 	if nw != nil {
 		steps = append(steps, file("rvm/net", netFile(nw)), file("rvm/env", nw.env), file("etc/resolv.conf", nw.resolvConf))
+	}
+	if vol != nil {
+		steps = append(steps, file("rvm/mounts", mountsFile(vol)))
 	}
 	steps = append(steps,
 		func() error { return cw.File("init", 0o755, int64(len(init)), strings.NewReader(init)) },
