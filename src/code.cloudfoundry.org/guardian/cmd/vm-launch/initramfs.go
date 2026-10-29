@@ -270,19 +270,36 @@ func createInitramfsMemfd() (int, error) {
 	return fd, err
 }
 
+// guestContents is what the initramfs holds for one guest besides busybox.
+type guestContents struct {
+	// command is the guest command, /rvm/cmd.
+	command string
+	// nonce makes the console markers of /init (see startTag).
+	nonce string
+	// nw is the guest network, which run always builds.
+	nw *network
+	// env is the guest environment, /rvm/env (see buildGuestEnv).
+	env string
+	// vol is the guest volume, or nil without one.
+	vol *guestVolume
+	// caBundle is the guest's CA bundle (see guestCABundle), or nil when
+	// there is no certificate to trust.
+	caBundle []byte
+}
+
 // newInitramfs builds the guest initramfs (see writeInitramfs) in a sealed
 // memfd and returns it, so the archive never touches a disk. Its memory is
 // charged to the container and lasts while any process holds a descriptor
 // for it. The descriptor is close-on-exec: vm-launch passes it to the
 // hypervisor as an extra file, which the hypervisor opens through
 // /proc/self/fd, and closes its own copy once the hypervisor has started.
-func newInitramfs(busyboxPath, command, nonce string, nw *network, guestEnv string, vol *guestVolume) (*os.File, error) {
+func newInitramfs(busyboxPath string, g guestContents) (*os.File, error) {
 	fd, err := createInitramfsMemfd()
 	if err != nil {
 		return nil, fmt.Errorf("creating the initramfs memfd: %w", err)
 	}
 	f := os.NewFile(uintptr(fd), "memfd:"+initramfsName)
-	if err := writeInitramfs(f, busyboxPath, command, nonce, nw, guestEnv, vol); err != nil {
+	if err := writeInitramfs(f, busyboxPath, g); err != nil {
 		f.Close()
 		return nil, err
 	}
@@ -311,10 +328,13 @@ func addSeals(f *os.File, seals int) error {
 // writeInitramfs writes a gzip-compressed newc initramfs to dst holding a
 // static busybox, the console and null device nodes, the command script at
 // /rvm/cmd, the guest network's /rvm/net and /etc/resolv.conf, the guest
-// environment guestEnv as /rvm/env with mode 0600, and the /init that runs
-// it. With a volume it also holds /rvm/mounts. nw is the guest network,
-// which run always builds.
-func writeInitramfs(dst *os.File, busyboxPath, command, nonce string, nw *network, guestEnv string, vol *guestVolume) error {
+// environment as /rvm/env with mode 0600, and the /init that runs it. With a
+// volume it also holds /rvm/mounts, and with a CA bundle it holds that at
+// /etc/ssl/certs/ca-certificates.crt.
+func writeInitramfs(dst *os.File, busyboxPath string, g guestContents) error {
+	if g.nw == nil {
+		return errors.New("writing the initramfs: no guest network")
+	}
 	busybox, err := os.Open(busyboxPath)
 	if err != nil {
 		return fmt.Errorf("opening busybox: %w", err)
@@ -328,13 +348,13 @@ func writeInitramfs(dst *os.File, busyboxPath, command, nonce string, nw *networ
 		return fmt.Errorf("busybox %s is not a regular file", busyboxPath)
 	}
 
-	if err := writeInitramfsArchive(dst, busybox, info.Size(), command, nonce, nw, guestEnv, vol); err != nil {
+	if err := writeInitramfsArchive(dst, busybox, info.Size(), g); err != nil {
 		return fmt.Errorf("writing the initramfs: %w", err)
 	}
 	return nil
 }
 
-func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, command, nonce string, nw *network, guestEnv string, vol *guestVolume) error {
+func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, g guestContents) error {
 	buf := bufio.NewWriter(w)
 	gz := gzip.NewWriter(buf)
 	cw := newCPIOWriter(gz)
@@ -342,7 +362,7 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, co
 		return func() error { return cw.File(name, perm, int64(len(content)), strings.NewReader(content)) }
 	}
 
-	init := initScript(nonce, vol != nil)
+	init := initScript(g.nonce, g.vol != nil)
 	steps := []func() error{
 		func() error { return cw.Dir("bin", 0o755) },
 		func() error { return cw.Dir("dev", 0o755) },
@@ -354,13 +374,21 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, co
 		func() error { return cw.Dir("tmp", 0o1777) },
 		func() error { return cw.Dir("rvm", 0o755) },
 		func() error { return cw.File("bin/busybox", 0o755, busyboxSize, busybox) },
-		file("rvm/cmd", 0o644, command),
-		file("rvm/net", 0o644, netFile(nw)),
-		file("rvm/env", 0o600, guestEnv),
-		file("etc/resolv.conf", 0o644, nw.resolvConf),
+		file("rvm/cmd", 0o644, g.command),
+		file("rvm/net", 0o644, netFile(g.nw)),
+		file("rvm/env", 0o600, g.env),
+		file("etc/resolv.conf", 0o644, g.nw.resolvConf),
 	}
-	if vol != nil {
-		steps = append(steps, file("rvm/mounts", 0o644, mountsFile(vol)))
+	if g.vol != nil {
+		steps = append(steps, file("rvm/mounts", 0o644, mountsFile(g.vol)))
+	}
+	if len(g.caBundle) > 0 {
+		bundle := strings.TrimPrefix(guestCABundlePath, "/")
+		steps = append(steps,
+			func() error { return cw.Dir(path.Dir(path.Dir(bundle)), 0o755) },
+			func() error { return cw.Dir(path.Dir(bundle), 0o755) },
+			file(bundle, 0o644, string(g.caBundle)),
+		)
 	}
 	steps = append(steps,
 		func() error { return cw.File("init", 0o755, int64(len(init)), strings.NewReader(init)) },

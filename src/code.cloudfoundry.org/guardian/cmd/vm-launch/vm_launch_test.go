@@ -104,6 +104,12 @@ func taskNetwork() *network {
 // the guest gets.
 const noGuestEnv = ""
 
+// taskGuest returns the initramfs contents of a task that runs command, with
+// no guest environment, no volume, and no CA bundle.
+func taskGuest(command string) guestContents {
+	return guestContents{command: command, nonce: testNonce, nw: taskNetwork(), env: noGuestEnv}
+}
+
 // buildInitramfs builds an initramfs through newInitramfs, with busybox as
 // the busybox binary and an empty guest environment, and returns the
 // archive.
@@ -116,7 +122,7 @@ func buildInitramfs(busybox []byte, command string, nw *network, vol *guestVolum
 func buildInitramfsWithEnv(busybox []byte, command string, nw *network, guestEnv string, vol *guestVolume) []byte {
 	bb := filepath.Join(GinkgoT().TempDir(), "busybox")
 	Expect(os.WriteFile(bb, busybox, 0o755)).To(Succeed())
-	f, err := newInitramfs(bb, command, testNonce, nw, guestEnv, vol)
+	f, err := newInitramfs(bb, guestContents{command: command, nonce: testNonce, nw: nw, env: guestEnv, vol: vol})
 	Expect(err).NotTo(HaveOccurred())
 	defer f.Close()
 	return fileBytes(f)
@@ -269,7 +275,7 @@ var _ = Describe("initramfs", func() {
 			bb := filepath.Join(GinkgoT().TempDir(), "busybox")
 			Expect(os.WriteFile(bb, busybox, 0o755)).To(Succeed())
 			var err error
-			f, err = newInitramfs(bb, "true", testNonce, taskNetwork(), noGuestEnv, nil)
+			f, err = newInitramfs(bb, taskGuest("true"))
 			Expect(err).NotTo(HaveOccurred())
 			DeferCleanup(func() { _ = f.Close() })
 		})
@@ -359,7 +365,7 @@ var _ = Describe("initramfs", func() {
 
 		It("asks for MFD_NOEXEC_SEAL first", func() {
 			kernel(nil)
-			f, err := newInitramfs(bb, "true", testNonce, taskNetwork(), noGuestEnv, nil)
+			f, err := newInitramfs(bb, taskGuest("true"))
 			Expect(err).NotTo(HaveOccurred())
 			defer f.Close()
 			Expect(calls).To(Equal([]int{unix.MFD_CLOEXEC | unix.MFD_ALLOW_SEALING | unix.MFD_NOEXEC_SEAL}))
@@ -367,7 +373,7 @@ var _ = Describe("initramfs", func() {
 
 		It("falls back to the plain flags on a kernel that rejects MFD_NOEXEC_SEAL", func() {
 			kernel(unix.EINVAL)
-			f, err := newInitramfs(bb, "true", testNonce, taskNetwork(), noGuestEnv, nil)
+			f, err := newInitramfs(bb, taskGuest("true"))
 			Expect(err).NotTo(HaveOccurred())
 			defer f.Close()
 			Expect(calls).To(Equal([]int{
@@ -383,7 +389,7 @@ var _ = Describe("initramfs", func() {
 		It("returns any other error without trying again, and holds no memfd", func() {
 			kernel(unix.EACCES)
 			held := heldInitramfs()
-			_, err := newInitramfs(bb, "true", testNonce, taskNetwork(), noGuestEnv, nil)
+			_, err := newInitramfs(bb, taskGuest("true"))
 			Expect(err).To(MatchError("creating the initramfs memfd: permission denied"))
 			Expect(errors.Is(err, unix.EACCES)).To(BeTrue())
 			Expect(calls).To(HaveLen(1))
@@ -394,9 +400,9 @@ var _ = Describe("initramfs", func() {
 	It("fails when busybox is missing or not a regular file, and leaves no memfd behind", func() {
 		dir := GinkgoT().TempDir()
 		held := heldInitramfs()
-		_, err := newInitramfs(filepath.Join(dir, "nope"), "true", testNonce, taskNetwork(), noGuestEnv, nil)
+		_, err := newInitramfs(filepath.Join(dir, "nope"), taskGuest("true"))
 		Expect(err).To(MatchError(ContainSubstring("opening busybox")))
-		_, err = newInitramfs(dir, "true", testNonce, taskNetwork(), noGuestEnv, nil)
+		_, err = newInitramfs(dir, taskGuest("true"))
 		Expect(err).To(MatchError(ContainSubstring("not a regular file")))
 		Expect(heldInitramfs()).To(Equal(held))
 	})
@@ -407,7 +413,7 @@ var _ = Describe("initramfs", func() {
 		ro, err := os.Open(bb)
 		Expect(err).NotTo(HaveOccurred())
 		defer ro.Close()
-		Expect(writeInitramfs(ro, bb, "true", testNonce, taskNetwork(), noGuestEnv, nil)).To(MatchError(ContainSubstring("writing the initramfs")))
+		Expect(writeInitramfs(ro, bb, taskGuest("true"))).To(MatchError(ContainSubstring("writing the initramfs")))
 	})
 
 	Describe("cpioWriter", func() {

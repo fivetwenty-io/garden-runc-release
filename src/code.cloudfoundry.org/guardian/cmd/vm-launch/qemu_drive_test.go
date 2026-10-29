@@ -252,7 +252,7 @@ var _ = Describe("the initramfs memfd against a real QEMU", func() {
 	// environment guestEnv, with the busybox at busyboxPath, in the sealed
 	// memfd vm-launch passes to the hypervisor.
 	memfdInitramfs := func(busyboxPath, command, guestEnv string) *os.File {
-		f, err := newInitramfs(busyboxPath, command, testNonce, taskNetwork(), guestEnv, nil)
+		f, err := newInitramfs(busyboxPath, guestContents{command: command, nonce: testNonce, nw: taskNetwork(), env: guestEnv})
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(f.Close)
 		return f

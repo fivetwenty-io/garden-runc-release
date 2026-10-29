@@ -81,6 +81,18 @@
 // holds a value from it. Other lines name values the platform sets, such as
 // PORT, MEMORY_LIMIT, the volume path, and the CredHub host.
 //
+// Trusted certificates: the guest gets one CA bundle at
+// /etc/ssl/certs/ca-certificates.crt that holds the certificates of the
+// container's own bundle, the first of the usual distribution paths that
+// vm-launch can read, and of every file directly under CF_SYSTEM_CERT_PATH,
+// each certificate once. Only certificates are copied. Files that cannot be
+// read, are not regular files, or hold no PEM certificate are left out,
+// with one line that counts them, and a CF_SYSTEM_CERT_PATH that names no
+// directory is not an error. The bundle, and every file read for it, may
+// have at most 2 MiB. When the bundle holds a certificate and the app has
+// not set SSL_CERT_FILE, the guest gets SSL_CERT_FILE naming the bundle, so
+// that a TLS library with another default path finds it too.
+//
 // CredHub: when a binding in VCAP_SERVICES holds a "credhub-ref", vm-launch
 // resolves the references before the guest boots, as the launcher does: one
 // POST of VCAP_SERVICES to /api/v1/interpolate at the credhub-uri in
@@ -141,10 +153,11 @@
 //	       an image another instance still holds after 30 seconds, a
 //	       guest environment that is too large, with one entry over
 //	       131071 bytes or more than 1 MiB in all, or a value that holds a
-//	       NUL byte, VCAP_PLATFORM_OPTIONS that is not valid JSON, a bad
-//	       launcher CredHub flag, or CredHub references that cannot be
-//	       resolved: missing or unreadable instance identity or CA files,
-//	       a credhub-uri that is not an https URL, or every attempt failing
+//	       NUL byte, trusted certificates over 2 MiB, VCAP_PLATFORM_OPTIONS
+//	       that is not valid JSON, a bad launcher CredHub flag, or CredHub
+//	       references that cannot be resolved: missing or unreadable
+//	       instance identity or CA files, a credhub-uri that is not an
+//	       https URL, or every attempt failing
 //	128+N  vm-launch received signal N (SIGTERM or SIGINT), or the hypervisor
 //	       died from signal N, before the guest reported a status; this
 //	       includes a signal while vm-launch waits for the volume image or
@@ -303,6 +316,17 @@ func run(argv []string, logger *log.Logger) int {
 	if resolved {
 		env[vcapServicesEnv] = services
 	}
+	caBundle, err := guestCABundle(rootfsCABundles, lookupEnv, logger)
+	if err != nil {
+		logger.Print(err)
+		return exitLaunchError
+	}
+	// SSL_CERT_FILE points a TLS library whose own default path is not
+	// guestCABundlePath, such as a static OpenSSL build, at the bundle. A
+	// value the app set itself stays.
+	if _, ok := env[sslCertFileEnv]; !ok && caBundle != nil {
+		env[sslCertFileEnv] = guestCABundlePath
+	}
 	envFile, err := buildGuestEnv(env, memMiB, logger)
 	if err != nil {
 		logger.Print(err)
@@ -337,7 +361,14 @@ func run(argv []string, logger *log.Logger) int {
 		defer img.Close()
 	}
 
-	initrd, err := newInitramfs(filepath.Join(cfg.artifacts, artBusybox), cfg.command, nonce, nw, envFile, vol)
+	initrd, err := newInitramfs(filepath.Join(cfg.artifacts, artBusybox), guestContents{
+		command:  cfg.command,
+		nonce:    nonce,
+		nw:       nw,
+		env:      envFile,
+		vol:      vol,
+		caBundle: caBundle,
+	})
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError

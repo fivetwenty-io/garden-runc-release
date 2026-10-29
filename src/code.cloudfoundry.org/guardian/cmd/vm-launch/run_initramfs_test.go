@@ -107,7 +107,7 @@ var _ = Describe("the initramfs release check", func() {
 	It("fails while the parent still holds the initramfs, so the run specs above can fail", func() {
 		bb := filepath.Join(GinkgoT().TempDir(), "busybox")
 		Expect(os.WriteFile(bb, []byte("busybox"), 0o755)).To(Succeed())
-		f, err := newInitramfs(bb, "true", testNonce, taskNetwork(), noGuestEnv, nil)
+		f, err := newInitramfs(bb, taskGuest("true"))
 		Expect(err).NotTo(HaveOccurred())
 		defer f.Close()
 
