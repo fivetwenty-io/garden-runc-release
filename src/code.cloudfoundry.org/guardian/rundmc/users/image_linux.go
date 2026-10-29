@@ -24,8 +24,9 @@ var ErrImageIdentityFileTooLarge = errors.New("image identity file is too large"
 // LookupImageUser resolves name against the passwd and group files of the
 // image root filesystem at root. It reads those files the way the container
 // would see them: every path component, including absolute and relative
-// symlinks, resolves inside root. Each file must be a regular file and is opened without blocking, so a
-// FIFO or device in the image fails the lookup instead of hanging it.
+// symlinks, resolves inside root. Each file must be a regular file and is
+// opened without blocking, so a FIFO or device in the image fails the lookup
+// instead of hanging it.
 //
 // A missing passwd file resolves "root" to uid 0, gid 0, home "/", as
 // LookupUser does. A missing group file leaves the supplementary groups empty.
