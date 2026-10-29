@@ -21,13 +21,14 @@ import (
 // fdThreeChecks is fake hypervisor shell that fails unless its file
 // descriptor 3 is the image at img and is locked, checked the way a
 // hypervisor uses it: a new open of /proc/self/fd/3, which cannot take the
-// flock that vm-launch's open file holds.
+// flock that vm-launch's open file holds. The reopen uses fd 9, because fd 4
+// is the initramfs when there is a volume.
 func fdThreeChecks(img string) string {
 	return `[ -f /proc/self/fd/3 ] || { echo "fd 3 is not a regular file" >&2; exit 1; }
 [ "$(stat -L -c %d:%i /proc/self/fd/3)" = "$(stat -c %d:%i ` + shellQuote(img) + `)" ] || { echo "fd 3 is not the image" >&2; exit 1; }
-exec 4<>/proc/self/fd/3 || { echo "cannot reopen /proc/self/fd/3" >&2; exit 1; }
-if flock -n 4; then echo "the image is not locked" >&2; exit 1; fi
-exec 4>&-
+exec 9<>/proc/self/fd/3 || { echo "cannot reopen /proc/self/fd/3" >&2; exit 1; }
+if flock -n 9; then echo "the image is not locked" >&2; exit 1; fi
+exec 9>&-
 `
 }
 
@@ -72,13 +73,17 @@ var _ = Describe("newHypervisorCmd", func() {
 		Expect(cmd.ExtraFiles).To(BeNil())
 	})
 
-	It("passes an image as the child's file descriptor 3", func() {
+	It("passes the extra files in order, from the child's file descriptor 3", func() {
 		f, err := os.Open(os.DevNull)
 		Expect(err).NotTo(HaveOccurred())
 		defer f.Close()
-		cmd := newHypervisorCmd([]string{"/bin/true"}, f)
-		Expect(cmd.ExtraFiles).To(HaveLen(1))
+		g, err := os.Open(os.DevNull)
+		Expect(err).NotTo(HaveOccurred())
+		defer g.Close()
+		cmd := newHypervisorCmd([]string{"/bin/true"}, []*os.File{f, g})
+		Expect(cmd.ExtraFiles).To(HaveLen(2))
 		Expect(cmd.ExtraFiles[0]).To(BeIdenticalTo(f))
+		Expect(cmd.ExtraFiles[1]).To(BeIdenticalTo(g))
 	})
 
 	Describe("with a real image", func() {
@@ -109,7 +114,7 @@ var _ = Describe("newHypervisorCmd", func() {
 			var out, logBuf bytes.Buffer
 			sup := supervisor{stdout: &out, logger: log.New(&logBuf, "", 0), signals: make(chan os.Signal), grace: time.Second}
 			cmd := newHypervisorCmd([]string{script(fdThreeChecks(img) +
-				"printf 'RVM_START_" + testNonce + "\\nvolume ok\\nRVM_EXIT_" + testNonce + "=0\\n'\n")}, f)
+				"printf 'RVM_START_" + testNonce + "\\nvolume ok\\nRVM_EXIT_" + testNonce + "=0\\n'\n")}, []*os.File{f})
 			res, err := sup.run(cmd, testNonce)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(codeOf(res)).To(Equal(0), logBuf.String())
@@ -117,7 +122,7 @@ var _ = Describe("newHypervisorCmd", func() {
 		})
 
 		It("keeps the image locked while the hypervisor lives, after vm-launch closes its copy", func() {
-			cmd := newHypervisorCmd([]string{script("exec sleep 60\n")}, f)
+			cmd := newHypervisorCmd([]string{script("exec sleep 60\n")}, []*os.File{f})
 			Expect(cmd.Start()).To(Succeed())
 			Expect(f.Close()).To(Succeed())
 			Expect(lockedElsewhere(img)).To(BeTrue())
@@ -230,7 +235,7 @@ var _ = Describe("run with a volume", func() {
 
 	It("gives QEMU the locked image as fd 3 and a raw drive, without the volume path in its argv", func() {
 		requireOpenat2()
-		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), fdThreeChecks(img)+
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), fdThreeChecks(img)+initramfsAt("4")+initramfsReleased+noFilesUnder(tmp)+
 			`gzip -dc "$initrd" | grep -a -q -F `+shellQuote("RVM_VOLUME_PATH="+shellQuote(volDir))+` || { echo "no /rvm/mounts" >&2; exit 1; }
 `)
 		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
@@ -238,6 +243,7 @@ var _ = Describe("run with a volume", func() {
 		argv, err := os.ReadFile(argvFile)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(string(argv)).To(HaveSuffix("\n" + strings.Join(goldenQEMUDrive, "\n") + "\n"))
+		Expect(string(argv)).To(ContainSubstring("\n-initrd\n/proc/self/fd/4\n"))
 		Expect(string(argv)).NotTo(ContainSubstring(volDir))
 
 		Expect(statOf(img).Size).To(Equal(int64(defaultImageSize)))
@@ -248,7 +254,7 @@ var _ = Describe("run with a volume", func() {
 	It("gives Firecracker the locked image as its one drive", func() {
 		requireOpenat2()
 		fcCopy := filepath.Join(GinkgoT().TempDir(), "fc.json")
-		writeFakeHypervisor(filepath.Join(art, "firecracker/firecracker"), fdThreeChecks(img)+
+		writeFakeHypervisor(filepath.Join(art, "firecracker/firecracker"), fdThreeChecks(img)+initramfsAt("4")+initramfsReleased+noFilesUnder(tmp)+
 			`p=; for a in "$@"; do [ "$p" = --config-file ] && cp "$a" `+shellQuote(fcCopy)+`; p=$a; done
 `)
 		Expect(runVM(backend.VMFirecracker)).To(Equal(0), logBuf.String())
@@ -256,6 +262,7 @@ var _ = Describe("run with a volume", func() {
 		cfg, err := os.ReadFile(fcCopy)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(string(cfg)).To(ContainSubstring(goldenFCDrive))
+		Expect(string(cfg)).To(ContainSubstring(`"initrd_path":"/proc/self/fd/4"`))
 		Expect(string(cfg)).NotTo(ContainSubstring(volDir))
 		noWorkDirs()
 	})

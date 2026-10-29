@@ -11,6 +11,8 @@ import (
 	"os"
 	"path"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 // File type bits of a newc cpio header mode field.
@@ -225,11 +227,81 @@ func mountsFile(v *guestVolume) string {
 		"RVM_VOLUME_IMAGE=" + shellQuote(v.ImageName) + "\n"
 }
 
+// initramfsName names the initramfs memfd. Its /proc/PID/fd link reads
+// /memfd:vm-launch-initramfs (deleted).
+const initramfsName = "vm-launch-initramfs"
+
+// initramfsSeals are the seals on the initramfs memfd. Once they are set, no
+// descriptor can change its contents or its size, and no seal can be added
+// or removed.
+const initramfsSeals = unix.F_SEAL_SHRINK | unix.F_SEAL_GROW | unix.F_SEAL_WRITE | unix.F_SEAL_SEAL
+
+// initramfsMemfdFlags are the memfd_create flags of the initramfs on every
+// kernel. vm-launch adds MFD_NOEXEC_SEAL where the kernel knows it.
+const initramfsMemfdFlags = unix.MFD_CLOEXEC | unix.MFD_ALLOW_SEALING
+
+// memfdCreate is unix.MemfdCreate. Specs replace it to see the flags and to
+// act as an older kernel.
+var memfdCreate = unix.MemfdCreate
+
+// createInitramfsMemfd creates the initramfs memfd with MFD_NOEXEC_SEAL,
+// which makes it non-executable and seals that with F_SEAL_EXEC, because
+// nothing ever runs the archive. From Linux 6.3, a memfd created without
+// MFD_EXEC or MFD_NOEXEC_SEAL draws a kernel warning, and vm.memfd_noexec=2
+// refuses it. Older kernels reject the unknown flag with EINVAL, and only
+// then does vm-launch create the memfd without it. Every other error is
+// returned as it is.
+func createInitramfsMemfd() (int, error) {
+	fd, err := memfdCreate(initramfsName, initramfsMemfdFlags|unix.MFD_NOEXEC_SEAL)
+	if errors.Is(err, unix.EINVAL) {
+		fd, err = memfdCreate(initramfsName, initramfsMemfdFlags)
+	}
+	return fd, err
+}
+
+// newInitramfs builds the guest initramfs (see writeInitramfs) in a sealed
+// memfd and returns it, so the archive never touches a disk. Its memory is
+// charged to the container and lasts while any process holds a descriptor
+// for it. The descriptor is close-on-exec: vm-launch passes it to the
+// hypervisor as an extra file, which the hypervisor opens through
+// /proc/self/fd, and closes its own copy once the hypervisor has started.
+func newInitramfs(busyboxPath, command, nonce string, nw *network, vol *guestVolume) (*os.File, error) {
+	fd, err := createInitramfsMemfd()
+	if err != nil {
+		return nil, fmt.Errorf("creating the initramfs memfd: %w", err)
+	}
+	f := os.NewFile(uintptr(fd), "memfd:"+initramfsName)
+	if err := writeInitramfs(f, busyboxPath, command, nonce, nw, vol); err != nil {
+		f.Close()
+		return nil, err
+	}
+	if err := addSeals(f, initramfsSeals); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("sealing the initramfs memfd: %w", err)
+	}
+	return f, nil
+}
+
+// addSeals adds seals to the memfd f.
+func addSeals(f *os.File, seals int) error {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var sealErr error
+	if err := rc.Control(func(fd uintptr) {
+		_, sealErr = unix.FcntlInt(fd, unix.F_ADD_SEALS, seals)
+	}); err != nil {
+		return err
+	}
+	return sealErr
+}
+
 // writeInitramfs writes a gzip-compressed newc initramfs to dst holding a
 // static busybox, the console and null device nodes, the command script at
 // /rvm/cmd, and the /init that runs it. With a network it also holds
 // /rvm/net, /rvm/env, and /etc/resolv.conf, and with a volume /rvm/mounts.
-func writeInitramfs(dst, busyboxPath, command, nonce string, nw *network, vol *guestVolume) error {
+func writeInitramfs(dst *os.File, busyboxPath, command, nonce string, nw *network, vol *guestVolume) error {
 	busybox, err := os.Open(busyboxPath)
 	if err != nil {
 		return fmt.Errorf("opening busybox: %w", err)
@@ -243,16 +315,8 @@ func writeInitramfs(dst, busyboxPath, command, nonce string, nw *network, vol *g
 		return fmt.Errorf("busybox %s is not a regular file", busyboxPath)
 	}
 
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return fmt.Errorf("creating initramfs: %w", err)
-	}
-	if err := writeInitramfsArchive(out, busybox, info.Size(), command, nonce, nw, vol); err != nil {
-		out.Close()
-		return fmt.Errorf("writing initramfs %s: %w", dst, err)
-	}
-	if err := out.Close(); err != nil {
-		return fmt.Errorf("closing initramfs %s: %w", dst, err)
+	if err := writeInitramfsArchive(dst, busybox, info.Size(), command, nonce, nw, vol); err != nil {
+		return fmt.Errorf("writing the initramfs: %w", err)
 	}
 	return nil
 }

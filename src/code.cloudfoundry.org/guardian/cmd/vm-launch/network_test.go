@@ -318,20 +318,7 @@ var _ = Describe("guest network", func() {
 		}
 
 		It("adds the network and environment files", func() {
-			dir := GinkgoT().TempDir()
-			bb := filepath.Join(dir, "busybox")
-			Expect(os.WriteFile(bb, []byte("busybox"), 0o755)).To(Succeed())
-			out := filepath.Join(dir, "initrd.cpio.gz")
-			Expect(writeInitramfs(out, bb, "httpd -f -p $PORT", testNonce, nw, nil)).To(Succeed())
-
-			raw, err := os.ReadFile(out)
-			Expect(err).NotTo(HaveOccurred())
-			var names []string
-			byName := map[string]cpioEntry{}
-			for _, e := range readNewc(gunzip(raw)) {
-				names = append(names, e.name)
-				byName[e.name] = e
-			}
+			names, byName := archiveEntries(buildInitramfs([]byte("busybox"), "httpd -f -p $PORT", nw, nil))
 			Expect(names).To(Equal([]string{"bin", "dev", "dev/console", "dev/null", "etc", "proc", "sys", "tmp", "rvm",
 				"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "etc/resolv.conf", "init", cpioTrailer}))
 			Expect(string(byName["rvm/net"].data)).To(Equal("RVM_ADDRESS='10.0.2.15/24'\nRVM_GATEWAY='10.0.2.2'\n"))
@@ -419,9 +406,9 @@ var _ = Describe("guest network", func() {
 		nw := &network{port: 8080}
 
 		It("adds a user-mode NIC that forwards PORT to QEMU", func() {
-			argv, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/tmp/w/initrd.cpio.gz", 128, nw, "")
+			argv, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/proc/self/fd/3", 128, nw, "")
 			Expect(err).NotTo(HaveOccurred())
-			plain, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/tmp/w/initrd.cpio.gz", 128, nil, "")
+			plain, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/proc/self/fd/3", 128, nil, "")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(argv).To(Equal(append(plain,
 				"-netdev", "user,id=n0,net=10.0.2.0/24,hostfwd=tcp:0.0.0.0:8080-10.0.2.15:8080",
@@ -431,7 +418,7 @@ var _ = Describe("guest network", func() {
 
 		It("attaches the Firecracker guest to garden's tap device", func() {
 			work := GinkgoT().TempDir()
-			argv, err := hypervisorArgv(backend.VMFirecracker, art, work, work+"/initrd.cpio.gz", 128, nw, "")
+			argv, err := hypervisorArgv(backend.VMFirecracker, art, work, "/proc/self/fd/3", 128, nw, "")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(argv).To(Equal([]string{art + "/firecracker/firecracker", "--no-api", "--config-file", work + "/fc.json"}))
 

@@ -187,19 +187,41 @@ func qemuArgv(root, initrd string, memMiB int, nw *network, drivePath string) []
 	return argv
 }
 
-// The volume drive. vm-launch hands the hypervisor the locked image as file
-// descriptor volumeDriveFD, and the hypervisor opens it through
-// /proc/self/fd, which reopens exactly the inode vm-launch checked. The
-// container path of the volume therefore never reaches a QEMU option
-// string or the Firecracker configuration.
+// The hypervisor's inherited files. The hypervisor gets the volume image,
+// when there is one, and the initramfs as extra files, and opens each through
+// /proc/self/fd. For the image that reopens exactly the inode vm-launch
+// checked, so the container path of the volume never reaches a QEMU option
+// string or the Firecracker configuration. The image keeps file descriptor
+// volumeDriveFD, and the initramfs takes the next one: 3 without a volume
+// and 4 with one.
 const (
-	volumeDriveFD = 3
+	firstExtraFD  = 3
+	volumeDriveFD = firstExtraFD
 	volumeDriveID = "vol0"
 )
 
+// procSelfFD is the path a process opens its own file descriptor fd by.
+func procSelfFD(fd int) string {
+	return "/proc/self/fd/" + strconv.Itoa(fd)
+}
+
 // volumeDrivePath is the path the hypervisor opens the volume image by.
 func volumeDrivePath() string {
-	return "/proc/self/fd/" + strconv.Itoa(volumeDriveFD)
+	return procSelfFD(volumeDriveFD)
+}
+
+// hypervisorFiles returns the hypervisor's extra files in order, for
+// exec.Cmd.ExtraFiles, with the paths the hypervisor opens them by. img is
+// the volume image or nil, and drivePath is empty without one. initrd is the
+// initramfs from newInitramfs.
+func hypervisorFiles(img, initrd *os.File) (files []*os.File, drivePath, initrdPath string) {
+	if img != nil {
+		files = append(files, img)
+		drivePath = procSelfFD(firstExtraFD + len(files) - 1)
+	}
+	files = append(files, initrd)
+	initrdPath = procSelfFD(firstExtraFD + len(files) - 1)
+	return files, drivePath, initrdPath
 }
 
 type firecrackerConfig struct {
@@ -530,6 +552,9 @@ type supervisor struct {
 	// stopping, when set, runs once at the first signal, before it is
 	// forwarded. vm-launch uses it to stop accepting guest connections.
 	stopping func()
+	// started, when set, runs once the hypervisor has started and before
+	// anything else. vm-launch uses it to close its copy of the initramfs.
+	started func()
 }
 
 // run starts cmd and waits for it. The error is non-nil only when the
@@ -542,6 +567,9 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 	}
 	if err := cmd.Start(); err != nil {
 		return runResult{}, fmt.Errorf("starting hypervisor %s: %w", cmd.Path, err)
+	}
+	if s.started != nil {
+		s.started()
 	}
 
 	type ended struct{ copyErr, waitErr error }

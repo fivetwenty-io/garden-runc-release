@@ -20,9 +20,9 @@ const (
 	goldenInitNet = "#!/bin/busybox sh\n/bin/busybox --install -s /bin\nexport PATH=/bin\nmount -t proc proc /proc\nmount -t sysfs sys /sys\nmount -t devtmpfs dev /dev 2>/dev/null\nrvm_fail() { echo \"vm-launch guest setup: $1\"; reboot -f; exit 1; }\n. /rvm/net\nip link set lo up || rvm_fail \"bringing up lo failed\"\nn=0\nwhile [ ! -e /sys/class/net/eth0 ]; do\n\tn=$((n + 1))\n\t[ \"$n\" -gt 5 ] && rvm_fail \"no eth0 network device\"\n\tsleep 1\ndone\nif [ -n \"${RVM_MTU:-}\" ]; then\n\tip link set eth0 mtu \"$RVM_MTU\" || echo \"vm-launch guest setup: setting the mtu of eth0 to $RVM_MTU failed; keeping the default mtu\"\nfi\nip link set eth0 up || rvm_fail \"bringing up eth0 failed\"\nip addr add \"$RVM_ADDRESS\" dev eth0 || rvm_fail \"adding $RVM_ADDRESS to eth0 failed\"\nip route add default via \"$RVM_GATEWAY\" dev eth0 || rvm_fail \"adding the default route via $RVM_GATEWAY failed\"\n. /rvm/env\necho RVM_START_0123456789abcdef\nsh /rvm/cmd </dev/null\necho RVM_EXIT_0123456789abcdef=$?\nreboot -f\n"
 )
 
-func archiveEntries(path string) ([]string, map[string]cpioEntry) {
-	raw, err := os.ReadFile(path)
-	Expect(err).NotTo(HaveOccurred())
+// archiveEntries parses a gzip newc archive into its entry names, in order,
+// and its entries by name.
+func archiveEntries(raw []byte) ([]string, map[string]cpioEntry) {
 	var names []string
 	byName := map[string]cpioEntry{}
 	for _, e := range readNewc(gunzip(raw)) {
@@ -36,13 +36,8 @@ var _ = Describe("guest volume initramfs", func() {
 	vol := &guestVolume{ContainerDir: "/data/it's $here", ImageName: "rvm-disk-3.img"}
 	nw := &network{port: 8080, address: qemuGuestCIDR, gateway: qemuGateway, resolvConf: "nameserver 10.0.2.3\n", env: "export PORT='8080'\n"}
 
-	writeArchive := func(nw *network, vol *guestVolume) string {
-		dir := GinkgoT().TempDir()
-		bb := filepath.Join(dir, "busybox")
-		Expect(os.WriteFile(bb, []byte("busybox"), 0o755)).To(Succeed())
-		out := filepath.Join(dir, "initrd.cpio.gz")
-		Expect(writeInitramfs(out, bb, "true", testNonce, nw, vol)).To(Succeed())
-		return out
+	writeArchive := func(nw *network, vol *guestVolume) []byte {
+		return buildInitramfs([]byte("busybox"), "true", nw, vol)
 	}
 
 	It("keeps the /init of a guest without a volume byte for byte", func() {

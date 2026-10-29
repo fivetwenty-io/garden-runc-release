@@ -61,6 +61,11 @@
 // and the reserve need, the guest gets 128 MiB and vm-launch logs a line
 // that says so.
 //
+// The initramfs that holds the guest's /init, busybox, and command is built
+// in a sealed memfd and never written to disk. The hypervisor gets it as the
+// file descriptor after the volume image's, 3 without a volume and 4 with
+// one, and vm-launch closes its own copy once the hypervisor has started.
+//
 // The guest's console output, stdout and stderr merged, is written to stdout
 // as it arrives. Kernel boot messages and the status marker are dropped.
 //
@@ -73,12 +78,12 @@
 //	       status, as QEMU does when PORT is already in use in the container
 //	       or when it cannot open the volume image
 //	125    vm-launch could not start the guest: bad arguments, a missing
-//	       artifact, a temp file it could not write, a hypervisor it could not
-//	       run, (Firecracker) PORT already in use in the container, or a
-//	       volume it cannot use: VCAP_SERVICES that is not valid JSON, more
-//	       than one volume mount, a read-only mount, a bad volume path,
-//	       CF_INSTANCE_INDEX, application_id, or process_type, a task with a
-//	       volume, an image that fails a check
+//	       artifact, a work file or initramfs it could not write, a
+//	       hypervisor it could not run, (Firecracker) PORT already in use in
+//	       the container, or a volume it cannot use: VCAP_SERVICES that is
+//	       not valid JSON, more than one volume mount, a read-only mount, a
+//	       bad volume path, CF_INSTANCE_INDEX, application_id, or
+//	       process_type, a task with a volume, an image that fails a check
 //	       or cannot be created, or an image another instance still holds
 //	       after 30 seconds
 //	128+N  vm-launch received signal N (SIGTERM or SIGINT), or the hypervisor
@@ -197,7 +202,6 @@ func run(argv []string, logger *log.Logger) int {
 
 	// The image stays open, and so locked, until the hypervisor is reaped.
 	var img *os.File
-	drivePath := ""
 	if vol != nil {
 		img, err = openVolumeImage(vol, defaultImageOptions, sigs)
 		if err != nil {
@@ -205,15 +209,27 @@ func run(argv []string, logger *log.Logger) int {
 			return volumeExitCode(err)
 		}
 		defer img.Close()
-		drivePath = volumeDrivePath()
 	}
 
-	initrd := filepath.Join(workDir, "initrd.cpio.gz")
-	if err := writeInitramfs(initrd, filepath.Join(cfg.artifacts, artBusybox), cfg.command, nonce, nw, vol); err != nil {
+	initrd, err := newInitramfs(filepath.Join(cfg.artifacts, artBusybox), cfg.command, nonce, nw, vol)
+	if err != nil {
 		logger.Print(err)
 		return exitLaunchError
 	}
-	hvArgv, err := hypervisorArgv(cfg.backend, cfg.artifacts, workDir, initrd, memMiB, nw, drivePath)
+	// vm-launch's copy of the initramfs closes as soon as the hypervisor has
+	// its own, or on the way out when the hypervisor never starts.
+	closeInitrd := func() {
+		if initrd == nil {
+			return
+		}
+		if err := initrd.Close(); err != nil {
+			logger.Printf("closing the initramfs: %v", err)
+		}
+		initrd = nil
+	}
+	defer closeInitrd()
+	files, drivePath, initrdPath := hypervisorFiles(img, initrd)
+	hvArgv, err := hypervisorArgv(cfg.backend, cfg.artifacts, workDir, initrdPath, memMiB, nw, drivePath)
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError
@@ -226,7 +242,7 @@ func run(argv []string, logger *log.Logger) int {
 	default:
 	}
 
-	cmd := newHypervisorCmd(hvArgv, img)
+	cmd := newHypervisorCmd(hvArgv, files)
 	// QEMU reports a port it cannot forward on its stderr and exits 1, so a
 	// networked QEMU run keeps the start of that stream to recognise it.
 	var hvStderr *headBuffer
@@ -235,7 +251,7 @@ func run(argv []string, logger *log.Logger) int {
 		cmd.Stderr = &stderrTee{capture: hvStderr, passthrough: os.Stderr}
 	}
 
-	sup := supervisor{stdout: os.Stdout, logger: logger, signals: sigs, grace: killGrace}
+	sup := supervisor{stdout: os.Stdout, logger: logger, signals: sigs, grace: killGrace, started: closeInitrd}
 	if nw != nil && cfg.backend == backend.VMFirecracker {
 		proxy, err := startProxy(nw.listenAddr(), nw.upstream(), upstreamDialPolicy, logger)
 		if err != nil {
@@ -264,17 +280,18 @@ func run(argv []string, logger *log.Logger) int {
 }
 
 // newHypervisorCmd returns the hypervisor command: an empty environment,
-// vm-launch's stderr, and SIGKILL when vm-launch dies. A volume image becomes
-// the child's file descriptor volumeDriveFD, sharing vm-launch's open file
-// and with it the flock, so the lock lasts while either process lives.
-func newHypervisorCmd(argv []string, img *os.File) *exec.Cmd {
+// vm-launch's stderr, and SIGKILL when vm-launch dies. files, from
+// hypervisorFiles, become the child's file descriptors from firstExtraFD on.
+// A volume image shares vm-launch's open file and with it the flock, so the
+// lock lasts while either process lives.
+func newHypervisorCmd(argv []string, files []*os.File) *exec.Cmd {
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = []string{}
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
-	if img != nil {
-		// ExtraFiles[0] is the child's file descriptor 3, volumeDriveFD.
-		cmd.ExtraFiles = []*os.File{img}
+	if len(files) > 0 {
+		// ExtraFiles[i] is the child's file descriptor firstExtraFD+i.
+		cmd.ExtraFiles = files
 	}
 	return cmd
 }

@@ -4,7 +4,7 @@ package main
 
 import (
 	"bytes"
-	"io"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -60,6 +60,37 @@ func driveOption(argv []string) string { return optionAfter(argv, "-drive", "") 
 // command line.
 func deviceOption(argv []string) string { return optionAfter(argv, "-device", "virtio-blk") }
 
+// runRealQEMU runs QEMU with argv, files as its extra files from
+// firstExtraFD on, as vm-launch passes them, and stdin as its input. It
+// returns QEMU's exit status, stdout, and stderr, and fails the spec when
+// QEMU is still running after timeout.
+func runRealQEMU(argv []string, files []*os.File, stdin string, timeout time.Duration) (int, string, string) {
+	cmd := newHypervisorCmd(argv, files)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	cmd.Stdin = strings.NewReader(stdin)
+	Expect(cmd.Start()).To(Succeed())
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err == nil {
+			return 0, stdout.String(), stderr.String()
+		}
+		if ee, ok := err.(*exec.ExitError); ok {
+			return ee.ExitCode(), stdout.String(), stderr.String()
+		}
+		Expect(err).NotTo(HaveOccurred())
+	case <-time.After(timeout):
+		_ = cmd.Process.Kill()
+		<-done
+		Fail(fmt.Sprintf("QEMU was still running after %v: %s", timeout, stderr.String()))
+	}
+	return -1, "", ""
+}
+
 var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 	// parseDrive starts QEMU stopped, with no display, and the drive's file as
 	// file descriptor 3 exactly as vm-launch passes the image. QEMU parses and
@@ -74,30 +105,8 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 
 		argv := append([]string{qemu, "-S", "-display", "none"}, machine...)
 		argv = append(argv, "-nodefaults", "-no-user-config", "-monitor", "stdio")
-		cmd := newHypervisorCmd(append(argv, args...), img)
-		var stderr bytes.Buffer
-		cmd.Stderr = &stderr
-		cmd.Stdin = strings.NewReader("quit\n")
-		cmd.Stdout = io.Discard
-		Expect(cmd.Start()).To(Succeed())
-
-		done := make(chan error, 1)
-		go func() { done <- cmd.Wait() }()
-		select {
-		case err := <-done:
-			if err == nil {
-				return 0, stderr.String()
-			}
-			if ee, ok := err.(*exec.ExitError); ok {
-				return ee.ExitCode(), stderr.String()
-			}
-			Expect(err).NotTo(HaveOccurred())
-		case <-time.After(30 * time.Second):
-			_ = cmd.Process.Kill()
-			<-done
-			Fail("QEMU neither accepted nor rejected the drive within 30 seconds: " + stderr.String())
-		}
-		return -1, ""
+		code, _, stderr := runRealQEMU(append(argv, args...), []*os.File{img}, "quit\n", 30*time.Second)
+		return code, stderr
 	}
 
 	noMachine := []string{"-machine", "none"}
@@ -105,7 +114,7 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 
 	It("accepts the drive option string vm-launch generates", func() {
 		qemu := realQEMU()
-		drive := driveOption(qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, nil, volumeDrivePath()))
+		drive := driveOption(qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, nil, volumeDrivePath()))
 		code, stderr := parseDrive(qemu, noMachine, "-drive", drive)
 		Expect(code).To(Equal(0), "QEMU rejected -drive %s: %s", drive, stderr)
 	})
@@ -113,7 +122,7 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 	It("accepts the -drive and -device pair vm-launch generates on a microvm machine", func() {
 		qemu := realQEMU()
 		requireMicrovm(qemu)
-		argv := qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, nil, volumeDrivePath())
+		argv := qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, nil, volumeDrivePath())
 		drive, device := driveOption(argv), deviceOption(argv)
 		Expect(device).To(ContainSubstring("drive=vol0"))
 		code, stderr := parseDrive(qemu, microvm, "-drive", drive, "-device", device)
@@ -123,7 +132,7 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 	It("rejects a -device that names a drive that does not exist, so the pair check above can fail", func() {
 		qemu := realQEMU()
 		requireMicrovm(qemu)
-		argv := qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, nil, volumeDrivePath())
+		argv := qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, nil, volumeDrivePath())
 		device := strings.Replace(deviceOption(argv), "drive=vol0", "drive=vol9", 1)
 		code, stderr := parseDrive(qemu, microvm, "-drive", driveOption(argv), "-device", device)
 		Expect(code).NotTo(Equal(0))
@@ -132,10 +141,120 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 
 	It("rejects the unprefixed locking option, so the check above can fail", func() {
 		qemu := realQEMU()
-		drive := strings.Replace(driveOption(qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, nil, volumeDrivePath())), "file.locking=off", "locking=off", 1)
+		drive := strings.Replace(driveOption(qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, nil, volumeDrivePath())), "file.locking=off", "locking=off", 1)
 		Expect(drive).To(ContainSubstring(",locking=off,"))
 		code, stderr := parseDrive(qemu, noMachine, "-drive", drive)
 		Expect(code).NotTo(Equal(0))
 		Expect(stderr).To(ContainSubstring("locking"))
+	})
+})
+
+// realArtifactsEnv names a directory that holds the real guest kernel as
+// kernel/bzImage, for the specs that start a real guest.
+const realArtifactsEnv = "VM_LAUNCH_ARTIFACTS"
+
+// realArtifacts returns the directory realArtifactsEnv names, or skips the
+// spec when it is unset or holds no kernel/bzImage.
+func realArtifacts() string {
+	dir := os.Getenv(realArtifactsEnv)
+	if dir == "" {
+		Skip(realArtifactsEnv + " is not set; point it at a directory that holds the guest kernel as " + artBzImage)
+	}
+	info, err := os.Stat(filepath.Join(dir, artBzImage))
+	if err != nil || !info.Mode().IsRegular() {
+		Skip(realArtifactsEnv + " holds no regular file " + artBzImage)
+	}
+	return dir
+}
+
+// tcgArgv turns vm-launch's QEMU command line into one for qemu, a system
+// QEMU on PATH: it drops the bundled loader and its share directory, and
+// runs the guest under TCG with QEMU's max CPU model in place of KVM and the
+// host CPU.
+func tcgArgv(qemu string, argv []string) []string {
+	start := -1
+	for i, a := range argv {
+		if strings.HasSuffix(a, artQEMUBinary) {
+			start = i + 1
+		}
+	}
+	Expect(start).To(BeNumerically(">", 0), "no QEMU binary in %q", argv)
+	out := []string{qemu}
+	for i := start; i < len(argv); i++ {
+		switch {
+		case argv[i] == "-L" && i+1 < len(argv):
+			i++
+		case argv[i] == "-M" && i+1 < len(argv):
+			out = append(out, "-M", strings.Replace(argv[i+1], "accel=kvm", "accel=tcg", 1))
+			i++
+		case argv[i] == "-cpu" && i+1 < len(argv):
+			out = append(out, "-cpu", "max")
+			i++
+		default:
+			out = append(out, argv[i])
+		}
+	}
+	return out
+}
+
+var _ = Describe("the initramfs memfd against a real QEMU", func() {
+	// stoppedQEMU starts QEMU stopped with the real kernel and initrdPath as
+	// its initrd, and with files as its extra files. QEMU loads the kernel
+	// and the initrd while it sets up the machine, before the -S pause, so
+	// the monitor's quit ends a QEMU that could read both.
+	stoppedQEMU := func(qemu, kernel, initrdPath string, files []*os.File) (int, string) {
+		argv := []string{qemu, "-S", "-display", "none", "-M", "microvm,accel=tcg", "-nodefaults", "-no-user-config",
+			"-m", "128", "-kernel", kernel, "-initrd", initrdPath, "-monitor", "stdio"}
+		code, _, stderr := runRealQEMU(argv, files, "quit\n", 60*time.Second)
+		return code, stderr
+	}
+
+	// memfdInitramfs builds an initramfs for command, with the busybox at
+	// busyboxPath, in the sealed memfd vm-launch passes to the hypervisor.
+	memfdInitramfs := func(busyboxPath, command string) *os.File {
+		f, err := newInitramfs(busyboxPath, command, testNonce, nil, nil)
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(f.Close)
+		return f
+	}
+
+	fakeBusybox := func() string {
+		bb := filepath.Join(GinkgoT().TempDir(), "busybox")
+		Expect(os.WriteFile(bb, []byte("not run"), 0o755)).To(Succeed())
+		return bb
+	}
+
+	It("loads the kernel and the sealed initramfs through /proc/self/fd", func() {
+		art := realArtifacts()
+		qemu := realQEMU()
+		requireMicrovm(qemu)
+		files, _, initrdPath := hypervisorFiles(nil, memfdInitramfs(fakeBusybox(), "true"))
+		Expect(initrdPath).To(Equal(goldenInitrd))
+		code, stderr := stoppedQEMU(qemu, filepath.Join(art, artBzImage), initrdPath, files)
+		Expect(code).To(Equal(0), "QEMU could not load the memfd initramfs: %s", stderr)
+	})
+
+	It("fails for an initrd path that names no open file, so the load check above can fail", func() {
+		art := realArtifacts()
+		qemu := realQEMU()
+		requireMicrovm(qemu)
+		files, _, _ := hypervisorFiles(nil, memfdInitramfs(fakeBusybox(), "true"))
+		code, stderr := stoppedQEMU(qemu, filepath.Join(art, artBzImage), procSelfFD(9), files)
+		Expect(code).NotTo(Equal(0))
+		Expect(stderr).To(ContainSubstring(procSelfFD(9)))
+	})
+
+	It("boots a guest from the memfd initramfs under TCG and runs the command", func() {
+		art := realArtifacts()
+		qemu := realQEMU()
+		requireMicrovm(qemu)
+		bb := guestBusybox()
+		files, _, initrdPath := hypervisorFiles(nil, memfdInitramfs(bb, `echo "hello from the memfd initramfs"; exit 7`))
+		argv := tcgArgv(qemu, qemuArgv(art, initrdPath, 128, nil, ""))
+		code, stdout, stderr := runRealQEMU(argv, files, "", 5*time.Minute)
+		Expect(code).To(Equal(0), "QEMU failed: %s\n%s", stderr, stdout)
+		Expect(stdout).To(ContainSubstring(startTag(testNonce)))
+		Expect(stdout).To(ContainSubstring("hello from the memfd initramfs"))
+		Expect(stdout).To(ContainSubstring(exitTag(testNonce) + "7"))
 	})
 })

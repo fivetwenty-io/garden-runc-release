@@ -21,6 +21,7 @@ import (
 	"code.cloudfoundry.org/guardian/backend"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"golang.org/x/sys/unix"
 )
 
 func TestVMLaunch(t *testing.T) {
@@ -93,6 +94,27 @@ func gunzip(b []byte) []byte {
 	return out
 }
 
+// buildInitramfs builds an initramfs through newInitramfs, with busybox as
+// the busybox binary, and returns the archive.
+func buildInitramfs(busybox []byte, command string, nw *network, vol *guestVolume) []byte {
+	bb := filepath.Join(GinkgoT().TempDir(), "busybox")
+	Expect(os.WriteFile(bb, busybox, 0o755)).To(Succeed())
+	f, err := newInitramfs(bb, command, testNonce, nw, vol)
+	Expect(err).NotTo(HaveOccurred())
+	defer f.Close()
+	return fileBytes(f)
+}
+
+// fileBytes reads all of f without moving its offset.
+func fileBytes(f *os.File) []byte {
+	info, err := f.Stat()
+	Expect(err).NotTo(HaveOccurred())
+	b := make([]byte, info.Size())
+	_, err = f.ReadAt(b, 0)
+	Expect(err).NotTo(HaveOccurred())
+	return b
+}
+
 type failingWriter struct{ err error }
 
 func (w failingWriter) Write([]byte) (int, error) { return 0, w.err }
@@ -152,19 +174,12 @@ var _ = Describe("initramfs", func() {
 		}
 	})
 
-	writeArchive := func() string {
-		dir := GinkgoT().TempDir()
-		bb := filepath.Join(dir, "busybox")
-		Expect(os.WriteFile(bb, busybox, 0o755)).To(Succeed())
-		out := filepath.Join(dir, "initrd.cpio.gz")
-		Expect(writeInitramfs(out, bb, "echo 'hi there'; exit 3\n", testNonce, nil, nil)).To(Succeed())
-		return out
+	writeArchive := func() []byte {
+		return buildInitramfs(busybox, "echo 'hi there'; exit 3\n", nil, nil)
 	}
 
 	It("writes a gzip newc archive with the guest layout", func() {
-		raw, err := os.ReadFile(writeArchive())
-		Expect(err).NotTo(HaveOccurred())
-		entries := readNewc(gunzip(raw))
+		entries := readNewc(gunzip(writeArchive()))
 
 		var names []string
 		byName := map[string]cpioEntry{}
@@ -200,11 +215,8 @@ var _ = Describe("initramfs", func() {
 		if err != nil {
 			Skip("cpio not installed")
 		}
-		archive := writeArchive()
-		raw, err := os.ReadFile(archive)
-		Expect(err).NotTo(HaveOccurred())
 		plain := filepath.Join(GinkgoT().TempDir(), "initrd.cpio")
-		Expect(os.WriteFile(plain, gunzip(raw), 0o600)).To(Succeed())
+		Expect(os.WriteFile(plain, gunzip(writeArchive()), 0o600)).To(Succeed())
 
 		list, err := exec.Command("sh", "-c", `"$0" -t --quiet < "$1"`, cpioBin, plain).CombinedOutput()
 		Expect(err).NotTo(HaveOccurred(), string(list))
@@ -233,16 +245,152 @@ var _ = Describe("initramfs", func() {
 		Expect(st.Rdev).To(Equal(uint64(5<<8 | 1)))
 	})
 
-	It("refuses to overwrite an existing file", func() {
-		archive := writeArchive()
-		err := writeInitramfs(archive, filepath.Join(filepath.Dir(archive), "busybox"), "true", testNonce, nil, nil)
-		Expect(err).To(MatchError(ContainSubstring("creating initramfs")))
+	Describe("the memfd", func() {
+		var f *os.File
+
+		BeforeEach(func() {
+			bb := filepath.Join(GinkgoT().TempDir(), "busybox")
+			Expect(os.WriteFile(bb, busybox, 0o755)).To(Succeed())
+			var err error
+			f, err = newInitramfs(bb, "true", testNonce, nil, nil)
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { _ = f.Close() })
+		})
+
+		It("is a close-on-exec memfd, not a file on disk", func() {
+			link, err := os.Readlink(procSelfFD(int(f.Fd())))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(link).To(Equal("/memfd:vm-launch-initramfs (deleted)"))
+			flags, err := unix.FcntlInt(f.Fd(), unix.F_GETFD, 0)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(flags & unix.FD_CLOEXEC).To(Equal(unix.FD_CLOEXEC))
+		})
+
+		It("carries every seal, so nothing can change it", func() {
+			seals, err := unix.FcntlInt(f.Fd(), unix.F_GET_SEALS, 0)
+			Expect(err).NotTo(HaveOccurred())
+			// F_SEAL_EXEC comes with MFD_NOEXEC_SEAL, which kernels before
+			// 6.3 do not have.
+			Expect(seals &^ unix.F_SEAL_EXEC).To(Equal(unix.F_SEAL_SHRINK | unix.F_SEAL_GROW | unix.F_SEAL_WRITE | unix.F_SEAL_SEAL))
+
+			before := fileBytes(f)
+			_, err = f.WriteAt([]byte("x"), 0)
+			Expect(err).To(MatchError(syscall.EPERM))
+			Expect(f.Truncate(1)).To(MatchError(syscall.EPERM))
+			Expect(f.Truncate(int64(len(before)) + 1)).To(MatchError(syscall.EPERM))
+			_, err = unix.FcntlInt(f.Fd(), unix.F_ADD_SEALS, unix.F_SEAL_WRITE)
+			Expect(err).To(MatchError(syscall.EPERM))
+
+			// A new open through /proc/self/fd, as the hypervisor makes, reads
+			// the archive and cannot write it either.
+			rw, err := os.OpenFile(procSelfFD(int(f.Fd())), os.O_RDWR, 0)
+			Expect(err).NotTo(HaveOccurred())
+			defer rw.Close()
+			_, err = rw.Write([]byte("x"))
+			Expect(err).To(MatchError(syscall.EPERM))
+			Expect(io.ReadAll(rw)).To(Equal(before))
+			readNewc(gunzip(before))
+		})
+
+		It("is not executable, and cannot be made executable, on a kernel with MFD_NOEXEC_SEAL", func() {
+			// The kernel's support decides the skip, so that a vm-launch
+			// that stops asking for the flag fails here on a kernel that
+			// has it.
+			probe, err := unix.MemfdCreate("vm-launch-noexec-probe", unix.MFD_NOEXEC_SEAL)
+			if errors.Is(err, unix.EINVAL) {
+				Skip("this kernel has no MFD_NOEXEC_SEAL, which Linux 6.3 added")
+			}
+			Expect(err).NotTo(HaveOccurred())
+			Expect(unix.Close(probe)).To(Succeed())
+
+			seals, err := unix.FcntlInt(f.Fd(), unix.F_GET_SEALS, 0)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(seals & unix.F_SEAL_EXEC).To(Equal(unix.F_SEAL_EXEC))
+			info, err := f.Stat()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(info.Mode().Perm() & 0o111).To(BeZero())
+			Expect(unix.Fchmod(int(f.Fd()), 0o755)).To(MatchError(syscall.EPERM))
+		})
 	})
 
-	It("fails when busybox is missing or not a regular file", func() {
+	Describe("the memfd_create flags", func() {
+		var (
+			bb    string
+			calls []int
+			orig  func(string, int) (int, error)
+		)
+
+		BeforeEach(func() {
+			bb = filepath.Join(GinkgoT().TempDir(), "busybox")
+			Expect(os.WriteFile(bb, busybox, 0o755)).To(Succeed())
+			calls = nil
+			orig = memfdCreate
+			DeferCleanup(func() { memfdCreate = orig })
+		})
+
+		// kernel makes memfdCreate record its flags and fail with err when
+		// they hold MFD_NOEXEC_SEAL, as a kernel without it does with EINVAL.
+		kernel := func(err error) {
+			memfdCreate = func(name string, flags int) (int, error) {
+				calls = append(calls, flags)
+				if err != nil && flags&unix.MFD_NOEXEC_SEAL != 0 {
+					return -1, err
+				}
+				return orig(name, flags)
+			}
+		}
+
+		It("asks for MFD_NOEXEC_SEAL first", func() {
+			kernel(nil)
+			f, err := newInitramfs(bb, "true", testNonce, nil, nil)
+			Expect(err).NotTo(HaveOccurred())
+			defer f.Close()
+			Expect(calls).To(Equal([]int{unix.MFD_CLOEXEC | unix.MFD_ALLOW_SEALING | unix.MFD_NOEXEC_SEAL}))
+		})
+
+		It("falls back to the plain flags on a kernel that rejects MFD_NOEXEC_SEAL", func() {
+			kernel(unix.EINVAL)
+			f, err := newInitramfs(bb, "true", testNonce, nil, nil)
+			Expect(err).NotTo(HaveOccurred())
+			defer f.Close()
+			Expect(calls).To(Equal([]int{
+				unix.MFD_CLOEXEC | unix.MFD_ALLOW_SEALING | unix.MFD_NOEXEC_SEAL,
+				unix.MFD_CLOEXEC | unix.MFD_ALLOW_SEALING,
+			}))
+			seals, err := unix.FcntlInt(f.Fd(), unix.F_GET_SEALS, 0)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(seals &^ unix.F_SEAL_EXEC).To(Equal(unix.F_SEAL_SHRINK | unix.F_SEAL_GROW | unix.F_SEAL_WRITE | unix.F_SEAL_SEAL))
+			readNewc(gunzip(fileBytes(f)))
+		})
+
+		It("returns any other error without trying again, and holds no memfd", func() {
+			kernel(unix.EACCES)
+			held := heldInitramfs()
+			_, err := newInitramfs(bb, "true", testNonce, nil, nil)
+			Expect(err).To(MatchError("creating the initramfs memfd: permission denied"))
+			Expect(errors.Is(err, unix.EACCES)).To(BeTrue())
+			Expect(calls).To(HaveLen(1))
+			Expect(heldInitramfs()).To(Equal(held))
+		})
+	})
+
+	It("fails when busybox is missing or not a regular file, and leaves no memfd behind", func() {
 		dir := GinkgoT().TempDir()
-		Expect(writeInitramfs(filepath.Join(dir, "a"), filepath.Join(dir, "nope"), "true", testNonce, nil, nil)).To(MatchError(ContainSubstring("opening busybox")))
-		Expect(writeInitramfs(filepath.Join(dir, "b"), dir, "true", testNonce, nil, nil)).To(MatchError(ContainSubstring("not a regular file")))
+		held := heldInitramfs()
+		_, err := newInitramfs(filepath.Join(dir, "nope"), "true", testNonce, nil, nil)
+		Expect(err).To(MatchError(ContainSubstring("opening busybox")))
+		_, err = newInitramfs(dir, "true", testNonce, nil, nil)
+		Expect(err).To(MatchError(ContainSubstring("not a regular file")))
+		Expect(heldInitramfs()).To(Equal(held))
+	})
+
+	It("reports a destination it cannot write", func() {
+		bb := filepath.Join(GinkgoT().TempDir(), "busybox")
+		Expect(os.WriteFile(bb, busybox, 0o755)).To(Succeed())
+		ro, err := os.Open(bb)
+		Expect(err).NotTo(HaveOccurred())
+		defer ro.Close()
+		Expect(writeInitramfs(ro, bb, "true", testNonce, nil, nil)).To(MatchError(ContainSubstring("writing the initramfs")))
 	})
 
 	Describe("cpioWriter", func() {
@@ -460,21 +608,21 @@ var _ = Describe("hypervisor command lines", func() {
 	const art = "/opt/garden-vm/artifacts"
 
 	It("builds the QEMU microvm command line through the bundled loader", func() {
-		argv, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/tmp/w/initrd.cpio.gz", 128, nil, "")
+		argv, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/proc/self/fd/3", 128, nil, "")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(argv).To(Equal([]string{
 			art + "/qemu/ld-linux-x86-64.so.2", "--library-path", art + "/qemu/lib",
 			art + "/qemu/qemu-system-x86_64-microvm", "-L", art + "/qemu/share",
 			"-M", "microvm,accel=kvm", "-cpu", "host", "-smp", "1", "-m", "128",
 			"-nodefaults", "-no-user-config", "-nographic", "-serial", "stdio", "-no-reboot",
-			"-kernel", art + "/kernel/bzImage", "-initrd", "/tmp/w/initrd.cpio.gz",
+			"-kernel", art + "/kernel/bzImage", "-initrd", "/proc/self/fd/3",
 			"-append", "console=ttyS0 reboot=t panic=-1 rdinit=/init pci=off quiet",
 		}))
 	})
 
 	It("writes the Firecracker config and builds its command line", func() {
 		work := GinkgoT().TempDir()
-		argv, err := hypervisorArgv(backend.VMFirecracker, art, work, work+"/initrd.cpio.gz", 128, nil, "")
+		argv, err := hypervisorArgv(backend.VMFirecracker, art, work, "/proc/self/fd/3", 128, nil, "")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(argv).To(Equal([]string{art + "/firecracker/firecracker", "--no-api", "--config-file", work + "/fc.json"}))
 
@@ -485,7 +633,7 @@ var _ = Describe("hypervisor command lines", func() {
 		Expect(cfg).To(Equal(map[string]any{
 			"boot-source": map[string]any{
 				"kernel_image_path": art + "/kernel/vmlinux",
-				"initrd_path":       work + "/initrd.cpio.gz",
+				"initrd_path":       "/proc/self/fd/3",
 				"boot_args":         "console=ttyS0 reboot=k panic=1 rdinit=/init quiet",
 			},
 			"drives":         []any{},
