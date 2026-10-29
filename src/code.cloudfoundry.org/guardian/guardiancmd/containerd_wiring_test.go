@@ -9,8 +9,11 @@ import (
 	"reflect"
 	"testing"
 
+	"code.cloudfoundry.org/garden"
+	"code.cloudfoundry.org/guardian/backend"
 	"code.cloudfoundry.org/guardian/metrics"
 	"code.cloudfoundry.org/guardian/rundmc/depot"
+	"code.cloudfoundry.org/guardian/rundmc/goci"
 	"code.cloudfoundry.org/guardian/rundmc/peas"
 	"code.cloudfoundry.org/guardian/rundmc/processes"
 	"code.cloudfoundry.org/guardian/rundmc/runcontainerd"
@@ -28,12 +31,15 @@ type containerdArgsFactory struct {
 	runtimeWiringFactory
 	processBuilder *processes.ProcBuilder
 	userLookupper  users.UserLookupper
+	runContainerd  *runcontainerd.RunContainerd
 }
 
 func (f *containerdArgsFactory) WireContainerd(processBuilder *processes.ProcBuilder, userLookupper users.UserLookupper, wireExecer func(runrunc.PidGetter) *runrunc.Execer, statser runcontainerd.Statser, log lager.Logger, volumizer peas.Volumizer, peaHandlesGetter runcontainerd.PeaHandlesGetter, metricsProvider *metrics.MetricsProvider) (*runcontainerd.RunContainerd, *runcontainerd.RunContainerPea, *runcontainerd.PidGetter, *containerdprivchecker.PrivilegeChecker, peas.BundleLoader, runcontainerd.RuntimePolicy, error) {
 	f.processBuilder = processBuilder
 	f.userLookupper = userLookupper
-	return f.runtimeWiringFactory.WireContainerd(processBuilder, userLookupper, wireExecer, statser, log, volumizer, peaHandlesGetter, metricsProvider)
+	runContainerd, peaRunner, pidGetter, privChecker, bundleLoader, policy, err := f.runtimeWiringFactory.WireContainerd(processBuilder, userLookupper, wireExecer, statser, log, volumizer, peaHandlesGetter, metricsProvider)
+	f.runContainerd = runContainerd
+	return runContainerd, peaRunner, pidGetter, privChecker, bundleLoader, policy, err
 }
 
 // serveEmptyContainerd listens on a socket that no containerd service backs.
@@ -57,6 +63,44 @@ func serveEmptyContainerd(t *testing.T) string {
 	return socket
 }
 
+// assertLookupStaysInImage checks that lookupper reads the passwd file inside
+// the image root and does not follow a link out of it.
+func assertLookupStaysInImage(t *testing.T, lookupper users.UserLookupper) {
+	t.Helper()
+
+	// The image's passwd file links to an absolute path. The host has a
+	// user at that path and so does the image, with different names.
+	hostDir := t.TempDir()
+	hostPasswd := filepath.Join(hostDir, "passwd")
+	if err := os.WriteFile(hostPasswd, []byte("hostuser:x:4001:4001::/host-home:/bin/sh\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	imageRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(imageRoot, "etc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(hostPasswd, filepath.Join(imageRoot, "etc", "passwd")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(imageRoot, hostDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(imageRoot, hostPasswd), []byte("imageuser:x:4002:4002::/image-home:/bin/sh\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	user, err := lookupper.Lookup(imageRoot, "imageuser")
+	if err != nil {
+		t.Fatalf("lookup of the image's user: %v", err)
+	}
+	if user.Uid != 4002 || user.Home != "/image-home" {
+		t.Errorf("image user = %+v, want uid 4002 and home /image-home", user)
+	}
+	if user, err := lookupper.Lookup(imageRoot, "hostuser"); err == nil {
+		t.Errorf("lookup found the host's user %+v through a link out of the image", user)
+	}
+}
+
 func TestContainerdWiringResolvesExecUsersInsideTheImage(t *testing.T) {
 	for _, runtimeType := range []string{"", runcontainerd.SupportedRuntimeType} {
 		t.Run("runtime type "+runtimeType, func(t *testing.T) {
@@ -73,38 +117,59 @@ func TestContainerdWiringResolvesExecUsersInsideTheImage(t *testing.T) {
 				t.Fatal("WireContainerd was given no user lookupper")
 			}
 
-			// The image's passwd file links to an absolute path. The host has a
-			// user at that path and so does the image, with different names.
-			hostDir := t.TempDir()
-			hostPasswd := filepath.Join(hostDir, "passwd")
-			if err := os.WriteFile(hostPasswd, []byte("hostuser:x:4001:4001::/host-home:/bin/sh\n"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			imageRoot := t.TempDir()
-			if err := os.MkdirAll(filepath.Join(imageRoot, "etc"), 0o755); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Symlink(hostPasswd, filepath.Join(imageRoot, "etc", "passwd")); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.MkdirAll(filepath.Join(imageRoot, hostDir), 0o755); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(filepath.Join(imageRoot, hostPasswd), []byte("imageuser:x:4002:4002::/image-home:/bin/sh\n"), 0o644); err != nil {
-				t.Fatal(err)
-			}
-
-			user, err := factory.userLookupper.Lookup(imageRoot, "imageuser")
-			if err != nil {
-				t.Fatalf("lookup of the image's user: %v", err)
-			}
-			if user.Uid != 4002 || user.Home != "/image-home" {
-				t.Errorf("image user = %+v, want uid 4002 and home /image-home", user)
-			}
-			if user, err := factory.userLookupper.Lookup(imageRoot, "hostuser"); err == nil {
-				t.Errorf("lookup found the host's user %+v through a link out of the image", user)
-			}
+			assertLookupStaysInImage(t, factory.userLookupper)
 		})
+	}
+}
+
+// A cell can leave use_containerd_for_processes off and enable oci-gvisor. Only
+// gVisor containers then exec through containerd, and they have to resolve the
+// user and the working directory inside the image like any other gVisor exec.
+func TestContainerdWiringConfinesGvisorExecsWhenContainerdDoesNotRunProcesses(t *testing.T) {
+	cmd := &CommonCommand{}
+	cmd.Containers.Dir = t.TempDir()
+	cmd.Containerd.Socket = serveEmptyContainerd(t)
+	cmd.Containerd.UseContainerdForProcesses = false
+	cmd.ExecutionBackends.Enabled = []string{string(backend.OCIGvisor)}
+
+	backends, err := cmd.wireExecutionBackends(lager.NewLogger("execution-backends"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !backends.dispatch() {
+		t.Fatal("oci-gvisor did not turn on backend dispatch")
+	}
+	cmd.wiredBackends = backends
+
+	factory := &containerdArgsFactory{runtimeWiringFactory: runtimeWiringFactory{LinuxFactory: &LinuxFactory{config: cmd}}}
+	if _, _, err := cmd.wireContainerizer(lager.NewLogger("containerd-wiring"), factory, nil, nil, 1, depot.NetworkDepot{}, nil, backends); err != nil {
+		t.Fatal(err)
+	}
+	if factory.userLookupper == nil {
+		t.Fatal("WireContainerd was given no user lookupper")
+	}
+
+	runContainerd := reflect.ValueOf(factory.runContainerd).Elem()
+	if runContainerd.FieldByName("useContainerdForProcesses").Bool() {
+		t.Error("RunContainerd runs every process through containerd, want only gVisor containers to")
+	}
+	if !runContainerd.FieldByName("backendDispatch").Bool() {
+		t.Error("RunContainerd does not look up the backend of a container, so a gVisor exec would take the runc path")
+	}
+
+	assertLookupStaysInImage(t, factory.userLookupper)
+
+	// The working directory of a gVisor process is a link that leaves the image.
+	rootfs := t.TempDir()
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(rootfs, "app")); err != nil {
+		t.Fatal(err)
+	}
+	bndl := goci.Bundle().WithRootFS(rootfs)
+	bndl.Spec.Annotations = map[string]string{backend.AnnotationKey: string(backend.OCIGvisor)}
+	process := factory.processBuilder.BuildProcess(bndl, garden.ProcessSpec{Path: "program", Dir: "/app"}, &users.ExecUser{Home: "/"})
+	if process.Cwd != "/" {
+		t.Errorf("gVisor process working directory = %q, want %q because the link leaves the image", process.Cwd, "/")
 	}
 }
 
