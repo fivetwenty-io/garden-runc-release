@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"unsafe"
 
 	"code.cloudfoundry.org/garden"
 	"code.cloudfoundry.org/guardian/backend"
@@ -101,6 +102,21 @@ func assertLookupStaysInImage(t *testing.T, lookupper users.UserLookupper) {
 	}
 }
 
+// storedLookupper returns the user lookupper that RunContainerd keeps and
+// uses for exec.
+func storedLookupper(t *testing.T, runContainerd *runcontainerd.RunContainerd) users.UserLookupper {
+	t.Helper()
+	field := reflect.ValueOf(runContainerd).Elem().FieldByName("userLookupper")
+	if !field.IsValid() {
+		t.Fatal("RunContainerd has no userLookupper field")
+	}
+	stored, ok := reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem().Interface().(users.UserLookupper)
+	if !ok || stored == nil {
+		t.Fatal("RunContainerd keeps no user lookupper")
+	}
+	return stored
+}
+
 func TestContainerdWiringResolvesExecUsersInsideTheImage(t *testing.T) {
 	for _, runtimeType := range []string{"", runcontainerd.SupportedRuntimeType} {
 		t.Run("runtime type "+runtimeType, func(t *testing.T) {
@@ -118,6 +134,7 @@ func TestContainerdWiringResolvesExecUsersInsideTheImage(t *testing.T) {
 			}
 
 			assertLookupStaysInImage(t, factory.userLookupper)
+			assertLookupStaysInImage(t, storedLookupper(t, factory.runContainerd))
 		})
 	}
 }
@@ -158,6 +175,7 @@ func TestContainerdWiringConfinesGvisorExecsWhenContainerdDoesNotRunProcesses(t 
 	}
 
 	assertLookupStaysInImage(t, factory.userLookupper)
+	assertLookupStaysInImage(t, storedLookupper(t, factory.runContainerd))
 
 	// The working directory of a gVisor process is a link that leaves the image.
 	rootfs := t.TempDir()
