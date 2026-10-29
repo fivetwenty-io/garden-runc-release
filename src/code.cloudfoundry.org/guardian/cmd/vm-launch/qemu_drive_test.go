@@ -18,7 +18,8 @@ import (
 // realQEMU returns a QEMU system binary on PATH, or skips the spec. The
 // binary only parses the drive options here, with no guest, so any
 // architecture will do for the specs that use no machine. The specs that
-// need the microvm machine skip unless it is qemu-system-x86_64.
+// need the microvm machine skip unless it is qemu-system-x86_64 or
+// qemu-system-i386 (requireMicrovm).
 func realQEMU() string {
 	for _, name := range []string{"qemu-system-x86_64", "qemu-system-aarch64", "qemu-system-i386"} {
 		if p, err := exec.LookPath(name); err == nil {
@@ -27,6 +28,16 @@ func realQEMU() string {
 	}
 	Skip("no qemu-system binary on PATH; run these specs where QEMU is installed")
 	return ""
+}
+
+// requireMicrovm skips a spec unless qemu is an x86 system emulator, which
+// is the only kind with the microvm machine type. The pair check and its
+// control use it together, so the control always runs where the check does.
+func requireMicrovm(qemu string) {
+	base := filepath.Base(qemu)
+	if !strings.Contains(base, "x86_64") && !strings.Contains(base, "i386") {
+		Skip("the microvm machine type needs qemu-system-x86_64 or qemu-system-i386")
+	}
 }
 
 // optionAfter returns the argument that follows flag in the generated QEMU
@@ -101,9 +112,7 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 
 	It("accepts the -drive and -device pair vm-launch generates on a microvm machine", func() {
 		qemu := realQEMU()
-		if !strings.Contains(filepath.Base(qemu), "x86_64") && !strings.Contains(filepath.Base(qemu), "i386") {
-			Skip("the microvm machine type needs qemu-system-x86_64")
-		}
+		requireMicrovm(qemu)
 		argv := qemuArgv(goldenArt, goldenInitrd, nil, volumeDrivePath())
 		drive, device := driveOption(argv), deviceOption(argv)
 		Expect(device).To(ContainSubstring("drive=vol0"))
@@ -113,9 +122,7 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 
 	It("rejects a -device that names a drive that does not exist, so the pair check above can fail", func() {
 		qemu := realQEMU()
-		if !strings.Contains(filepath.Base(qemu), "x86_64") {
-			Skip("the microvm machine type needs qemu-system-x86_64")
-		}
+		requireMicrovm(qemu)
 		argv := qemuArgv(goldenArt, goldenInitrd, nil, volumeDrivePath())
 		device := strings.Replace(deviceOption(argv), "drive=vol0", "drive=vol9", 1)
 		code, stderr := parseDrive(qemu, microvm, "-drive", driveOption(argv), "-device", device)

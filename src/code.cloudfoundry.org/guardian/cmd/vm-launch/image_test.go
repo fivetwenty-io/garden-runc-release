@@ -4,6 +4,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -495,6 +496,58 @@ var _ = Describe("openVolumeImage", func() {
 			_, err = f.ReadAt(got, 0)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(got).NotTo(Equal([]byte("stale")))
+		})
+
+		It("fails with 125 and a publish message when the rename fails for a reason other than the name existing", func() {
+			opts.afterTempCreate = func(dirfd int, tempName string) {
+				Expect(unix.Unlinkat(dirfd, tempName, 0)).To(Succeed())
+			}
+			_, err := open()
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("publishing it"))
+			Expect(err.Error()).NotTo(ContainSubstring("appeared"))
+			Expect(errors.Is(err, errImageAppeared)).To(BeFalse())
+			Expect(errors.Is(err, unix.ENOENT)).To(BeTrue(), "%v", err)
+			Expect(volumeExitCode(err)).To(Equal(exitLaunchError))
+			Expect(fileExists(img)).To(BeFalse())
+			Expect(tempFiles(dir)).To(BeEmpty())
+		})
+
+		DescribeTable("renameHint",
+			func(err error, want string) { Expect(renameHint(err)).To(Equal(want)) },
+			Entry("EINVAL", unix.EINVAL, " (the volume does not support renameat2 with RENAME_NOREPLACE)"),
+			Entry("ENOSYS", unix.ENOSYS, " (the volume does not support renameat2 with RENAME_NOREPLACE)"),
+			Entry("a wrapped EINVAL", fmt.Errorf("rename: %w", unix.EINVAL), " (the volume does not support renameat2 with RENAME_NOREPLACE)"),
+			Entry("ENOENT", unix.ENOENT, ""),
+			Entry("EDQUOT", unix.EDQUOT, ""),
+		)
+
+		Describe("sizeNewImage", func() {
+			It("names the image path and keeps the kind when a check fails on the new file", func() {
+				name, fd, err := createTempImage(dirfd)
+				Expect(err).NotTo(HaveOccurred())
+				DeferCleanup(func() { unix.Close(fd); _ = unix.Unlinkat(dirfd, name, 0) })
+				Expect(unix.Fchmod(fd, 0o644)).To(Succeed())
+
+				err = sizeNewImage(fd, img, defaultImageSize)
+				Expect(err).To(HaveOccurred())
+				Expect(errors.Is(err, errImageMode)).To(BeTrue(), "%v", err)
+				Expect(err.Error()).To(HavePrefix("creating volume image " + img + ": the new file failed a check"))
+				Expect(err.Error()).To(ContainSubstring("the volume may force file owners or modes"))
+				Expect(volumeExitCode(err)).To(Equal(exitLaunchError))
+			})
+
+			It("leaves out the owner and mode hint for a check that is not about them", func() {
+				name, fd, err := createTempImage(dirfd)
+				Expect(err).NotTo(HaveOccurred())
+				DeferCleanup(func() { unix.Close(fd); _ = unix.Unlinkat(dirfd, name, 0) })
+				Expect(unix.Linkat(dirfd, name, dirfd, "second-link", 0)).To(Succeed())
+				DeferCleanup(func() { _ = unix.Unlinkat(dirfd, "second-link", 0) })
+
+				err = sizeNewImage(fd, img, defaultImageSize)
+				Expect(errors.Is(err, errImageLinks)).To(BeTrue(), "%v", err)
+				Expect(err.Error()).NotTo(ContainSubstring("force file owners"))
+			})
 		})
 
 		Describe("removeOwnTemp", func() {

@@ -43,10 +43,12 @@ var applicationIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]
 
 // processTypePattern is the only process_type vm-launch puts into a file
 // name. A process type comes from a Procfile or a manifest, not from Cloud
-// Controller, so it is checked against what CF accepts for one: lowercase
-// letters, digits, underscores, and hyphens, starting with a letter or digit.
-// The instance index after it is decimal without a hyphen, so a name maps back
-// to exactly one process type and index.
+// Controller, so it is checked against a deliberately narrow set that is safe
+// in a file name: lowercase letters, digits, underscores, and hyphens,
+// starting with a letter or digit. CF may accept more, and a process type
+// outside this set fails the launch. The instance index after it is decimal
+// without a hyphen, so a name maps back to exactly one process type and
+// index.
 var processTypePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,62}$`)
 
 // reservedGuestDirs are guest paths /init needs for itself. A volume mounted

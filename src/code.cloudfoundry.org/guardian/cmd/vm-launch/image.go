@@ -15,13 +15,15 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// The guest volume image. vm-launch creates it sparse in the volume root,
+// The guest volume image. vm-launch creates it in the volume root,
 // checks that it is a plain file the app owns, locks it, and hands the open
 // file to the hypervisor. It never reads or writes the image's bytes: only
 // the guest kernel parses what is in it.
 const (
 	// defaultImageSize is the size of a new image. An existing image keeps
-	// its size; vm-launch never resizes one.
+	// its size; vm-launch never resizes one. A new image is sparse, but a
+	// quota that counts file length, as JuiceFS does, charges all of it as
+	// soon as the file is sized.
 	defaultImageSize = 1 << 30
 
 	// imageSectorSize is the unit virtio-blk exposes a drive in.
@@ -40,8 +42,9 @@ const (
 
 	// tempPrefix and tempSuffix frame the unique name a new image has until
 	// it is sized and published. A launch killed in between leaves such a
-	// file behind. It is harmless: nothing ever opens, trusts, or reuses a
-	// temp file, and an operator may delete it.
+	// file behind. Nothing ever opens, trusts, or reuses a temp file, but
+	// on a volume whose quota counts file length it holds up to the image
+	// size of quota until an operator deletes it.
 	tempPrefix = ".rvm-disk-"
 	tempSuffix = ".tmp"
 
@@ -125,10 +128,10 @@ func (e *signalledError) Error() string {
 // the wait.
 //
 // A missing image is created under a unique temporary name in the same
-// directory, sized to Size (sparse), synced, and only then published under
-// its name with renameat2(RENAME_NOREPLACE), so the published name never
-// refers to an unsized file, whatever happens to this launch. See
-// createImage.
+// directory, sized to Size (sparse, but a quota that counts file length
+// charges all of it), synced, and only then published under its name with
+// renameat2(RENAME_NOREPLACE), so the published name never refers to an
+// unsized file, whatever happens to this launch. See createImage.
 func openVolumeImage(v *guestVolume, o imageOptions, sigs <-chan os.Signal) (*os.File, error) {
 	if err := checkImageRequest(v, o); err != nil {
 		return nil, err
@@ -254,7 +257,8 @@ var errImageAppeared = errors.New("volume image appeared while this launch creat
 // It returns the open file, which is still the one now at name. The published
 // name therefore never refers to an unsized file, and a launch killed at any
 // point leaves at worst a temp file. Nothing opens, trusts, or reuses a temp
-// file, so a leftover one is harmless.
+// file, but a leftover one holds up to the image size of quota on a volume
+// whose quota counts file length, until an operator deletes it.
 //
 // When name exists already, the rename fails with EEXIST and createImage
 // returns errImageAppeared, after removing its own temp file, so that the
@@ -355,7 +359,8 @@ func newTempName() (string, error) {
 // fd, which this launch created, and does nothing otherwise. The comparison
 // by device and inode, without following a symbolic link, keeps it from
 // removing a file that a co-bound app moved to the name in the meantime. A
-// failure is ignored: a temp file left behind is harmless.
+// failure is ignored: the launch is already failing, and an operator can
+// delete a leftover temp file.
 func removeOwnTemp(dirfd, fd int, tempName string) {
 	if checkImageName(dirfd, fd, tempName, tempName) != nil {
 		return
@@ -364,20 +369,40 @@ func removeOwnTemp(dirfd, fd int, tempName string) {
 }
 
 // sizeNewImage truncates a file this launch created to size, which leaves it
-// sparse, and confirms that the filesystem kept the size.
+// sparse, and confirms that the filesystem kept the size. On a volume whose
+// quota counts file length, the truncate charges the whole size, so a quota
+// error here is an ordinary failure to create the image. The file checked is
+// still the temp file, so a failed check is reported by newImageCheckError.
 func sizeNewImage(fd int, path string, size int64) error {
 	if err := unix.Ftruncate(fd, size); err != nil {
 		return fmt.Errorf("creating volume image %s: %w", path, err)
 	}
 	got, err := checkImage(fd, path)
 	if err != nil {
-		return err
+		return newImageCheckError(path, err)
 	}
 	if got != size {
 		return &volumeError{kind: errImageSize,
 			msg: fmt.Sprintf("creating volume image %s: size is %d after sizing it to %d", path, got, size)}
 	}
 	return nil
+}
+
+// newImageCheckError reports a check that failed on the new temp file. The
+// image name does not exist yet, so the message says that the new file failed
+// and, for an owner or mode, that the volume may be forcing them, as a FUSE
+// mount can. The error keeps the kind of the failed check.
+func newImageCheckError(path string, err error) error {
+	hint := ""
+	if errors.Is(err, errImageOwner) || errors.Is(err, errImageMode) {
+		hint = "; the volume may force file owners or modes"
+	}
+	var ve *volumeError
+	if errors.As(err, &ve) {
+		return &volumeError{kind: ve.kind, cause: err,
+			msg: fmt.Sprintf("creating volume image %s: the new file failed a check: %v%s", path, err, hint)}
+	}
+	return fmt.Errorf("creating volume image %s: the new file failed a check: %w%s", path, err, hint)
 }
 
 // checkImageName checks that name in dirfd still refers to the file fd, by

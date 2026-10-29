@@ -37,19 +37,22 @@
 // that has a volume fails to start. vm-launch creates a missing image under
 // a temporary name, as a sparse 1 GiB file with mode 0600, and publishes it
 // with renameat2(RENAME_NOREPLACE) once it is sized, so the image name never
-// refers to an unsized file; a launch that is killed leaves at worst a
-// .rvm-disk-*.tmp file, which nothing reads. It sizes only an image it
-// creates: an existing image that is not exactly 1 GiB fails the launch. The
-// volume path and the image are resolved without following symbolic links,
-// the volume path must be a mount point, and the image must be a regular file
-// owned by the app's uid, with one link and mode 0600. vm-launch never reads
-// the image. It holds an exclusive flock on the image for as long as the VM
-// runs, waiting up to 30 seconds for another instance to release it, checks
-// after the wait that the name still refers to the locked file, and passes
-// the image to the hypervisor as file descriptor 3. The guest formats the image as ext2 when its first 64 KiB
-// are all zero and mounts it synchronously; a non-blank image that does not
-// mount is never formatted. A VM app supports one read-write volume mount,
-// and VCAP_SERVICES itself never reaches the guest.
+// refers to an unsized file. A launch that is killed leaves at worst a
+// .rvm-disk-*.tmp file, which nothing reads but which holds up to 1 GiB of
+// quota until an operator deletes it, because a quota that counts file
+// length, as JuiceFS does, charges a new image its whole size. It sizes only
+// an image it creates: an existing image that is not exactly 1 GiB fails the
+// launch. The volume path and the image are resolved without following
+// symbolic links, the volume path must be a mount point, and the image must
+// be a regular file owned by the app's uid, with one link and mode 0600.
+// vm-launch never reads the image. It holds an exclusive flock on the image
+// for as long as the VM runs, waiting up to 30 seconds for another instance
+// to release it, checks after the wait that the name still refers to the
+// locked file, and passes the image to the hypervisor as file descriptor 3.
+// The guest formats the image as ext2 when its first 64 KiB are all zero and
+// mounts it synchronously; a non-blank image that does not mount is never
+// formatted. A VM app supports one read-write volume mount, and
+// VCAP_SERVICES itself never reaches the guest.
 //
 // The guest's console output, stdout and stderr merged, is written to stdout
 // as it arrives. Kernel boot messages and the status marker are dropped.
