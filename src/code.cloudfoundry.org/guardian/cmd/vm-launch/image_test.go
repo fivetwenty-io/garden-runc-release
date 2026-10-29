@@ -510,6 +510,20 @@ var _ = Describe("openVolumeImage", func() {
 			Expect(errors.Is(err, unix.ENOENT)).To(BeTrue(), "%v", err)
 			Expect(volumeExitCode(err)).To(Equal(exitLaunchError))
 			Expect(fileExists(img)).To(BeFalse())
+		})
+
+		It("removes its temp file and adds the RENAME_NOREPLACE hint when the volume cannot publish the image", func() {
+			opts.rename = func(_ int, _, _ string) error {
+				Expect(tempFiles(dir)).To(HaveLen(1), "the temp file exists when the publish fails")
+				return unix.EINVAL
+			}
+			_, err := open()
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("publishing it"))
+			Expect(err.Error()).To(ContainSubstring("does not support renameat2 with RENAME_NOREPLACE"))
+			Expect(errors.Is(err, unix.EINVAL)).To(BeTrue(), "%v", err)
+			Expect(volumeExitCode(err)).To(Equal(exitLaunchError))
+			Expect(fileExists(img)).To(BeFalse())
 			Expect(tempFiles(dir)).To(BeEmpty())
 		})
 

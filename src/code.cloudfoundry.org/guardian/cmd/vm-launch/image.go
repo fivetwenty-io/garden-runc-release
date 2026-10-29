@@ -64,6 +64,10 @@ type imageOptions struct {
 	// afterTempCreate, when set, runs once a new image is sized and before it
 	// is published. Tests use it to act as a co-bound app would.
 	afterTempCreate func(dirfd int, tempName string)
+
+	// rename, when set, replaces renameNoReplace as the step that publishes a
+	// new image. Tests use it to fail the publish while the temp file exists.
+	rename func(dirfd int, oldName, newName string) error
 }
 
 var defaultImageOptions = imageOptions{
@@ -291,7 +295,11 @@ func createImage(dirfd int, name, path string, o imageOptions) (int, error) {
 	if o.afterTempCreate != nil {
 		o.afterTempCreate(dirfd, tempName)
 	}
-	switch err := renameNoReplace(dirfd, tempName, name); {
+	publish := o.rename
+	if publish == nil {
+		publish = renameNoReplace
+	}
+	switch err := publish(dirfd, tempName, name); {
 	case err == nil:
 		return fd, nil
 	case errors.Is(err, unix.EEXIST):
