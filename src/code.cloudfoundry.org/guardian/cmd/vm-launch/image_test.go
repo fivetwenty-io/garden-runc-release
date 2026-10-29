@@ -164,7 +164,7 @@ var _ = Describe("openVolumeImage", func() {
 		_, err := open()
 		Expect(errors.Is(err, errImageSize)).To(BeTrue(), "%v", err)
 		Expect(err).To(MatchError("volume image " + img + ": size 0, want 1073741824; vm-launch resizes only an image it creates, so inspect or delete it"))
-		Expect(volumeExitCode(err)).To(Equal(exitLaunchError))
+		Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 		Expect(statOf(img).Size).To(BeZero())
 		Expect(lockedElsewhere(img)).To(BeFalse(), "a rejected image is closed")
 	})
@@ -471,7 +471,7 @@ var _ = Describe("openVolumeImage", func() {
 			_, err := open()
 			Expect(err).To(HaveOccurred())
 			Expect(errors.Is(err, errImageReplaced) || errors.Is(err, errImageLinks)).To(BeTrue(), "%v", err)
-			Expect(volumeExitCode(err)).To(Equal(exitLaunchError))
+			Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 			Expect(os.ReadFile(img)).To(HavePrefix("other"), "the file that took the name is left alone")
 		})
 
@@ -508,7 +508,7 @@ var _ = Describe("openVolumeImage", func() {
 			Expect(err.Error()).NotTo(ContainSubstring("appeared"))
 			Expect(errors.Is(err, errImageAppeared)).To(BeFalse())
 			Expect(errors.Is(err, unix.ENOENT)).To(BeTrue(), "%v", err)
-			Expect(volumeExitCode(err)).To(Equal(exitLaunchError))
+			Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 			Expect(fileExists(img)).To(BeFalse())
 		})
 
@@ -522,7 +522,7 @@ var _ = Describe("openVolumeImage", func() {
 			Expect(err.Error()).To(ContainSubstring("publishing it"))
 			Expect(err.Error()).To(ContainSubstring("does not support renameat2 with RENAME_NOREPLACE"))
 			Expect(errors.Is(err, unix.EINVAL)).To(BeTrue(), "%v", err)
-			Expect(volumeExitCode(err)).To(Equal(exitLaunchError))
+			Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 			Expect(fileExists(img)).To(BeFalse())
 			Expect(tempFiles(dir)).To(BeEmpty())
 		})
@@ -548,7 +548,7 @@ var _ = Describe("openVolumeImage", func() {
 				Expect(errors.Is(err, errImageMode)).To(BeTrue(), "%v", err)
 				Expect(err.Error()).To(HavePrefix("creating volume image " + img + ": the new file failed a check"))
 				Expect(err.Error()).To(ContainSubstring("the volume may force file owners or modes"))
-				Expect(volumeExitCode(err)).To(Equal(exitLaunchError))
+				Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 			})
 
 			It("leaves out the owner and mode hint for a check that is not about them", func() {
@@ -626,7 +626,7 @@ var _ = Describe("openVolumeImage", func() {
 			Expect(time.Since(began)).To(BeNumerically(">=", opts.LockWait))
 			Expect(errors.Is(err, errVolumeInUse)).To(BeTrue(), "%v", err)
 			Expect(err).To(MatchError("volume image " + img + " is in use by another instance; VM backends allow one writer per image"))
-			Expect(volumeExitCode(err)).To(Equal(exitLaunchError))
+			Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 		})
 
 		It("fails at once with no wait", func() {
@@ -679,7 +679,7 @@ var _ = Describe("openVolumeImage", func() {
 			Expect(errors.As(err, &sigErr)).To(BeTrue(), "%v", err)
 			Expect(sigErr.Sig).To(Equal(syscall.SIGTERM))
 			Expect(err).To(MatchError("received terminated while waiting for the volume image lock"))
-			Expect(volumeExitCode(err)).To(Equal(143))
+			Expect(stepExitCode(err)).To(Equal(143))
 		})
 
 		It("fails closed when the name is replaced by another file during the wait", func() {
@@ -701,7 +701,7 @@ var _ = Describe("openVolumeImage", func() {
 			_, err = open()
 			Expect(errors.Is(err, errImageReplaced)).To(BeTrue(), "%v", err)
 			Expect(err).To(MatchError("volume image " + img + ": was deleted or replaced while this instance waited for its lock; start again"))
-			Expect(volumeExitCode(err)).To(Equal(exitLaunchError))
+			Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 			Expect(os.ReadFile(img)).To(HavePrefix("other"), "the replacement is left alone")
 		})
 

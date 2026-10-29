@@ -107,12 +107,15 @@ func (e *volumeError) Unwrap() []error {
 	return []error{e.kind, e.cause}
 }
 
-// signalledError reports a SIGTERM or SIGINT that arrived while vm-launch
-// waited for the image lock.
-type signalledError struct{ Sig syscall.Signal }
+// signalledError reports a SIGTERM or SIGINT that arrived during a step
+// before the guest started, such as waiting for the image lock.
+type signalledError struct {
+	Sig    syscall.Signal
+	during string
+}
 
 func (e *signalledError) Error() string {
-	return fmt.Sprintf("received %v while waiting for the volume image lock", e.Sig)
+	return fmt.Sprintf("received %v while %s", e.Sig, e.during)
 }
 
 // openVolumeImage opens, and creates when missing, the image of v in the
@@ -536,7 +539,7 @@ func lockImage(fd int, path string, o imageOptions, sigs <-chan os.Signal) error
 		select {
 		case sig := <-sigs:
 			timer.Stop()
-			return &signalledError{Sig: syscall.Signal(signalNumber(sig))}
+			return &signalledError{Sig: syscall.Signal(signalNumber(sig)), during: "waiting for the volume image lock"}
 		case <-timer.C:
 		}
 	}
@@ -584,9 +587,11 @@ func statxMountRoot(dirfd int) (bool, error) {
 	return stx.Attributes&unix.STATX_ATTR_MOUNT_ROOT != 0, nil
 }
 
-// volumeExitCode is vm-launch's exit status for a volume failure: 128+N for
-// a signal during the lock wait, 125 for every other error, and 0 for none.
-func volumeExitCode(err error) int {
+// stepExitCode is vm-launch's exit status for a failed step before the
+// guest starts, such as opening the volume image or resolving CredHub
+// references: 128+N for a signal during the step, 125 for every other
+// error, and 0 for none.
+func stepExitCode(err error) int {
 	if err == nil {
 		return 0
 	}

@@ -38,22 +38,22 @@ exec 9>&-
 const noFDThree = `case "$(readlink /proc/self/fd/3 2>/dev/null)" in *rvm-disk-*) echo "fd 3 is a volume image without a volume" >&2; exit 1 ;; esac
 `
 
-var _ = Describe("volumeExitCode", func() {
+var _ = Describe("stepExitCode", func() {
 	It("maps a signal during the lock wait to 128+N", func() {
-		Expect(volumeExitCode(&signalledError{Sig: syscall.SIGTERM})).To(Equal(143))
-		Expect(volumeExitCode(&signalledError{Sig: syscall.SIGINT})).To(Equal(130))
-		Expect(volumeExitCode(fmt.Errorf("wrapped: %w", &signalledError{Sig: syscall.SIGTERM}))).To(Equal(143))
+		Expect(stepExitCode(&signalledError{Sig: syscall.SIGTERM})).To(Equal(143))
+		Expect(stepExitCode(&signalledError{Sig: syscall.SIGINT})).To(Equal(130))
+		Expect(stepExitCode(fmt.Errorf("wrapped: %w", &signalledError{Sig: syscall.SIGTERM}))).To(Equal(143))
 	})
 
 	It("maps every other volume failure to 125", func() {
 		for _, kind := range []error{errVolumeInUse, errNotMountRoot, errImageNotRegular, errImageOwner, errImageLinks, errImageMode, errImageSize, errImageReplaced} {
 			err := &volumeError{kind: kind, msg: "x"}
 			Expect(errors.Is(err, kind)).To(BeTrue())
-			Expect(volumeExitCode(err)).To(Equal(exitLaunchError), kind.Error())
+			Expect(stepExitCode(err)).To(Equal(exitLaunchError), kind.Error())
 		}
-		Expect(volumeExitCode(syscall.ELOOP)).To(Equal(exitLaunchError))
-		Expect(volumeExitCode(errors.New("VCAP_SERVICES is not valid JSON"))).To(Equal(exitLaunchError))
-		Expect(volumeExitCode(nil)).To(Equal(0))
+		Expect(stepExitCode(syscall.ELOOP)).To(Equal(exitLaunchError))
+		Expect(stepExitCode(errors.New("VCAP_SERVICES is not valid JSON"))).To(Equal(exitLaunchError))
+		Expect(stepExitCode(nil)).To(Equal(0))
 	})
 
 	It("matches both the kind and the cause of a volume error", func() {

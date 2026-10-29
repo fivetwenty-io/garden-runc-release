@@ -81,8 +81,10 @@ type vcapServices map[string][]struct {
 // are errors, so a misconfigured app fails to start instead of losing data to
 // the wrong volume. Errors never repeat VCAP_SERVICES, which carries
 // credentials. lookup reads the environment the rest of vm-launch shares
-// (see lastWinsEnv), so the volume always comes from the VCAP_SERVICES value
-// the guest gets.
+// (see lastWinsEnv), so the volume comes from the pre-resolution
+// VCAP_SERVICES, which the guest also gets apart from resolved credentials.
+// vm-launch reads the volume before it resolves CredHub references, which
+// replace credentials and never a volume mount.
 func volumeFromEnv(lookup func(string) (string, bool)) (*guestVolume, error) {
 	raw, ok := lookup(vcapServicesEnv)
 	if !ok {

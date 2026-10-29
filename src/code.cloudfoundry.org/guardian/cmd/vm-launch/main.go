@@ -81,6 +81,23 @@
 // holds a value from it. Other lines name values the platform sets, such as
 // PORT, MEMORY_LIMIT, the volume path, and the CredHub host.
 //
+// CredHub: when a binding in VCAP_SERVICES holds a "credhub-ref", vm-launch
+// resolves the references before the guest boots, as the launcher does: one
+// POST of VCAP_SERVICES to /api/v1/interpolate at the credhub-uri in
+// VCAP_PLATFORM_OPTIONS, with the instance identity from CF_INSTANCE_CERT
+// and CF_INSTANCE_KEY as the client certificate, trusting only the .crt
+// files under CF_SYSTEM_CERT_PATH. The launcher also trusts the system CA
+// pool, and vm-launch does not, so a CA from the app's rootfs never vouches
+// for CredHub. The response becomes VCAP_SERVICES, and DATABASE_URL comes
+// from it. CREDHUB_SKIP_INTERPOLATION skips the step. The launcher's
+// -credhubConnectAttempts and -credhubRetryDelay, which default to 3 and 1s,
+// set the retries; each attempt may take 45 seconds and goes through
+// HTTPS_PROXY when NO_PROXY does not exclude the host. Go's proxy lookup
+// reads the process environment itself, so when HTTPS_PROXY or NO_PROXY
+// appears twice, the proxy uses the first value, while every other reader
+// uses the last. Each failed attempt logs a line with the CredHub host and a
+// reason class, never a body or a reference path.
+//
 // Memory: the guest gets MEMORY_LIMIT less 192 MiB, which the container
 // keeps for the hypervisor and everything else it runs, with a floor of 128
 // MiB and a ceiling of 16 GiB. MEMORY_LIMIT must be whole megabytes, such as
@@ -121,13 +138,17 @@
 //	       one volume mount, a read-only mount, a bad volume path,
 //	       CF_INSTANCE_INDEX, application_id, or process_type, a task with
 //	       a volume, an image that fails a check or cannot be created, or
-//	       an image another instance still holds after 30 seconds, or a
+//	       an image another instance still holds after 30 seconds, a
 //	       guest environment that is too large, with one entry over
 //	       131071 bytes or more than 1 MiB in all, or a value that holds a
-//	       NUL byte
+//	       NUL byte, VCAP_PLATFORM_OPTIONS that is not valid JSON, a bad
+//	       launcher CredHub flag, or CredHub references that cannot be
+//	       resolved: missing or unreadable instance identity or CA files,
+//	       a credhub-uri that is not an https URL, or every attempt failing
 //	128+N  vm-launch received signal N (SIGTERM or SIGINT), or the hypervisor
 //	       died from signal N, before the guest reported a status; this
-//	       includes a signal while vm-launch waits for the volume image
+//	       includes a signal while vm-launch waits for the volume image or
+//	       resolves CredHub references
 //
 // A guest command can exit with any of these values itself; whenever vm-launch
 // picks the status, it also writes a "vm-launch:" line to stderr.
@@ -176,6 +197,7 @@ type config struct {
 	backend   backend.Kind
 	artifacts string
 	command   string
+	credhub   credhubRetry
 }
 
 func main() {
@@ -271,6 +293,16 @@ func run(argv []string, logger *log.Logger) int {
 		return exitLaunchError
 	}
 	memMiB := guestMemory(lookupEnv, logger)
+	// The launcher derives DATABASE_URL from the resolved VCAP_SERVICES, so
+	// the references are resolved before buildGuestEnv.
+	services, resolved, err := resolveCredhubRefs(lookupEnv, cfg.credhub, defaultCredhubClient, sigs, logger)
+	if err != nil {
+		logger.Print(err)
+		return stepExitCode(err)
+	}
+	if resolved {
+		env[vcapServicesEnv] = services
+	}
 	envFile, err := buildGuestEnv(env, memMiB, logger)
 	if err != nil {
 		logger.Print(err)
@@ -300,7 +332,7 @@ func run(argv []string, logger *log.Logger) int {
 		img, err = openVolumeImage(vol, defaultImageOptions, sigs)
 		if err != nil {
 			logger.Print(err)
-			return volumeExitCode(err)
+			return stepExitCode(err)
 		}
 		defer img.Close()
 	}
@@ -458,7 +490,7 @@ func parseArgs(argv []string) (config, error) {
 	}
 	cfg.artifacts = abs
 
-	cfg.command, err = guestCommand(fs.Args())
+	cfg.command, cfg.credhub, err = guestCommand(fs.Args())
 	if err != nil {
 		return config{}, err
 	}
@@ -466,24 +498,31 @@ func parseArgs(argv []string) (config, error) {
 }
 
 // guestCommand returns the shell command the guest runs for the wrapped
-// process argv.
-func guestCommand(args []string) (string, error) {
+// process argv, and the CredHub retry settings: the launcher's CredHub flags
+// for the CF launcher, and the launcher's defaults for any other command.
+func guestCommand(args []string) (string, credhubRetry, error) {
 	if len(args) == 0 {
-		return "", errors.New("no guest command given after --")
+		return "", credhubRetry{}, errors.New("no guest command given after --")
 	}
 	if filepath.Base(args[0]) != "launcher" {
-		return shellJoin(args), nil
+		return shellJoin(args), defaultCredhubRetry, nil
 	}
 	// The CF launcher takes APP-DIR START-COMMAND METADATA. An empty start
 	// command means "use the droplet's detected one", which lives in the
 	// droplet and is not available in the guest.
 	if len(args) < 3 {
-		return "", fmt.Errorf("launcher argv has %d arguments, want APP-DIR START-COMMAND [METADATA]", len(args)-1)
+		return "", credhubRetry{}, fmt.Errorf("launcher argv has %d arguments, want APP-DIR START-COMMAND [METADATA]", len(args)-1)
 	}
 	if strings.TrimSpace(args[2]) == "" {
-		return "", errors.New("empty start command: VM backends need an explicit command because the droplet's detected start command is not available in the guest")
+		return "", credhubRetry{}, errors.New("empty start command: VM backends need an explicit command because the droplet's detected start command is not available in the guest")
 	}
-	return args[2], nil
+	// The launcher parses its CredHub flags from the arguments after
+	// START-COMMAND, as vm-launch does here.
+	retry, err := credhubRetryFromArgs(args[3:])
+	if err != nil {
+		return "", credhubRetry{}, err
+	}
+	return args[2], retry, nil
 }
 
 // shellJoin quotes each argument for POSIX sh and joins them with spaces.

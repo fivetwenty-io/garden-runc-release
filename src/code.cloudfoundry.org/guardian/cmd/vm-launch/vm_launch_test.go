@@ -580,7 +580,7 @@ var _ = Describe("parseArgs", func() {
 	It("accepts the form garden wraps the CF launcher in", func() {
 		cfg, err := parseArgs([]string{"--backend", "vm-qemu", "--", "/tmp/lifecycle/launcher", "app", "echo hi && exit 3", ""})
 		Expect(err).NotTo(HaveOccurred())
-		Expect(cfg).To(Equal(config{backend: backend.VMQemu, artifacts: defaultArtifactsDir, command: "echo hi && exit 3"}))
+		Expect(cfg).To(Equal(config{backend: backend.VMQemu, artifacts: defaultArtifactsDir, command: "echo hi && exit 3", credhub: credhubRetry{attempts: 3, delay: time.Second}}))
 	})
 
 	It("takes --artifacts and makes it absolute", func() {
