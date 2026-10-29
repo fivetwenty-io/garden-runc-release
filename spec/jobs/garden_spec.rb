@@ -23,10 +23,14 @@ describe 'garden' do
       expect(server['use-containerd-for-processes']).to be_nil
     end
 
-    it 'renders an explicitly selected runtime without changing the process backend' do
-      server = render_runtime({'containerd_runtime_type' => 'io.containerd.runsc.v1'})
-      expect(server['containerd-runtime-type']).to eql('io.containerd.runsc.v1')
+    it 'renders an explicitly selected stock runtime without changing the process backend' do
+      server = render_runtime({'containerd_runtime_type' => 'io.containerd.runc.v2'})
+      expect(server['containerd-runtime-type']).to eql('io.containerd.runc.v2')
       expect(server['use-containerd-for-processes']).to be_nil
+    end
+
+    it 'raises when runsc is selected without the process backend' do
+      expect { render_runtime({'containerd_runtime_type' => 'io.containerd.runsc.v1'}) }.to raise_error(/requires garden.use_containerd_for_processes/)
     end
 
     it 'renders an explicitly enabled process backend without selecting runsc' do
@@ -515,7 +519,7 @@ describe 'garden' do
       end
 
       context 'when the cell runs every container under runsc' do
-        let(:garden_properties) { { 'execution_backends' => ['oci-gvisor'], 'containerd_runtime_type' => 'io.containerd.runsc.v1' } }
+        let(:garden_properties) { { 'execution_backends' => ['oci-gvisor'], 'containerd_runtime_type' => 'io.containerd.runsc.v1', 'use_containerd_for_processes' => true } }
 
         it 'raises' do
           expect { raw_template }.to raise_error(/cannot be combined with garden.containerd_runtime_type "io.containerd.runsc.v1"/)

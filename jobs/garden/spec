@@ -199,7 +199,7 @@ properties:
     default: 250
 
   garden.containerd_runtime_type:
-    description: "Containerd runtime type. Empty preserves the stock runc runtime. Requires containerd_mode."
+    description: "Containerd runtime type. Empty preserves the stock runc runtime. Requires containerd_mode. io.containerd.runsc.v1 also requires use_containerd_for_processes."
     default: ""
 
   garden.use_containerd_for_processes:

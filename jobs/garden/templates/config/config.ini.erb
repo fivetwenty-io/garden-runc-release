@@ -252,6 +252,9 @@ parse_ip(p('garden.network_pool'), 'garden.network_pool')
 <% if !p("garden.containerd_mode") && (!p("garden.containerd_runtime_type").empty? || p("garden.use_containerd_for_processes"))
   raise "garden.containerd_runtime_type and garden.use_containerd_for_processes require garden.containerd_mode to be true"
 end -%>
+<% if p("garden.containerd_runtime_type") == "io.containerd.runsc.v1" && !p("garden.use_containerd_for_processes")
+  raise "garden.containerd_runtime_type #{p("garden.containerd_runtime_type").inspect} requires garden.use_containerd_for_processes to be true"
+end -%>
 <% if p("garden.containerd_mode") -%>
 ; containerd
   containerd-socket = /var/vcap/sys/run/containerd/containerd.sock
