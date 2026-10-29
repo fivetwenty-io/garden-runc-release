@@ -113,20 +113,21 @@ func exitTag(nonce string) string  { return "RVM_EXIT_" + nonce + "=" }
 //
 // Right after the mounts, /init defines rvm_fail, which every setup step
 // uses. It then brings up lo and eth0 from /rvm/net, for every guest, a
-// task's included, and checks that /rvm/env sources. A guest with a volume
-// then formats the volume image when it is blank and mounts it. When a setup
-// step fails, /init reboots before the start tag, so vm-launch reports a
-// guest that never started its command and shows the console output, which
-// ends with the failed step.
+// task's included, prepares the open-files limit from /rvm/limits, and
+// checks that /rvm/env sources. A guest with a volume then formats the
+// volume image when it is blank and mounts it. When a setup step fails,
+// /init reboots before the start tag, so vm-launch reports a guest that
+// never started its command and shows the console output, which ends with
+// the failed step.
 //
-// The command runs in a subshell that sources /rvm/env and then becomes the
-// shell that runs /rvm/cmd, so its status is the command's. The guest
-// environment applies only inside that subshell, never to /init's own steps,
-// such as the unquoted status in the exit line or the volume teardown. With
-// a volume, /init syncs and unmounts it after the command and before it
-// reports the status.
+// The command runs in a subshell that sets its open-files limit, sources
+// /rvm/env, and then becomes the shell that runs /rvm/cmd, so its status is
+// the command's. The guest environment applies only inside that subshell,
+// never to /init's own steps, such as the unquoted status in the exit line
+// or the volume teardown. With a volume, /init syncs and unmounts it after
+// the command and before it reports the status.
 func initScript(nonce string, volume bool) string {
-	setup := guestFailFunc + guestNetworkSetup + guestEnvChecks
+	setup := guestFailFunc + guestNetworkSetup + guestLimitsSetup + guestEnvChecks
 	if volume {
 		setup += guestVolumeSetup
 	}
@@ -168,15 +169,42 @@ ip addr add "$RVM_ADDRESS" dev eth0 || rvm_fail "adding $RVM_ADDRESS to eth0 fai
 ip route add default via "$RVM_GATEWAY" dev eth0 || rvm_fail "adding the default route via $RVM_GATEWAY failed"
 `
 
+// guestLimitsSetup prepares the command's open-files limit from
+// /rvm/limits. A guest kernel caps every process at fs.nr_open, which is
+// 1048576 by default, so /init raises it to the hard limit when that is
+// higher, and it lifts fs.file-max, which the kernel sizes from guest RAM,
+// to the highest value, as systemd does, so that the guest-wide count of
+// open files never binds before a process limit does. A failure there only
+// warns, because the command runs as root, which fs.file-max does not
+// limit. /init then checks, in a subshell, that the limits apply, so that a
+// limit that cannot be set is a failed setup step; the command's own
+// subshell sets them again (see guestRunCommand). busybox ulimit without -H
+// or -S sets both limits.
+const guestLimitsSetup = `. /rvm/limits
+echo 9223372036854775807 >/proc/sys/fs/file-max || echo "vm-launch guest setup: raising fs.file-max failed; keeping the default"
+rvm_nr_open=$(cat /proc/sys/fs/nr_open) || rvm_fail "reading fs.nr_open failed"
+if [ "$rvm_nr_open" -lt "$RVM_NOFILE_HARD" ]; then
+	echo "$RVM_NOFILE_HARD" >/proc/sys/fs/nr_open || rvm_fail "raising fs.nr_open to $RVM_NOFILE_HARD failed"
+fi
+( ` + guestSetLimits + ` ) || rvm_fail "setting the open files limit to $RVM_NOFILE_SOFT soft and $RVM_NOFILE_HARD hard failed"
+`
+
+// guestSetLimits sets the open-files limit of the shell that runs it: both
+// limits to the hard one first, which works whether the limit rises or
+// falls, and then the soft one.
+const guestSetLimits = `ulimit -n "$RVM_NOFILE_HARD" && ulimit -S -n "$RVM_NOFILE_SOFT"`
+
 // guestEnvChecks makes a broken /rvm/env a failed setup step, with the
 // console shown, instead of a command that fails to start. It sources
 // /rvm/env in a subshell, so /init itself never gets the guest environment.
 const guestEnvChecks = `( . /rvm/env ) || rvm_fail "reading /rvm/env failed"
 `
 
-// guestRunCommand runs the guest command with the guest environment, in a
-// subshell that becomes the shell running the command.
-const guestRunCommand = "( . /rvm/env && exec sh /rvm/cmd ) </dev/null\n"
+// guestRunCommand runs the guest command with its open-files limit and the
+// guest environment, in a subshell that becomes the shell running the
+// command. Only that subshell gets the limit, so /init's own steps never run
+// short of descriptors under a low one.
+const guestRunCommand = "( " + guestSetLimits + " && . /rvm/env && exec sh /rvm/cmd ) </dev/null\n"
 
 // guestVolumeDevice is the guest block device of the volume image. The guest
 // boots from the initramfs and has no other drive, so the image is the first
@@ -285,6 +313,8 @@ type guestContents struct {
 	// caBundle is the guest's CA bundle (see guestCABundle), or nil when
 	// there is no certificate to trust.
 	caBundle []byte
+	// nofile is the command's open-files limit (see guestNofile), /rvm/limits.
+	nofile nofileLimit
 }
 
 // newInitramfs builds the guest initramfs (see writeInitramfs) in a sealed
@@ -328,12 +358,18 @@ func addSeals(f *os.File, seals int) error {
 // writeInitramfs writes a gzip-compressed newc initramfs to dst holding a
 // static busybox, the console and null device nodes, the command script at
 // /rvm/cmd, the guest network's /rvm/net and /etc/resolv.conf, the guest
-// environment as /rvm/env with mode 0600, and the /init that runs it. With a
-// volume it also holds /rvm/mounts, and with a CA bundle it holds that at
-// /etc/ssl/certs/ca-certificates.crt.
+// environment as /rvm/env with mode 0600, the command's limits as
+// /rvm/limits, and the /init that runs it. With a volume it also holds
+// /rvm/mounts, and with a CA bundle it holds that at
+// /etc/ssl/certs/ca-certificates.crt. A hard open-files limit of 0 is an
+// error, because it is a limit no caller can have meant: vm-launch itself
+// could not run under it.
 func writeInitramfs(dst *os.File, busyboxPath string, g guestContents) error {
 	if g.nw == nil {
 		return errors.New("writing the initramfs: no guest network")
+	}
+	if g.nofile.hard == 0 {
+		return errors.New("writing the initramfs: no open files limit")
 	}
 	busybox, err := os.Open(busyboxPath)
 	if err != nil {
@@ -377,6 +413,7 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, g 
 		file("rvm/cmd", 0o644, g.command),
 		file("rvm/net", 0o644, netFile(g.nw)),
 		file("rvm/env", 0o600, g.env),
+		file("rvm/limits", 0o644, limitsFile(g.nofile)),
 		file("etc/resolv.conf", 0o644, g.nw.resolvConf),
 	}
 	if g.vol != nil {

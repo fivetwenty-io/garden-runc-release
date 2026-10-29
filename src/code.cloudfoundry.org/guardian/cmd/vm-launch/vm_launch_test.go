@@ -107,8 +107,12 @@ const noGuestEnv = ""
 // taskGuest returns the initramfs contents of a task that runs command, with
 // no guest environment, no volume, and no CA bundle.
 func taskGuest(command string) guestContents {
-	return guestContents{command: command, nonce: testNonce, nw: taskNetwork(), env: noGuestEnv}
+	return guestContents{command: command, nonce: testNonce, nw: taskNetwork(), env: noGuestEnv, nofile: testNofile}
 }
+
+// testNofile is the open-files limit of the guests specs build, soft and
+// hard alike, as Garden sets them.
+var testNofile = nofileLimit{soft: 1024, hard: 1024}
 
 // buildInitramfs builds an initramfs through newInitramfs, with busybox as
 // the busybox binary and an empty guest environment, and returns the
@@ -122,7 +126,7 @@ func buildInitramfs(busybox []byte, command string, nw *network, vol *guestVolum
 func buildInitramfsWithEnv(busybox []byte, command string, nw *network, guestEnv string, vol *guestVolume) []byte {
 	bb := filepath.Join(GinkgoT().TempDir(), "busybox")
 	Expect(os.WriteFile(bb, busybox, 0o755)).To(Succeed())
-	f, err := newInitramfs(bb, guestContents{command: command, nonce: testNonce, nw: nw, env: guestEnv, vol: vol})
+	f, err := newInitramfs(bb, guestContents{command: command, nonce: testNonce, nw: nw, env: guestEnv, vol: vol, nofile: testNofile})
 	Expect(err).NotTo(HaveOccurred())
 	defer f.Close()
 	return fileBytes(f)
@@ -211,7 +215,7 @@ var _ = Describe("initramfs", func() {
 			byName[e.name] = e
 		}
 		Expect(names).To(Equal([]string{"bin", "dev", "dev/console", "dev/null", "etc", "proc", "sys", "tmp", "rvm",
-			"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "etc/resolv.conf", "init", cpioTrailer}))
+			"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "rvm/limits", "etc/resolv.conf", "init", cpioTrailer}))
 
 		Expect(byName["bin"].mode).To(Equal(uint32(0o040755)))
 		Expect(byName["tmp"].mode).To(Equal(uint32(0o041777)))
@@ -229,7 +233,7 @@ var _ = Describe("initramfs", func() {
 		script := initScript(testNonce, false)
 		Expect(script).To(HavePrefix("#!/bin/busybox sh\n"))
 		Expect(script).To(ContainSubstring("\necho RVM_START_" + testNonce + "\n"))
-		Expect(script).To(ContainSubstring("\n( . /rvm/env && exec sh /rvm/cmd ) </dev/null\necho RVM_EXIT_" + testNonce + "=$?\nreboot -f\n"))
+		Expect(script).To(ContainSubstring("\n( ulimit -n \"$RVM_NOFILE_HARD\" && ulimit -S -n \"$RVM_NOFILE_SOFT\" && . /rvm/env && exec sh /rvm/cmd ) </dev/null\necho RVM_EXIT_" + testNonce + "=$?\nreboot -f\n"))
 		Expect(script).NotTo(ContainSubstring("poweroff"))
 	})
 
@@ -244,7 +248,7 @@ var _ = Describe("initramfs", func() {
 		list, err := exec.Command("sh", "-c", `"$0" -t --quiet < "$1"`, cpioBin, plain).CombinedOutput()
 		Expect(err).NotTo(HaveOccurred(), string(list))
 		Expect(strings.Fields(string(list))).To(Equal([]string{"bin", "dev", "dev/console", "dev/null", "etc", "proc", "sys", "tmp", "rvm",
-			"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "etc/resolv.conf", "init"}))
+			"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "rvm/limits", "etc/resolv.conf", "init"}))
 
 		if os.Geteuid() != 0 {
 			Skip("extracting device nodes needs root")

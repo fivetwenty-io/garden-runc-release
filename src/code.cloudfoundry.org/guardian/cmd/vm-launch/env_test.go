@@ -560,7 +560,8 @@ var _ = Describe("guest environment", func() {
 
 var _ = Describe("the guest command line of /init", func() {
 	// initTail is /init from the environment checks on, with the guest paths
-	// replaced and reboot turned into a line the spec can see.
+	// replaced and reboot turned into a line the spec can see. The limits
+	// /rvm/limits would set are the shell's own, which any user may set.
 	initTail := func(paths *strings.Replacer, volume bool) string {
 		script := initScript(testNonce, volume)
 		tail := script[strings.Index(script, guestEnvChecks):]
@@ -568,7 +569,8 @@ var _ = Describe("the guest command line of /init", func() {
 			tail = strings.Replace(tail, guestVolumeSetup, "", 1)
 			tail = strings.Replace(tail, guestVolumeTeardown, "rvm_status=$?\n", 1)
 		}
-		return paths.Replace(guestFailFunc + tail)
+		limits := "RVM_NOFILE_SOFT=$(ulimit -S -n)\nRVM_NOFILE_HARD=$(ulimit -H -n)\n"
+		return paths.Replace(guestFailFunc + limits + tail)
 	}
 
 	// runInit runs the tail of /init and returns its console output and its

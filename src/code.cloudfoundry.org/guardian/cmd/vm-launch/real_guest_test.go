@@ -59,4 +59,17 @@ ls -ld /etc/ssl/certs/ca-certificates.crt`)
 		Expect(out).To(MatchRegexp(`-rw-r--r-- +1 0 +0 .*` + guestCABundlePath))
 		Expect(out).To(ContainSubstring(exitTag(testNonce) + "0"))
 	})
+
+	It("gives the command the container's open files limit above the kernel's default fs.nr_open", func() {
+		g := taskGuest(`echo "soft=$(ulimit -S -n) hard=$(ulimit -H -n) nr_open=$(cat /proc/sys/fs/nr_open) file_max=$(cat /proc/sys/fs/file-max)"
+echo "init=$(sed -n 's/^Max open files *\([0-9]*\) *\([0-9]*\).*/\1 \2/p' /proc/1/limits)"`)
+		g.nofile = nofileLimit{soft: 1500000, hard: 2000000}
+		out := bootRealGuest(g)
+		Expect(out).To(ContainSubstring("soft=1500000 hard=2000000 nr_open=2000000 file_max=9223372036854775807"))
+		// /init keeps the kernel's own limit; only the command gets the
+		// container's.
+		Expect(out).To(MatchRegexp(`init=\d+ \d+`))
+		Expect(out).NotTo(ContainSubstring("init=1500000 2000000"))
+		Expect(out).To(ContainSubstring(exitTag(testNonce) + "0"))
+	})
 })

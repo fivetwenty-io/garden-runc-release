@@ -273,7 +273,7 @@ var _ = Describe("guest network", func() {
 		It("adds the network and environment files", func() {
 			names, byName := archiveEntries(buildInitramfsWithEnv([]byte("busybox"), "httpd -f -p $PORT", nw, "export PORT='8080'\n", nil))
 			Expect(names).To(Equal([]string{"bin", "dev", "dev/console", "dev/null", "etc", "proc", "sys", "tmp", "rvm",
-				"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "etc/resolv.conf", "init", cpioTrailer}))
+				"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "rvm/limits", "etc/resolv.conf", "init", cpioTrailer}))
 			Expect(string(byName["rvm/net"].data)).To(Equal("RVM_ADDRESS='10.0.2.15/24'\nRVM_GATEWAY='10.0.2.2'\n"))
 			Expect(string(byName["rvm/env"].data)).To(Equal("export PORT='8080'\n"))
 			Expect(byName["rvm/env"].mode).To(Equal(uint32(0o100600)))
@@ -299,7 +299,7 @@ var _ = Describe("guest network", func() {
 				Expect(idx).To(BeNumerically(">", 0), step)
 				Expect(idx).To(BeNumerically("<", start), step)
 			}
-			Expect(script).To(HaveSuffix("\n( . /rvm/env && exec sh /rvm/cmd ) </dev/null\necho RVM_EXIT_" + testNonce + "=$?\nreboot -f\n"))
+			Expect(script).To(HaveSuffix("\n( ulimit -n \"$RVM_NOFILE_HARD\" && ulimit -S -n \"$RVM_NOFILE_SOFT\" && . /rvm/env && exec sh /rvm/cmd ) </dev/null\necho RVM_EXIT_" + testNonce + "=$?\nreboot -f\n"))
 		})
 
 		It("sets the mtu of eth0 only when /rvm/net names one, and before it brings eth0 up", func() {

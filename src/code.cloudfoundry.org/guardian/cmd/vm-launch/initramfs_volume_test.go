@@ -17,7 +17,7 @@ import (
 // guest environment sources, and runs the command in a subshell with the guest
 // environment. A guest without a volume must keep getting exactly this.
 const (
-	goldenInitNet = "#!/bin/busybox sh\n/bin/busybox --install -s /bin\nexport PATH=/bin\nmount -t proc proc /proc\nmount -t sysfs sys /sys\nmount -t devtmpfs dev /dev 2>/dev/null\nrvm_fail() { echo \"vm-launch guest setup: $1\"; reboot -f; exit 1; }\n. /rvm/net\nip link set lo up || rvm_fail \"bringing up lo failed\"\nn=0\nwhile [ ! -e /sys/class/net/eth0 ]; do\n\tn=$((n + 1))\n\t[ \"$n\" -gt 5 ] && rvm_fail \"no eth0 network device\"\n\tsleep 1\ndone\nif [ -n \"${RVM_MTU:-}\" ]; then\n\tip link set eth0 mtu \"$RVM_MTU\" || echo \"vm-launch guest setup: setting the mtu of eth0 to $RVM_MTU failed; keeping the default mtu\"\nfi\nip link set eth0 up || rvm_fail \"bringing up eth0 failed\"\nip addr add \"$RVM_ADDRESS\" dev eth0 || rvm_fail \"adding $RVM_ADDRESS to eth0 failed\"\nip route add default via \"$RVM_GATEWAY\" dev eth0 || rvm_fail \"adding the default route via $RVM_GATEWAY failed\"\n( . /rvm/env ) || rvm_fail \"reading /rvm/env failed\"\necho RVM_START_0123456789abcdef\n( . /rvm/env && exec sh /rvm/cmd ) </dev/null\necho RVM_EXIT_0123456789abcdef=$?\nreboot -f\n"
+	goldenInitNet = "#!/bin/busybox sh\n/bin/busybox --install -s /bin\nexport PATH=/bin\nmount -t proc proc /proc\nmount -t sysfs sys /sys\nmount -t devtmpfs dev /dev 2>/dev/null\nrvm_fail() { echo \"vm-launch guest setup: $1\"; reboot -f; exit 1; }\n. /rvm/net\nip link set lo up || rvm_fail \"bringing up lo failed\"\nn=0\nwhile [ ! -e /sys/class/net/eth0 ]; do\n\tn=$((n + 1))\n\t[ \"$n\" -gt 5 ] && rvm_fail \"no eth0 network device\"\n\tsleep 1\ndone\nif [ -n \"${RVM_MTU:-}\" ]; then\n\tip link set eth0 mtu \"$RVM_MTU\" || echo \"vm-launch guest setup: setting the mtu of eth0 to $RVM_MTU failed; keeping the default mtu\"\nfi\nip link set eth0 up || rvm_fail \"bringing up eth0 failed\"\nip addr add \"$RVM_ADDRESS\" dev eth0 || rvm_fail \"adding $RVM_ADDRESS to eth0 failed\"\nip route add default via \"$RVM_GATEWAY\" dev eth0 || rvm_fail \"adding the default route via $RVM_GATEWAY failed\"\n. /rvm/limits\necho 9223372036854775807 >/proc/sys/fs/file-max || echo \"vm-launch guest setup: raising fs.file-max failed; keeping the default\"\nrvm_nr_open=$(cat /proc/sys/fs/nr_open) || rvm_fail \"reading fs.nr_open failed\"\nif [ \"$rvm_nr_open\" -lt \"$RVM_NOFILE_HARD\" ]; then\n\techo \"$RVM_NOFILE_HARD\" >/proc/sys/fs/nr_open || rvm_fail \"raising fs.nr_open to $RVM_NOFILE_HARD failed\"\nfi\n( ulimit -n \"$RVM_NOFILE_HARD\" && ulimit -S -n \"$RVM_NOFILE_SOFT\" ) || rvm_fail \"setting the open files limit to $RVM_NOFILE_SOFT soft and $RVM_NOFILE_HARD hard failed\"\n( . /rvm/env ) || rvm_fail \"reading /rvm/env failed\"\necho RVM_START_0123456789abcdef\n( ulimit -n \"$RVM_NOFILE_HARD\" && ulimit -S -n \"$RVM_NOFILE_SOFT\" && . /rvm/env && exec sh /rvm/cmd ) </dev/null\necho RVM_EXIT_0123456789abcdef=$?\nreboot -f\n"
 )
 
 // archiveEntries parses a gzip newc archive into its entry names, in order,
@@ -53,7 +53,7 @@ var _ = Describe("guest volume initramfs", func() {
 	It("adds /rvm/mounts with the device, the quoted path, and the image name", func() {
 		names, byName := archiveEntries(writeArchive(task, vol))
 		Expect(names).To(Equal([]string{"bin", "dev", "dev/console", "dev/null", "etc", "proc", "sys", "tmp", "rvm",
-			"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "etc/resolv.conf", "rvm/mounts", "init", cpioTrailer}))
+			"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "rvm/limits", "etc/resolv.conf", "rvm/mounts", "init", cpioTrailer}))
 		Expect(string(byName["rvm/mounts"].data)).To(Equal(
 			"RVM_VOLUME_DEVICE=/dev/vda\nRVM_VOLUME_PATH='/data/it'\\''s $here'\nRVM_VOLUME_IMAGE='rvm-disk-3.img'\n"))
 		Expect(byName["rvm/mounts"].mode).To(Equal(uint32(0o100644)))
@@ -68,7 +68,7 @@ var _ = Describe("guest volume initramfs", func() {
 	It("adds /rvm/mounts after the network files of an LRP", func() {
 		names, byName := archiveEntries(writeArchive(nw, vol))
 		Expect(names).To(Equal([]string{"bin", "dev", "dev/console", "dev/null", "etc", "proc", "sys", "tmp", "rvm",
-			"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "etc/resolv.conf", "rvm/mounts", "init", cpioTrailer}))
+			"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "rvm/limits", "etc/resolv.conf", "rvm/mounts", "init", cpioTrailer}))
 		Expect(string(byName["init"].data)).To(Equal(initScript(testNonce, true)))
 	})
 
@@ -83,7 +83,7 @@ var _ = Describe("guest volume initramfs", func() {
 		Expect(setup).To(BeNumerically(">", 0))
 		Expect(setup + len(guestVolumeSetup)).To(BeNumerically("<=", start+1))
 		Expect(strings.Index(script, guestEnvChecks)).To(BeNumerically("<", strings.Index(script, ". /rvm/mounts\n")))
-		Expect(script).To(HaveSuffix("\necho RVM_START_" + testNonce + "\n( . /rvm/env && exec sh /rvm/cmd ) </dev/null\n" + guestVolumeTeardown +
+		Expect(script).To(HaveSuffix("\necho RVM_START_" + testNonce + "\n( ulimit -n \"$RVM_NOFILE_HARD\" && ulimit -S -n \"$RVM_NOFILE_SOFT\" && . /rvm/env && exec sh /rvm/cmd ) </dev/null\n" + guestVolumeTeardown +
 			"echo RVM_EXIT_" + testNonce + "=$rvm_status\nreboot -f\n"))
 	})
 

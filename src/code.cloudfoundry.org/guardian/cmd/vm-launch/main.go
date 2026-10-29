@@ -110,6 +110,14 @@
 // uses the last. Each failed attempt logs a line with the CredHub host and a
 // reason class, never a body or a reference path.
 //
+// Open files: the guest command gets vm-launch's own RLIMIT_NOFILE, soft
+// and hard, which Garden sets to the limit Diego asks for. The guest /init
+// raises fs.nr_open to the hard limit when that is higher than the kernel's
+// 1048576, and lifts fs.file-max to its highest value, so neither binds
+// before the process limit does. A limit above 2147483584, the highest a
+// 64-bit kernel allows, is lowered to that with a line that says so. Only
+// the command gets the limit; /init's own steps keep the kernel's default.
+//
 // Memory: the guest gets MEMORY_LIMIT less 192 MiB, which the container
 // keeps for the hypervisor and everything else it runs, with a floor of 128
 // MiB and a ceiling of 16 GiB. MEMORY_LIMIT must be whole megabytes, such as
@@ -143,11 +151,12 @@
 //	       status, as QEMU does when PORT is already in use in the container
 //	       or when it cannot open the volume image
 //	125    vm-launch could not start the guest: core dumps it could not
-//	       disable, bad arguments, a missing artifact, a work file or
-//	       initramfs it could not write, a hypervisor it could not run,
-//	       (Firecracker) PORT already in use in the container, or a volume
-//	       it cannot use: VCAP_SERVICES that is not valid JSON, more than
-//	       one volume mount, a read-only mount, a bad volume path,
+//	       disable, an open files limit it could not read, bad arguments,
+//	       a missing artifact, a work file or initramfs it could not write,
+//	       a hypervisor it could not run, (Firecracker) PORT already in
+//	       use in the container, or a volume it cannot use: VCAP_SERVICES
+//	       that is not valid JSON, more than one volume mount, a read-only
+//	       mount, a bad volume path,
 //	       CF_INSTANCE_INDEX, application_id, or process_type, a task with
 //	       a volume, an image that fails a check or cannot be created, or
 //	       an image another instance still holds after 30 seconds, a
@@ -332,6 +341,11 @@ func run(argv []string, logger *log.Logger) int {
 		logger.Print(err)
 		return exitLaunchError
 	}
+	nofile, err := guestNofile(getNofile, logger)
+	if err != nil {
+		logger.Print(err)
+		return exitLaunchError
+	}
 
 	workDir, err := os.MkdirTemp("", "vm-launch-")
 	if err != nil {
@@ -368,6 +382,7 @@ func run(argv []string, logger *log.Logger) int {
 		env:      envFile,
 		vol:      vol,
 		caBundle: caBundle,
+		nofile:   nofile,
 	})
 	if err != nil {
 		logger.Print(err)
