@@ -13,10 +13,12 @@ import (
 	"time"
 )
 
-// dialPolicy says how the proxy reaches the guest. The listener is up before
-// the guest has booted, so a connection that arrives early waits for the
-// guest app instead of failing: the proxy retries the upstream dial with
-// exponential backoff until giveUp has passed since the client connected.
+// dialPolicy says how the proxy reaches the guest. vm-launch listens only
+// while the guest app does (see portGate), but the guest's report of that
+// lags by up to a second, so a connection that arrives as the guest app
+// restarts its listener waits for it instead of failing: the proxy retries
+// the upstream dial with exponential backoff until giveUp has passed since
+// the client connected.
 type dialPolicy struct {
 	attemptTimeout time.Duration
 	firstBackoff   time.Duration
@@ -34,12 +36,13 @@ var upstreamDialPolicy = dialPolicy{
 }
 
 // tcpProxy carries TCP connections from a listener in the container to the
-// guest, one pair of goroutines per connection. Each direction is copied
+// guest, one pair of goroutines per connection. The listener can open and
+// close any number of times (see Listen and StopListening); connections
+// outlive the listener that accepted them. Each direction is copied
 // until EOF and then half-closed, so either side can finish sending while it
 // still reads. Copy errors such as a peer reset end that connection only and
 // are not logged: they are how TCP connections normally end.
 type tcpProxy struct {
-	listener net.Listener
 	upstream string
 	policy   dialPolicy
 	logger   *log.Logger
@@ -49,24 +52,21 @@ type tcpProxy struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu     sync.Mutex
-	closed bool
-	conns  map[net.Conn]struct{}
-	wg     sync.WaitGroup
-
-	stopOnce sync.Once
+	mu       sync.Mutex
+	listener net.Listener
+	stopped  bool
+	closed   bool
+	conns    map[net.Conn]struct{}
+	wg       sync.WaitGroup
 }
 
-// startProxy listens on listenAddr and starts accepting connections for
-// upstream. The listener is bound when it returns.
-func startProxy(listenAddr, upstream string, policy dialPolicy, logger *log.Logger) (*tcpProxy, error) {
-	ln, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		return nil, fmt.Errorf("listening for the guest port: %w", err)
-	}
+// errProxyStopped reports a Listen after StopAccepting or Close.
+var errProxyStopped = errors.New("the port proxy has stopped accepting connections")
+
+// newProxy returns a proxy for upstream that does not listen yet.
+func newProxy(upstream string, policy dialPolicy, logger *log.Logger) *tcpProxy {
 	ctx, cancel := context.WithCancel(context.Background())
-	p := &tcpProxy{
-		listener: ln,
+	return &tcpProxy{
 		upstream: upstream,
 		policy:   policy,
 		logger:   logger,
@@ -74,22 +74,85 @@ func startProxy(listenAddr, upstream string, policy dialPolicy, logger *log.Logg
 		cancel:   cancel,
 		conns:    map[net.Conn]struct{}{},
 	}
-	p.wg.Add(1)
-	go p.acceptLoop()
+}
+
+// startProxy returns a proxy for upstream that listens on listenAddr.
+func startProxy(listenAddr, upstream string, policy dialPolicy, logger *log.Logger) (*tcpProxy, error) {
+	p := newProxy(upstream, policy, logger)
+	if err := p.Listen(listenAddr); err != nil {
+		p.Close()
+		return nil, err
+	}
 	return p, nil
 }
 
-// Addr is the bound listener address.
-func (p *tcpProxy) Addr() net.Addr { return p.listener.Addr() }
+// Listen listens on listenAddr and accepts connections there until
+// StopListening, StopAccepting, or Close. It fails while the proxy already
+// listens, and with errProxyStopped after StopAccepting or Close. The
+// listener is bound when it returns.
+func (p *tcpProxy) Listen(listenAddr string) error {
+	p.mu.Lock()
+	busy, stopped := p.listener != nil, p.stopped
+	p.mu.Unlock()
+	switch {
+	case stopped:
+		return errProxyStopped
+	case busy:
+		return errors.New("the port proxy is already listening")
+	}
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		return fmt.Errorf("listening for the guest port: %w", err)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	switch {
+	case p.stopped:
+		ln.Close()
+		return errProxyStopped
+	case p.listener != nil:
+		ln.Close()
+		return errors.New("the port proxy is already listening")
+	}
+	p.listener = ln
+	p.wg.Add(1)
+	go p.acceptLoop(ln)
+	return nil
+}
 
-// StopAccepting closes the listener, so new connections are refused, and
-// leaves established ones running.
+// Addr is the address of the open listener, or nil when there is none.
+func (p *tcpProxy) Addr() net.Addr {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.listener == nil {
+		return nil
+	}
+	return p.listener.Addr()
+}
+
+// StopListening closes the listener, if there is one, so new connections
+// are refused, and leaves established ones running. Listen may open a new
+// listener afterwards.
+func (p *tcpProxy) StopListening() {
+	p.mu.Lock()
+	ln := p.listener
+	p.listener = nil
+	p.mu.Unlock()
+	if ln == nil {
+		return
+	}
+	if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		p.logger.Printf("closing the port listener: %v", err)
+	}
+}
+
+// StopAccepting closes the listener for good: new connections are refused
+// from then on, and established ones keep running.
 func (p *tcpProxy) StopAccepting() {
-	p.stopOnce.Do(func() {
-		if err := p.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			p.logger.Printf("closing the port listener: %v", err)
-		}
-	})
+	p.mu.Lock()
+	p.stopped = true
+	p.mu.Unlock()
+	p.StopListening()
 }
 
 // Close stops accepting, closes every connection, and returns once all
@@ -128,11 +191,11 @@ func (p *tcpProxy) untrack(c net.Conn) {
 	c.Close()
 }
 
-func (p *tcpProxy) acceptLoop() {
+func (p *tcpProxy) acceptLoop(ln net.Listener) {
 	defer p.wg.Done()
 	backoff := time.Duration(0)
 	for {
-		c, err := p.listener.Accept()
+		c, err := ln.Accept()
 		if errors.Is(err, net.ErrClosed) {
 			return
 		}

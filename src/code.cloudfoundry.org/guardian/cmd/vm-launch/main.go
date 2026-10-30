@@ -19,13 +19,16 @@
 // network policies and application security groups apply as they do to the
 // container. With PORT, as for an LRP, connections to PORT on the container
 // also reach PORT in the guest. QEMU forwards them itself (user-mode
-// networking); for Firecracker, vm-launch listens on PORT and proxies each
-// connection to the guest over Garden's tap device. The listener is up
-// before the guest boots, and connections that arrive early
-// wait for the guest app to listen. At the first SIGTERM or SIGINT the
-// listener closes; open connections close when the guest stops. Without
-// PORT, as for a task, nothing outside can connect to the guest, as for a
-// runc task.
+// networking), with a rule that vm-launch adds on QEMU's QMP monitor; for
+// Firecracker, vm-launch listens on PORT and proxies each connection to the
+// guest over Garden's tap device. vm-launch reserves PORT when it starts, so
+// connections are refused, and it opens PORT only while something in the
+// guest listens on the port at an address other than loopback, which the
+// guest reports within a second of a change. So, as for a runc app, a
+// connection to PORT, and with it Diego's port health check, succeeds only
+// once the app listens. At the first SIGTERM or SIGINT, PORT closes for
+// good; open connections close when the guest stops. Without PORT, as for a
+// task, nothing outside can connect to the guest, as for a runc task.
 //
 // Volumes: when VCAP_SERVICES names a volume mount, as it does for an app
 // bound to a volume service, the guest gets that volume at the same path the
@@ -153,15 +156,14 @@
 //	123    the hypervisor exited cleanly, but the guest never reported a status,
 //	       as when the guest cannot find, format, or mount the volume image
 //	124    the hypervisor failed: it exited non-zero before the guest reported a
-//	       status, as QEMU does when PORT is already in use in the container
-//	       or when it cannot open the volume image
+//	       status, as QEMU does when it cannot open the volume image
 //	125    vm-launch could not start the guest: core dumps it could not
 //	       disable, an open files limit it could not read, bad arguments,
-//	       a missing artifact, a work file or initramfs it could not write,
-//	       a hypervisor it could not run, (Firecracker) PORT already in
-//	       use in the container, or a volume it cannot use: VCAP_SERVICES
-//	       that is not valid JSON, more than one volume mount, a read-only
-//	       mount, a bad volume path,
+//	       a missing artifact, a work file, initramfs, or QMP socket it
+//	       could not create, a hypervisor it could not run, PORT already
+//	       in use in the container, or a volume it cannot use:
+//	       VCAP_SERVICES that is not valid JSON, more than one volume
+//	       mount, a read-only mount, a bad volume path,
 //	       CF_INSTANCE_INDEX, application_id, or process_type, a task with
 //	       a volume, an image that fails a check or cannot be created, or
 //	       an image another instance still holds after 30 seconds, a
@@ -181,8 +183,11 @@
 // picks the status, it also writes a "vm-launch:" line to stderr.
 //
 // A container runs one VM per port: a second vm-launch for the same PORT, such
-// as a CF sidecar that gets the app's PORT, cannot listen on it and fails as
-// described above, with a line that names the port conflict.
+// as a CF sidecar that gets the app's PORT, cannot reserve it and exits 125,
+// as does a vm-launch whose PORT another process already listens on, with a
+// line that names the port conflict. A process that starts listening on PORT
+// after vm-launch reserved it keeps the guest's port closed, with the same
+// line when the guest listens.
 package main
 
 import (
@@ -193,6 +198,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -351,6 +357,21 @@ func run(argv []string, logger *log.Logger) int {
 		logger.Print(err)
 		return exitLaunchError
 	}
+	if nw.port > 0 {
+		reservation, err := reservePort(nw.port)
+		if err != nil {
+			logger.Print(err)
+			if errors.Is(err, syscall.EADDRINUSE) {
+				logger.Print(portConflictMessage(nw.port))
+			}
+			return exitLaunchError
+		}
+		defer func() {
+			if err := reservation.Close(); err != nil {
+				logger.Printf("releasing port %d: %v", nw.port, err)
+			}
+		}()
+	}
 
 	workDir, err := os.MkdirTemp("", "vm-launch-")
 	if err != nil {
@@ -393,20 +414,30 @@ func run(argv []string, logger *log.Logger) int {
 		logger.Print(err)
 		return exitLaunchError
 	}
-	// vm-launch's copy of the initramfs closes as soon as the hypervisor has
-	// its own, or on the way out when the hypervisor never starts.
-	closeInitrd := func() {
-		if initrd == nil {
-			return
-		}
-		if err := initrd.Close(); err != nil {
-			logger.Printf("closing the initramfs: %v", err)
-		}
+	// vm-launch's copies of the files only the hypervisor uses close as soon
+	// as the hypervisor has its own, or on the way out when the hypervisor
+	// never starts.
+	var qemuMonitor *os.File
+	closeInherited := func() {
+		closeFile(initrd, "the initramfs", logger)
 		initrd = nil
+		closeFile(qemuMonitor, "QEMU's end of the QMP socket", logger)
+		qemuMonitor = nil
 	}
-	defer closeInitrd()
-	files, drivePath, initrdPath := hypervisorFiles(img, initrd)
-	hvArgv, err := hypervisorArgv(cfg.backend, cfg.artifacts, workDir, initrdPath, memMiB, nw, drivePath)
+	defer closeInherited()
+	// QEMU forwards PORT through rules that vm-launch adds and removes on
+	// its QMP monitor.
+	var monitor net.Conn
+	if nw.port > 0 && cfg.backend == backend.VMQemu {
+		monitor, qemuMonitor, err = newQMPSocket()
+		if err != nil {
+			logger.Print(err)
+			return exitLaunchError
+		}
+		defer monitor.Close()
+	}
+	files, drivePath, initrdPath, monitorFD := hypervisorFiles(img, initrd, qemuMonitor)
+	hvArgv, err := hypervisorArgv(cfg.backend, cfg.artifacts, workDir, initrdPath, memMiB, nw, drivePath, monitorFD)
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError
@@ -420,27 +451,22 @@ func run(argv []string, logger *log.Logger) int {
 	}
 
 	cmd := newHypervisorCmd(hvArgv, files)
-	// QEMU reports a port it cannot forward on its stderr and exits 1, so a
-	// QEMU run that forwards PORT keeps the start of that stream to
-	// recognise it.
-	var hvStderr *headBuffer
-	if nw.port > 0 && cfg.backend == backend.VMQemu {
-		hvStderr = &headBuffer{limit: maxBootLog}
-		cmd.Stderr = &stderrTee{capture: hvStderr, passthrough: os.Stderr}
-	}
-
-	sup := supervisor{stdout: os.Stdout, logger: logger, signals: sigs, grace: killGrace, started: closeInitrd}
-	if nw.port > 0 && cfg.backend == backend.VMFirecracker {
-		proxy, err := startProxy(nw.listenAddr(), nw.upstream(), upstreamDialPolicy, logger)
-		if err != nil {
-			logger.Print(err)
-			if errors.Is(err, syscall.EADDRINUSE) {
-				logger.Print(portConflictMessage(nw.port))
-			}
-			return exitLaunchError
+	sup := supervisor{stdout: os.Stdout, logger: logger, signals: sigs, grace: killGrace, started: closeInherited}
+	if nw.port > 0 {
+		var opener portOpener
+		if cfg.backend == backend.VMFirecracker {
+			proxy := newProxy(nw.upstream(), upstreamDialPolicy, logger)
+			defer proxy.Close()
+			opener = proxyPort{proxy: proxy, addr: nw.listenAddr()}
+		} else {
+			opener = qmpPort{monitor: newQMPMonitor(monitor), port: nw.port}
 		}
-		defer proxy.Close()
-		sup.stopping = proxy.StopAccepting
+		// The gate ends before the proxy closes and before the monitor
+		// closes, because deferred calls run last first.
+		gate := startPortGate(opener, nw.port, logger)
+		defer gate.end()
+		sup.stopping = gate.shutDown
+		sup.listen = gate.set
 	}
 	res, err := sup.run(cmd, nonce)
 	if err != nil {
@@ -451,10 +477,17 @@ func run(argv []string, logger *log.Logger) int {
 	if reason != "" {
 		logger.Printf("%s; exiting %d", reason, code)
 	}
-	if hvStderr != nil && code == exitHypervisorFailed && strings.Contains(hvStderr.String(), qemuHostfwdFailure) {
-		logger.Print(portConflictMessage(nw.port))
-	}
 	return code
+}
+
+// closeFile closes f, when it is set, and logs a failure as closing what.
+func closeFile(f *os.File, what string, logger *log.Logger) {
+	if f == nil {
+		return
+	}
+	if err := f.Close(); err != nil {
+		logger.Printf("closing %s: %v", what, err)
+	}
 }
 
 // newHypervisorCmd returns the hypervisor command: an empty environment,
@@ -474,50 +507,11 @@ func newHypervisorCmd(argv []string, files []*os.File) *exec.Cmd {
 	return cmd
 }
 
-// qemuHostfwdFailure starts the error QEMU prints when it cannot bind a
-// hostfwd rule's listening port.
-const qemuHostfwdFailure = "Could not set up host forwarding rule"
-
 // portConflictMessage explains a PORT that the guest cannot be given: only one
 // VM per container can serve it.
 func portConflictMessage(port int) string {
 	return fmt.Sprintf("port %d already in use in this container; VM backends run one app process per container", port)
 }
-
-// stderrTee copies the hypervisor's stderr to a capture buffer and to a
-// passthrough writer. The capture side sees every byte whether or not the
-// passthrough works, and a failing passthrough never reaches the copy loop
-// that feeds the tee: an error there would stop the capture and make Wait
-// report the copy as a failure of the hypervisor run. Stderr cannot report
-// its own breakage, so the passthrough error is dropped.
-type stderrTee struct {
-	capture     io.Writer
-	passthrough io.Writer
-}
-
-func (t *stderrTee) Write(p []byte) (int, error) {
-	_, _ = t.capture.Write(p)
-	_, _ = t.passthrough.Write(p)
-	return len(p), nil
-}
-
-// headBuffer keeps the first limit bytes written to it and drops the rest.
-type headBuffer struct {
-	limit int
-	buf   []byte
-}
-
-func (b *headBuffer) Write(p []byte) (int, error) {
-	if room := b.limit - len(b.buf); room > 0 {
-		if len(p) < room {
-			room = len(p)
-		}
-		b.buf = append(b.buf, p[:room]...)
-	}
-	return len(p), nil
-}
-
-func (b *headBuffer) String() string { return string(b.buf) }
 
 func parseArgs(argv []string) (config, error) {
 	fs := flag.NewFlagSet("vm-launch", flag.ContinueOnError)

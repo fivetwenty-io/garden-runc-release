@@ -223,9 +223,11 @@ var _ = Describe("tcpProxy", func() {
 		_, err = io.ReadFull(c, make([]byte, 1))
 		Expect(err).NotTo(HaveOccurred())
 
+		addr := p.Addr().String()
 		p.StopAccepting()
 		p.StopAccepting()
-		_, err = net.Dial("tcp", p.Addr().String())
+		Expect(p.Addr()).To(BeNil())
+		_, err = net.Dial("tcp", addr)
 		Expect(err).To(MatchError(ContainSubstring("connection refused")))
 
 		_, err = c.Write([]byte("b"))
@@ -246,6 +248,7 @@ var _ = Describe("tcpProxy", func() {
 		_, err = io.ReadFull(c, make([]byte, 1))
 		Expect(err).NotTo(HaveOccurred())
 
+		addr := p.Addr().String()
 		closed := make(chan struct{})
 		go func() {
 			p.Close()
@@ -256,7 +259,7 @@ var _ = Describe("tcpProxy", func() {
 
 		_, err = c.Read(make([]byte, 1))
 		Expect(err).To(HaveOccurred())
-		_, err = net.Dial("tcp", p.Addr().String())
+		_, err = net.Dial("tcp", addr)
 		Expect(err).To(MatchError(ContainSubstring("connection refused")))
 	})
 
@@ -274,6 +277,57 @@ var _ = Describe("tcpProxy", func() {
 		_, err := io.ReadAll(c)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(logBuf.String()).NotTo(ContainSubstring("giving up"))
+	})
+
+	It("stops listening and listens again, keeping open connections in between", func() {
+		up := listenLocal()
+		serve(up, echo)
+		p := newProxy(up.Addr().String(), testDialPolicy, logger)
+		DeferCleanup(p.Close)
+		Expect(p.Addr()).To(BeNil())
+		p.StopListening()
+
+		Expect(p.Listen("127.0.0.1:0")).To(Succeed())
+		Expect(p.Listen("127.0.0.1:0")).To(MatchError("the port proxy is already listening"))
+		addr := p.Addr().String()
+		c := dialProxy(p)
+		_, err := c.Write([]byte("a"))
+		Expect(err).NotTo(HaveOccurred())
+		_, err = io.ReadFull(c, make([]byte, 1))
+		Expect(err).NotTo(HaveOccurred())
+
+		p.StopListening()
+		p.StopListening()
+		Expect(p.Addr()).To(BeNil())
+		_, err = net.Dial("tcp", addr)
+		Expect(err).To(MatchError(ContainSubstring("connection refused")))
+		_, err = c.Write([]byte("b"))
+		Expect(err).NotTo(HaveOccurred())
+		buf := make([]byte, 1)
+		_, err = io.ReadFull(c, buf)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(buf)).To(Equal("b"))
+
+		Expect(p.Listen(addr)).To(Succeed())
+		again := dialProxy(p)
+		_, err = again.Write([]byte("c"))
+		Expect(err).NotTo(HaveOccurred())
+		_, err = io.ReadFull(again, buf)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(buf)).To(Equal("c"))
+		Expect(logBuf.String()).To(BeEmpty())
+	})
+
+	It("refuses to listen after StopAccepting or Close", func() {
+		p := newProxy(unusedAddr(), testDialPolicy, logger)
+		DeferCleanup(p.Close)
+		p.StopAccepting()
+		Expect(p.Listen("127.0.0.1:0")).To(MatchError(errProxyStopped))
+		Expect(p.Addr()).To(BeNil())
+
+		closed := newProxy(unusedAddr(), testDialPolicy, logger)
+		closed.Close()
+		Expect(closed.Listen("127.0.0.1:0")).To(MatchError(errProxyStopped))
 	})
 
 	It("fails to start when the address is taken", func() {

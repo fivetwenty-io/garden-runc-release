@@ -145,10 +145,13 @@ func checkArtifacts(kind backend.Kind, root string) error {
 //
 // The guest gets a virtio-net NIC on QEMU's user-mode network. That needs no
 // privileges, and guest egress leaves from the container's network
-// namespace, so application security groups still apply. With a port, QEMU
-// itself also listens on the container's PORT and forwards each connection
-// to the guest; without one, as for a task, nothing can connect to the
-// guest. nw must be set.
+// namespace, so application security groups still apply. No connection
+// from outside reaches the guest unless vm-launch adds a forwarding rule,
+// which it does for a port, through the QMP monitor, only while the guest
+// listens on it (see qmpPort). nw must be set.
+//
+// monitorFD, when above 0, is the inherited file descriptor of a connected
+// stream socket that QEMU serves its QMP monitor on.
 //
 // With a volume, drivePath names the volume image, and the guest gets it as
 // its one virtio-blk drive. The format is pinned to raw, so QEMU never probes
@@ -156,7 +159,7 @@ func checkArtifacts(kind backend.Kind, root string) error {
 // I/O errors, ENOSPC and EDQUOT included, reach the guest as errors instead
 // of pausing the VM. QEMU's own image locking is off because vm-launch holds
 // the flock that decides who writes the image.
-func qemuArgv(root, initrd string, memMiB int, nw *network, drivePath string) []string {
+func qemuArgv(root, initrd string, memMiB int, nw *network, drivePath string, monitorFD int) []string {
 	art := func(rel string) string { return filepath.Join(root, rel) }
 	argv := []string{
 		art(artQEMULoader),
@@ -176,14 +179,9 @@ func qemuArgv(root, initrd string, memMiB int, nw *network, drivePath string) []
 		"-initrd", initrd,
 		"-append", qemuKernelArgs,
 	}
-	netdev := "user,id=n0,net=" + qemuNetwork
-	if nw.port > 0 {
-		port := strconv.Itoa(nw.port)
-		netdev += ",hostfwd=tcp:0.0.0.0:" + port + "-" + qemuGuestIP + ":" + port
-	}
 	argv = append(argv,
-		"-netdev", netdev,
-		"-device", "virtio-net-device,netdev=n0",
+		"-netdev", "user,id="+qemuNetdevID+",net="+qemuNetwork,
+		"-device", "virtio-net-device,netdev="+qemuNetdevID,
 	)
 	if drivePath != "" {
 		argv = append(argv,
@@ -192,8 +190,18 @@ func qemuArgv(root, initrd string, memMiB int, nw *network, drivePath string) []
 			"-device", "virtio-blk-device,drive="+volumeDriveID,
 		)
 	}
+	if monitorFD > 0 {
+		argv = append(argv,
+			"-chardev", "socket,id=qmp0,fd="+strconv.Itoa(monitorFD)+",server=off",
+			"-mon", "chardev=qmp0,mode=control",
+		)
+	}
 	return argv
 }
+
+// qemuNetdevID names the guest's user-mode network, which forwarding rules
+// name too.
+const qemuNetdevID = "n0"
 
 // The hypervisor's inherited files. The hypervisor gets the volume image,
 // when there is one, and the initramfs as extra files, and opens each through
@@ -201,7 +209,7 @@ func qemuArgv(root, initrd string, memMiB int, nw *network, drivePath string) []
 // checked, so the container path of the volume never reaches a QEMU option
 // string or the Firecracker configuration. The image keeps file descriptor
 // volumeDriveFD, and the initramfs takes the next one: 3 without a volume
-// and 4 with one.
+// and 4 with one. A QEMU monitor socket, when there is one, comes last.
 const (
 	firstExtraFD  = 3
 	volumeDriveFD = firstExtraFD
@@ -221,15 +229,21 @@ func volumeDrivePath() string {
 // hypervisorFiles returns the hypervisor's extra files in order, for
 // exec.Cmd.ExtraFiles, with the paths the hypervisor opens them by. img is
 // the volume image or nil, and drivePath is empty without one. initrd is the
-// initramfs from newInitramfs.
-func hypervisorFiles(img, initrd *os.File) (files []*os.File, drivePath, initrdPath string) {
+// initramfs from newInitramfs. monitor is QEMU's end of the QMP socket or
+// nil, and monitorFD is its file descriptor in the hypervisor, or 0 without
+// one.
+func hypervisorFiles(img, initrd, monitor *os.File) (files []*os.File, drivePath, initrdPath string, monitorFD int) {
 	if img != nil {
 		files = append(files, img)
 		drivePath = procSelfFD(firstExtraFD + len(files) - 1)
 	}
 	files = append(files, initrd)
 	initrdPath = procSelfFD(firstExtraFD + len(files) - 1)
-	return files, drivePath, initrdPath
+	if monitor != nil {
+		files = append(files, monitor)
+		monitorFD = firstExtraFD + len(files) - 1
+	}
+	return files, drivePath, initrdPath, monitorFD
 }
 
 type firecrackerConfig struct {
@@ -315,12 +329,16 @@ func firecrackerArgv(root, configPath string) []string {
 // memMiB is the guest memory size from guestMemory, which keeps it between
 // the floor and the ceiling. nw is the guest network, which run always
 // builds, and drivePath is the volume image path the hypervisor opens, or
-// empty without a volume.
-func hypervisorArgv(kind backend.Kind, root, workDir, initrd string, memMiB int, nw *network, drivePath string) ([]string, error) {
+// empty without a volume. monitorFD is QEMU's QMP socket (see qemuArgv), or 0;
+// Firecracker has no monitor.
+func hypervisorArgv(kind backend.Kind, root, workDir, initrd string, memMiB int, nw *network, drivePath string, monitorFD int) ([]string, error) {
 	switch kind {
 	case backend.VMQemu:
-		return qemuArgv(root, initrd, memMiB, nw, drivePath), nil
+		return qemuArgv(root, initrd, memMiB, nw, drivePath, monitorFD), nil
 	case backend.VMFirecracker:
+		if monitorFD != 0 {
+			return nil, errors.New("firecracker has no QMP monitor")
+		}
 		cfg, err := firecrackerConfigJSON(root, initrd, memMiB, nw, drivePath)
 		if err != nil {
 			return nil, fmt.Errorf("encoding firecracker config: %w", err)
@@ -351,13 +369,20 @@ const maxStatusDigits = 3
 // serialFilter turns the guest serial console into the guest command's
 // output. It drops the console before the start tag and after the exit
 // marker, swallows the marker, converts the console's CRLF line endings to LF,
-// and records the exit status. It never fails a Write, so the hypervisor's
-// output keeps draining when the destination breaks; the first destination
-// error is kept in writeErr.
+// and records the exit status. With a listen callback, it also swallows each
+// listen line the guest writes while the command runs (see
+// guestListenWatch) and passes its state to the callback, which must not
+// block. A listen line can follow command output that has no newline yet,
+// so it is found anywhere in a line, and the output around it is kept as it
+// was. It never fails a Write, so the hypervisor's output keeps draining
+// when the destination breaks; the first destination error is kept in
+// writeErr.
 type serialFilter struct {
-	out      io.Writer
-	startTag []byte
-	exitTag  []byte
+	out       io.Writer
+	startTag  []byte
+	exitTag   []byte
+	listenTag []byte
+	listen    func(up bool)
 
 	phase    int
 	pending  []byte
@@ -376,6 +401,12 @@ func newSerialFilter(out io.Writer, nonce string) *serialFilter {
 		exitTag:  []byte(exitTag(nonce)),
 		exited:   make(chan struct{}),
 	}
+}
+
+// onListen makes the filter pass listen lines to listen.
+func (f *serialFilter) onListen(nonce string, listen func(up bool)) {
+	f.listenTag = []byte(listenTag(nonce))
+	f.listen = listen
 }
 
 func (f *serialFilter) Write(p []byte) (int, error) {
@@ -445,6 +476,12 @@ func (f *serialFilter) keepBootLog(b []byte) {
 func (f *serialFilter) processRun(eof bool) {
 	for {
 		idx := bytes.Index(f.pending, f.exitTag)
+		if li := f.indexListen(); li >= 0 && (idx < 0 || li < idx) {
+			if !f.processListen(li, eof) {
+				return
+			}
+			continue
+		}
 		if idx < 0 {
 			break
 		}
@@ -469,7 +506,42 @@ func (f *serialFilter) processRun(eof bool) {
 		f.emitPending(len(f.pending), true)
 		return
 	}
-	f.emitPending(len(f.pending)-tagPrefixSuffix(f.pending, f.exitTag), false)
+	hold := tagPrefixSuffix(f.pending, f.exitTag)
+	if f.listenTag != nil {
+		hold = max(hold, tagPrefixSuffix(f.pending, f.listenTag))
+	}
+	f.emitPending(len(f.pending)-hold, false)
+}
+
+// indexListen returns the index of the first listen tag in pending, or -1.
+func (f *serialFilter) indexListen() int {
+	if f.listenTag == nil {
+		return -1
+	}
+	return bytes.Index(f.pending, f.listenTag)
+}
+
+// processListen handles the listen tag at pending[idx:]. It reports false
+// when the line is not complete yet and more input may come; the output
+// before the tag is written and the tag stays pending. A complete listen
+// line goes to the callback and leaves the output, its line ending
+// included. Anything else after the tag is output, like the tag itself.
+func (f *serialFilter) processListen(idx int, eof bool) bool {
+	up, n, ok, needMore := parseListen(f.pending[idx+len(f.listenTag):])
+	if needMore && !eof {
+		f.emitPending(idx, false)
+		return false
+	}
+	if !ok {
+		// The tag ends in its only '=', and neither tag can start inside
+		// it, so scanning resumes right after it.
+		f.emitPending(idx+len(f.listenTag), true)
+		return true
+	}
+	f.emitPending(idx, true)
+	f.pending = append([]byte(nil), f.pending[len(f.listenTag)+n:]...)
+	f.listen(up)
+	return true
 }
 
 // emitPending writes pending[:n] as guest output with the console's CRLF
@@ -525,6 +597,30 @@ func parseStatus(b []byte) (status int, ok, needMore bool) {
 	}
 }
 
+// parseListen parses the bytes after a listen tag: 1 or 0, then LF or CRLF.
+// n is the length of what it parsed. needMore reports that b ends before
+// that can be decided.
+func parseListen(b []byte) (up bool, n int, ok, needMore bool) {
+	switch {
+	case len(b) == 0:
+		return false, 0, false, true
+	case b[0] != '0' && b[0] != '1':
+		return false, 0, false, false
+	case len(b) == 1:
+		return false, 0, false, true
+	case b[1] == '\n':
+		return b[0] == '1', 2, true, false
+	case b[1] != '\r':
+		return false, 0, false, false
+	case len(b) == 2:
+		return false, 0, false, true
+	case b[2] == '\n':
+		return b[0] == '1', 3, true, false
+	default:
+		return false, 0, false, false
+	}
+}
+
 // tagPrefixSuffix returns the length of the longest suffix of b that is a
 // proper prefix of tag, which is the part of b that may still become a tag.
 func tagPrefixSuffix(b, tag []byte) int {
@@ -563,14 +659,21 @@ type supervisor struct {
 	// forwarded. vm-launch uses it to stop accepting guest connections.
 	stopping func()
 	// started, when set, runs once the hypervisor has started and before
-	// anything else. vm-launch uses it to close its copy of the initramfs.
+	// anything else. vm-launch uses it to close its copies of the files the
+	// hypervisor inherited.
 	started func()
+	// listen, when set, gets the guest's listen lines (see serialFilter). It
+	// must not block.
+	listen func(up bool)
 }
 
 // run starts cmd and waits for it. The error is non-nil only when the
 // hypervisor could not be started.
 func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 	filter := newSerialFilter(s.stdout, nonce)
+	if s.listen != nil {
+		filter.onListen(nonce, s.listen)
+	}
 	pipe, err := cmd.StdoutPipe()
 	if err != nil {
 		return runResult{}, fmt.Errorf("creating serial pipe: %w", err)

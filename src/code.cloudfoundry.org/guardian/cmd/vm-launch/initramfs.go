@@ -103,8 +103,9 @@ func (c *cpioWriter) pad(n int64) error {
 
 // Serial console markers written by the guest /init. The nonce makes them
 // impossible to forge by accident from guest command output.
-func startTag(nonce string) string { return "RVM_START_" + nonce }
-func exitTag(nonce string) string  { return "RVM_EXIT_" + nonce + "=" }
+func startTag(nonce string) string  { return "RVM_START_" + nonce }
+func exitTag(nonce string) string   { return "RVM_EXIT_" + nonce + "=" }
+func listenTag(nonce string) string { return "RVM_LISTEN_" + nonce + "=" }
 
 // initScript is the guest /init. It runs the command with stdin from
 // /dev/null (the serial console never delivers EOF), reports its status on
@@ -124,17 +125,20 @@ func exitTag(nonce string) string  { return "RVM_EXIT_" + nonce + "=" }
 // /rvm/env, and then becomes the shell that runs /rvm/cmd, so its status is
 // the command's. The guest environment applies only inside that subshell,
 // never to /init's own steps, such as the unquoted status in the exit line
-// or the volume teardown. With a volume, /init syncs and unmounts it after
-// the command and before it reports the status.
+// or the volume teardown. A guest with a port watches, while the command
+// runs, whether anything listens on it (see guestListenWatch). With a
+// volume, /init syncs and unmounts it after the command and before it
+// reports the status.
 func initScript(nonce string, volume bool) string {
 	setup := guestFailFunc + guestShmSetup + guestNetworkSetup + guestLimitsSetup + guestEnvChecks
 	if volume {
 		setup += guestVolumeSetup
 	}
-	run := guestRunCommand + "echo " + exitTag(nonce) + "$?\n"
+	run := guestListenWatch(nonce) + guestRunCommand + "rvm_status=$?\n" + guestListenStop
 	if volume {
-		run = guestRunCommand + guestVolumeTeardown + "echo " + exitTag(nonce) + "$rvm_status\n"
+		run += guestVolumeTeardown
 	}
+	run += "echo " + exitTag(nonce) + "$rvm_status\n"
 	return `#!/bin/busybox sh
 /bin/busybox --install -s /bin
 export PATH=/bin
@@ -207,6 +211,49 @@ fi
 // falls, and then the soft one.
 const guestSetLimits = `ulimit -n "$RVM_NOFILE_HARD" && ulimit -S -n "$RVM_NOFILE_SOFT"`
 
+// guestListenWatch starts, in a guest with a port (RVM_PORT in /rvm/net),
+// a background watcher that tells vm-launch whether anything in the guest
+// listens on that port, so that vm-launch opens the container's PORT only
+// while it does, as a container's port refuses connections until its app
+// listens. Once a second, the watcher looks in /proc/net/tcp and
+// /proc/net/tcp6 for a listening socket on the port at an address other
+// than loopback, which is what a connection forwarded from the container
+// reaches, and prints a listen line, the listen tag and 1 or 0, each time
+// the answer changes. It starts after the start tag, so vm-launch reads
+// every listen line as part of the command's run. The kernel writes an IPv4
+// address in /proc/net/tcp as eight hex digits in host byte order, so a
+// loopback address, 127.0.0.0/8, ends in 7F; ::1 and ::ffff:127.0.0.0/104
+// are the IPv6 loopback forms.
+func guestListenWatch(nonce string) string {
+	return `rvm_watch=
+if [ -n "${RVM_PORT:-}" ]; then
+	rvm_port_hex=$(printf '%04X' "$RVM_PORT")
+	(
+		rvm_up=0
+		while :; do
+			rvm_now=0
+			grep -hE "^ *[0-9]+: [0-9A-F]+:$rvm_port_hex [0-9A-F]+:0000 0A " /proc/net/tcp /proc/net/tcp6 2>/dev/null |
+				grep -qvE '^ *[0-9]+: ([0-9A-F]{6}7F|0{24}01000000|0{16}FFFF0000[0-9A-F]{6}7F):' && rvm_now=1
+			if [ "$rvm_now" != "$rvm_up" ]; then
+				echo "` + listenTag(nonce) + `$rvm_now"
+				rvm_up=$rvm_now
+			fi
+			sleep 1
+		done
+	) </dev/null &
+	rvm_watch=$!
+fi
+`
+}
+
+// guestListenStop stops the listen watcher once the command has ended and
+// before /init reports its status, so no listen line follows the exit line.
+const guestListenStop = `if [ -n "$rvm_watch" ]; then
+	kill "$rvm_watch"
+	wait "$rvm_watch"
+fi
+`
+
 // guestEnvChecks makes a broken /rvm/env a failed setup step, with the
 // console shown, instead of a command that fails to start. It sources
 // /rvm/env in a subshell, so /init itself never gets the guest environment.
@@ -262,12 +309,11 @@ else
 fi
 `
 
-// guestVolumeTeardown follows the command: it keeps the command's status,
-// flushes, and unmounts the volume. A failed unmount loses nothing, because
-// the mount is synchronous and sync has run, so it is reported and the
-// status stays the command's.
-const guestVolumeTeardown = `rvm_status=$?
-sync
+// guestVolumeTeardown follows the command, once its status is kept in
+// rvm_status: it flushes and unmounts the volume. A failed unmount loses
+// nothing, because the mount is synchronous and sync has run, so it is
+// reported and the status stays the command's.
+const guestVolumeTeardown = `sync
 umount "$RVM_VOLUME_PATH" 2>/dev/null || echo "vm-launch guest: unmounting $RVM_VOLUME_PATH failed; data was already synced"
 `
 

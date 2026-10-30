@@ -567,7 +567,7 @@ var _ = Describe("the guest command line of /init", func() {
 		tail := script[strings.Index(script, guestEnvChecks):]
 		if volume {
 			tail = strings.Replace(tail, guestVolumeSetup, "", 1)
-			tail = strings.Replace(tail, guestVolumeTeardown, "rvm_status=$?\n", 1)
+			tail = strings.Replace(tail, guestVolumeTeardown, "", 1)
 		}
 		limits := "RVM_NOFILE_SOFT=$(ulimit -S -n)\nRVM_NOFILE_HARD=$(ulimit -H -n)\n"
 		return paths.Replace(guestFailFunc + limits + tail)

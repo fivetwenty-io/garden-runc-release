@@ -231,12 +231,16 @@ func formatResolvConf(nameservers, search []string) string {
 }
 
 // netFile returns the guest /rvm/net, which /init sources before it
-// configures eth0.
+// configures eth0. A network with a port also names it as RVM_PORT, which
+// the guest's listen watcher reads (see guestListenWatch).
 func netFile(n *network) string {
 	s := "RVM_ADDRESS=" + shellQuote(n.address) + "\n" +
 		"RVM_GATEWAY=" + shellQuote(n.gateway) + "\n"
 	if n.mtu > 0 {
 		s += "RVM_MTU=" + shellQuote(strconv.Itoa(n.mtu)) + "\n"
+	}
+	if n.port > 0 {
+		s += "RVM_PORT=" + shellQuote(strconv.Itoa(n.port)) + "\n"
 	}
 	return s
 }

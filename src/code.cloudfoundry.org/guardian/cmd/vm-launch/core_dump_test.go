@@ -147,7 +147,7 @@ echo "$(ulimit -S -c) $(ulimit -H -c) $filter" > ` + shellQuote(file) + "\n"
 	})
 
 	It("leaves guest RAM out of QEMU's core dumps", func() {
-		argv := qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, taskNetwork(), "")
+		argv := qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, taskNetwork(), "", 0)
 		machine := optionAfter(argv, "-M", "microvm")
 		Expect(strings.Split(machine, ",")).To(Equal([]string{"microvm", "accel=kvm", "dump-guest-core=off"}))
 	})

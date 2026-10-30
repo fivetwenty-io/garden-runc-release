@@ -77,7 +77,7 @@ var _ = Describe("guest memory", func() {
 
 	It("gives the size to QEMU's -m and Firecracker's mem_size_mib", func() {
 		nw := &network{port: 8080}
-		Expect(optionAfter(qemuArgv(goldenArt, goldenInitrd, 320, nw, ""), "-m", "")).To(Equal("320"))
+		Expect(optionAfter(qemuArgv(goldenArt, goldenInitrd, 320, nw, "", 0), "-m", "")).To(Equal("320"))
 
 		raw, err := firecrackerConfigJSON(goldenArt, goldenInitrd, 832, nw, "")
 		Expect(err).NotTo(HaveOccurred())

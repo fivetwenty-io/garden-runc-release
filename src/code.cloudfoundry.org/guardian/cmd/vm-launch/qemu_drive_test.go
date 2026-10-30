@@ -115,7 +115,7 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 	It("accepts the machine option vm-launch generates, with TCG in place of KVM", func() {
 		qemu := realQEMU()
 		requireMicrovm(qemu)
-		machine := optionAfter(qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, taskNetwork(), ""), "-M", "microvm")
+		machine := optionAfter(qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, taskNetwork(), "", 0), "-M", "microvm")
 		Expect(strings.Split(machine, ",")).To(ContainElement("dump-guest-core=off"))
 		code, stderr := parseDrive(qemu, []string{"-M", strings.Replace(machine, "accel=kvm", "accel=tcg", 1)})
 		Expect(code).To(Equal(0), "QEMU rejected -M %s: %s", machine, stderr)
@@ -124,7 +124,7 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 	It("rejects a dump-guest-core value it does not know, so the machine check above can fail", func() {
 		qemu := realQEMU()
 		requireMicrovm(qemu)
-		machine := optionAfter(qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, taskNetwork(), ""), "-M", "microvm")
+		machine := optionAfter(qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, taskNetwork(), "", 0), "-M", "microvm")
 		machine = strings.Replace(strings.Replace(machine, "accel=kvm", "accel=tcg", 1), "dump-guest-core=off", "dump-guest-core=maybe", 1)
 		code, stderr := parseDrive(qemu, []string{"-M", machine})
 		Expect(code).NotTo(Equal(0))
@@ -134,7 +134,7 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 	It("accepts the -netdev and -device pair vm-launch generates for a task on a microvm machine", func() {
 		qemu := realQEMU()
 		requireMicrovm(qemu)
-		argv := qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, taskNetwork(), "")
+		argv := qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, taskNetwork(), "", 0)
 		netdev, device := optionAfter(argv, "-netdev", "user"), optionAfter(argv, "-device", "virtio-net")
 		Expect(netdev).NotTo(ContainSubstring("hostfwd"))
 		code, stderr := parseDrive(qemu, microvm, "-netdev", netdev, "-device", device)
@@ -144,7 +144,7 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 	It("rejects a NIC that names a netdev that does not exist, so the NIC check above can fail", func() {
 		qemu := realQEMU()
 		requireMicrovm(qemu)
-		argv := qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, taskNetwork(), "")
+		argv := qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, taskNetwork(), "", 0)
 		device := strings.Replace(optionAfter(argv, "-device", "virtio-net"), "netdev=n0", "netdev=n9", 1)
 		code, stderr := parseDrive(qemu, microvm, "-netdev", optionAfter(argv, "-netdev", "user"), "-device", device)
 		Expect(code).NotTo(Equal(0))
@@ -153,7 +153,7 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 
 	It("accepts the drive option string vm-launch generates", func() {
 		qemu := realQEMU()
-		drive := driveOption(qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), volumeDrivePath()))
+		drive := driveOption(qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), volumeDrivePath(), 0))
 		code, stderr := parseDrive(qemu, noMachine, "-drive", drive)
 		Expect(code).To(Equal(0), "QEMU rejected -drive %s: %s", drive, stderr)
 	})
@@ -161,7 +161,7 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 	It("accepts the -drive and -device pair vm-launch generates on a microvm machine", func() {
 		qemu := realQEMU()
 		requireMicrovm(qemu)
-		argv := qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), volumeDrivePath())
+		argv := qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), volumeDrivePath(), 0)
 		drive, device := driveOption(argv), deviceOption(argv)
 		Expect(device).To(ContainSubstring("drive=vol0"))
 		code, stderr := parseDrive(qemu, microvm, "-drive", drive, "-device", device)
@@ -171,7 +171,7 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 	It("rejects a -device that names a drive that does not exist, so the pair check above can fail", func() {
 		qemu := realQEMU()
 		requireMicrovm(qemu)
-		argv := qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), volumeDrivePath())
+		argv := qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), volumeDrivePath(), 0)
 		device := strings.Replace(deviceOption(argv), "drive=vol0", "drive=vol9", 1)
 		code, stderr := parseDrive(qemu, microvm, "-drive", driveOption(argv), "-device", device)
 		Expect(code).NotTo(Equal(0))
@@ -180,7 +180,7 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 
 	It("rejects the unprefixed locking option, so the check above can fail", func() {
 		qemu := realQEMU()
-		drive := strings.Replace(driveOption(qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), volumeDrivePath())), "file.locking=off", "locking=off", 1)
+		drive := strings.Replace(driveOption(qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), volumeDrivePath(), 0)), "file.locking=off", "locking=off", 1)
 		Expect(drive).To(ContainSubstring(",locking=off,"))
 		code, stderr := parseDrive(qemu, noMachine, "-drive", drive)
 		Expect(code).NotTo(Equal(0))
@@ -268,7 +268,7 @@ var _ = Describe("the initramfs memfd against a real QEMU", func() {
 		art := realArtifacts()
 		qemu := realQEMU()
 		requireMicrovm(qemu)
-		files, _, initrdPath := hypervisorFiles(nil, memfdInitramfs(fakeBusybox(), "true", noGuestEnv))
+		files, _, initrdPath, _ := hypervisorFiles(nil, memfdInitramfs(fakeBusybox(), "true", noGuestEnv), nil)
 		Expect(initrdPath).To(Equal(goldenInitrd))
 		code, stderr := stoppedQEMU(qemu, filepath.Join(art, artBzImage), initrdPath, files)
 		Expect(code).To(Equal(0), "QEMU could not load the memfd initramfs: %s", stderr)
@@ -278,7 +278,7 @@ var _ = Describe("the initramfs memfd against a real QEMU", func() {
 		art := realArtifacts()
 		qemu := realQEMU()
 		requireMicrovm(qemu)
-		files, _, _ := hypervisorFiles(nil, memfdInitramfs(fakeBusybox(), "true", noGuestEnv))
+		files, _, _, _ := hypervisorFiles(nil, memfdInitramfs(fakeBusybox(), "true", noGuestEnv), nil)
 		code, stderr := stoppedQEMU(qemu, filepath.Join(art, artBzImage), procSelfFD(9), files)
 		Expect(code).NotTo(Equal(0))
 		Expect(stderr).To(ContainSubstring(procSelfFD(9)))
@@ -289,8 +289,8 @@ var _ = Describe("the initramfs memfd against a real QEMU", func() {
 		qemu := realQEMU()
 		requireMicrovm(qemu)
 		bb := guestBusybox()
-		files, _, initrdPath := hypervisorFiles(nil, memfdInitramfs(bb, `echo "hello from the $RVM_SOURCE"; exit 7`, "export RVM_SOURCE='memfd initramfs'\n"))
-		argv := tcgArgv(qemu, qemuArgv(art, initrdPath, 128, taskNetwork(), ""))
+		files, _, initrdPath, _ := hypervisorFiles(nil, memfdInitramfs(bb, `echo "hello from the $RVM_SOURCE"; exit 7`, "export RVM_SOURCE='memfd initramfs'\n"), nil)
+		argv := tcgArgv(qemu, qemuArgv(art, initrdPath, 128, taskNetwork(), "", 0))
 		code, stdout, stderr := runRealQEMU(argv, files, "", 5*time.Minute)
 		Expect(code).To(Equal(0), "QEMU failed: %s\n%s", stderr, stdout)
 		Expect(stdout).To(ContainSubstring(startTag(testNonce)))
