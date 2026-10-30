@@ -540,7 +540,8 @@ func newQMPSocket() (net.Conn, *os.File, error) {
 
 // portReservation holds PORT from the start of vm-launch to its exit, so
 // that a port the container already uses fails the launch before the guest
-// boots, and nothing else takes the port while the guest is not listening.
+// boots, and a plain bind cannot take the port while the guest is not
+// listening. A listener that sets SO_REUSEADDR can (see reservePort).
 type portReservation struct {
 	lock net.Listener
 	fd   int

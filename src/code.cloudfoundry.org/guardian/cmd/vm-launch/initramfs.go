@@ -102,7 +102,10 @@ func (c *cpioWriter) pad(n int64) error {
 }
 
 // Serial console markers written by the guest /init. The nonce makes them
-// impossible to forge by accident from guest command output.
+// impossible to forge by accident from guest command output. The guest
+// command runs as root and can read the nonce from /init, so it can forge
+// them on purpose, which changes only what vm-launch reports for that
+// command: its exit status, and whether its own port is open.
 func startTag(nonce string) string  { return "RVM_START_" + nonce }
 func exitTag(nonce string) string   { return "RVM_EXIT_" + nonce + "=" }
 func listenTag(nonce string) string { return "RVM_LISTEN_" + nonce + "=" }
