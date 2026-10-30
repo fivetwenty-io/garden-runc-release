@@ -553,6 +553,7 @@ echo "RVM_EXIT_$nonce=0"
 // vmLaunchListeners is fake hypervisor shell that sets $listening to the
 // inodes of the listening TCP sockets its parent, vm-launch, holds open.
 const vmLaunchListeners = `listening=
+ls /proc/$PPID/fd >/dev/null 2>&1 || { echo "cannot read the descriptors of vm-launch" >&2; exit 1; }
 for l in /proc/$PPID/fd/*; do
 	t=$(readlink "$l") || continue
 	case "$t" in socket:\[*\]) ;; *) continue ;; esac
@@ -563,6 +564,18 @@ for l in /proc/$PPID/fd/*; do
 	fi
 done
 `
+
+// letFirecrackerSeeVMLaunch makes vm-launch start Firecracker without
+// changing its thread's capabilities, for the rest of the spec, so that a
+// fake Firecracker can read this process's descriptors under /proc. As root,
+// this process holds capabilities that a confined Firecracker does not, and
+// the kernel would refuse it. The transparent proxy specs cover the
+// confinement itself.
+func letFirecrackerSeeVMLaunch() {
+	saved := hypervisorCaps
+	DeferCleanup(func() { hypervisorCaps = saved })
+	hypervisorCaps = &fakeCaps{}
+}
 
 // runVMTimeout bounds one vm-launch run in the PORT specs, each of which
 // takes a few seconds.
@@ -700,6 +713,7 @@ echo "RVM_EXIT_$nonce=0"
 	})
 
 	It("gives a Firecracker task its NIC and opens no port in the container", func() {
+		letFirecrackerSeeVMLaunch()
 		fcCopy := filepath.Join(art, "fc-copy.json")
 		fakeHypervisor(filepath.Join(art, "firecracker/firecracker"),
 			`p=; for a in "$@"; do [ "$p" = --config-file ] && cp "$a" `+shellQuote(fcCopy)+`; p=$a; done
@@ -711,6 +725,7 @@ echo "RVM_EXIT_$nonce=0"
 	})
 
 	It("sees the Firecracker port proxy with the same check, so the task spec above can fail", func() {
+		letFirecrackerSeeVMLaunch()
 		port := freePort()
 		portHypervisor(filepath.Join(art, "firecracker/firecracker"), port, `listen 1
 await open
@@ -721,6 +736,7 @@ await open
 	})
 
 	It("keeps PORT closed for Firecracker until the guest listens, follows the guest after that, and closes it at exit", func() {
+		letFirecrackerSeeVMLaunch()
 		port := freePort()
 		argvFile, _ := portHypervisor(filepath.Join(art, "firecracker/firecracker"), port, `await closed
 `+vmLaunchListeners+`[ -z "$listening" ] || { echo "vm-launch listens on socket$listening before the guest does" >&2; exit 1; }

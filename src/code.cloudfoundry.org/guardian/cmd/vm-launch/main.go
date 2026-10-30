@@ -41,20 +41,23 @@
 // The Firecracker proxy dials the guest from the container's tap address,
 // 169.254.100.1, so the guest sees that address as the peer of every
 // connection. With --transparent-proxy, which Garden passes to the vm-launch
-// it wraps in a vm-firecracker container, the proxy instead dials from the
-// client's own IPv4 address, so the guest sees the peer a runc app would:
-// the gorouter, another app, or the container IP for a client inside the
-// container that dials it. A loopback client still shows up as
-// 169.254.100.1, because no packet from a loopback address leaves the
-// container's loopback device. The transparent dial takes CAP_NET_RAW,
-// which Garden grants this vm-launch, and Garden routes the guest's replies
-// back to the proxy. vm-launch checks that it can make a socket transparent
-// before the guest boots and exits 125 when it cannot, and a connection whose
-// socket cannot be made transparent is closed rather than dialled from the
-// tap address. The hypervisor never holds CAP_NET_RAW: vm-launch starts it
-// from a thread that has dropped the capability from every set it could
-// pass on, and refuses to start a hypervisor binary that has file
-// capabilities.
+// it wraps in a vm-firecracker container when the process has PORT, the proxy
+// instead dials from the client's own IPv4 address, so the guest sees the
+// peer a runc app would: the gorouter, another app, or the container IP for a
+// client inside the container that dials it. A loopback client still shows
+// up as 169.254.100.1, because no packet from a loopback address leaves the
+// container's loopback device. The transparent dial takes CAP_NET_RAW, which
+// Garden grants this vm-launch together with the flag, and Garden routes the
+// guest's replies back to the proxy. vm-launch checks that it can make a
+// socket transparent before the guest boots and exits 125 when it cannot, and
+// a connection whose socket cannot be made transparent is closed rather than
+// dialled from the tap address. Firecracker never holds a capability, with or
+// without the flag: vm-launch starts it from a thread that has dropped every
+// capability from every set it could pass on, and refuses to start a
+// Firecracker binary that has file capabilities. A thread with fewer
+// capabilities than the rest of vm-launch would let a process of the same
+// user write vm-launch's memory, so vm-launch makes itself non-dumpable first
+// (see Core dumps).
 //
 // Stopping: at the first SIGTERM or SIGINT while the guest's command runs,
 // vm-launch asks the guest, over its serial console, to stop the command,
@@ -185,7 +188,10 @@
 //
 // Core dumps: vm-launch sets its RLIMIT_CORE to zero, soft and hard, and its
 // coredump_filter to zero before it does anything else, and the hypervisor
-// inherits both. A pipe core handler takes a dump despite the limit, but the
+// inherits both. Then vm-launch makes itself non-dumpable, which also keeps
+// a process without CAP_SYS_PTRACE, of any user, from tracing it or opening
+// its memory or environment under /proc; the hypervisor's own exec makes it
+// dumpable again. A pipe core handler takes a dump despite the limit, but the
 // kernel applies the filter to that dump too, so it holds none of the
 // process's memory mappings except the vDSO. QEMU also runs with
 // dump-guest-core=off, which keeps guest RAM out of a dump of QEMU even if
@@ -202,8 +208,9 @@
 //	124    the hypervisor failed: it exited non-zero before the guest reported a
 //	       status, as QEMU does when it cannot open the volume image
 //	125    vm-launch could not start the guest: core dumps it could not
-//	       disable, an open files limit it could not read, bad arguments,
-//	       a guest command over 131071 bytes, a missing artifact, a work
+//	       disable, a dumpable flag it could not clear, an open files
+//	       limit it could not read, bad arguments, a guest command over
+//	       131071 bytes, a missing artifact, a work
 //	       file, initramfs, or QMP socket it could not create, a
 //	       hypervisor it could not run, PORT already in use in the
 //	       container, or a volume it cannot use:
@@ -258,6 +265,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -285,7 +293,7 @@ const killGrace = 5 * time.Second
 
 // transparentProxyFlag names the flag that turns on the transparent port
 // proxy. Garden's process builder passes it, as --transparent-proxy, to the
-// vm-launch it wraps in a vm-firecracker container.
+// vm-launch it wraps in a vm-firecracker container when the process has PORT.
 const transparentProxyFlag = "transparent-proxy"
 
 // stopDeadline is how long the hypervisor may keep running after the first
@@ -305,6 +313,14 @@ type config struct {
 	// transparent makes the Firecracker port proxy dial the guest from its
 	// clients' addresses (see transparentSource).
 	transparent bool
+}
+
+// init holds the main goroutine, and with it run, to the thread-group
+// leader for the whole run. The goroutine that starts the hypervisor changes
+// its own thread's credentials, so it can then never run on the leader, and
+// the leader's /proc status keeps showing vm-launch's own capabilities.
+func init() {
+	runtime.LockOSThread()
 }
 
 func main() {
@@ -345,6 +361,31 @@ func writeCoreDumpFilter(path string) error {
 	return nil
 }
 
+// markUndumpable clears vm-launch's dumpable flag and reads it back. A
+// process that is not dumpable can be traced, and its memory opened under
+// /proc, only by a process with CAP_SYS_PTRACE, which no process in a Garden
+// container holds. That matters once the hypervisor's thread has dropped its
+// capabilities: the kernel compares the capabilities of a tracer with those
+// of the one thread it targets, so that thread would otherwise let a process
+// of the same user without capabilities write the memory every thread of
+// vm-launch shares, CAP_NET_RAW threads included. The /proc files of a
+// process that is not dumpable belong to root, so the coredump_filter write
+// must come first. Specs replace markUndumpable for the test process itself,
+// which calls run many times and must keep writing its own coredump_filter.
+var markUndumpable = func() error {
+	if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
+		return os.NewSyscallError("prctl PR_SET_DUMPABLE", err)
+	}
+	dumpable, err := unix.PrctlRetInt(unix.PR_GET_DUMPABLE, 0, 0, 0, 0)
+	if err != nil {
+		return os.NewSyscallError("prctl PR_GET_DUMPABLE", err)
+	}
+	if dumpable != 0 {
+		return fmt.Errorf("the dumpable flag is still %d", dumpable)
+	}
+	return nil
+}
+
 func run(argv []string, logger *log.Logger) int {
 	// Guest RAM holds what vm-launch puts in the guest, and a core dump of
 	// the hypervisor would write that to disk. The hypervisor inherits the
@@ -353,6 +394,14 @@ func run(argv []string, logger *log.Logger) int {
 	// a coredump_filter of zero, which leaves its memory out of any dump.
 	if err := disableCoreDumps(); err != nil {
 		logger.Printf("disabling core dumps: %v", err)
+		return exitLaunchError
+	}
+	// This comes before any thread drops a capability. Until the
+	// hypervisor's thread does, every thread of a vm-launch that Garden
+	// granted CAP_NET_RAW holds it in its permitted set, which keeps a
+	// process of the same user without it from tracing any of them.
+	if err := markUndumpable(); err != nil {
+		logger.Printf("making vm-launch non-dumpable: %v", err)
 		return exitLaunchError
 	}
 
@@ -398,8 +447,8 @@ func run(argv []string, logger *log.Logger) int {
 		return exitLaunchError
 	}
 	// The proxy serves ports only, so only then does it need the
-	// capability, but the hypervisor is kept from it whenever vm-launch
-	// was given it.
+	// capability. The hypervisor is confined whatever the flag says (see
+	// sup.prepare below).
 	if cfg.transparent && len(nw.ports) > 0 {
 		if err := checkTransparentDial(); err != nil {
 			logger.Print(transparentCheckMessage(err))
@@ -547,7 +596,10 @@ func run(argv []string, logger *log.Logger) int {
 
 	cmd := newHypervisorCmd(hvArgv, files)
 	sup := supervisor{stdout: os.Stdout, logger: logger, signals: sigs, grace: killGrace, deadline: stopDeadline, started: closeInherited}
-	if cfg.transparent {
+	// Firecracker starts without a capability whether or not vm-launch was
+	// given --transparent-proxy, so a grant that reaches vm-launch some other
+	// way never reaches the hypervisor.
+	if cfg.backend == backend.VMFirecracker {
 		sup.prepare = confinedPrepare(cmd)
 	}
 	var gates *portGates

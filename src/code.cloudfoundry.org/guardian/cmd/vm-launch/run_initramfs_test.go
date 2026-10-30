@@ -27,6 +27,7 @@ func initramfsAt(fd string) string {
 // for its parent, vm-launch, to close its copy of the initramfs memfd, and
 // fails when it never does. The hypervisor's own copy stays open.
 const initramfsReleased = `n=0
+ls /proc/$PPID/fd >/dev/null 2>&1 || { echo "cannot read the descriptors of vm-launch" >&2; exit 1; }
 while for l in /proc/$PPID/fd/*; do readlink "$l"; done 2>/dev/null | grep -q -F memfd:vm-launch-initramfs; do
 	n=$((n + 1))
 	[ "$n" -gt 100 ] && { echo "vm-launch still holds the initramfs" >&2; exit 1; }
@@ -70,6 +71,7 @@ var _ = Describe("run with the initramfs in a memfd", func() {
 	})
 
 	It("gives Firecracker the initramfs as fd 3 and keeps only its configuration on disk", func() {
+		letFirecrackerSeeVMLaunch()
 		// The copy goes outside TMPDIR, which must stay empty.
 		fcCopy := filepath.Join(art, "fc-copy.json")
 		writeFakeHypervisor(filepath.Join(art, "firecracker/firecracker"),

@@ -32,11 +32,138 @@ const helperEchoPorts = "VM_LAUNCH_TEST_ECHO_PORTS"
 
 // helperTransparentRun makes this test binary run vm-launch for
 // vm-firecracker with the artifacts directory it names, the CF launcher argv,
-// and --transparent-proxy when helperTransparentFlag is set.
+// and --transparent-proxy when helperTransparentFlag is set. TestMain runs
+// it, so that run is called as main calls it (see transparentRun).
 const (
 	helperTransparentRun  = "VM_LAUNCH_TEST_TRANSPARENT_RUN"
 	helperTransparentFlag = "VM_LAUNCH_TEST_TRANSPARENT_FLAG"
 )
+
+// helperOpenMem makes this test binary try to open, read-write, the memory
+// file of each task of each of the comma-separated process IDs it names, and
+// print one line per task: the pid, the task id, the task's permitted
+// capabilities, and "open" or the name of the errno.
+const helperOpenMem = "VM_LAUNCH_TEST_OPEN_MEM"
+
+// helperTalkPort makes this test binary a stand-in for a guest app that
+// listens on the port it names, prints "ready", and writes a line to each
+// connection every 100ms for as long as the writes succeed.
+const helperTalkPort = "VM_LAUNCH_TEST_TALK_PORT"
+
+// helperResetClient makes this test binary connect to the address it names,
+// retrying for 15 seconds until it reads a line, print "connected", wait for
+// its stdin to end, and then reset the connection (SO_LINGER 0) and print
+// "reset".
+const helperResetClient = "VM_LAUNCH_TEST_RESET_CLIENT"
+
+// transparentRun is the helperTransparentRun process.
+func transparentRun(art string) int {
+	argv := []string{"--backend", string(backend.VMFirecracker), "--artifacts", art}
+	if os.Getenv(helperTransparentFlag) != "" {
+		argv = append(argv, "--transparent-proxy")
+	}
+	argv = append(argv, "--", "/tmp/lifecycle/launcher", "app", "true", "")
+	return run(argv, log.New(os.Stderr, "vm-launch: ", 0))
+}
+
+// openMem is the helperOpenMem process.
+func openMem(pids string) int {
+	for _, pid := range strings.Split(pids, ",") {
+		tasks, err := os.ReadDir("/proc/" + pid + "/task")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		for _, t := range tasks {
+			dir := "/proc/" + pid + "/task/" + t.Name()
+			status, err := os.ReadFile(dir + "/status")
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 1
+			}
+			prm := "?"
+			for _, line := range strings.Split(string(status), "\n") {
+				if v, ok := strings.CutPrefix(line, "CapPrm:"); ok {
+					prm = strings.TrimSpace(v)
+				}
+			}
+			result := "open"
+			fd, err := unix.Open(dir+"/mem", unix.O_RDWR|unix.O_CLOEXEC, 0)
+			if err == nil {
+				unix.Close(fd)
+			} else {
+				var errno syscall.Errno
+				if !errors.As(err, &errno) {
+					fmt.Fprintln(os.Stderr, err)
+					return 1
+				}
+				result = unix.ErrnoName(errno)
+			}
+			fmt.Println(pid, t.Name(), prm, result)
+		}
+	}
+	return 0
+}
+
+// talk is the helperTalkPort process.
+func talk(port string) int {
+	l, err := net.Listen("tcp4", "0.0.0.0:"+port)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				for {
+					if _, err := fmt.Fprintln(c, "talk"); err != nil {
+						return
+					}
+					time.Sleep(100 * time.Millisecond)
+				}
+			}()
+		}
+	}()
+	fmt.Println("ready")
+	select {}
+}
+
+// resetClient is the helperResetClient process.
+func resetClient(addr string) int {
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		c, err := net.DialTimeout("tcp4", addr, time.Second)
+		if err == nil {
+			_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+			_, err = bufio.NewReader(c).ReadString('\n')
+			if err == nil {
+				fmt.Println("connected")
+				_, _ = io.Copy(io.Discard, os.Stdin)
+				if err := c.(*net.TCPConn).SetLinger(0); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					return 1
+				}
+				if err := c.Close(); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					return 1
+				}
+				fmt.Println("reset")
+				return 0
+			}
+			c.Close()
+		}
+		if time.Now().After(deadline) {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
 
 // echoPeers is the helperEchoPorts process.
 func echoPeers(ports string) int {
@@ -68,11 +195,11 @@ const capNetRawBit = uint64(1) << unix.CAP_NET_RAW
 // CAP_SETPCAP in the effective set. Each ignore field makes the matching
 // change look successful without happening, and errs fails the named call.
 type fakeCaps struct {
-	sets        capSets
-	ambient     uint64
-	bounding    uint64
-	root        bool
-	hasFileCaps bool
+	sets         capSets
+	ambientBits  uint64
+	boundingBits uint64
+	root         bool
+	hasFileCaps  bool
 
 	ignoreSet, ignoreClear, ignoreDrop bool
 	errs                               map[string]error
@@ -98,7 +225,7 @@ func (f *fakeCaps) set(s capSets) error {
 	if !f.ignoreSet {
 		f.sets = s
 		// Lowering the permitted or inheritable set lowers the ambient one.
-		f.ambient &= s.permitted & s.inheritable
+		f.ambientBits &= s.permitted & s.inheritable
 	}
 	return nil
 }
@@ -108,23 +235,23 @@ func (f *fakeCaps) clearAmbient() error {
 		return err
 	}
 	if !f.ignoreClear {
-		f.ambient = 0
+		f.ambientBits = 0
 	}
 	return nil
 }
 
-func (f *fakeCaps) ambientRaised(c uint) (bool, error) {
-	if err := f.call("ambientRaised"); err != nil {
-		return false, err
+func (f *fakeCaps) ambient() (uint64, error) {
+	if err := f.call("ambient"); err != nil {
+		return 0, err
 	}
-	return f.ambient&capBit(c) != 0, nil
+	return f.ambientBits, nil
 }
 
-func (f *fakeCaps) inBounding(c uint) (bool, error) {
-	if err := f.call("inBounding"); err != nil {
-		return false, err
+func (f *fakeCaps) bounding() (uint64, error) {
+	if err := f.call("bounding"); err != nil {
+		return 0, err
 	}
-	return f.bounding&capBit(c) != 0, nil
+	return f.boundingBits, nil
 }
 
 func (f *fakeCaps) dropBounding(c uint) error {
@@ -135,7 +262,7 @@ func (f *fakeCaps) dropBounding(c uint) error {
 		return unix.EPERM
 	}
 	if !f.ignoreDrop {
-		f.bounding &^= capBit(c)
+		f.boundingBits &^= capBit(c)
 	}
 	return nil
 }
@@ -226,9 +353,13 @@ var _ = Describe("the transparent dial", func() {
 	})
 
 	It("names the capability and keeps the cause", func() {
-		err := error(&transparentError{os.NewSyscallError("setsockopt IP_TRANSPARENT", unix.EPERM)})
+		err := error(&transparentError{err: os.NewSyscallError("setsockopt IP_TRANSPARENT", unix.EPERM)})
 		Expect(err).To(MatchError("making the socket to the guest transparent, which takes CAP_NET_RAW: setsockopt IP_TRANSPARENT: operation not permitted"))
 		Expect(errors.Is(err, unix.EPERM)).To(BeTrue())
+
+		err = &transparentError{noPort: true, err: os.NewSyscallError("setsockopt IP_BIND_ADDRESS_NO_PORT", unix.ENOPROTOOPT)}
+		Expect(err).To(MatchError("leaving the port of the socket to the guest to connect: setsockopt IP_BIND_ADDRESS_NO_PORT: protocol not available"))
+		Expect(errors.Is(err, unix.ENOPROTOOPT)).To(BeTrue())
 	})
 
 	It("does not retry a socket that cannot be made transparent", func() {
@@ -239,7 +370,7 @@ var _ = Describe("the transparent dial", func() {
 		p.control = func(network, address string, c syscall.RawConn) error {
 			calls++
 			Expect(network).To(Equal("tcp4"))
-			return &transparentError{unix.EPERM}
+			return &transparentError{err: unix.EPERM}
 		}
 
 		_, err := p.dialUpstream(upstream.Addr().String(), &net.TCPAddr{IP: net.ParseIP("10.9.8.7").To4()})
@@ -308,6 +439,35 @@ var _ = Describe("the transparent dial", func() {
 			var te *transparentError
 			Expect(errors.As(err, &te)).To(BeTrue(), "%v", err)
 		}
+	})
+
+	It("leaves the port of a transparent socket to connect", func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		if !effectiveCap(unix.CAP_NET_RAW) && !effectiveCap(unix.CAP_NET_ADMIN) {
+			Skip("IP_TRANSPARENT takes CAP_NET_RAW or CAP_NET_ADMIN")
+		}
+
+		var transparent, noPort int
+		var getErr error
+		d := net.Dialer{Control: func(network, address string, c syscall.RawConn) error {
+			if err := setTransparent(network, address, c); err != nil {
+				return err
+			}
+			return c.Control(func(fd uintptr) {
+				transparent, getErr = unix.GetsockoptInt(int(fd), unix.SOL_IP, unix.IP_TRANSPARENT)
+				if getErr == nil {
+					noPort, getErr = unix.GetsockoptInt(int(fd), unix.SOL_IP, unix.IP_BIND_ADDRESS_NO_PORT)
+				}
+			})
+		}}
+		l := listenLocal()
+		c, err := d.Dial("tcp4", l.Addr().String())
+		Expect(err).NotTo(HaveOccurred())
+		c.Close()
+		Expect(getErr).NotTo(HaveOccurred())
+		Expect(transparent).To(Equal(1))
+		Expect(noPort).To(Equal(1))
 	})
 
 	// The proxy's upstream sees the client's own address: here a local,
@@ -380,99 +540,124 @@ var _ = Describe("confineHypervisor", func() {
 	// inheritable and bounding sets.
 	gardenNonRoot := func() *fakeCaps {
 		return &fakeCaps{
-			sets:     capSets{effective: bits(netRaw), permitted: bits(netRaw), inheritable: bits(chown, netRaw, kill)},
-			ambient:  bits(netRaw),
-			bounding: bits(chown, netRaw, kill, setpcap),
+			sets:         capSets{effective: bits(netRaw), permitted: bits(netRaw), inheritable: bits(chown, netRaw, kill)},
+			ambientBits:  bits(netRaw),
+			boundingBits: bits(chown, netRaw, kill, setpcap),
 		}
 	}
 	// gardenRoot is the wrapped vm-launch as root, which holds the whole
 	// bounding set, CAP_SETPCAP among it.
 	gardenRoot := func() *fakeCaps {
 		all := bits(chown, netRaw, kill, setpcap)
-		return &fakeCaps{sets: capSets{effective: all, permitted: all, inheritable: bits(chown, netRaw, kill)}, ambient: bits(netRaw), bounding: all, root: true}
+		return &fakeCaps{sets: capSets{effective: all, permitted: all, inheritable: bits(chown, netRaw, kill)}, ambientBits: bits(netRaw), boundingBits: all, root: true}
+	}
+	count := func(calls []string, name string) int {
+		n := 0
+		for _, c := range calls {
+			if c == name {
+				n++
+			}
+		}
+		return n
 	}
 
-	It("clears the ambient set and drops CAP_NET_RAW from the others for the app user", func() {
+	It("clears the ambient, effective, permitted, and inheritable sets for the app user", func() {
 		f := gardenNonRoot()
 		Expect(confineHypervisor(f, hv)).To(Succeed())
-		Expect(f.ambient).To(BeZero())
-		Expect(f.sets).To(Equal(capSets{effective: 0, permitted: 0, inheritable: bits(chown, kill)}))
-		// The app user has no CAP_SETPCAP to drop it with, and a non-root
+		Expect(f.ambientBits).To(BeZero())
+		Expect(f.sets).To(Equal(capSets{}))
+		// The app user has no CAP_SETPCAP to drop them with, and a non-root
 		// exec without file capabilities gets nothing from it.
-		Expect(f.bounding).To(Equal(bits(chown, netRaw, kill, setpcap)))
+		Expect(f.boundingBits).To(Equal(bits(chown, netRaw, kill, setpcap)))
 		Expect(f.calls).NotTo(ContainElement("dropBounding"))
 		Expect(f.calls).To(ContainElement("fileCaps " + hv))
 		Expect(f.calls[0]).To(Equal("clearAmbient"))
 	})
 
-	It("also drops CAP_NET_RAW from the bounding set for root", func() {
+	It("also empties the bounding set for root, one capability at a time", func() {
 		f := gardenRoot()
 		Expect(confineHypervisor(f, hv)).To(Succeed())
-		Expect(f.bounding).To(Equal(bits(chown, kill, setpcap)))
-		Expect(f.sets).To(Equal(capSets{effective: bits(chown, kill, setpcap), permitted: bits(chown, kill, setpcap), inheritable: bits(chown, kill)}))
-		Expect(f.ambient).To(BeZero())
+		Expect(f.boundingBits).To(BeZero())
+		Expect(count(f.calls, "dropBounding")).To(Equal(4))
+		Expect(f.sets).To(Equal(capSets{}))
+		Expect(f.ambientBits).To(BeZero())
 	})
 
-	It("raises CAP_SETPCAP from the permitted set to drop from the bounding set", func() {
+	It("raises CAP_SETPCAP from the permitted set to empty the bounding set", func() {
 		f := gardenRoot()
 		f.sets.effective &^= bits(setpcap)
 		Expect(confineHypervisor(f, hv)).To(Succeed())
-		Expect(f.bounding).To(Equal(bits(chown, kill, setpcap)))
-		Expect(f.sets.permitted & capNetRawBit).To(BeZero())
+		Expect(f.boundingBits).To(BeZero())
+		Expect(f.sets).To(Equal(capSets{}))
 	})
 
 	It("fails for root without CAP_SETPCAP, whose hypervisor would get the bounding set", func() {
 		f := gardenRoot()
 		f.sets.effective &^= bits(setpcap)
 		f.sets.permitted &^= bits(setpcap)
-		Expect(confineHypervisor(f, hv)).To(MatchError(ContainSubstring("runs as root without CAP_SETPCAP")))
+		Expect(confineHypervisor(f, hv)).To(MatchError(ContainSubstring("runs as root without CAP_SETPCAP, so its bounding set keeps capabilities (0x2121)")))
 		Expect(f.calls).NotTo(ContainElement("dropBounding"))
 	})
 
-	It("changes nothing for a process without CAP_NET_RAW", func() {
-		f := &fakeCaps{sets: capSets{inheritable: bits(chown)}, bounding: bits(chown)}
+	It("fails for root whose bounding set keeps a capability other than CAP_NET_RAW", func() {
+		f := &fakeCaps{root: true, boundingBits: bits(chown)}
+		Expect(confineHypervisor(f, hv)).To(MatchError(ContainSubstring("keeps capabilities (0x1)")))
+	})
+
+	It("changes nothing for a process without capabilities", func() {
+		f := &fakeCaps{}
 		Expect(confineHypervisor(f, hv)).To(Succeed())
 		Expect(f.calls).NotTo(ContainElement("set"))
-		Expect(f.sets).To(Equal(capSets{inheritable: bits(chown)}))
+		Expect(f.sets).To(Equal(capSets{}))
+	})
+
+	It("drops the other capabilities of a process without CAP_NET_RAW too", func() {
+		f := &fakeCaps{sets: capSets{inheritable: bits(chown, kill)}, boundingBits: bits(chown)}
+		Expect(confineHypervisor(f, hv)).To(Succeed())
+		Expect(f.sets).To(Equal(capSets{}))
+		Expect(f.boundingBits).To(Equal(bits(chown)))
 	})
 
 	It("tolerates a kernel without ambient capabilities", func() {
 		f := gardenNonRoot()
-		f.ambient = 0
-		f.errs = map[string]error{"clearAmbient": unix.EINVAL, "ambientRaised": unix.EINVAL}
+		f.ambientBits = 0
+		f.errs = map[string]error{"clearAmbient": unix.EINVAL, "ambient": unix.EINVAL}
 		Expect(confineHypervisor(f, hv)).To(Succeed())
-		Expect(f.sets.inheritable & capNetRawBit).To(BeZero())
+		Expect(f.sets).To(Equal(capSets{}))
 	})
 
-	DescribeTable("fails rather than start a hypervisor that could hold CAP_NET_RAW",
+	DescribeTable("fails rather than start a hypervisor that could hold a capability",
 		func(change func(*fakeCaps), msg string) {
 			f := gardenNonRoot()
 			change(f)
 			Expect(confineHypervisor(f, hv)).To(MatchError(ContainSubstring(msg)))
 		},
 		Entry("clearing the ambient set fails", func(f *fakeCaps) { f.errs = map[string]error{"clearAmbient": unix.EPERM} }, "clearing the ambient capabilities: operation not permitted"),
-		Entry("the ambient set stays", func(f *fakeCaps) { f.ignoreClear = true; f.ignoreSet = true }, "still in the effective, permitted, or inheritable set"),
+		Entry("the ambient set stays", func(f *fakeCaps) { f.ignoreClear = true; f.ignoreSet = true }, "still in the effective (0x2000), permitted (0x2000), or inheritable (0x2021) set"),
 		Entry("the ambient set alone stays", func(f *fakeCaps) {
 			f.ignoreClear = true
-			f.sets.permitted, f.sets.inheritable = 0, 0
-			f.sets.effective = 0
-		}, "CAP_NET_RAW is still in the ambient set"),
-		Entry("the sets stay", func(f *fakeCaps) { f.ignoreSet = true }, "still in the effective, permitted, or inheritable set"),
-		Entry("setting the sets fails", func(f *fakeCaps) { f.errs = map[string]error{"set": unix.EPERM} }, "dropping CAP_NET_RAW: operation not permitted"),
+			f.sets = capSets{}
+		}, "capabilities are still in the ambient set (0x2000)"),
+		Entry("the sets stay", func(f *fakeCaps) { f.ignoreSet = true }, "still in the effective"),
+		Entry("only an inheritable capability stays", func(f *fakeCaps) {
+			f.ignoreSet = true
+			f.sets = capSets{inheritable: bits(kill)}
+		}, "or inheritable (0x20) set"),
+		Entry("setting the sets fails", func(f *fakeCaps) { f.errs = map[string]error{"set": unix.EPERM} }, "dropping the capabilities: operation not permitted"),
 		Entry("reading the sets fails", func(f *fakeCaps) { f.errs = map[string]error{"get": unix.EFAULT} }, "reading the capabilities"),
-		Entry("reading the bounding set fails", func(f *fakeCaps) { f.errs = map[string]error{"inBounding": unix.EINVAL} }, "reading the bounding set"),
-		Entry("reading the ambient set back fails", func(f *fakeCaps) { f.errs = map[string]error{"ambientRaised": unix.EFAULT} }, "reading the ambient set back"),
+		Entry("reading the bounding set fails", func(f *fakeCaps) { f.errs = map[string]error{"bounding": unix.EINVAL} }, "reading the bounding set"),
+		Entry("reading the ambient set back fails", func(f *fakeCaps) { f.errs = map[string]error{"ambient": unix.EFAULT} }, "reading the ambient set back"),
 		Entry("the binary has file capabilities", func(f *fakeCaps) { f.hasFileCaps = true }, hv+" has file capabilities"),
 		Entry("reading the file capabilities fails", func(f *fakeCaps) { f.errs = map[string]error{"fileCaps " + hv: unix.EACCES} }, "reading the file capabilities of "+hv),
 	)
 
-	DescribeTable("fails for root when the bounding set keeps CAP_NET_RAW",
+	DescribeTable("fails for root when the bounding set keeps a capability",
 		func(change func(*fakeCaps), msg string) {
 			f := gardenRoot()
 			change(f)
 			Expect(confineHypervisor(f, hv)).To(MatchError(ContainSubstring(msg)))
 		},
-		Entry("the drop fails", func(f *fakeCaps) { f.errs = map[string]error{"dropBounding": unix.EPERM} }, "dropping CAP_NET_RAW from the bounding set"),
+		Entry("a drop fails", func(f *fakeCaps) { f.errs = map[string]error{"dropBounding": unix.EPERM} }, "dropping capability 0 from the bounding set: operation not permitted"),
 		Entry("the drop does nothing", func(f *fakeCaps) { f.ignoreDrop = true }, "runs as root without CAP_SETPCAP"),
 		Entry("raising CAP_SETPCAP fails", func(f *fakeCaps) {
 			f.sets.effective &^= bits(setpcap)
@@ -494,12 +679,13 @@ var _ = Describe("threadCaps", func() {
 		caps := statusCaps(string(status))
 		Expect(sets).To(Equal(capSets{effective: caps["CapEff"], permitted: caps["CapPrm"], inheritable: caps["CapInh"]}))
 
-		bounded, err := threadCaps{}.inBounding(unix.CAP_NET_RAW)
+		bounding, err := threadCaps{}.bounding()
 		Expect(err).NotTo(HaveOccurred())
-		Expect(bounded).To(Equal(caps["CapBnd"]&capNetRawBit != 0))
-		ambient, err := threadCaps{}.ambientRaised(unix.CAP_NET_RAW)
+		Expect(bounding).To(Equal(caps["CapBnd"]))
+		Expect(bounding).NotTo(BeZero())
+		ambient, err := threadCaps{}.ambient()
 		Expect(err).NotTo(HaveOccurred())
-		Expect(ambient).To(Equal(caps["CapAmb"]&capNetRawBit != 0))
+		Expect(ambient).To(Equal(caps["CapAmb"]))
 		Expect(threadCaps{}.isRoot()).To(Equal(os.Geteuid() == 0))
 	})
 
@@ -537,10 +723,10 @@ var _ = Describe("threadCaps", func() {
 		Expect(r[0]).To(BeNil())
 		caps := statusCaps(r[1].(string))
 		for _, set := range []string{"CapEff", "CapPrm", "CapInh", "CapAmb"} {
-			Expect(caps[set]&capNetRawBit).To(BeZero(), set)
+			Expect(caps[set]).To(BeZero(), set)
 		}
 		if os.Geteuid() == 0 {
-			Expect(caps["CapBnd"] & capNetRawBit).To(BeZero())
+			Expect(caps["CapBnd"]).To(BeZero())
 		}
 
 		runtime.LockOSThread()
@@ -635,7 +821,7 @@ var _ = Describe("run with --transparent-proxy", func() {
 		art = makeArtifacts()
 		GinkgoT().Setenv("TMPDIR", GinkgoT().TempDir())
 		logBuf = &safeBuffer{}
-		caps = &fakeCaps{sets: capSets{effective: capNetRawBit, permitted: capNetRawBit, inheritable: capNetRawBit}, ambient: capNetRawBit}
+		caps = &fakeCaps{sets: capSets{effective: capNetRawBit, permitted: capNetRawBit, inheritable: capNetRawBit}, ambientBits: capNetRawBit}
 		savedCaps, savedCheck := hypervisorCaps, checkTransparentDial
 		hypervisorCaps = caps
 		checks = 0
@@ -659,7 +845,7 @@ var _ = Describe("run with --transparent-proxy", func() {
 	It("exits 125 before the guest boots when a socket cannot be made transparent", func() {
 		argvFile := writeFakeHypervisor(filepath.Join(art, artFirecracker), "")
 		GinkgoT().Setenv("PORT", freePort())
-		checkTransparentDial = func() error { return &transparentError{unix.EPERM} }
+		checkTransparentDial = func() error { return &transparentError{err: unix.EPERM} }
 		Expect(runFC("--transparent-proxy")).To(Equal(exitLaunchError))
 		Expect(logBuf.String()).To(ContainSubstring("the transparent port proxy cannot run: making the socket to the guest transparent, which takes CAP_NET_RAW: operation not permitted; Garden grants CAP_NET_RAW"))
 		Expect(argvFile).NotTo(BeAnExistingFile())
@@ -673,7 +859,7 @@ var _ = Describe("run with --transparent-proxy", func() {
 		Expect(runFC("--transparent-proxy")).To(Equal(0), logBuf.String())
 		Expect(checks).To(BeZero())
 		Expect(caps.calls).To(ContainElement("fileCaps " + filepath.Join(art, artFirecracker)))
-		Expect(caps.ambient).To(BeZero())
+		Expect(caps.ambientBits).To(BeZero())
 		Expect(caps.sets).To(Equal(capSets{}))
 	})
 
@@ -685,11 +871,28 @@ var _ = Describe("run with --transparent-proxy", func() {
 		Expect(argvFile).NotTo(BeAnExistingFile())
 	})
 
-	It("does neither without the flag", func() {
+	It("still confines the hypervisor's thread without the flag, but does not check the dial", func() {
 		writeFakeHypervisor(filepath.Join(art, artFirecracker), "")
 		GinkgoT().Setenv("PORT", freePort())
 		Expect(runFC()).To(Equal(0), logBuf.String())
 		Expect(checks).To(BeZero())
+		Expect(caps.calls).To(ContainElement("fileCaps " + filepath.Join(art, artFirecracker)))
+		Expect(caps.ambientBits).To(BeZero())
+		Expect(caps.sets).To(Equal(capSets{}))
+	})
+
+	It("exits 125 without the flag when the hypervisor's thread cannot be confined", func() {
+		argvFile := writeFakeHypervisor(filepath.Join(art, artFirecracker), "")
+		caps.hasFileCaps = true
+		Expect(runFC()).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(ContainSubstring("confining the hypervisor's capabilities: " + filepath.Join(art, artFirecracker) + " has file capabilities"))
+		Expect(argvFile).NotTo(BeAnExistingFile())
+	})
+
+	It("leaves QEMU's start alone", func() {
+		writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+		code := run([]string{"--backend", string(backend.VMQemu), "--artifacts", art, "--", "/tmp/lifecycle/launcher", "app", "true", ""}, log.New(logBuf, "", 0))
+		Expect(code).To(Equal(0), logBuf.String())
 		Expect(caps.calls).To(BeEmpty())
 	})
 })
@@ -698,9 +901,10 @@ var _ = Describe("run with --transparent-proxy", func() {
 // a network namespace that stands in for the container, a namespace behind
 // tap0 that stands in for the guest, and one behind eth0 that stands in for
 // the rest of the network. vm-launch runs in the container namespace as the
-// app user, with the credentials Garden gives the wrapped vm-launch, and its
-// fake Firecracker reports the guest app's listeners and records its own
-// capabilities.
+// app user, with the credentials Garden gives the wrapped vm-launch, from
+// TestMain, which calls run as main does. Its fake Firecracker reports the
+// guest app's listeners and records its own and vm-launch's process IDs,
+// capabilities, and /proc owners.
 var _ = Describe("the transparent port proxy on a real kernel", func() {
 	const (
 		containerIP = "10.255.0.5"
@@ -708,6 +912,9 @@ var _ = Describe("the transparent port proxy on a real kernel", func() {
 		appUID      = "2000"
 		portA       = 18080
 		portB       = 18081
+		// portC is a guest app that writes to each client until a write
+		// fails.
+		portC = 18082
 	)
 
 	var (
@@ -783,11 +990,15 @@ for a in "$@"; do
 	prev=$a
 done
 nonce=$(gzip -dc "$initrd" | grep -a -o 'RVM_START_[0-9a-f]*' | head -n 1 | cut -d_ -f3)
-grep ^Cap /proc/self/status > `+shellQuote(capsDir)+`/hypervisor
-grep ^Cap /proc/$PPID/status > `+shellQuote(capsDir)+`/vm-launch
+caps=`+shellQuote(capsDir)+`
+grep ^Cap /proc/self/status > "$caps/hypervisor"
+grep ^Cap /proc/$PPID/status > "$caps/vm-launch"
+echo "$(stat -c %u /proc/self/status) $(stat -c %u /proc/$PPID/status)" > "$caps/owners"
+echo "$PPID $$" > "$caps/pids.tmp" && mv "$caps/pids.tmp" "$caps/pids"
 echo "RVM_START_$nonce"
 echo "RVM_LISTEN_${nonce}=`+strconv.Itoa(portA)+`:1"
 echo "RVM_LISTEN_${nonce}=`+strconv.Itoa(portB)+`:1"
+echo "RVM_LISTEN_${nonce}=`+strconv.Itoa(portC)+`:1"
 for i in $(seq 600); do [ -e `+shellQuote(done)+` ] && break; sleep 0.05; done
 echo "RVM_EXIT_$nonce=0"
 `), 0o755)).To(Succeed())
@@ -851,6 +1062,20 @@ echo "RVM_EXIT_$nonce=0"
 		ready, err := bufio.NewReader(guestOut).ReadString('\n')
 		Expect(err).NotTo(HaveOccurred())
 		Expect(ready).To(Equal("ready\n"))
+
+		talker := exec.Command("ip", "netns", "exec", ns["guest"], bin)
+		talker.Env = append(os.Environ(), helperTalkPort+"="+strconv.Itoa(portC))
+		talkerOut, err := talker.StdoutPipe()
+		Expect(err).NotTo(HaveOccurred())
+		talker.Stderr = GinkgoWriter
+		Expect(talker.Start()).To(Succeed())
+		DeferCleanup(func() {
+			_ = talker.Process.Kill()
+			_ = talker.Wait()
+		})
+		ready, err = bufio.NewReader(talkerOut).ReadString('\n')
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ready).To(Equal("ready\n"))
 	})
 
 	// startVMLaunch runs vm-launch in the container namespace with setpriv
@@ -864,7 +1089,7 @@ echo "RVM_EXIT_$nonce=0"
 			"PATH=" + os.Getenv("PATH"),
 			"TMPDIR=" + filepath.Join(dir, "tmp"),
 			"PORT=" + strconv.Itoa(portA),
-			fmt.Sprintf(`CF_INSTANCE_PORTS=[{"internal":%d},{"internal":2222},{"internal":%d}]`, portA, portB),
+			fmt.Sprintf(`CF_INSTANCE_PORTS=[{"internal":%d},{"internal":2222},{"internal":%d},{"internal":%d}]`, portA, portB, portC),
 			helperTransparentRun + "=" + art,
 		}
 		if transparent {
@@ -933,7 +1158,7 @@ echo "RVM_EXIT_$nonce=0"
 		return statusCaps(string(status))
 	}
 
-	It("shows the guest each client's own address on every port, and keeps CAP_NET_RAW from the hypervisor", func() {
+	It("shows the guest each client's own address on every port, and starts the hypervisor without capabilities", func() {
 		startVMLaunch(appUser, true)
 
 		Expect(peer("outside", containerIP, portA)).To(Equal(outsideIP))
@@ -951,29 +1176,34 @@ echo "RVM_EXIT_$nonce=0"
 		Expect(launcher["CapAmb"] & capNetRawBit).NotTo(BeZero())
 		hypervisor := readCaps("hypervisor")
 		for _, set := range []string{"CapEff", "CapPrm", "CapInh", "CapAmb"} {
-			Expect(hypervisor[set]&capNetRawBit).To(BeZero(), "%s of the hypervisor: %v", set, hypervisor)
+			Expect(hypervisor[set]).To(BeZero(), "%s of the hypervisor: %v", set, hypervisor)
 		}
-		Expect(hypervisor["CapInh"]).To(Equal(bits(unix.CAP_CHOWN, unix.CAP_KILL)))
+		// The app user cannot empty the bounding set, and no_new_privs
+		// keeps the hypervisor from gaining anything in it.
+		Expect(hypervisor["CapBnd"]).To(Equal(bits(unix.CAP_CHOWN, unix.CAP_KILL, unix.CAP_NET_RAW, unix.CAP_SETPCAP)))
 	})
 
-	It("shows the guest the tap address without the flag, and the same credentials would leak CAP_NET_RAW then", func() {
+	It("shows the guest the tap address without the flag, and still keeps CAP_NET_RAW from the hypervisor", func() {
 		startVMLaunch(appUser, false)
 		Expect(peer("outside", containerIP, portA)).To(Equal(fcHostIP))
 		finish()
-		// This is what the confinement prevents, and it shows that the
-		// fake hypervisor's record reads the right bits.
-		Expect(readCaps("hypervisor")["CapAmb"] & capNetRawBit).NotTo(BeZero())
+		// The same credentials leave CAP_NET_RAW ambient in vm-launch, so
+		// an unconfined hypervisor would hold it.
+		Expect(readCaps("vm-launch")["CapAmb"] & capNetRawBit).NotTo(BeZero())
+		hypervisor := readCaps("hypervisor")
+		for _, set := range []string{"CapEff", "CapPrm", "CapInh", "CapAmb"} {
+			Expect(hypervisor[set]).To(BeZero(), "%s of the hypervisor: %v", set, hypervisor)
+		}
 	})
 
-	It("drops CAP_NET_RAW from the hypervisor's bounding set when vm-launch runs as root", func() {
+	It("starts the hypervisor with no capabilities, and an empty bounding set, when vm-launch runs as root", func() {
 		startVMLaunch([]string{"--bounding-set=-all,+chown,+kill,+net_raw,+setpcap"}, true)
 		Expect(peer("outside", containerIP, portA)).To(Equal(outsideIP))
 		finish()
 		hypervisor := readCaps("hypervisor")
 		for _, set := range []string{"CapEff", "CapPrm", "CapInh", "CapAmb", "CapBnd"} {
-			Expect(hypervisor[set]&capNetRawBit).To(BeZero(), "%s of the hypervisor: %v", set, hypervisor)
+			Expect(hypervisor[set]).To(BeZero(), "%s of the hypervisor: %v", set, hypervisor)
 		}
-		Expect(hypervisor["CapBnd"]).To(Equal(bits(unix.CAP_CHOWN, unix.CAP_KILL, unix.CAP_SETPCAP)))
 	})
 
 	It("refuses to start the hypervisor as root without CAP_SETPCAP", func() {
@@ -993,5 +1223,149 @@ echo "RVM_EXIT_$nonce=0"
 		Expect(errors.As(err, &exitErr)).To(BeTrue(), "%v", err)
 		Expect(exitErr.ExitCode()).To(Equal(exitLaunchError))
 		Expect(vmLaunchLog.String()).To(ContainSubstring("the transparent port proxy cannot run"))
+	})
+
+	// The hypervisor's thread has no capabilities, and the kernel checks a
+	// tracer against the one thread it names, so vm-launch must be
+	// non-dumpable for every thread to be safe from a process of the same
+	// user without capabilities.
+	It("refuses a process of the same user without capabilities the memory of every vm-launch thread", func() {
+		startVMLaunch(appUser, true)
+		Expect(peer("outside", containerIP, portA)).To(Equal(outsideIP))
+		var launcherPID, hypervisorPID string
+		Eventually(func() error {
+			raw, err := os.ReadFile(filepath.Join(capsDir, "pids"))
+			if err == nil {
+				_, err = fmt.Sscan(string(raw), &launcherPID, &hypervisorPID)
+			}
+			return err
+		}, 15*time.Second).Should(Succeed())
+
+		attacker := exec.Command("setpriv", "--reuid="+appUID, "--regid="+appUID, "--clear-groups",
+			"--inh-caps=-all", "--bounding-set=-all", "--", bin)
+		attacker.Env = []string{helperOpenMem + "=" + launcherPID + "," + hypervisorPID}
+		attacker.Stderr = GinkgoWriter
+		out, err := attacker.Output()
+		Expect(err).NotTo(HaveOccurred(), string(out))
+		GinkgoWriter.Print(string(out))
+
+		type task struct {
+			tid, result string
+			prm         uint64
+		}
+		tasks := map[string][]task{}
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			f := strings.Fields(line)
+			Expect(f).To(HaveLen(4), line)
+			prm, err := strconv.ParseUint(f[2], 16, 64)
+			Expect(err).NotTo(HaveOccurred(), line)
+			tasks[f[0]] = append(tasks[f[0]], task{tid: f[1], prm: prm, result: f[3]})
+		}
+
+		// The hypervisor is dumpable and has no capabilities, so its own
+		// memory shows that this kernel lets the attacker reach a process of
+		// the same user at all, as it does without Yama.
+		Expect(tasks[hypervisorPID]).NotTo(BeEmpty())
+		if tasks[hypervisorPID][0].result != "open" {
+			Skip("this kernel refuses a process of the same user the memory of a dumpable one: " + tasks[hypervisorPID][0].result)
+		}
+
+		launcher := tasks[launcherPID]
+		Expect(len(launcher)).To(BeNumerically(">=", 2), string(out))
+		withoutNetRaw := 0
+		for _, t := range launcher {
+			if t.tid == launcherPID {
+				Expect(t.prm&capNetRawBit).NotTo(BeZero(), "the thread-group leader: %s", out)
+			}
+			if t.prm&capNetRawBit == 0 {
+				withoutNetRaw++
+			}
+			Expect(t.result).To(BeElementOf("EACCES", "EPERM"), "task %s: %s", t.tid, out)
+		}
+		// The hypervisor's thread, which dropped its capabilities.
+		Expect(withoutNetRaw).To(Equal(1), string(out))
+
+		// vm-launch's /proc files belong to root once it is not dumpable;
+		// the hypervisor's still belong to the app user.
+		Expect(os.ReadFile(filepath.Join(capsDir, "owners"))).To(Equal([]byte(appUID + " 0\n")))
+		finish()
+	})
+
+	// A client that resets its connection makes the proxy close the guest's
+	// side. The guest here drops resets, so it keeps sending on that
+	// connection, and nothing it sends may leave the container from the
+	// guest's own address.
+	It("keeps the guest's segments for a closed proxy connection in the container", func() {
+		mustNS("guest", iptables, "-A", "INPUT", "-p", "tcp", "--tcp-flags", "RST", "RST", "-j", "DROP")
+		mustNS("guest", iptables, "-A", "OUTPUT", "-p", "tcp", "--sport", strconv.Itoa(portC))
+		mustNS("outside", iptables, "-t", "raw", "-A", "PREROUTING", "-s", fcGuestIP)
+		counter := func(name string, table, chain string) uint64 {
+			GinkgoHelper()
+			out, err := inNS(name, iptables, "-t", table, "-n", "-v", "-x", "-L", chain)
+			Expect(err).NotTo(HaveOccurred(), out)
+			lines := strings.Split(strings.TrimSpace(out), "\n")
+			Expect(len(lines)).To(BeNumerically(">=", 3), out)
+			n, err := strconv.ParseUint(strings.Fields(lines[2])[0], 10, 64)
+			Expect(err).NotTo(HaveOccurred(), out)
+			return n
+		}
+
+		startVMLaunch(appUser, true)
+		client := exec.Command("ip", "netns", "exec", ns["outside"], bin)
+		client.Env = append(os.Environ(), helperResetClient+"="+net.JoinHostPort(containerIP, strconv.Itoa(portC)))
+		stdin, err := client.StdinPipe()
+		Expect(err).NotTo(HaveOccurred())
+		stdout, err := client.StdoutPipe()
+		Expect(err).NotTo(HaveOccurred())
+		client.Stderr = GinkgoWriter
+		Expect(client.Start()).To(Succeed())
+		DeferCleanup(func() {
+			_ = client.Process.Kill()
+			_ = client.Wait()
+		})
+		lines := bufio.NewReader(stdout)
+		Expect(lines.ReadString('\n')).To(Equal("connected\n"), vmLaunchLog.String())
+		Expect(stdin.Close()).To(Succeed())
+		Expect(lines.ReadString('\n')).To(Equal("reset\n"))
+		Expect(client.Wait()).To(Succeed())
+
+		// Let the proxy close the guest's side, then watch the guest send.
+		time.Sleep(500 * time.Millisecond)
+		sent := counter("guest", "filter", "OUTPUT")
+		Eventually(func() uint64 { return counter("guest", "filter", "OUTPUT") }, 10*time.Second, 100*time.Millisecond).
+			Should(BeNumerically(">=", sent+3))
+		Expect(counter("outside", "raw", "PREROUTING")).To(BeZero())
+		finish()
+	})
+
+	// The proxy dials the guest from the client's address. With one local
+	// port, a dial that picked its port at bind would find it taken by the
+	// open connection; one that picks it at connect shares it, because the
+	// destinations differ.
+	It("leaves the choice of the upstream port to connect, so one client address shares a port across guest ports", func() {
+		mustNS("container", "sysctl", "-w", "net.ipv4.ip_local_port_range=40000 40000")
+		startVMLaunch(appUser, true)
+		client := exec.Command("ip", "netns", "exec", ns["outside"], bin)
+		client.Env = append(os.Environ(), helperResetClient+"="+net.JoinHostPort(containerIP, strconv.Itoa(portC)))
+		stdin, err := client.StdinPipe()
+		Expect(err).NotTo(HaveOccurred())
+		stdout, err := client.StdoutPipe()
+		Expect(err).NotTo(HaveOccurred())
+		client.Stderr = GinkgoWriter
+		Expect(client.Start()).To(Succeed())
+		DeferCleanup(func() {
+			_ = client.Process.Kill()
+			_ = client.Wait()
+		})
+		Expect(bufio.NewReader(stdout).ReadString('\n')).To(Equal("connected\n"), vmLaunchLog.String())
+		out, err := inNS("container", "ss", "-tnH", "state", "established", "dst", fcGuestIP)
+		if err == nil {
+			Expect(out).To(ContainSubstring(outsideIP+":40000"), out)
+		}
+
+		Expect(peer("outside", containerIP, portA)).To(Equal(outsideIP))
+		Expect(peer("outside", containerIP, portB)).To(Equal(outsideIP))
+		Expect(stdin.Close()).To(Succeed())
+		finish()
 	})
 })

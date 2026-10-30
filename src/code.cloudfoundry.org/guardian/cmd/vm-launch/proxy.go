@@ -108,9 +108,10 @@ var errProxyStopped = errors.New("the port proxy has stopped accepting connectio
 type proxyOption func(*tcpProxy)
 
 // withTransparentDial makes the proxy dial the guest from its clients'
-// addresses, setting IP_TRANSPARENT on each such socket through
-// setTransparent, which takes CAP_NET_RAW. Garden routes the guest's replies
-// to these sockets (see the netplugin package's FirecrackerReplyRouting).
+// addresses, setting IP_TRANSPARENT, which takes CAP_NET_RAW, and
+// IP_BIND_ADDRESS_NO_PORT on each such socket through setTransparent. Garden
+// routes the guest's replies to these sockets (see the netplugin package's
+// FirecrackerReplyRouting).
 func withTransparentDial() proxyOption {
 	return func(p *tcpProxy) {
 		p.transparent = true

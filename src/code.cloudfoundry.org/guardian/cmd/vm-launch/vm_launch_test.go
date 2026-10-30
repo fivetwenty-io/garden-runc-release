@@ -27,6 +27,32 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// TestMain runs the helper processes that must call run as main does: from
+// main's goroutine once every init function has run, which is not how the
+// Go runtime schedules a call from init, and with the real markUndumpable.
+// The specs themselves run with a markUndumpable that does nothing, because
+// they call run in this process many times, and a process that is not
+// dumpable can no longer write its own coredump_filter as a non-root user.
+func TestMain(m *testing.M) {
+	if art := os.Getenv(helperTransparentRun); art != "" {
+		os.Exit(transparentRun(art))
+	}
+	if pids := os.Getenv(helperOpenMem); pids != "" {
+		os.Exit(openMem(pids))
+	}
+	if port := os.Getenv(helperTalkPort); port != "" {
+		os.Exit(talk(port))
+	}
+	if addr := os.Getenv(helperResetClient); addr != "" {
+		os.Exit(resetClient(addr))
+	}
+	if os.Getenv(helperUndumpable) != "" {
+		os.Exit(undumpable())
+	}
+	markUndumpable = func() error { return nil }
+	os.Exit(m.Run())
+}
+
 func TestVMLaunch(t *testing.T) {
 	RegisterFailHandler(Fail)
 	RunSpecs(t, "VM Launch Suite")
@@ -78,14 +104,6 @@ func init() {
 	}
 	if ports := os.Getenv(helperEchoPorts); ports != "" {
 		os.Exit(echoPeers(ports))
-	}
-	if art := os.Getenv(helperTransparentRun); art != "" {
-		argv := []string{"--backend", string(backend.VMFirecracker), "--artifacts", art}
-		if os.Getenv(helperTransparentFlag) != "" {
-			argv = append(argv, "--transparent-proxy")
-		}
-		argv = append(argv, "--", "/tmp/lifecycle/launcher", "app", "true", "")
-		os.Exit(run(argv, log.New(os.Stderr, "vm-launch: ", 0)))
 	}
 	if art := os.Getenv(helperArtifacts); art != "" {
 		kind := string(backend.VMQemu)

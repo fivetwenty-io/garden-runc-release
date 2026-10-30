@@ -809,9 +809,10 @@ type supervisor struct {
 	reported func()
 	// prepare, when set, makes the supervisor start the hypervisor from an
 	// OS thread of its own, after prepare has run on it (see
-	// startConfined). vm-launch uses it to keep CAP_NET_RAW, which its
-	// transparent port proxy needs, from the hypervisor. A failure of
-	// prepare is a failure to start the hypervisor.
+	// startConfined). vm-launch uses it to start Firecracker without any
+	// capability, CAP_NET_RAW, which its transparent port proxy needs,
+	// among them. A failure of prepare is a failure to start the
+	// hypervisor.
 	prepare func() error
 }
 

@@ -5,8 +5,10 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -146,12 +148,82 @@ echo "$(ulimit -S -c) $(ulimit -H -c) $filter" > ` + shellQuote(file) + "\n"
 		Expect(os.ReadDir(tmp)).To(BeEmpty())
 	})
 
+	It("makes itself non-dumpable after it disables core dumps and before it parses its arguments", func() {
+		savedCore, savedDumpable := disableCoreDumps, markUndumpable
+		DeferCleanup(func() { disableCoreDumps, markUndumpable = savedCore, savedDumpable })
+		var calls []string
+		disableCoreDumps = func() error {
+			calls = append(calls, "core dumps")
+			return nil
+		}
+		markUndumpable = func() error {
+			calls = append(calls, "dumpable")
+			return nil
+		}
+		Expect(runVM("nope")).To(Equal(exitLaunchError))
+		Expect(calls).To(Equal([]string{"core dumps", "dumpable"}))
+		Expect(logBuf.String()).To(ContainSubstring("nope"))
+	})
+
+	It("exits 125 without starting the hypervisor when it cannot clear its dumpable flag", func() {
+		saved := markUndumpable
+		DeferCleanup(func() { markUndumpable = saved })
+		markUndumpable = func() error { return errors.New("the dumpable flag is still 1") }
+
+		argvFile := writeFakeHypervisor(filepath.Join(art, "firecracker/firecracker"), "")
+		Expect(runVM(backend.VMFirecracker)).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(Equal("making vm-launch non-dumpable: the dumpable flag is still 1\n"))
+		Expect(argvFile).NotTo(BeAnExistingFile())
+		Expect(os.ReadDir(tmp)).To(BeEmpty())
+	})
+
+	// The real markUndumpable runs in a process of its own, because this one
+	// must stay dumpable to keep writing its own coredump_filter.
+	It("clears the dumpable flag, which hands its /proc files to root", func() {
+		self, err := os.Executable()
+		Expect(err).NotTo(HaveOccurred())
+		cmd := exec.Command(self)
+		cmd.Env = append(os.Environ(), helperUndumpable+"=1")
+		cmd.Stderr = GinkgoWriter
+		out, err := cmd.Output()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(out)).To(Equal(fmt.Sprintf("dumpable 1 owner %d\ndumpable 0 owner 0\n", os.Geteuid())))
+	})
+
 	It("leaves guest RAM out of QEMU's core dumps", func() {
 		argv := qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, taskNetwork(), "", 0)
 		machine := optionAfter(argv, "-M", "microvm")
 		Expect(strings.Split(machine, ",")).To(Equal([]string{"microvm", "accel=kvm", "dump-guest-core=off"}))
 	})
 })
+
+// helperUndumpable makes this test binary print its dumpable flag and the
+// owner of its /proc/self/status, run the real markUndumpable, and print
+// them again.
+const helperUndumpable = "VM_LAUNCH_TEST_UNDUMPABLE"
+
+// undumpable is the helperUndumpable process.
+func undumpable() int {
+	report := func() error {
+		dumpable, err := unix.PrctlRetInt(unix.PR_GET_DUMPABLE, 0, 0, 0, 0)
+		if err != nil {
+			return err
+		}
+		var st unix.Stat_t
+		if err := unix.Stat("/proc/self/status", &st); err != nil {
+			return err
+		}
+		fmt.Printf("dumpable %d owner %d\n", dumpable, st.Uid)
+		return nil
+	}
+	for _, step := range []func() error{report, markUndumpable, report} {
+		if err := step(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+	}
+	return 0
+}
 
 // ownCoreDumpFilter returns this process's coredump_filter as the kernel
 // prints it, eight hex digits.
