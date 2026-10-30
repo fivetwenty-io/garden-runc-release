@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -19,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -36,8 +38,8 @@ func bootRealGuest(g guestContents) string {
 	f, err := newInitramfs(guestBusybox(), g)
 	Expect(err).NotTo(HaveOccurred())
 	DeferCleanup(f.Close)
-	files, _, initrdPath, _ := hypervisorFiles(nil, f, nil)
-	argv := tcgArgv(qemu, qemuArgv(art, initrdPath, minGuestMemoryMiB, g.nw, "", 0))
+	files, _, initrdPath, _ := hypervisorFiles(nil, withUserspaceMark(f), nil)
+	argv := markedArgv(tcgArgv(qemu, qemuArgv(art, initrdPath, minGuestMemoryMiB, g.nw, "", 0)))
 	code, stdout, stderr := bootRealQEMU(argv, files)
 	Expect(code).To(Equal(0), "QEMU failed: %s\n%s", stderr, stdout)
 	Expect(stdout).To(ContainSubstring(startTag(testNonce)), stdout)
@@ -47,15 +49,65 @@ func bootRealGuest(g guestContents) string {
 // A real guest under TCG boots in a few seconds, but now and then, on a
 // loaded host, its kernel cannot calibrate the TSC against the microvm's
 // timers and spins before it reaches userspace. Nothing inside the guest
-// ends that, so the specs that boot a real guest kill a QEMU whose guest
-// has not booted after realBootTimeout and boot again, up to
-// realBootAttempts times. A guest that booted and still runs after
-// realRunTimeout fails its spec, with QEMU killed.
+// ends that, so the specs that boot a real guest kill a QEMU whose kernel
+// has not started userspace after realBootTimeout and boot again, up to
+// realBootAttempts times. Userspace starts with a test /init that prints
+// realBootMark before it runs vm-launch's /init (see withUserspaceMark), so
+// a hang in vm-launch's /init is never retried: a guest that printed the
+// mark and still runs after realRunTimeout fails its spec, with QEMU killed.
+// Each retry is a report entry, so a passing run shows it too, and the
+// suite fails a boot once it has retried realBootRetries of them, because
+// that many retries is a host too loaded to test on or a kernel that hangs.
 const (
 	realBootTimeout  = 90 * time.Second
 	realBootAttempts = 3
+	realBootRetries  = 3
 	realRunTimeout   = 2 * time.Minute
+	realBootMark     = "RVM_TEST_USERSPACE"
+	realTestInit     = "rvm-test-init"
 )
+
+// realBootRetried counts the boots that the suite has retried.
+var realBootRetried atomic.Int32
+
+// withUserspaceMark returns a copy of the initramfs f, in a sealed memfd
+// as vm-launch passes it, with an archive appended that adds
+// /rvm-test-init, which prints realBootMark and then runs vm-launch's /init
+// as the same process, the guest's init. The kernel unpacks each archive
+// of a concatenated initramfs in turn.
+func withUserspaceMark(f *os.File) *os.File {
+	info, err := f.Stat()
+	Expect(err).NotTo(HaveOccurred())
+	fd, err := createInitramfsMemfd()
+	Expect(err).NotTo(HaveOccurred())
+	marked := os.NewFile(uintptr(fd), "memfd:"+initramfsName+"-marked")
+	DeferCleanup(marked.Close)
+	_, err = io.Copy(marked, io.NewSectionReader(f, 0, info.Size()))
+	Expect(err).NotTo(HaveOccurred())
+	script := "#!/bin/busybox sh\necho " + realBootMark + "\nexec /init\n"
+	gz := gzip.NewWriter(marked)
+	cw := newCPIOWriter(gz)
+	Expect(cw.File(realTestInit, 0o755, int64(len(script)), strings.NewReader(script))).To(Succeed())
+	Expect(cw.Close()).To(Succeed())
+	Expect(gz.Close()).To(Succeed())
+	Expect(addSeals(marked, initramfsSeals)).To(Succeed())
+	return marked
+}
+
+// markedArgv returns QEMU's argv with the kernel starting /rvm-test-init in
+// place of /init (see withUserspaceMark).
+func markedArgv(argv []string) []string {
+	out := slices.Clone(argv)
+	n := 0
+	for i, a := range out {
+		if strings.Contains(a, "rdinit=/init") {
+			out[i] = strings.Replace(a, "rdinit=/init", "rdinit=/"+realTestInit, 1)
+			n++
+		}
+	}
+	Expect(n).To(Equal(1), "no single rdinit=/init in %q", argv)
+	return out
+}
 
 // bootWriter collects a real guest's console output and closes booted
 // once the output holds mark.
@@ -89,12 +141,64 @@ func (w *bootWriter) String() string {
 	return w.buf.String()
 }
 
+// consoleLogArgv returns QEMU's argv with the serial console also logged
+// to path, for a spec whose console goes through a serialFilter, which
+// drops the output before the start tag and with it realBootMark.
+func consoleLogArgv(argv []string, path string) []string {
+	for i := 0; i+1 < len(argv); i++ {
+		if argv[i] == "-serial" && argv[i+1] == "stdio" {
+			return slices.Concat(argv[:i], []string{"-chardev", "stdio,id=rvmcon,logfile=" + path, "-serial", "chardev:rvmcon"}, argv[i+2:])
+		}
+	}
+	Fail(fmt.Sprintf("no -serial stdio in %q", argv))
+	return nil
+}
+
+// tailFile copies what is written to path into w, from a goroutine, until
+// stop closes, and returns a channel that closes once it has stopped. It
+// reads the file once more after stop closes, so w then holds all that the
+// file held. A path that does not exist yet is tried again.
+func tailFile(path string, w io.Writer, stop <-chan struct{}) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer GinkgoRecover()
+		defer close(done)
+		var off int64
+		for {
+			stopping := false
+			select {
+			case <-stop:
+				stopping = true
+			default:
+			}
+			f, err := os.Open(path)
+			switch {
+			case err == nil:
+				n, err := io.Copy(w, io.NewSectionReader(f, off, 1<<62))
+				off += n
+				Expect(f.Close()).To(Succeed())
+				Expect(err).NotTo(HaveOccurred())
+			case !errors.Is(err, os.ErrNotExist):
+				Expect(err).NotTo(HaveOccurred())
+			}
+			if stopping {
+				return
+			}
+			select {
+			case <-stop:
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+	}()
+	return done
+}
+
 // awaitRealGuest waits for a real guest whose console output w collects
 // until exited closes, which it does once QEMU has been reaped. It returns
 // false, with QEMU killed by kill and reaped, when the guest did not boot
-// in realBootTimeout. It fails the spec, with QEMU killed and reaped, when
-// the guest still runs realRunTimeout after it booted. details describes
-// the run for either message.
+// in realBootTimeout, and adds a report entry that says so. It fails the
+// spec, with QEMU killed and reaped, when the guest still runs
+// realRunTimeout after it booted. details describes the run for either.
 func awaitRealGuest(kill func(), w *bootWriter, exited <-chan struct{}, details func() string) bool {
 	select {
 	case <-w.booted:
@@ -103,7 +207,7 @@ func awaitRealGuest(kill func(), w *bootWriter, exited <-chan struct{}, details 
 	case <-time.After(realBootTimeout):
 		kill()
 		<-exited
-		GinkgoWriter.Printf("the guest did not boot in %v, so QEMU was killed\n%s\n", realBootTimeout, details())
+		AddReportEntry("real QEMU boot retry", fmt.Sprintf("the guest did not print %s in %v, so QEMU was killed\n%s", w.mark, realBootTimeout, details()))
 		return false
 	}
 	select {
@@ -117,22 +221,28 @@ func awaitRealGuest(kill func(), w *bootWriter, exited <-chan struct{}, details 
 }
 
 // bootWithRetry calls boot, which reports whether its guest booted, until
-// one does, and fails the spec after realBootAttempts guests that did not.
+// one does. It fails the spec after realBootAttempts guests that did not,
+// or when the suite has already retried realBootRetries boots.
 func bootWithRetry(boot func() bool) {
 	for attempt := 1; !boot(); attempt++ {
 		if attempt == realBootAttempts {
 			Fail(fmt.Sprintf("none of %d guests booted in %v", realBootAttempts, realBootTimeout))
+		}
+		if n := realBootRetried.Add(1); n > realBootRetries {
+			Fail(fmt.Sprintf("the suite has retried %d real QEMU boots, more than the %d a healthy host needs", n, realBootRetries))
 		}
 	}
 }
 
 // bootRealQEMU runs QEMU with argv and files under bootWithRetry, and
 // returns the exit status, the console output, and stderr of the QEMU
-// whose guest booted.
+// whose guest booted. argv must start /rvm-test-init (see markedArgv), and
+// the initrd among files must hold it (see withUserspaceMark).
 func bootRealQEMU(argv []string, files []*os.File) (code int, stdout, stderr string) {
+	Expect(argv).To(ContainElement(ContainSubstring("rdinit=/"+realTestInit)), "the guest would never print %s", realBootMark)
 	bootWithRetry(func() bool {
 		cmd := newHypervisorCmd(argv, files)
-		out := newBootWriter(startTag(testNonce))
+		out := newBootWriter(realBootMark)
 		errOut := &safeBuffer{}
 		cmd.Stdout, cmd.Stderr = out, errOut
 		Expect(cmd.Start()).To(Succeed())
@@ -146,6 +256,7 @@ func bootRealQEMU(argv []string, files []*os.File) (code int, stdout, stderr str
 		if !awaitRealGuest(func() { _ = cmd.Process.Kill() }, out, exited, details) {
 			return false
 		}
+		Expect(out.String()).To(ContainSubstring(realBootMark), "QEMU exited before the guest started userspace\n%s", details())
 		var exitErr *exec.ExitError
 		switch {
 		case waitErr == nil:
@@ -290,10 +401,8 @@ var _ = Describe("the port gate against a real QEMU", func() {
 		nw := taskNetwork()
 		nw.port = port
 		// The guest boots, waits, serves PORT for a while, and stops
-		// serving it well before it exits. Its first line tells the spec
-		// that it booted.
-		g := taskGuest(`echo booted
-mkdir -p /tmp/www && echo hello >/tmp/www/index.html
+		// serving it well before it exits.
+		g := taskGuest(`mkdir -p /tmp/www && echo hello >/tmp/www/index.html
 sleep 4
 httpd -f -p ` + p + ` -h /tmp/www &
 h=$!
@@ -313,7 +422,7 @@ echo served`)
 		}
 		var (
 			r      result
-			out    *bootWriter
+			out    *safeBuffer
 			stderr *safeBuffer
 			logBuf *safeBuffer
 			states []string
@@ -325,14 +434,19 @@ echo served`)
 			// The supervisor closes vm-launch's copy of QEMU's end once
 			// QEMU has it; this closes it when QEMU never started.
 			DeferCleanup(func() { _ = qemuEnd.Close() })
-			files, _, initrdPath, monitorFD := hypervisorFiles(nil, f, qemuEnd)
-			cmd := newHypervisorCmd(tcgArgv(qemu, qemuArgv(art, initrdPath, minGuestMemoryMiB, nw, "", monitorFD)), files)
+			files, _, initrdPath, monitorFD := hypervisorFiles(nil, withUserspaceMark(f), qemuEnd)
+			consoleLog := filepath.Join(GinkgoT().TempDir(), "console.log")
+			argv := consoleLogArgv(markedArgv(tcgArgv(qemu, qemuArgv(art, initrdPath, minGuestMemoryMiB, nw, "", monitorFD))), consoleLog)
+			cmd := newHypervisorCmd(argv, files)
 			stderr = &safeBuffer{}
 			cmd.Stderr = stderr
 
 			logBuf = &safeBuffer{}
 			gate := startPortGate(qmpPort{monitor: newQMPMonitor(monitor), port: port}, port, gateRetry, log.New(logBuf, "", 0))
-			out = newBootWriter("booted")
+			out = &safeBuffer{}
+			console := newBootWriter(realBootMark)
+			stopTail := make(chan struct{})
+			tailed := tailFile(consoleLog, console, stopTail)
 			// started runs in the supervisor's goroutine once QEMU runs,
 			// and hands its process to kill.
 			var qemuProc *os.Process
@@ -372,14 +486,16 @@ echo served`)
 					}
 				}
 			}()
-			// stop ends the gate and the probe, once, whether the spec
-			// gets past this attempt or fails in it.
+			// stop ends the gate, the probe, and the console tail, once,
+			// whether the spec gets past this attempt or fails in it.
 			var stopOnce sync.Once
 			stop := func() {
 				stopOnce.Do(func() {
 					gate.end()
 					close(stopProbe)
 					<-probed
+					close(stopTail)
+					<-tailed
 				})
 			}
 			DeferCleanup(stop)
@@ -391,10 +507,13 @@ echo served`)
 				r = result{res, err}
 			}()
 			details := func() string {
-				return "stderr: " + stderr.String() + "\nconsole: " + out.String() + "\nlog: " + logBuf.String() + fmt.Sprintf("\nport %s went %q", p, probe.got())
+				return "stderr: " + stderr.String() + "\nconsole: " + console.String() + "\nlog: " + logBuf.String() + fmt.Sprintf("\nport %s went %q", p, probe.got())
 			}
-			booted := awaitRealGuest(kill, out, exited, details)
+			booted := awaitRealGuest(kill, console, exited, details)
 			stop()
+			if booted {
+				Expect(console.String()).To(ContainSubstring(realBootMark), "QEMU exited before the guest started userspace\n%s", details())
+			}
 			states = probe.got()
 			return booted
 		})
