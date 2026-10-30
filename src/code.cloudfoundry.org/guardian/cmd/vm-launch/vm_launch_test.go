@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -38,18 +39,36 @@ const testNonce = "0123456789abcdef"
 const helperArtifacts = "VM_LAUNCH_TEST_ARTIFACTS"
 
 // helperStopCheck marks a helper process that calls run, which fails at
-// once on its arguments, and then writes to its stdout. It exits with
-// status 0 and a message on stderr if the write returned, and the runtime
+// once on its arguments, with a logger whose first write also goes to the
+// broken stdout. run only logs once it has registered SIGPIPE, so that write
+// must come back as an error, and the helper reports it on stderr. Then
+// the helper writes to its stdout again, after run has returned. The runtime
 // kills a process whose write to a broken stdout returns while nothing
 // catches SIGPIPE, so a helper that dies by SIGPIPE shows that run stopped
-// catching it.
+// catching it, and the stderr line shows that run was catching it while it ran.
 const helperStopCheck = "VM_LAUNCH_TEST_SIGPIPE_AFTER_RUN"
+
+// stdoutProbe is a log writer that, on its first write, also writes to the
+// process's stdout and keeps the error.
+type stdoutProbe struct {
+	once sync.Once
+	err  error
+}
+
+func (p *stdoutProbe) Write(b []byte) (int, error) {
+	p.once.Do(func() {
+		_, p.err = os.Stdout.WriteString("written during run\n")
+	})
+	return len(b), nil
+}
 
 func init() {
 	if os.Getenv(helperStopCheck) != "" {
-		code := run([]string{"--backend", "nope", "--", "true"}, log.New(io.Discard, "", 0))
+		probe := &stdoutProbe{}
+		code := run([]string{"--backend", "nope", "--", "true"}, log.New(probe, "", 0))
+		fmt.Fprintf(os.Stderr, "run returned %d, and a write to a broken stdout during it returned: %v\n", code, probe.err)
 		_, err := os.Stdout.WriteString("written after run\n")
-		fmt.Fprintf(os.Stderr, "run returned %d, and a write to a broken stdout after it returned: %v\n", code, err)
+		fmt.Fprintf(os.Stderr, "a write to a broken stdout after run returned: %v\n", err)
 		os.Exit(0)
 	}
 	if art := os.Getenv(helperArtifacts); art != "" {
@@ -863,7 +882,7 @@ var _ = Describe("run", func() {
 })
 
 var _ = Describe("run with a stdout that nobody reads", func() {
-	It("stops catching SIGPIPE once it has returned, so the runtime's default applies again", func() {
+	It("catches SIGPIPE while it runs and stops catching it once it has returned, so the runtime's default applies again", func() {
 		r, w, err := os.Pipe()
 		Expect(err).NotTo(HaveOccurred())
 		Expect(r.Close()).To(Succeed())
@@ -881,6 +900,9 @@ var _ = Describe("run with a stdout that nobody reads", func() {
 		status := state.Sys().(syscall.WaitStatus)
 		Expect(status.Signaled()).To(BeTrue(), "the helper was not killed by SIGPIPE; stderr: %s", stderr.String())
 		Expect(status.Signal()).To(Equal(syscall.SIGPIPE), stderr.String())
+		// A helper that run did not protect dies inside run, before it says this.
+		Expect(stderr.String()).To(ContainSubstring("during it returned: write /dev/stdout: broken pipe"))
+		Expect(stderr.String()).NotTo(ContainSubstring("after run returned"))
 	})
 
 	It("reports the write error and still exits with the guest's status instead of dying from SIGPIPE", func() {
