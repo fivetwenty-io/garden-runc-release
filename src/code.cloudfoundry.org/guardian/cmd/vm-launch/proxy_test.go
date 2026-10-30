@@ -173,6 +173,17 @@ var _ = Describe("tcpProxy", func() {
 		Eventually(logBuf.String).Should(ContainSubstring("giving up on the guest at"))
 	})
 
+	It("holds a connection to a guest that stopped listening through the guest's next look, and closes it soon after", func() {
+		c := dialProxy(startTestProxy(unusedAddr(), upstreamDialPolicy))
+
+		began := time.Now()
+		_, err := io.ReadAll(c)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(time.Since(began)).To(BeNumerically(">=", time.Second))
+		Expect(time.Since(began)).To(BeNumerically("<", 4*time.Second))
+		Eventually(logBuf.String).Should(ContainSubstring("giving up on the guest at"))
+	})
+
 	It("serves concurrent connections independently", func() {
 		up := listenLocal()
 		serve(up, echo)

@@ -26,13 +26,19 @@ type dialPolicy struct {
 	giveUp         time.Duration
 }
 
-// upstreamDialPolicy covers a guest boot of a few seconds with room to spare.
-// attemptTimeout cuts short a dial that waits on ARP while eth0 is still down.
+// upstreamDialPolicy gives up 2 seconds after the client connected. The
+// proxy listens only once the guest app does, so it never sees a guest boot,
+// and a dial that the guest refuses means the guest app has closed its
+// listener. That is an app that restarts its listener, which 2 seconds
+// covers, or an app that stopped listening, whose port the gate closes at the
+// guest's next look, within a second. Either way, a client of an app that
+// stopped listening learns it within 2 seconds, so the gorouter can try
+// another instance. attemptTimeout bounds a dial that gets no answer.
 var upstreamDialPolicy = dialPolicy{
 	attemptTimeout: time.Second,
 	firstBackoff:   25 * time.Millisecond,
 	maxBackoff:     500 * time.Millisecond,
-	giveUp:         30 * time.Second,
+	giveUp:         2 * time.Second,
 }
 
 // tcpProxy carries TCP connections from a listener in the container to the
