@@ -270,3 +270,76 @@ func TestRunscCellRequiresLoopbackInTheNetworker(t *testing.T) {
 		})
 	}
 }
+
+// wiredPeaBundleLoader returns the BundleLoader of the PeaCreator that
+// containerizer creates peas with.
+func wiredPeaBundleLoader(t *testing.T, containerizer interface{}) peas.BundleLoader {
+	t.Helper()
+	field := reflect.ValueOf(containerizer).Elem().FieldByName("peaCreator")
+	if !field.IsValid() {
+		t.Fatal("the containerizer has no peaCreator field")
+	}
+	creator, ok := reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem().Interface().(*peas.PeaCreator)
+	if !ok || creator == nil {
+		t.Fatal("the containerizer keeps no *peas.PeaCreator")
+	}
+	return creator.BundleLoader
+}
+
+// A VM sandbox's peas are confined only when the PeaCreator can read the
+// sandbox's backend, so every runtime path has to hand it a bundle loader
+// once a backend beyond oci-runc is enabled, and none otherwise.
+func TestPeaCreatorReadsSandboxBundlesExactlyWhenBackendsDispatch(t *testing.T) {
+	vmBackends := func(t *testing.T) *executionBackends {
+		registry, err := backend.NewRegistry(backend.VMQemu)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &executionBackends{registry: registry}
+	}
+
+	for _, path := range []struct {
+		name       string
+		containerd bool
+		wantType   string
+	}{
+		{name: "runc", wantType: "*depot.DirectoryDepot"},
+		{name: "containerd", containerd: true, wantType: "runcontainerd.BndlLoader"},
+	} {
+		for _, dispatch := range []bool{false, true} {
+			t.Run(path.name+map[bool]string{false: " without dispatch", true: " with dispatch"}[dispatch], func(t *testing.T) {
+				cmd := &CommonCommand{}
+				cmd.Containers.Dir = t.TempDir()
+				var factory GardenFactory = runtimeWiringFactory{LinuxFactory: &LinuxFactory{config: cmd}}
+				if path.containerd {
+					cmd.Containerd.Socket = serveEmptyContainerd(t)
+					cmd.Containerd.UseContainerdForProcesses = true
+					factory = &containerdArgsFactory{runtimeWiringFactory: runtimeWiringFactory{LinuxFactory: &LinuxFactory{config: cmd}}}
+				}
+				backends := &executionBackends{}
+				if dispatch {
+					backends = vmBackends(t)
+					cmd.wiredBackends = backends
+				}
+
+				containerizer, _, err := cmd.wireContainerizer(lager.NewLogger("pea-wiring"), factory, nil, nil, 1, depot.NetworkDepot{}, nil, backends)
+				if err != nil {
+					t.Fatal(err)
+				}
+				loader := wiredPeaBundleLoader(t, containerizer)
+				if !dispatch {
+					if loader != nil {
+						t.Errorf("the PeaCreator reads sandbox bundles (%T) with no backend beyond oci-runc enabled", loader)
+					}
+					return
+				}
+				if loader == nil {
+					t.Fatal("the PeaCreator has no bundle loader, so it would not confine a VM sandbox's peas")
+				}
+				if got := reflect.TypeOf(loader).String(); got != path.wantType {
+					t.Errorf("the PeaCreator's bundle loader is %s, want %s", got, path.wantType)
+				}
+			})
+		}
+	}
+}

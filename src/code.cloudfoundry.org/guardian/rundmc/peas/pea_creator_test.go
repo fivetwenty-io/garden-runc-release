@@ -447,8 +447,13 @@ var _ = Describe("PeaCreator", func() {
 			allCaps      []string
 		)
 
+		// sandboxBundle is an unprivileged sandbox's bundle: it has a user
+		// namespace.
 		sandboxBundle := func(annotations map[string]string) goci.Bndl {
-			return goci.Bndl{Spec: specs.Spec{Annotations: annotations}}
+			return goci.Bndl{Spec: specs.Spec{
+				Annotations: annotations,
+				Linux:       &specs.Linux{Namespaces: []specs.LinuxNamespace{{Type: "network"}, {Type: "user"}}},
+			}}
 		}
 
 		runningBundleProcess := func() specs.Process {
@@ -491,10 +496,11 @@ var _ = Describe("PeaCreator", func() {
 					Expect(err).NotTo(HaveOccurred())
 				})
 
-				It("loads the sandbox's bundle", func() {
+				It("loads the sandbox's bundle once, and takes the sandbox's privilege from it", func() {
 					Expect(bundleLoader.LoadCallCount()).To(Equal(1))
 					_, handle := bundleLoader.LoadArgsForCall(0)
 					Expect(handle).To(Equal(ctrHandle))
+					Expect(privilegedGetter.PrivilegedCallCount()).To(Equal(0))
 				})
 
 				It("keeps only CAP_DAC_OVERRIDE, of a privileged container's capabilities, in every capability set", func() {
@@ -615,6 +621,60 @@ var _ = Describe("PeaCreator", func() {
 				Expect(createErr).To(MatchError(ContainSubstring("determining-backend")))
 				Expect(createErr).To(MatchError(ContainSubstring("no-bundle")))
 				Expect(execRunner.RunPeaCallCount()).To(Equal(0))
+				Expect(privilegedGetter.PrivilegedCallCount()).To(Equal(0))
+			})
+		})
+
+		for _, kind := range []backend.Kind{backend.VMQemu, backend.OCIRunc} {
+			kind := kind
+
+			Context("when the "+string(kind)+" sandbox's bundle has no user namespace", func() {
+				BeforeEach(func() {
+					privilegedGetter.PrivilegedReturns(false, nil)
+					bndl := sandboxBundle(map[string]string{backend.AnnotationKey: string(kind)})
+					bndl.Spec.Linux.Namespaces = []specs.LinuxNamespace{{Type: "network"}}
+					bundleLoader.LoadReturns(bndl, nil)
+					_, err := peaCreator.CreatePea(log, processSpec, pio, ctrHandle)
+					Expect(err).NotTo(HaveOccurred())
+				})
+
+				It("treats the sandbox as privileged", func() {
+					Expect(networkDepot.SetupBindMountsCallCount()).To(Equal(1))
+					_, _, privileged, _ := networkDepot.SetupBindMountsArgsForCall(0)
+					Expect(privileged).To(BeTrue())
+					Expect(bundleGenerator.GenerateArgsForCall(0).Privileged).To(BeTrue())
+				})
+			})
+
+			Context("when the "+string(kind)+" sandbox's bundle has a user namespace", func() {
+				BeforeEach(func() {
+					privilegedGetter.PrivilegedReturns(true, nil)
+					bundleLoader.LoadReturns(sandboxBundle(map[string]string{backend.AnnotationKey: string(kind)}), nil)
+					_, err := peaCreator.CreatePea(log, processSpec, pio, ctrHandle)
+					Expect(err).NotTo(HaveOccurred())
+				})
+
+				It("treats the sandbox as unprivileged", func() {
+					_, _, privileged, _ := networkDepot.SetupBindMountsArgsForCall(0)
+					Expect(privileged).To(BeFalse())
+					Expect(bundleGenerator.GenerateArgsForCall(0).Privileged).To(BeFalse())
+				})
+			})
+		}
+
+		Context("when the sandbox's bundle has no linux section", func() {
+			var createErr error
+
+			BeforeEach(func() {
+				bundleLoader.LoadReturns(goci.Bndl{Spec: specs.Spec{Annotations: map[string]string{backend.AnnotationKey: string(backend.VMQemu)}}}, nil)
+				_, createErr = peaCreator.CreatePea(log, processSpec, pio, ctrHandle)
+			})
+
+			It("returns a wrapped error and runs nothing", func() {
+				Expect(createErr).To(MatchError(ContainSubstring("determining-privileged")))
+				Expect(createErr).To(MatchError(ContainSubstring("no linux section")))
+				Expect(execRunner.RunPeaCallCount()).To(Equal(0))
+				Expect(privilegedGetter.PrivilegedCallCount()).To(Equal(0))
 			})
 		})
 	})

@@ -773,7 +773,7 @@ func (cmd *CommonCommand) wireContainerizer(
 		BundleSaver:      bundleSaver,
 		ExecRunner:       peasExecRunner,
 		PeaCleaner:       peaCleaner,
-		BundleLoader:     peasBundleLoader,
+		BundleLoader:     backends.peaBundleLoader(peasBundleLoader),
 		GroupedRunsc:     runtimePolicy.IsAlternative(),
 	}
 
@@ -828,6 +828,17 @@ type taskPidListerFactory interface {
 // backend; otherwise both keep their stock code paths.
 func (b *executionBackends) dispatch() bool {
 	return b != nil && b.registry != nil
+}
+
+// peaBundleLoader returns the loader that the PeaCreator reads a sandbox's
+// bundle with, to find the sandbox's backend, or nil when no backend beyond
+// oci-runc is enabled. Every sandbox is then an OCI one, and peas keep the
+// stock path, which asks the privilege checker alone about the sandbox.
+func (b *executionBackends) peaBundleLoader(loader peas.BundleLoader) peas.BundleLoader {
+	if !b.dispatch() {
+		return nil
+	}
+	return loader
 }
 
 // containerizerOptions returns the Containerizer options the enabled backends

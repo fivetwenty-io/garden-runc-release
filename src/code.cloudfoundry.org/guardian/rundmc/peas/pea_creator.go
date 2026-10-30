@@ -71,8 +71,10 @@ type PeaCreator struct {
 	ProcessBuilder   runrunc.ProcessBuilder
 	ExecRunner       ExecRunner
 	PeaCleaner       gardener.PeaCleaner
-	// BundleLoader reads the sandbox's bundle to find its execution backend.
-	// When nil, every pea is treated as running on an OCI backend.
+	// BundleLoader reads the sandbox's bundle to find its execution backend
+	// and whether it is privileged, from one read. When nil, every pea is
+	// treated as running on an OCI backend, and PrivilegedGetter says whether
+	// the sandbox is privileged.
 	BundleLoader BundleLoader
 	// GroupedRunsc creates image-backed runsc subcontainers: they use virtual
 	// parent namespaces rather than the Sentry's host PID, share the sandbox's
@@ -101,18 +103,25 @@ func (p *PeaCreator) CreatePea(log lager.Logger, processSpec garden.ProcessSpec,
 	log.Info("creating", lager.Data{"process_id": processID})
 	defer log.Info("done")
 
-	privileged, err := p.PrivilegedGetter.Privileged(sandboxHandle)
-	if err != nil {
-		return errs("determining-privileged", err)
-	}
-
+	var privileged bool
 	kind := backend.OCIRunc
 	if p.BundleLoader != nil {
+		// A pea whose sandbox's bundle cannot be read fails: without the
+		// backend, a VM sandbox's pea could not be confined.
 		sandboxBundle, err := p.BundleLoader.Load(log, sandboxHandle)
 		if err != nil {
 			return errs("determining-backend", err)
 		}
 		kind = backend.FromBundle(sandboxBundle)
+		privileged, err = privilegedBundle(sandboxBundle)
+		if err != nil {
+			return errs("determining-privileged", err)
+		}
+	} else {
+		privileged, err = p.PrivilegedGetter.Privileged(sandboxHandle)
+		if err != nil {
+			return errs("determining-privileged", err)
+		}
 	}
 
 	if p.GroupedRunsc && processSpec.OverrideContainerLimits != nil && *processSpec.OverrideContainerLimits != (garden.ProcessLimits{}) {
@@ -231,6 +240,21 @@ func (p *PeaCreator) CreatePea(log lager.Logger, processSpec garden.ProcessSpec,
 	}
 
 	return proc, nil
+}
+
+// privilegedBundle says whether the container that bndl describes is
+// privileged, as the privilege checkers do: a container without a user
+// namespace is.
+func privilegedBundle(bndl goci.Bndl) (bool, error) {
+	if bndl.Spec.Linux == nil {
+		return false, errors.New("the sandbox's bundle has no linux section")
+	}
+	for _, namespace := range bndl.Spec.Linux.Namespaces {
+		if namespace.Type == "user" {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // confineVMPea returns a copy of a pea's process for a VM sandbox. The pea
