@@ -21,7 +21,13 @@ const (
 )
 
 // guestBusybox returns the path guestBusyboxEnv names, or skips the spec
-// when it is unset. A file that is not the guest's busybox fails the spec,
+// when it is unset. The skip names the variable, and Ginkgo lists it in a
+// verbose run, but it does not fail the run, so a release check must set the
+// variable and confirm that these specs ran. No other shell can stand in,
+// because the host's /bin/sh may be dash, which lacks the `read -t` and
+// `read -u` that the watcher's pause uses. Without the variable, the golden
+// /init text spec alone guards the pause, and the spec that times two pauses
+// does not run. A file that is not the guest's busybox fails the spec,
 // because another build behaves differently: Debian's and busybox.net's
 // builds import environment names that the guest's build drops.
 func guestBusybox() string {
