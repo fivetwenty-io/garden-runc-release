@@ -154,14 +154,18 @@ func markedArgv(argv []string) []string {
 }
 
 // bootWriter collects a real guest's console output and closes booted
-// once the output holds mark.
+// once the output holds mark. When stamp is set, it also records the time at
+// which the output first held it.
 type bootWriter struct {
 	mark   string
 	booted chan struct{}
+	stamp  string
 
-	mu   sync.Mutex
-	buf  bytes.Buffer
-	seen bool
+	mu        sync.Mutex
+	buf       bytes.Buffer
+	seen      bool
+	stamped   bool
+	stampedAt time.Time
 }
 
 func newBootWriter(mark string) *bootWriter {
@@ -176,7 +180,19 @@ func (w *bootWriter) Write(p []byte) (int, error) {
 		w.seen = true
 		close(w.booted)
 	}
+	if w.stamp != "" && !w.stamped && bytes.Contains(w.buf.Bytes(), []byte(w.stamp)) {
+		w.stamped = true
+		w.stampedAt = time.Now()
+	}
 	return len(p), nil
+}
+
+// stampTime returns the time at which the output first held the stamp, and
+// whether it did.
+func (w *bootWriter) stampTime() (time.Time, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.stampedAt, w.stamped
 }
 
 func (w *bootWriter) String() string {
@@ -283,17 +299,28 @@ func bootWithRetry(boot func() bool) {
 // whose guest booted. argv must start /rvm-test-init (see markedArgv), and
 // the initrd among files must hold it (see withUserspaceMark).
 func bootRealQEMU(argv []string, files []*os.File) (code int, stdout, stderr string) {
+	code, stdout, stderr, _ = bootRealQEMUStamped(argv, files, "")
+	return code, stdout, stderr
+}
+
+// bootRealQEMUStamped is bootRealQEMU that also returns how long QEMU ran
+// after its console output first held stamp, or 0 with no stamp. It fails the
+// spec when a stamp is given and the output never held it.
+func bootRealQEMUStamped(argv []string, files []*os.File, stamp string) (code int, stdout, stderr string, after time.Duration) {
 	Expect(argv).To(ContainElement(ContainSubstring("rdinit=/"+realTestInit)), "the guest would never print %s", realBootMark)
 	bootWithRetry(func() bool {
 		cmd := newHypervisorCmd(argv, files)
 		out := newBootWriter(realBootMark)
+		out.stamp = stamp
 		errOut := &safeBuffer{}
 		cmd.Stdout, cmd.Stderr = out, errOut
 		Expect(cmd.Start()).To(Succeed())
 		exited := make(chan struct{})
 		var waitErr error
+		var exitedAt time.Time
 		go func() {
 			waitErr = cmd.Wait()
+			exitedAt = time.Now()
 			close(exited)
 		}()
 		details := func() string { return "stderr: " + errOut.String() + "\nconsole:\n" + out.String() }
@@ -311,9 +338,14 @@ func bootRealQEMU(argv []string, files []*os.File) (code int, stdout, stderr str
 			Expect(waitErr).NotTo(HaveOccurred())
 		}
 		stdout, stderr = out.String(), errOut.String()
+		if stamp != "" {
+			stampedAt, ok := out.stampTime()
+			Expect(ok).To(BeTrue(), "the console never held %q\n%s", stamp, details())
+			after = exitedAt.Sub(stampedAt)
+		}
 		return true
 	})
-	return code, stdout, stderr
+	return code, stdout, stderr, after
 }
 
 var _ = Describe("the guest userland against a real QEMU", func() {

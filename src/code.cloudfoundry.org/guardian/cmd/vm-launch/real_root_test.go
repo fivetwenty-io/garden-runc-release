@@ -8,7 +8,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"syscall"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -92,13 +94,14 @@ func guestBytes(out, key string) int64 {
 // in turn, the last of them asked for far more than the root image holds. It
 // prints each dd's status, the bytes in the files it wrote as written=, and
 // the status of a later 8 MiB write to each of the first two places. dd's own
-// messages go to the console.
+// messages go to the console. The data is not zeros, because the root drive
+// turns a write of zeros into a hole in the image.
 const fillRootCommand = `mkdir -p /var
-dd if=/dev/zero of=/tmp/a bs=1M count=16 2>&1; echo "dd-tmp=$?"
-dd if=/dev/zero of=/b bs=1M count=16 2>&1; echo "dd-root=$?"
-dd if=/dev/zero of=/var/c bs=1M count=200 2>&1; echo "dd-var=$?"
-dd if=/dev/zero of=/tmp/d bs=1M count=8 2>&1; echo "dd-after-tmp=$?"
-dd if=/dev/zero of=/e bs=1M count=8 2>&1; echo "dd-after-root=$?"
+tr '\000' x </dev/zero | dd of=/tmp/a bs=1M count=16 iflag=fullblock 2>&1; echo "dd-tmp=$?"
+tr '\000' x </dev/zero | dd of=/b bs=1M count=16 iflag=fullblock 2>&1; echo "dd-root=$?"
+tr '\000' x </dev/zero | dd of=/var/c bs=1M count=200 iflag=fullblock 2>&1; echo "dd-var=$?"
+tr '\000' x </dev/zero | dd of=/tmp/d bs=1M count=8 iflag=fullblock 2>&1; echo "dd-after-tmp=$?"
+tr '\000' x </dev/zero | dd of=/e bs=1M count=8 iflag=fullblock 2>&1; echo "dd-after-root=$?"
 echo "written=$(( $(wc -c </tmp/a) + $(wc -c </b) + $(wc -c </var/c) ))"
 sync
 `
@@ -145,7 +148,7 @@ echo "disks=$(ls /sys/block | grep -c '^vd')"
 		Expect(vol.Truncate(defaultImageSize)).To(Succeed())
 		withVolume := func(command string) guestContents {
 			g := taskGuest(command)
-			g.vol = &guestVolume{ContainerDir: "/home/vcap/data", ImageName: "volume.img"}
+			g.vol, g.volumeBytes = &guestVolume{ContainerDir: "/home/vcap/data", ImageName: "volume.img"}, defaultImageSize
 			withRealRoot(&g)
 			return g
 		}
@@ -176,7 +179,7 @@ echo "root=$(cat /root-only 2>/dev/null || echo gone)"
 
 	Describe("the root image's quota", func() {
 		It("fails a write past the image's capacity with ENOSPC wherever it goes, and never grows the image", func() {
-			g := taskGuest(fillRootCommand + "df -k / | tail -n 1\ndmesg 2>&1 | grep -c overlayfs\necho \"kmsg=$(dmesg 2>&1 | wc -l)\"\n")
+			g := taskGuest(fillRootCommand + "df -k / | tail -n 1\necho \"overlayfs-lines=$(dmesg 2>&1 | grep -c overlayfs)\"\necho \"kmsg=$(dmesg 2>&1 | wc -l)\"\n")
 			withRealRoot(&g)
 			root := realRootImage()
 			out := bootRealGuestWith(g, nil, root)
@@ -202,7 +205,7 @@ echo "root=$(cat /root-only 2>/dev/null || echo gone)"
 			// No overlayfs warning, which would mean the upper layer lacks
 			// d_type or xattrs, and the kernel log was readable to say so.
 			Expect(guestBytes(out, "kmsg")).To(BeNumerically(">", 0), out)
-			Expect(out).To(MatchRegexp(`(?m)^0\r?$`), "grep counted overlayfs lines in the kernel log\n"+out)
+			Expect(out).To(MatchRegexp(`(?m)^overlayfs-lines=0\r?$`), "grep counted overlayfs lines in the kernel log\n"+out)
 			Expect(out).To(ContainSubstring(exitTag(testNonce) + "0"))
 		})
 
@@ -219,7 +222,7 @@ echo "root=$(cat /root-only 2>/dev/null || echo gone)"
 		It("returns the space of files the guest deletes to the host, which discard makes happen", func() {
 			requireHolePunching()
 			const fileMiB = 32
-			write := "dd if=/dev/zero of=/tmp/big bs=1M count=32 2>&1; echo \"dd=$?\"\nsync\n"
+			write := "tr '\\000' x </dev/zero | dd of=/tmp/big bs=1M count=32 iflag=fullblock 2>&1; echo \"dd=$?\"\nsync\n"
 
 			kept := realRootImage()
 			out := bootRealGuestWith(withRealRootGuest(write), nil, kept)
@@ -243,6 +246,54 @@ echo "root=$(cat /root-only 2>/dev/null || echo gone)"
 		})
 	})
 
+	// A guest that has written much to its root and not synced it must still
+	// stop at once. The root drive is throttled to writeBackMiBPerSecond, and
+	// the guest is told to keep its dirty pages, so that a reboot which syncs
+	// the whole guest first, as reboot -f does, would take longer than the
+	// time the hypervisor gets after the command ends (see killGrace), while
+	// reboot -nf does not wait for the root at all.
+	It("stops the hypervisor soon after the command ends, though the guest holds much unwritten data for its root", func() {
+		const (
+			dirtyMiB              = 24
+			writeBackMiBPerSecond = 1
+			// bound is well under killGrace, and under the 24 seconds that
+			// writing the data back would take.
+			bound = 3 * time.Second
+		)
+		Expect(bound).To(BeNumerically("<", killGrace))
+		g := withRealRootGuest(`echo 90 >/proc/sys/vm/dirty_ratio
+echo 90 >/proc/sys/vm/dirty_background_ratio
+echo 360000 >/proc/sys/vm/dirty_expire_centisecs
+tr '\000' x </dev/zero | head -c ` + strconv.Itoa(dirtyMiB<<20) + ` >/tmp/dirty
+echo "dirty-kib=$(sed -n 's/^Dirty: *\([0-9]*\) kB.*/\1/p' /proc/meminfo)"
+echo writes-done
+`)
+		art := realArtifacts()
+		qemu := realQEMU()
+		requireMicrovm(qemu)
+		f, err := newInitramfs(guestBusybox(), g)
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(f.Close)
+		files, drivePath, initrdPath, _, rootPath := hypervisorFiles(nil, withUserspaceMark(f), nil, realRootImage())
+		argv := withRealRootDrive(qemuArgv(art, initrdPath, minGuestMemoryMiB, g.nw, drivePath, 0), rootPath)
+		throttled := 0
+		for i, a := range argv {
+			if strings.HasPrefix(a, "if=none,id="+rootDriveID+",") {
+				argv[i] = a + ",throttling.bps-write=" + strconv.Itoa(writeBackMiBPerSecond<<20)
+				throttled++
+			}
+		}
+		Expect(throttled).To(Equal(1))
+
+		code, stdout, stderr, after := bootRealQEMUStamped(markedArgv(tcgArgv(qemu, argv)), files, "writes-done")
+		Expect(code).To(Equal(0), "QEMU failed: %s\n%s", stderr, stdout)
+		Expect(stdout).To(ContainSubstring(exitTag(testNonce) + "0"))
+		GinkgoWriter.Printf("QEMU exited %v after the command's last output\n", after)
+		// The guest had the data in memory when the command ended.
+		Expect(guestBytes(stdout, "dirty-kib")).To(BeNumerically(">", (dirtyMiB-8)<<10), stdout)
+		Expect(after).To(BeNumerically("<", bound), "QEMU took %v to exit after the command ended\n%s", after, stdout)
+	})
+
 	It("flushes the volume with sync -f, which the guest's busybox runs on a volume mount", func() {
 		volPath := filepath.Join(GinkgoT().TempDir(), "volume.img")
 		vol, err := os.OpenFile(volPath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
@@ -253,7 +304,7 @@ echo "root=$(cat /root-only 2>/dev/null || echo gone)"
 sync -f /home/vcap/data
 echo "sync-f-volume=$?"
 `)
-		g.vol = &guestVolume{ContainerDir: "/home/vcap/data", ImageName: "volume.img"}
+		g.vol, g.volumeBytes = &guestVolume{ContainerDir: "/home/vcap/data", ImageName: "volume.img"}, defaultImageSize
 		withRealRoot(&g)
 		out := bootRealGuestWith(g, vol, realRootImage())
 
