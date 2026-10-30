@@ -195,10 +195,10 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 	}
 	onFDThree := func(option string) string { return strings.Replace(option, procSelfFD(4), procSelfFD(3), 1) }
 
-	It("accepts the root image's drive option string, with discard=unmap", func() {
+	It("accepts the root image's drive option string, with discard=unmap and detect-zeroes=unmap", func() {
 		qemu := realQEMU()
 		drive := onFDThree(rootDriveOption(rootArgv()))
-		Expect(strings.Split(drive, ",")).To(ContainElement("discard=unmap"))
+		Expect(strings.Split(drive, ",")).To(ContainElements("discard=unmap", "detect-zeroes=unmap"))
 		code, stderr := parseDrive(qemu, noMachine, "-drive", drive)
 		Expect(code).To(Equal(0), "QEMU rejected -drive %s: %s", drive, stderr)
 	})
@@ -218,6 +218,14 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 		code, stderr := parseDrive(qemu, noMachine, "-drive", drive)
 		Expect(code).NotTo(Equal(0))
 		Expect(stderr).To(ContainSubstring("discard"))
+	})
+
+	It("rejects a detect-zeroes value it does not know, so the root drive check above can fail", func() {
+		qemu := realQEMU()
+		drive := strings.Replace(onFDThree(rootDriveOption(rootArgv())), "detect-zeroes=unmap", "detect-zeroes=maybe", 1)
+		code, stderr := parseDrive(qemu, noMachine, "-drive", drive)
+		Expect(code).NotTo(Equal(0))
+		Expect(stderr).To(ContainSubstring("detect-zeroes"))
 	})
 
 	It("rejects the unprefixed locking option, so the check above can fail", func() {

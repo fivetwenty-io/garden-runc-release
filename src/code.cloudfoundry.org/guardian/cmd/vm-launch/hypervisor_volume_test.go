@@ -76,7 +76,7 @@ var (
 	// line, for the image on file descriptor fd.
 	goldenQEMURootDrive = func(fd string) []string {
 		return []string{
-			"-drive", "if=none,id=root0,file=/proc/self/fd/" + fd + ",format=raw,cache=unsafe,aio=threads,file.locking=off,werror=report,rerror=report,discard=unmap",
+			"-drive", "if=none,id=root0,file=/proc/self/fd/" + fd + ",format=raw,cache=unsafe,aio=threads,file.locking=off,werror=report,rerror=report,discard=unmap,detect-zeroes=unmap",
 			"-device", "virtio-blk-device,drive=root0",
 		}
 	}
@@ -109,6 +109,17 @@ func concat(parts ...[]string) []string {
 		out = append(out, p...)
 	}
 	return out
+}
+
+// fcConfigJSON returns the Firecracker configuration file that hypervisorArgv
+// writes for a guest of memMiB MiB, the one Firecracker is started with.
+func fcConfigJSON(initrd string, memMiB int, nw *network, drivePath, rootPath string) string {
+	work := GinkgoT().TempDir()
+	_, err := hypervisorArgv(backend.VMFirecracker, goldenArt, work, initrd, memMiB, nw, drivePath, rootPath, 0)
+	Expect(err).NotTo(HaveOccurred())
+	raw, err := os.ReadFile(filepath.Join(work, "fc.json"))
+	Expect(err).NotTo(HaveOccurred())
+	return string(raw)
 }
 
 var _ = Describe("hypervisor volume drive", func() {
@@ -191,9 +202,7 @@ var _ = Describe("hypervisor volume drive", func() {
 
 	It("keeps the Firecracker configuration without a volume byte for byte, for a task and an LRP alike", func() {
 		for _, n := range []*network{task, nw} {
-			raw, err := firecrackerConfigJSON(goldenArt, goldenInitrd, goldenMemMiB, n, "")
-			Expect(err).NotTo(HaveOccurred())
-			Expect(string(raw)).To(Equal(goldenFCNet), "ports %v", n.ports)
+			Expect(fcConfigJSON(goldenInitrd, goldenMemMiB, n, "", "")).To(Equal(goldenFCNet), "ports %v", n.ports)
 		}
 	})
 
@@ -215,12 +224,11 @@ var _ = Describe("hypervisor volume drive", func() {
 
 	It("gives Firecracker the image as its only drive", func() {
 		for _, n := range []*network{task, nw} {
-			raw, err := firecrackerConfigJSON(goldenArt, goldenVolumeInitrd, goldenMemMiB, n, volumeDrivePath())
-			Expect(err).NotTo(HaveOccurred())
-			Expect(string(raw)).To(Equal(strings.Replace(fcWithInitrd(goldenFCNet, goldenVolumeInitrd), `"drives":[]`, goldenFCDrive, 1)))
+			raw := fcConfigJSON(goldenVolumeInitrd, goldenMemMiB, n, volumeDrivePath(), "")
+			Expect(raw).To(Equal(strings.Replace(fcWithInitrd(goldenFCNet, goldenVolumeInitrd), `"drives":[]`, goldenFCDrive, 1)))
 
 			var cfg map[string]any
-			Expect(json.Unmarshal(raw, &cfg)).To(Succeed())
+			Expect(json.Unmarshal([]byte(raw), &cfg)).To(Succeed())
 			Expect(cfg["drives"]).To(Equal([]any{map[string]any{
 				"drive_id":       "vol0",
 				"path_on_host":   "/proc/self/fd/3",
@@ -262,10 +270,10 @@ var _ = Describe("hypervisor guest root drive", func() {
 		Expect(argv).To(Equal(concat(withInitrd(goldenQEMUBase, goldenVolumeInitrd), goldenQEMUNetdev, goldenQEMUDrive, goldenQEMUMonitor("5"), goldenQEMURootDrive("6"))))
 	})
 
-	It("pins the QEMU root drive to raw, unmap, unsafe caching, reported errors, and no QEMU locking", func() {
+	It("pins the QEMU root drive to raw, unmap and zero detection, unsafe caching, reported errors, and no QEMU locking", func() {
 		drive := goldenQEMURootDrive("4")[1]
 		Expect(qemuRootDrive("/proc/self/fd/4")[1]).To(Equal(drive))
-		for _, o := range []string{"format=raw", "discard=unmap", "cache=unsafe", "werror=report", "rerror=report", "file.locking=off", "id=root0"} {
+		for _, o := range []string{"format=raw", "discard=unmap", "detect-zeroes=unmap", "cache=unsafe", "werror=report", "rerror=report", "file.locking=off", "id=root0"} {
 			Expect(strings.Split(drive, ",")).To(ContainElement(o))
 		}
 	})
@@ -279,14 +287,10 @@ var _ = Describe("hypervisor guest root drive", func() {
 
 	Describe("Firecracker", func() {
 		firecrackerConfig := func(initrd, drivePath, rootPath string, n *network) (string, map[string]any) {
-			work := GinkgoT().TempDir()
-			_, err := hypervisorArgv(backend.VMFirecracker, goldenArt, work, initrd, goldenMemMiB, n, drivePath, rootPath, 0)
-			Expect(err).NotTo(HaveOccurred())
-			raw, err := os.ReadFile(filepath.Join(work, "fc.json"))
-			Expect(err).NotTo(HaveOccurred())
+			raw := fcConfigJSON(initrd, goldenMemMiB, n, drivePath, rootPath)
 			var cfg map[string]any
-			Expect(json.Unmarshal(raw, &cfg)).To(Succeed())
-			return string(raw), cfg
+			Expect(json.Unmarshal([]byte(raw), &cfg)).To(Succeed())
+			return raw, cfg
 		}
 
 		It("gives the root image as the only drive, with discard on the Sync engine", func() {

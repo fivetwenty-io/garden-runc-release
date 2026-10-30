@@ -79,10 +79,8 @@ var _ = Describe("guest memory", func() {
 		nw := &network{ports: []int{8080}}
 		Expect(optionAfter(qemuArgv(goldenArt, goldenInitrd, 320, nw, "", 0), "-m", "")).To(Equal("320"))
 
-		raw, err := firecrackerConfigJSON(goldenArt, goldenInitrd, 832, nw, "")
-		Expect(err).NotTo(HaveOccurred())
 		var cfg firecrackerConfig
-		Expect(json.Unmarshal(raw, &cfg)).To(Succeed())
+		Expect(json.Unmarshal([]byte(fcConfigJSON(goldenInitrd, 832, nw, "", "")), &cfg)).To(Succeed())
 		Expect(cfg.MachineConfig).To(Equal(firecrackerMachineConfig{VCPUCount: 1, MemSizeMiB: 832}))
 	})
 })

@@ -262,11 +262,14 @@ func hypervisorFiles(img, initrd, monitor, root *os.File) (files []*os.File, dri
 // the volume's is (see qemuArgv). Unsafe caching drops the guest's flushes,
 // which costs nothing because the data never outlives the VM, and
 // discard=unmap turns the guest's discards into holes in the image, so that
-// the blocks the guest frees go back to the container's quota.
+// the blocks the guest frees go back to the container's quota. With
+// detect-zeroes=unmap, which needs discard=unmap, a write of zeros becomes a
+// hole too, so the zeros that mke2fs writes into every inode table at format
+// time take no blocks.
 func qemuRootDrive(rootPath string) []string {
 	return []string{
 		"-drive", "if=none,id=" + rootDriveID + ",file=" + rootPath +
-			",format=raw,cache=unsafe,aio=threads,file.locking=off,werror=report,rerror=report,discard=unmap",
+			",format=raw,cache=unsafe,aio=threads,file.locking=off,werror=report,rerror=report,discard=unmap,detect-zeroes=unmap",
 		"-device", "virtio-blk-device,drive=" + rootDriveID,
 	}
 }
@@ -324,19 +327,14 @@ type firecrackerNetworkInterface struct {
 	HostDevName string `json:"host_dev_name"`
 }
 
-// firecrackerConfigJSON returns the --config-file content for a guest of
-// memMiB MiB: a network interface on Garden's tap device, which Garden
-// creates for every Firecracker container, with or without a port, and the
-// volume image as the only drive when drivePath is set. nw must be set; the
-// port does not change the configuration, because vm-launch itself, not
+// newFirecrackerConfig returns the --config-file content, before it is
+// encoded, for a guest of memMiB MiB: a network interface on Garden's tap
+// device, which Garden creates for every Firecracker container, with or
+// without a port, the volume image as a drive when drivePath is set, and the
+// guest root image as a drive after it when rootPath is set. nw must be set;
+// the port does not change the configuration, because vm-launch itself, not
 // Firecracker, forwards PORT.
-func firecrackerConfigJSON(root, initrd string, memMiB int, nw *network, drivePath string) ([]byte, error) {
-	return json.Marshal(newFirecrackerConfig(root, initrd, memMiB, nw, drivePath))
-}
-
-// newFirecrackerConfig returns the configuration firecrackerConfigJSON
-// encodes.
-func newFirecrackerConfig(root, initrd string, memMiB int, nw *network, drivePath string) firecrackerConfig {
+func newFirecrackerConfig(root, initrd string, memMiB int, nw *network, drivePath, rootPath string) firecrackerConfig {
 	cfg := firecrackerConfig{
 		BootSource: firecrackerBootSource{
 			KernelImagePath: filepath.Join(root, artVmlinux),
@@ -355,6 +353,17 @@ func newFirecrackerConfig(root, initrd string, memMiB int, nw *network, drivePat
 			CacheType:    fcDriveCacheType,
 			IOEngine:     fcDriveIOEngine,
 		}}
+	}
+	if rootPath != "" {
+		cfg.Drives = append(cfg.Drives, firecrackerDrive{
+			DriveID:      rootDriveID,
+			PathOnHost:   rootPath,
+			IsRootDevice: false,
+			IsReadOnly:   false,
+			CacheType:    fcRootDriveCacheType,
+			IOEngine:     fcDriveIOEngine,
+			Discard:      true,
+		})
 	}
 	cfg.NetworkInterfaces = []firecrackerNetworkInterface{{IfaceID: "eth0", GuestMAC: fcGuestMAC, HostDevName: fcTapName}}
 	return cfg
@@ -385,19 +394,7 @@ func hypervisorArgv(kind backend.Kind, root, workDir, initrd string, memMiB int,
 		if monitorFD != 0 {
 			return nil, errors.New("firecracker has no QMP monitor")
 		}
-		fc := newFirecrackerConfig(root, initrd, memMiB, nw, drivePath)
-		if rootPath != "" {
-			fc.Drives = append(fc.Drives, firecrackerDrive{
-				DriveID:      rootDriveID,
-				PathOnHost:   rootPath,
-				IsRootDevice: false,
-				IsReadOnly:   false,
-				CacheType:    fcRootDriveCacheType,
-				IOEngine:     fcDriveIOEngine,
-				Discard:      true,
-			})
-		}
-		cfg, err := json.Marshal(fc)
+		cfg, err := json.Marshal(newFirecrackerConfig(root, initrd, memMiB, nw, drivePath, rootPath))
 		if err != nil {
 			return nil, fmt.Errorf("encoding firecracker config: %w", err)
 		}
