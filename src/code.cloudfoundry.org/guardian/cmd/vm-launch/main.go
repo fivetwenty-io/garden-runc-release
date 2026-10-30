@@ -78,7 +78,11 @@
 // locked file, and passes the image to the hypervisor as file descriptor 3.
 // The guest formats the image as ext2 when its first 64 KiB are all zero and
 // mounts it synchronously; a non-blank image that does not mount is never
-// formatted. A VM app supports one read-write volume mount.
+// formatted. A VM app supports one read-write volume mount, and it must be a
+// JuiceFS mount. Cloud Controller strips the driver name from volume_mounts,
+// so vm-launch reads the filesystem type of the mount at the volume path from
+// /proc/self/mountinfo, and any type other than fuse.juicefs, or a path with
+// no mount entry, fails the launch with exit 125 before anything boots.
 //
 // Environment: the guest command sees the container's environment after the
 // changes the CF launcher would have made to it. vm-launch reads its
@@ -368,6 +372,9 @@ func run(argv []string, logger *log.Logger) int {
 		return exitLaunchError
 	}
 	vol, err := volumeFromEnv(lookupEnv)
+	if err == nil && vol != nil {
+		err = checkVolumeProvider(mountInfoPath, vol.ContainerDir)
+	}
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError

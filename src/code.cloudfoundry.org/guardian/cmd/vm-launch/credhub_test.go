@@ -919,6 +919,8 @@ var _ = Describe("run with CredHub references", func() {
 
 	It("fails before it opens or creates a volume image", func() {
 		volDir := GinkgoT().TempDir()
+		DeferCleanup(func(saved string) { mountInfoPath = saved }, mountInfoPath)
+		mountInfoPath = writeTempFile("mountinfo", mountinfoLine(40, volDir, "fuse.juicefs"))
 		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
 		GinkgoT().Setenv("CF_INSTANCE_INDEX", "0")
 		GinkgoT().Setenv("VCAP_APPLICATION", vcapApp)

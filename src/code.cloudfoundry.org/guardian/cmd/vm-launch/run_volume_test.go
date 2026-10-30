@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -141,11 +142,20 @@ var _ = Describe("run with a volume", func() {
 		volDir string
 		img    string
 		logBuf *bytes.Buffer
+
+		// setMountInfo makes the mount table show one mount, outside the
+		// TMPDIR the specs check for leftovers.
+		setMountInfo func(point, fstype string)
 	)
 
 	BeforeEach(func() {
 		art = makeArtifacts()
 		volDir = GinkgoT().TempDir()
+		infoDir := GinkgoT().TempDir()
+		setMountInfo = func(point, fstype string) {
+			mountInfoPath = filepath.Join(infoDir, "mountinfo")
+			Expect(os.WriteFile(mountInfoPath, []byte(mountinfoLine(40, point, fstype)), 0o644)).To(Succeed())
+		}
 		img = filepath.Join(volDir, "rvm-disk-"+testAppID+"-web-2.img")
 		tmp = GinkgoT().TempDir()
 		GinkgoT().Setenv("TMPDIR", tmp)
@@ -153,6 +163,9 @@ var _ = Describe("run with a volume", func() {
 		GinkgoT().Setenv("VCAP_APPLICATION", vcapApp)
 		GinkgoT().Setenv("VCAP_SERVICES", vcapWith(map[string][]string{"juicefs": {mountJSON(volDir, "rw")}}))
 		logBuf = &bytes.Buffer{}
+
+		DeferCleanup(func(saved string) { mountInfoPath = saved }, mountInfoPath)
+		setMountInfo(volDir, "fuse.juicefs")
 
 		saved := defaultImageOptions
 		DeferCleanup(func() { defaultImageOptions = saved })
@@ -181,6 +194,35 @@ var _ = Describe("run with a volume", func() {
 		Expect(os.ReadDir(tmp)).To(BeEmpty())
 		Expect(os.ReadDir(volDir)).To(BeEmpty())
 		Expect(argvFile).NotTo(BeAnExistingFile())
+	})
+
+	It("exits 125 before it creates anything when the volume is not a JuiceFS mount", func() {
+		for _, fstype := range []string{"nfs4", "fuse.mapfs", "ext4"} {
+			setMountInfo(volDir, fstype)
+			logBuf.Reset()
+			argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+			Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError), fstype)
+			Expect(logBuf.String()).To(ContainSubstring(strconv.Quote(fstype)))
+			Expect(logBuf.String()).To(ContainSubstring("VM backends support only JuiceFS volumes today"))
+			Expect(logBuf.String()).NotTo(ContainSubstring(secretSentinel))
+			Expect(os.ReadDir(tmp)).To(BeEmpty())
+			Expect(os.ReadDir(volDir)).To(BeEmpty())
+			Expect(argvFile).NotTo(BeAnExistingFile())
+		}
+	})
+
+	It("exits 125 when the volume path has no mount entry", func() {
+		setMountInfo("/elsewhere", "fuse.juicefs")
+		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(ContainSubstring("has no mount entry"))
+		Expect(os.ReadDir(tmp)).To(BeEmpty())
+	})
+
+	It("does not read the mount table for an app with no volume", func() {
+		GinkgoT().Setenv("VCAP_SERVICES", `{}`)
+		mountInfoPath = filepath.Join(volDir, "absent")
+		writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), noFDThree)
+		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
 	})
 
 	It("exits 125 for VCAP_SERVICES that is not JSON and never prints it", func() {

@@ -3,9 +3,11 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -230,3 +232,119 @@ func quoteForLog(s string) string {
 	}
 	return strconv.Quote(s)
 }
+
+// mountInfoPath is the mount table checkVolumeProvider reads. Tests point it
+// at a file.
+var mountInfoPath = "/proc/self/mountinfo"
+
+// volumeProvider is a storage provider whose volumes a VM backend supports.
+// Cloud Controller removes the driver name from volume_mounts, so a provider
+// is recognised by the filesystem type its mount shows in the mount table.
+type volumeProvider struct {
+	// Name is how an error line names the provider.
+	Name string
+	// FSType is the filesystem type of the provider's mounts.
+	FSType string
+}
+
+// volumeProviders is the table of supported providers. JuiceFS mounts
+// itself as fuse.juicefs (juicefs cmd/mount_unix.go, and the juicefs-broker
+// ctl script matches the same type in findmnt output).
+var volumeProviders = []volumeProvider{
+	{Name: "JuiceFS", FSType: "fuse.juicefs"},
+}
+
+// providerForFSType returns the provider whose mounts have the filesystem
+// type fstype.
+func providerForFSType(fstype string) (volumeProvider, bool) {
+	for _, p := range volumeProviders {
+		if p.FSType == fstype {
+			return p, true
+		}
+	}
+	return volumeProvider{}, false
+}
+
+// checkVolumeProvider refuses a volume that no provider supports, before
+// anything boots. It finds the mount at exactly dir in the mount table at
+// mountinfo and looks its filesystem type up in volumeProviders. A path with
+// no mount entry is refused too. When mounts shadow one another at dir, the
+// last entry in the table is the one the process sees. Errors never repeat
+// VCAP_SERVICES.
+func checkVolumeProvider(mountinfo, dir string) error {
+	const only = "VM backends support only JuiceFS volumes today"
+	f, err := os.Open(mountinfo)
+	if err != nil {
+		var pathErr *os.PathError
+		if errors.As(err, &pathErr) {
+			err = pathErr.Err
+		}
+		return fmt.Errorf("reading %s to find the filesystem of volume path %s: %w; %s", mountinfo, quoteForLog(dir), err, only)
+	}
+	defer f.Close()
+
+	var fstype string
+	found := false
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		point, typ, ok := parseMountInfoLine(sc.Text())
+		if ok && point == dir {
+			fstype, found = typ, true
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return fmt.Errorf("reading %s to find the filesystem of volume path %s: %w; %s", mountinfo, quoteForLog(dir), err, only)
+	}
+	if !found {
+		return fmt.Errorf("volume path %s has no mount entry in %s; %s", quoteForLog(dir), mountinfo, only)
+	}
+	if _, ok := providerForFSType(fstype); !ok {
+		return fmt.Errorf("volume path %s is a %s mount; %s", quoteForLog(dir), quoteForLog(fstype), only)
+	}
+	return nil
+}
+
+// parseMountInfoLine returns the mount point and filesystem type of one
+// mountinfo line, which reads
+//
+//	ID PARENT MAJ:MIN ROOT MOUNTPOINT OPTIONS [OPTIONAL...] - FSTYPE SOURCE SUPEROPTIONS
+//
+// The optional fields end at the lone "-". ok is false for a line that does
+// not have that shape.
+func parseMountInfoLine(line string) (point, fstype string, ok bool) {
+	fields := strings.Fields(line)
+	if len(fields) < 5 {
+		return "", "", false
+	}
+	for i := 6; i < len(fields); i++ {
+		if fields[i] == "-" {
+			if i+1 >= len(fields) {
+				return "", "", false
+			}
+			return unescapeMountInfo(fields[4]), fields[i+1], true
+		}
+	}
+	return "", "", false
+}
+
+// unescapeMountInfo decodes the three-digit octal escapes the kernel writes
+// for a space, tab, newline, and backslash in a mountinfo path. Any other
+// backslash stays as it is.
+func unescapeMountInfo(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+3 < len(s) && isOctal(s[i+1]) && s[i+1] <= '3' && isOctal(s[i+2]) && isOctal(s[i+3]) {
+			b.WriteByte((s[i+1]-'0')<<6 | (s[i+2]-'0')<<3 | (s[i+3] - '0'))
+			i += 3
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+func isOctal(c byte) bool { return c >= '0' && c <= '7' }
