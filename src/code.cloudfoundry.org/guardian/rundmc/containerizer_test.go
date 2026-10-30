@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"syscall"
@@ -617,6 +618,170 @@ var _ = Describe("Rundmc", func() {
 					Expect(first.Path).To(Equal("/bin/sh"))
 				})
 
+				Context("when the wrapped launcher reports a guest OOM on stderr", func() {
+					const oomLine = "vm-launch: the guest ran out of memory: its kernel killed 2 processes; the guest has 128 MiB\n"
+
+					var (
+						inner  *gardenfakes.FakeProcess
+						stderr *bytes.Buffer
+						pio    garden.ProcessIO
+						lines  []string
+					)
+
+					BeforeEach(func() {
+						inner = new(gardenfakes.FakeProcess)
+						stderr = new(bytes.Buffer)
+						pio = garden.ProcessIO{Stderr: stderr}
+						lines = []string{oomLine}
+
+						fakeOCIRuntime.ExecStub = func(_ lager.Logger, _ string, _ garden.ProcessSpec, io garden.ProcessIO) (garden.Process, error) {
+							for _, line := range lines {
+								_, _ = io.Stderr.Write([]byte(line))
+							}
+							return inner, nil
+						}
+					})
+
+					It("records Out of memory once, before Wait returns", func() {
+						inner.WaitStub = func() (int, error) {
+							Expect(fakeEventStore.OnEventCallCount()).To(Equal(0))
+							return 137, nil
+						}
+
+						process, err := containerizer.Run(logger, "some-handle", launcherSpec(), pio)
+						Expect(err).NotTo(HaveOccurred())
+
+						status, err := process.Wait()
+						Expect(err).NotTo(HaveOccurred())
+						Expect(status).To(Equal(137))
+
+						Expect(fakeEventStore.OnEventCallCount()).To(Equal(1))
+						handle, message := fakeEventStore.OnEventArgsForCall(0)
+						Expect(handle).To(Equal("some-handle"))
+						Expect(message).To(Equal("Out of memory"))
+					})
+
+					It("records it once however often Wait is called", func() {
+						process, err := containerizer.Run(logger, "some-handle", launcherSpec(), pio)
+						Expect(err).NotTo(HaveOccurred())
+
+						_, _ = process.Wait()
+						_, _ = process.Wait()
+
+						Expect(fakeEventStore.OnEventCallCount()).To(Equal(1))
+					})
+
+					It("passes the stderr bytes on unchanged", func() {
+						lines = []string{"before\n", oomLine, "after"}
+
+						_, err := containerizer.Run(logger, "some-handle", launcherSpec(), pio)
+						Expect(err).NotTo(HaveOccurred())
+
+						Expect(stderr.String()).To(Equal("before\n" + oomLine + "after"))
+					})
+
+					It("returns the inner exit status and error", func() {
+						inner.WaitReturns(7, errors.New("wait-failed"))
+
+						process, err := containerizer.Run(logger, "some-handle", launcherSpec(), pio)
+						Expect(err).NotTo(HaveOccurred())
+
+						status, err := process.Wait()
+						Expect(status).To(Equal(7))
+						Expect(err).To(MatchError("wait-failed"))
+						Expect(fakeEventStore.OnEventCallCount()).To(Equal(1))
+					})
+
+					It("still returns the exit status when the event cannot be stored", func() {
+						fakeEventStore.OnEventReturns(errors.New("store-failed"))
+						inner.WaitReturns(137, nil)
+
+						process, err := containerizer.Run(logger, "some-handle", launcherSpec(), pio)
+						Expect(err).NotTo(HaveOccurred())
+
+						status, err := process.Wait()
+						Expect(err).NotTo(HaveOccurred())
+						Expect(status).To(Equal(137))
+					})
+
+					It("still forwards the other process methods", func() {
+						process, err := containerizer.Run(logger, "some-handle", launcherSpec(), pio)
+						Expect(err).NotTo(HaveOccurred())
+
+						inner.IDReturns("pid-1")
+						Expect(process.ID()).To(Equal("pid-1"))
+						Expect(process.Signal(garden.SignalTerminate)).To(Succeed())
+						Expect(inner.SignalCallCount()).To(Equal(1))
+					})
+
+					It("records nothing when the line is not at the start of a stderr line", func() {
+						lines = []string{"app said " + oomLine}
+
+						process, err := containerizer.Run(logger, "some-handle", launcherSpec(), pio)
+						Expect(err).NotTo(HaveOccurred())
+						_, _ = process.Wait()
+
+						Expect(fakeEventStore.OnEventCallCount()).To(Equal(0))
+					})
+
+					It("records nothing when the launcher wrote no OOM line", func() {
+						lines = []string{"vm-launch: some other note\n"}
+
+						process, err := containerizer.Run(logger, "some-handle", launcherSpec(), pio)
+						Expect(err).NotTo(HaveOccurred())
+						_, _ = process.Wait()
+
+						Expect(fakeEventStore.OnEventCallCount()).To(Equal(0))
+					})
+
+					It("works when the caller gave no stderr", func() {
+						process, err := containerizer.Run(logger, "some-handle", launcherSpec(), garden.ProcessIO{})
+						Expect(err).NotTo(HaveOccurred())
+						_, _ = process.Wait()
+
+						Expect(fakeEventStore.OnEventCallCount()).To(Equal(1))
+					})
+
+					It("returns the runtime error when the launcher cannot start", func() {
+						fakeOCIRuntime.ExecStub = nil
+						fakeOCIRuntime.ExecReturns(nil, errors.New("exec-failed"))
+
+						process, err := containerizer.Run(logger, "some-handle", launcherSpec(), pio)
+						Expect(err).To(MatchError("exec-failed"))
+						Expect(process).To(BeNil())
+					})
+
+					It("returns no process when the runtime returns none", func() {
+						fakeOCIRuntime.ExecStub = nil
+						fakeOCIRuntime.ExecReturns(nil, nil)
+
+						process, err := containerizer.Run(logger, "some-handle", launcherSpec(), pio)
+						Expect(err).NotTo(HaveOccurred())
+						Expect(process).To(BeNil())
+					})
+
+					It("does not wrap a process that is not the launcher", func() {
+						process, err := containerizer.Run(logger, "some-handle", garden.ProcessSpec{Path: "/bin/sh"}, pio)
+						Expect(err).NotTo(HaveOccurred())
+						Expect(process).To(BeIdenticalTo(inner))
+
+						_, _ = process.Wait()
+						Expect(fakeEventStore.OnEventCallCount()).To(Equal(0))
+					})
+
+					It("does not scan the stderr of a process that is not the launcher", func() {
+						var gotStderr io.Writer
+						fakeOCIRuntime.ExecStub = func(_ lager.Logger, _ string, _ garden.ProcessSpec, pio garden.ProcessIO) (garden.Process, error) {
+							gotStderr = pio.Stderr
+							return inner, nil
+						}
+
+						_, err := containerizer.Run(logger, "some-handle", garden.ProcessSpec{Path: "/opt/garden-vm/vm-launch"}, pio)
+						Expect(err).NotTo(HaveOccurred())
+						Expect(gotStderr).To(BeIdenticalTo(stderr))
+					})
+				})
+
 				It("does not wrap a pea that runs the launcher path", func() {
 					spec := launcherSpec()
 					spec.Image = garden.ImageRef{URI: "some-uri"}
@@ -651,6 +816,25 @@ var _ = Describe("Rundmc", func() {
 
 					_, _, actual, _ := fakeOCIRuntime.ExecArgsForCall(0)
 					Expect(actual).To(Equal(launcherSpec()))
+				})
+
+				It("does not scan the stderr or wrap the process", func() {
+					inner := new(gardenfakes.FakeProcess)
+					stderr := new(bytes.Buffer)
+					var gotStderr io.Writer
+					fakeOCIRuntime.ExecStub = func(_ lager.Logger, _ string, _ garden.ProcessSpec, pio garden.ProcessIO) (garden.Process, error) {
+						gotStderr = pio.Stderr
+						_, _ = pio.Stderr.Write([]byte("vm-launch: the guest ran out of memory\n"))
+						return inner, nil
+					}
+
+					process, err := containerizer.Run(logger, "some-handle", launcherSpec(), garden.ProcessIO{Stderr: stderr})
+					Expect(err).NotTo(HaveOccurred())
+					Expect(gotStderr).To(BeIdenticalTo(stderr))
+					Expect(process).To(BeIdenticalTo(inner))
+
+					_, _ = process.Wait()
+					Expect(fakeEventStore.OnEventCallCount()).To(Equal(0))
 				})
 			})
 		}

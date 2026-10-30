@@ -328,12 +328,16 @@ func (c *Containerizer) Run(log lager.Logger, handle string, spec garden.Process
 	}
 
 	if c.backendDispatch && spec.Path == cfLauncherPath {
-		wrapped, err := c.wrapVMLauncher(log, handle, spec)
+		wrapped, isVM, err := c.wrapVMLauncher(log, handle, spec)
 		if err != nil {
 			return nil, err
 		}
 
 		spec = wrapped
+
+		if isVM {
+			return c.runVMLauncher(log, handle, spec, io)
+		}
 	}
 
 	return c.runtime.Exec(log, handle, spec, io)
@@ -342,17 +346,18 @@ func (c *Containerizer) Run(log lager.Logger, handle string, spec garden.Process
 // wrapVMLauncher rewrites the CF launcher process of a vm-* container so that
 // it runs through vm-launch, which boots the workload inside a microVM, and
 // marks it so that the process builder grants it the kvm gid. Every other
-// process, and every container on another backend, is returned as is.
-func (c *Containerizer) wrapVMLauncher(log lager.Logger, handle string, spec garden.ProcessSpec) (garden.ProcessSpec, error) {
+// process, and every container on another backend, is returned as is. It
+// reports whether it wrapped the process.
+func (c *Containerizer) wrapVMLauncher(log lager.Logger, handle string, spec garden.ProcessSpec) (garden.ProcessSpec, bool, error) {
 	_, bundle, err := c.runtime.BundleInfo(log, handle)
 	if err != nil {
 		log.Error("bundle-info-failed", err)
-		return spec, err
+		return spec, false, err
 	}
 
 	kind := backend.FromBundle(bundle)
 	if !backend.IsVM(kind) {
-		return spec, nil
+		return spec, false, nil
 	}
 
 	log.Info("vm-wrap-launcher", lager.Data{"backend": string(kind)})
@@ -364,7 +369,7 @@ func (c *Containerizer) wrapVMLauncher(log lager.Logger, handle string, spec gar
 	spec.Path = processes.VMLaunchPath
 	spec.Args = args
 
-	return processes.MarkVMLaunch(spec), nil
+	return processes.MarkVMLaunch(spec), true, nil
 }
 
 // runPeaAsExec runs a pea's process inside the sandbox container itself. A
