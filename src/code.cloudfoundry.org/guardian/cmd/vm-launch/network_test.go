@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"code.cloudfoundry.org/guardian/backend"
@@ -622,6 +624,7 @@ await open
 		GinkgoT().Setenv("PORT", strconv.Itoa(port))
 
 		Expect(runVM(backend.VMFirecracker)).To(Equal(0), logBuf.String())
+		Expect(gateLoops()).To(BeZero())
 		Expect(os.ReadFile(argvFile)).To(ContainSubstring("--config-file"))
 		_, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
 		Expect(err).To(HaveOccurred())
@@ -648,11 +651,47 @@ sleep 0.3
 		GinkgoT().Setenv("PORT", strconv.Itoa(port))
 
 		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
+		Expect(gateLoops()).To(BeZero())
 		Expect(os.ReadFile(qmpLog)).To(Equal([]byte(qmpCapabilities + "\n" + hostfwdAdd(2, port) + "\n" + hostfwdRemove(3, port) + "\n")))
 		p := strconv.Itoa(port)
 		Expect(logBuf.String()).To(ContainSubstring("the guest listens on port " + p + "; it is open in the container\n"))
 		Expect(logBuf.String()).To(ContainSubstring("the guest no longer listens on port " + p + "; it is closed in the container\n"))
 		Expect(logBuf.String()).NotTo(ContainSubstring("QMP"))
+	})
+
+	It("removes QEMU's forwarding rule at SIGTERM while the hypervisor still runs", func() {
+		port := freePort()
+		p := strconv.Itoa(port)
+		// The fake QEMU ignores the SIGTERM that vm-launch passes on, so
+		// only the gate's shutDown at the signal can remove the rule.
+		_, qmpLog := portHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), port, `trap '' TERM
+`+qmpGreeting+`listen 1
+qmp_recv
+qmp_reply '{"return": {}}'
+qmp_recv
+qmp_reply '{"return": ""}'
+kill -TERM "$PPID"
+qmp_recv
+qmp_reply '{"return": "host forwarding rule for tcp:0.0.0.0:`+p+` removed\r\n"}'
+exit 0
+`)
+		// vm-launch runs in a helper process, which the signal stops in
+		// place of this test process.
+		ctx, cancel := context.WithTimeout(context.Background(), runVMTimeout)
+		defer cancel()
+		var stderr bytes.Buffer
+		cmd := exec.CommandContext(ctx, os.Args[0])
+		cmd.Env = []string{helperArtifacts + "=" + art, "PORT=" + p, "TMPDIR=" + tmp, "PATH=" + os.Getenv("PATH")}
+		cmd.Stderr = &stderr
+		err := cmd.Run()
+		Expect(ctx.Err()).NotTo(HaveOccurred(), "vm-launch was still running after %v; its log so far:\n%s", runVMTimeout, stderr.String())
+		Expect(err).To(HaveOccurred(), stderr.String())
+		Expect(cmd.ProcessState.Sys().(syscall.WaitStatus).Signaled()).To(BeFalse(), stderr.String())
+		Expect(cmd.ProcessState.ExitCode()).To(Equal(143), stderr.String())
+		Expect(os.ReadFile(qmpLog)).To(Equal([]byte(qmpCapabilities + "\n" + hostfwdAdd(2, port) + "\n" + hostfwdRemove(3, port) + "\n")))
+		Expect(stderr.String()).To(HaveSuffix("vm-launch: the guest listens on port " + p + "; it is open in the container\n" +
+			"vm-launch: received terminated, forwarding it to the hypervisor\n" +
+			"vm-launch: stopped by terminated before the guest reported a status; exiting 143\n"))
 	})
 
 	It("names the port conflict when QEMU cannot add the forwarding rule, and keeps the guest running", func() {

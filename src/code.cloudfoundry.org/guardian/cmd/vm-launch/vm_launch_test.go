@@ -31,12 +31,13 @@ func TestVMLaunch(t *testing.T) {
 
 const testNonce = "0123456789abcdef"
 
-// brokenStdoutArtifacts names the artifacts directory of the helper process
-// that the broken stdout spec starts: this test binary running vm-launch.
-const brokenStdoutArtifacts = "VM_LAUNCH_TEST_ARTIFACTS"
+// helperArtifacts names the artifacts directory of a helper process that a
+// spec starts: this test binary running vm-launch, in a process of its own,
+// for a spec that needs vm-launch's own stdout or signals.
+const helperArtifacts = "VM_LAUNCH_TEST_ARTIFACTS"
 
 func init() {
-	if art := os.Getenv(brokenStdoutArtifacts); art != "" {
+	if art := os.Getenv(helperArtifacts); art != "" {
 		os.Exit(run([]string{"--backend", "vm-qemu", "--artifacts", art, "--", "true"}, log.New(os.Stderr, "vm-launch: ", 0)))
 	}
 }
@@ -857,7 +858,7 @@ echo "RVM_EXIT_$nonce=7"
 
 		var stderr bytes.Buffer
 		cmd := exec.Command(os.Args[0])
-		cmd.Env = []string{brokenStdoutArtifacts + "=" + art, "TMPDIR=" + GinkgoT().TempDir(), "PATH=" + os.Getenv("PATH")}
+		cmd.Env = []string{helperArtifacts + "=" + art, "TMPDIR=" + GinkgoT().TempDir(), "PATH=" + os.Getenv("PATH")}
 		cmd.Stdout = w
 		cmd.Stderr = &stderr
 		err = cmd.Run()

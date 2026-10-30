@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -193,6 +194,19 @@ func (o *fakeOpener) got() []string {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return append([]string(nil), o.calls...)
+}
+
+// gateLoops counts the port gates running in this process. run ends its
+// gate before it returns, so after run there are none.
+func gateLoops() int {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			return strings.Count(string(buf[:n]), ".(*portGate).loop(")
+		}
+		buf = make([]byte, 2*len(buf))
+	}
 }
 
 var _ = Describe("the port gate", func() {
@@ -376,7 +390,9 @@ var _ = Describe("the port gate", func() {
 		start()
 		gate.set(true)
 		Eventually(opener.got).Should(Equal([]string{"open"}))
+		Expect(gateLoops()).To(Equal(1))
 		gate.end()
+		Expect(gateLoops()).To(BeZero())
 		gate.end()
 		gate.set(false)
 		gate.shutDown()
