@@ -59,7 +59,8 @@ func isPortConflict(err error) bool {
 //
 // A change that fails is tried again, after retry.first and then after
 // twice as long each time up to retry.max, until it succeeds or the guest's
-// state changes, and only the first failure in a row is logged. The gate
+// state changes. The first failure in a row is logged, and so is a failure
+// that turns a port conflict into another error or back. The gate
 // tries again rather than ending the run, because a change can fail for a
 // moment, as when QEMU's monitor is slow to reply, and the app in the guest
 // is still healthy; a port that stays closed shows up in the health check,
@@ -177,18 +178,24 @@ func (g *portGate) loop() {
 		up, shut, goal bool
 		state          = portClosed
 		// retry fires when a failed change is due to be tried again.
-		retry   <-chan time.Time
-		timer   *time.Timer
-		wait    = g.retry.first
-		failing bool
+		retry <-chan time.Time
+		timer *time.Timer
+		wait  = g.retry.first
+		// failing is set while the changes toward goal fail, and conflict
+		// while the last of them failed on a port conflict.
+		failing, conflict bool
 	)
-	// newGoal forgets the failures of the last goal.
-	newGoal := func() {
+	// retryNow drops the wait before the next try.
+	retryNow := func() {
 		if timer != nil {
 			timer.Stop()
 		}
 		timer, retry = nil, nil
-		wait, failing = g.retry.first, false
+	}
+	// newGoal forgets the failures of the last goal.
+	newGoal := func() {
+		retryNow()
+		wait, failing, conflict = g.retry.first, false, false
 	}
 	for {
 		select {
@@ -200,6 +207,9 @@ func (g *portGate) loop() {
 			select {
 			case <-g.shut:
 				shut = true
+				// A close that waits out its backoff runs at once, as
+				// the guest is stopping.
+				retryNow()
 			default:
 			}
 		}
@@ -209,15 +219,17 @@ func (g *portGate) loop() {
 		}
 		if retry == nil && state != stateFor(goal) {
 			if err := g.change(&state, goal); err != nil {
-				if !failing {
-					failing = true
+				if c := isPortConflict(err); !failing || c != conflict {
+					failing, conflict = true, c
 					g.logFailure(goal, err)
 				}
 				timer = time.NewTimer(wait)
 				retry = timer.C
 				wait = g.retry.next(wait)
 			} else {
-				wait, failing = g.retry.first, false
+				// The port now matches the goal, so no change follows
+				// until the goal changes, and newGoal ends the run of
+				// failures then.
 				switch {
 				case goal:
 					if g.logf("the guest listens on port %d; it is open in the container", g.port) {

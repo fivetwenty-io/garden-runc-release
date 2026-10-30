@@ -337,6 +337,59 @@ var _ = Describe("the port gate", func() {
 		Eventually(logBuf.String).Should(Equal(failed + "the guest no longer listens on port 8080; it is closed in the container\n" + failed))
 	})
 
+	It("logs a failed close that follows a failed open, as a new run of failures", func() {
+		opener.open = func() error { return errors.New("boom") }
+		opener.closeErr = errors.New("nope")
+		startWith(backoff{first: time.Hour, max: time.Hour})
+		gate.set(true)
+		Eventually(opener.got).Should(Equal([]string{"open"}))
+		gate.set(false)
+		Eventually(opener.got).Should(Equal([]string{"open", "close"}))
+		Eventually(logBuf.String).Should(Equal("the guest listens on port 8080, but vm-launch could not open it in the container: boom\n" +
+			"closing port 8080 in the container: nope\n"))
+	})
+
+	It("keeps its wait when the guest reports the same state again", func() {
+		opener.open = func() error { return errors.New("boom") }
+		startWith(backoff{first: time.Hour, max: time.Hour})
+		gate.set(true)
+		Eventually(opener.got).Should(Equal([]string{"open"}))
+		for i := 0; i < 10; i++ {
+			gate.set(true)
+			time.Sleep(10 * time.Millisecond)
+		}
+		Consistently(opener.got, 100*time.Millisecond).Should(Equal([]string{"open"}))
+	})
+
+	It("logs a failure again when it turns into a port conflict, or out of one", func() {
+		var (
+			mu    sync.Mutex
+			tries int
+		)
+		conflict := &net.OpError{Op: "listen", Net: "tcp", Err: os.NewSyscallError("bind", syscall.EADDRINUSE)}
+		opener.open = func() error {
+			mu.Lock()
+			defer mu.Unlock()
+			tries++
+			switch {
+			case tries == 1:
+				return errors.New("boom")
+			case tries <= 4:
+				return conflict
+			default:
+				return errors.New("bang")
+			}
+		}
+		start()
+		gate.set(true)
+		failed := "the guest listens on port 8080, but vm-launch could not open it in the container: "
+		Eventually(opener.count).Should(BeNumerically(">=", 13))
+		Expect(logBuf.String()).To(Equal(failed + "boom\n" +
+			failed + "listen tcp: bind: address already in use\n" +
+			"port 8080 already in use in this container; VM backends run one app process per container\n" +
+			failed + "bang\n"))
+	})
+
 	It("doubles its wait after each failure, up to the maximum", func() {
 		b := backoff{first: time.Second, max: 5 * time.Second}
 		var waits []time.Duration
@@ -364,6 +417,22 @@ var _ = Describe("the port gate", func() {
 		Consistently(opener.count, 100*time.Millisecond).Should(Equal(n))
 		Expect(opener.got()[1:]).To(HaveEach("close"))
 		Expect(logBuf.String()).To(Equal("the guest listens on port 8080; it is open in the container\n" +
+			"closing port 8080 in the container: nope\n" +
+			"vm-launch is stopping; port 8080 is closed in the container\n"))
+	})
+
+	It("tries a close that waits out its backoff at once at shutDown", func() {
+		startWith(backoff{first: time.Hour, max: time.Hour})
+		gate.set(true)
+		Eventually(opener.got).Should(Equal([]string{"open"}))
+		opener.setCloseErr(errors.New("nope"))
+		gate.set(false)
+		Eventually(opener.got).Should(Equal([]string{"open", "close"}))
+		Consistently(opener.got, 100*time.Millisecond).Should(Equal([]string{"open", "close"}))
+		opener.setCloseErr(nil)
+		gate.shutDown()
+		Eventually(opener.got).Should(Equal([]string{"open", "close", "close"}))
+		Eventually(logBuf.String).Should(Equal("the guest listens on port 8080; it is open in the container\n" +
 			"closing port 8080 in the container: nope\n" +
 			"vm-launch is stopping; port 8080 is closed in the container\n"))
 	})
