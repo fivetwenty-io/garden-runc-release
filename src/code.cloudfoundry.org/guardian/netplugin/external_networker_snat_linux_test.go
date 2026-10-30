@@ -161,6 +161,20 @@ func firecrackerOnRealKernel(flavour string) {
 		Expect(inNetns("ip", "-o", "link", "show", "dev", netplugin.FirecrackerTapName)).To(ContainSubstring("UP"))
 	})
 
+	It("drops the guest's forwarded replies, loading the conntrack direction match", func() {
+		spec := garden.ContainerSpec{
+			Handle:     "stray-reply-handle",
+			Network:    "potato",
+			Properties: garden.Properties{backend.AnnotationKey: string(backend.VMFirecracker)},
+		}
+		Expect(plugin.Network(runnerLog, spec, pid)).To(Succeed())
+
+		forward := strings.Split(strings.TrimSpace(inNetns(iptables, "-S", "FORWARD")), "\n")
+		Expect(forward).To(ContainElement(
+			"-A FORWARD -i "+netplugin.FirecrackerTapName+" -m conntrack --ctdir REPLY -j DROP"),
+			"iptables -S FORWARD showed %q", forward)
+	})
+
 	It("routes the guest's replies to transparent sockets, loading the socket match the kernel needs", func() {
 		spec := garden.ContainerSpec{
 			Handle:     "reply-routing-handle",

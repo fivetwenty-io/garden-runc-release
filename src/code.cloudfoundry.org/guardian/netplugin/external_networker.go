@@ -300,7 +300,16 @@ func setupLoopback(log lager.Logger, pid int) error {
 // host that sets it to loose mode would make the device setting a no-op. The
 // FORWARD source rule is the spoofing control for traffic that leaves the
 // container, and the INPUT source rule is the one for traffic that stays in
-// it. Guest egress is translated with SNAT to containerIP, the container IP
+// it. Because nothing may open a connection into the guest, the only
+// connections on which the guest sends replies are the ones the container
+// opened, which are the port proxy's. Those replies reach the proxy's socket
+// through the reply routing, and a forwarded one belongs to a proxy socket
+// that has gone (closed with a reset, or a dial that timed out before a late
+// SYN-ACK), together with ICMP errors about such a connection. The REPLY
+// direction rule drops those, so that they do not leave eth0 from the guest's
+// address untranslated, since the SNAT rule applies only to connections the
+// guest opens. A conntrack INVALID rule would not do, because conntrack
+// accepts a reply ACK after a reset. Guest egress is translated with SNAT to containerIP, the container IP
 // the network plugin reported, which is the address that application security
 // groups and Diego know the container by. MASQUERADE would not do: it takes
 // the first address of universe scope on the outgoing device, and silk gives
@@ -353,6 +362,7 @@ func FirecrackerTapSteps(iptablesBin string, hostGID uint32, mtu int, egressSour
 		{"dropping spoofed guest sources", []string{iptablesBin, "-A", "FORWARD", "-i", tap, "!", "-s", guest, "-j", "DROP"}},
 		{"dropping spoofed guest sources to the container", []string{iptablesBin, "-A", "INPUT", "-i", tap, "!", "-s", guest, "-j", "DROP"}},
 		{"dropping connections opened towards the guest", []string{iptablesBin, "-A", "FORWARD", "-o", tap, "-m", "conntrack", "!", "--ctstate", "ESTABLISHED,RELATED", "-j", "DROP"}},
+		{"dropping the guest's replies that no port proxy socket takes", []string{iptablesBin, "-A", "FORWARD", "-i", tap, "-m", "conntrack", "--ctdir", "REPLY", "-j", "DROP"}},
 	}
 	steps = append(steps, FirecrackerReplyRouting(iptablesBin)...)
 	return append(steps,
