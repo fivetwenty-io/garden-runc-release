@@ -78,6 +78,7 @@ trap 'echo draining; sleep 3; kill $h; wait $h; echo closed; sleep 2; echo drain
 echo ready
 while :; do sleep 0.1; done`)
 		g.nw = nw
+		withRealRoot(&g)
 		f, err := newInitramfs(guestBusybox(), g)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(f.Close)
@@ -95,9 +96,9 @@ while :; do sleep 0.1; done`)
 			Expect(err).NotTo(HaveOccurred())
 			DeferCleanup(monitor.Close)
 			DeferCleanup(func() { _ = qemuEnd.Close() })
-			files, _, initrdPath, monitorFD, _ := hypervisorFiles(nil, withUserspaceMark(f), qemuEnd, nil)
+			files, _, initrdPath, monitorFD, rootPath := hypervisorFiles(nil, withUserspaceMark(f), qemuEnd, realRootImage())
 			consoleLog := filepath.Join(GinkgoT().TempDir(), "console.log")
-			argv := consoleLogArgv(markedArgv(tcgArgv(qemu, qemuArgv(art, initrdPath, minGuestMemoryMiB, nw, "", monitorFD))), consoleLog)
+			argv := consoleLogArgv(markedArgv(tcgArgv(qemu, withRealRootDrive(qemuArgv(art, initrdPath, minGuestMemoryMiB, nw, "", monitorFD), rootPath))), consoleLog)
 			cmd := newHypervisorCmd(argv, files)
 			stderr := &safeBuffer{}
 			cmd.Stderr = stderr

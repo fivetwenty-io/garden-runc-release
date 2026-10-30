@@ -127,33 +127,156 @@ func oomTag(nonce string) string    { return "RVM_OOM_" + nonce + "=" }
 // it can do anyway.
 func stopTag(nonce string) string { return "RVM_STOP_" + nonce }
 
-// initScript is the guest /init. It runs the command with stdin from
-// /dev/null (the serial console never delivers EOF), reports its status on
-// the console, and reboots: with -no-reboot (QEMU) or reboot=k (Firecracker)
-// that ends the hypervisor. poweroff -f hangs Firecracker, so it is not used.
+// guestRootInit is the guest /init, stage 1 of the guest's boot. It
+// installs busybox's applets, mounts /proc, /sys, and /dev, and finds the
+// guest's drives by their size in sectors, which /rvm/disks gives (see
+// disksFile), because neither hypervisor promises a device order once there
+// are two. A guest with a root disk then gets its overlay root: stage 1
+// formats the root disk as ext2, mounts it with online discard, mounts an
+// overlay with the initramfs as the lower layer and the disk as the upper,
+// moves /proc, /sys, and /dev into it, moves it onto /, and runs stage 2,
+// /rvm/init (see initScript), inside it through chroot. switch_root would
+// first delete the initramfs, which is the lower layer, and the kernel
+// refuses pivot_root on rootfs, so stage 1 takes switch_root's last two
+// steps by hand. A guest without a root disk, which is a guest without a
+// disk quota, runs stage 2 on the initramfs, its root in RAM. Either way
+// stage 2 gets the volume's device, or nothing without a volume, as its
+// argument, because a variable /init exported would reach the command.
 //
-// Right after the mounts, /init defines rvm_fail, which every setup step
-// uses, and turns off console echo. It then mounts /dev/shm, brings up lo
-// and eth0 from /rvm/net (in every guest, a task's included), prepares the
-// open-files limit from /rvm/limits, and checks that /rvm/env sources. A
-// guest with a volume then formats the volume image when it is blank and
-// mounts it. When a setup step fails, /init reboots before the start tag, so
-// vm-launch reports a guest that never started its command and shows the
-// console output, which ends with the failed step. Last before the start
-// tag, /init starts the stop reader (see guestStopReader), which /init stops
-// again once the command has ended.
+// Stage 1 must never format the volume, so it formats a device as the root
+// only when exactly one device has the root's size, which vm-launch keeps
+// apart from the volume's, and only when that device's first 64 KiB read as
+// all zero, as a new image's do. Each other case fails the boot: a root
+// size without an inode ratio, a size or ratio that is not a positive
+// number, a root of the volume's size, two devices of one size, a root disk
+// that is not blank, and a drive that has not appeared after six checks a
+// second apart. Stage 1
+// writes no console marker, so a failure reboots before the start tag and
+// vm-launch shows the console, which ends with the failed step.
+const guestRootInit = `#!/bin/busybox sh
+/bin/busybox --install -s /bin
+export PATH=/bin
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev 2>/dev/null
+` + guestFailFunc + guestDiskFind + guestRootSetup + `exec /bin/sh ` + guestStage2 + ` "$rvm_volume"
+`
+
+// guestStage2 is where the initramfs holds stage 2 of the guest's boot.
+const guestStage2 = "/rvm/init"
+
+// guestDiskFunc defines the two helpers of the drive search. rvm_number
+// succeeds for a positive decimal number without leading zeros, the form
+// in which sysfs gives a size. rvm_disk sets rvm_dev to the one block
+// device under the sysfs directory $1 whose size in sectors is $2, and
+// fails when no device has it; a device whose size cannot be read is
+// skipped. A second device of that size fails the boot, naming $3 as what
+// the size is for, because stage 1 never guesses which device is which.
+const guestDiskFunc = `rvm_number() { case "$1" in '' | 0* | *[!0-9]*) return 1 ;; esac; }
+rvm_disk() {
+	rvm_dev=
+	for rvm_b in "$1"/vd*; do
+		[ -r "$rvm_b/size" ] && read -r rvm_s 2>/dev/null <"$rvm_b/size" && [ "$rvm_s" = "$2" ] || continue
+		[ -z "$rvm_dev" ] || rvm_fail "two block devices, $rvm_dev and /dev/${rvm_b##*/}, have the size of the $3, so the guest cannot tell which one it is"
+		rvm_dev=/dev/${rvm_b##*/}
+	done
+	[ -n "$rvm_dev" ]
+}
+`
+
+// guestDiskFind reads /rvm/disks, checks its sizes, and waits for the
+// drives it names, in rvm_root and rvm_volume. Both drives are built into
+// the guest kernel and normally ready before /init runs; the wait covers a
+// late probe.
+const guestDiskFind = guestDiskFunc + `. /rvm/disks
+if [ -n "${RVM_ROOT_SECTORS:-}" ]; then
+	rvm_number "$RVM_ROOT_SECTORS" && rvm_number "${RVM_ROOT_INODE_RATIO:-}" || rvm_fail "the guest root size or inode ratio in /rvm/disks is not a positive number"
+	[ "$RVM_ROOT_SECTORS" != "${RVM_VOLUME_SECTORS:-}" ] || rvm_fail "the guest root and the volume have the same size, so the guest cannot tell them apart"
+fi
+if [ -n "${RVM_VOLUME_SECTORS:-}" ]; then
+	rvm_number "$RVM_VOLUME_SECTORS" || rvm_fail "the volume size in /rvm/disks is not a positive number"
+fi
+rvm_root=
+rvm_volume=
+n=0
+until { [ -z "${RVM_ROOT_SECTORS:-}" ] || { rvm_disk /sys/block "$RVM_ROOT_SECTORS" "guest root" && rvm_root=$rvm_dev; }; } &&
+	{ [ -z "${RVM_VOLUME_SECTORS:-}" ] || { rvm_disk /sys/block "$RVM_VOLUME_SECTORS" volume && rvm_volume=$rvm_dev; }; }; do
+	n=$((n + 1))
+	[ "$n" -gt 5 ] && rvm_fail "no block device of the expected size for the guest root or the volume"
+	sleep 1
+done
+`
+
+// Guest scratch files of the root disk's blank check. They live on the
+// initramfs and are gone before the overlay is mounted.
+const (
+	guestRootHead = "/rvm/root-head"
+	guestRootUsed = "/rvm/root-used"
+)
+
+// guestRootSetup formats the root disk, when the guest has one, and enters
+// the overlay root on it. The blank check reads the disk as the volume's
+// does (see guestVolumeSetup), and a read error fails the boot. mke2fs makes
+// 4096-byte blocks, so that every block the guest frees lines up with the
+// host's discard granularity, at the inode ratio vm-launch picked (see
+// inodeRatioFor), with no reserved blocks. ext4 mounts the disk without a
+// journal, which busybox mke2fs never makes, with discard, which gives the
+// blocks the guest frees back to the container's quota at once, and with
+// errors=continue, so an I/O error from a quota that another writer used up
+// leaves the root writable. Overlayfs never crosses a mount in its lower
+// layer, so /proc, /sys, /dev, and the two mount points show through it as
+// plain directories.
+const guestRootSetup = `if [ -n "$rvm_root" ]; then
+	dd if="$rvm_root" of=` + guestRootHead + ` bs=4096 count=16 || rvm_fail "reading the start of the guest root disk $rvm_root failed"
+	tr -d '\000' <` + guestRootHead + ` >` + guestRootUsed + ` || rvm_fail "checking whether the guest root disk $rvm_root is blank failed"
+	rvm_blank=
+	[ -s ` + guestRootHead + ` ] && [ ! -s ` + guestRootUsed + ` ] && rvm_blank=1
+	rm -f ` + guestRootHead + ` ` + guestRootUsed + `
+	[ -n "$rvm_blank" ] || rvm_fail "the guest root disk $rvm_root is not blank, so vm-launch will not format it"
+	mke2fs -F -b 4096 -m 0 -i "$RVM_ROOT_INODE_RATIO" -L rvm-root "$rvm_root" || rvm_fail "formatting the guest root disk $rvm_root failed"
+	mkdir -p /rvm/disk /rvm/root || rvm_fail "creating the guest root mount points failed"
+	mount -t ext4 -o noatime,discard,errors=continue "$rvm_root" /rvm/disk || rvm_fail "mounting the guest root disk $rvm_root failed"
+	mkdir /rvm/disk/upper /rvm/disk/work || rvm_fail "creating the overlay directories failed"
+	mount -t overlay -o lowerdir=/,upperdir=/rvm/disk/upper,workdir=/rvm/disk/work overlay /rvm/root || rvm_fail "mounting the overlay root failed; the guest kernel needs overlayfs"
+	for rvm_m in proc sys dev; do
+		mount -o move "/$rvm_m" "/rvm/root/$rvm_m" || rvm_fail "moving /$rvm_m into the overlay root failed"
+	done
+	cd /rvm/root && mount -o move . / || rvm_fail "moving the overlay root onto / failed"
+	exec chroot . /bin/sh ` + guestStage2 + ` "$rvm_volume"
+	rvm_fail "entering the overlay root failed"
+fi
+`
+
+// initScript is the guest /rvm/init, stage 2 of the guest's boot, which
+// stage 1 runs on the guest root once it has mounted it (see
+// guestRootInit), with the volume's device as its argument. It runs the
+// command with stdin from /dev/null (the serial console never delivers
+// EOF), reports its status on the console, and reboots: with -no-reboot
+// (QEMU) or reboot=k (Firecracker) that ends the hypervisor. poweroff -f
+// hangs Firecracker, so it is not used.
+//
+// First, stage 2 defines rvm_fail, which every setup step uses, and turns
+// off console echo. It then mounts /dev/shm, brings up lo and eth0 from
+// /rvm/net (in every guest, a task's included), prepares the open-files
+// limit from /rvm/limits, and checks that /rvm/env sources. A guest with a
+// volume then formats the volume image when it is blank and mounts it. When
+// a setup step fails, stage 2 reboots before the start tag, so vm-launch
+// reports a guest that never started its command and shows the console
+// output, which ends with the failed step. Last before the start tag, stage
+// 2 starts the stop reader (see guestStopReader), which it stops again once
+// the command has ended.
 //
 // The command runs in a subshell that records its pid, sets its open-files
 // limit, sources /rvm/env, and then becomes the shell that runs /rvm/cmd
-// with sh -c, so its status is the command's (see guestRunCommand). /init
+// with sh -c, so its status is the command's (see guestRunCommand). Stage 2
 // writes the exit line through its own open of /dev/console, because the
-// command may have left the console that it shares with /init non-blocking,
-// and through the shared console only when that open fails. The guest
-// environment applies only inside that subshell, never to /init's own steps,
-// such as the unquoted status in the exit line or the volume teardown. A
-// guest with ports watches, while the command runs, whether anything
-// listens on each (see guestListenWatch). With a volume, /init syncs and
-// unmounts it after the command and before it reports the status.
+// command may have left the console that it shares with stage 2
+// non-blocking, and through the shared console only when that open fails.
+// The guest environment applies only inside that subshell, never to stage
+// 2's own steps, such as the unquoted status in the exit line or the volume
+// teardown. A guest with ports watches, while the command runs, whether
+// anything listens on each (see guestListenWatch). With a volume, stage 2
+// syncs and unmounts it after the command and before it reports the status.
 func initScript(nonce string, volume bool) string {
 	setup := guestFailFunc + guestConsoleSetup + guestShmSetup + guestNetworkSetup + guestLimitsSetup + guestEnvChecks
 	if volume {
@@ -167,11 +290,7 @@ func initScript(nonce string, volume bool) string {
 	exit := "echo " + exitTag(nonce) + "$rvm_status"
 	run += exit + " >/dev/console || " + exit + "\n"
 	return `#!/bin/busybox sh
-/bin/busybox --install -s /bin
 export PATH=/bin
-mount -t proc proc /proc
-mount -t sysfs sys /sys
-mount -t devtmpfs dev /dev 2>/dev/null
 ` + setup + `echo ` + startTag(nonce) + "\n" + run + `reboot -f
 `
 }
@@ -510,11 +629,6 @@ const guestRunStatus = "rvm_status=$?\ncommand exec 2>&3 3>&-\n"
 // which is the pid of the command's top process.
 const guestAppPid = "/rvm/app-pid"
 
-// guestVolumeDevice is the guest block device of the volume image. The guest
-// boots from the initramfs and has no other drive, so the image is the first
-// virtio-blk device.
-const guestVolumeDevice = "/dev/vda"
-
 // Guest scratch files of the blank check. They live under /rvm, which no
 // volume path may use, so that an app's container_dir can never collide with
 // them.
@@ -523,22 +637,22 @@ const (
 	guestVolumeUsed = "/rvm/volume-used"
 )
 
-// guestVolumeSetup formats and mounts the volume image. It formats only an
-// image whose first 64 KiB the guest itself reads as all zero, which is a new
-// image or one whose creator died before the first boot; the host never
-// tells it an image is new. A read error is a setup failure, never a blank
+// guestVolumeSetup formats and mounts the volume image, on the device that
+// stage 1 found by its size and passed as stage 2's argument (see
+// guestRootInit). An argument that names no block device is a setup
+// failure. It formats only an image whose first 64 KiB the guest itself
+// reads as all zero, which is a new image or one whose creator died before
+// the first boot; the host never tells it an image is new. A read error is a setup failure, never a blank
 // image. An image that is not blank and does not mount is never formatted:
 // that is a setup failure for an operator to look at. busybox mke2fs makes
 // ext2, which the kernel's ext4 driver mounts. The sync and dirsync options
 // put every completed write on the image before the syscall returns,
 // because the hypervisors stop at once on SIGTERM, without a guest shutdown.
+// The mount point is created on the guest root, which is the overlay when
+// the guest has a root disk.
 const guestVolumeSetup = `. /rvm/mounts
-n=0
-while [ ! -b "$RVM_VOLUME_DEVICE" ]; do
-	n=$((n + 1))
-	[ "$n" -gt 5 ] && rvm_fail "no $RVM_VOLUME_DEVICE block device for the volume"
-	sleep 1
-done
+RVM_VOLUME_DEVICE=${1:-}
+[ -b "$RVM_VOLUME_DEVICE" ] || rvm_fail "no block device for the volume image $RVM_VOLUME_IMAGE"
 mkdir -p "$RVM_VOLUME_PATH" || rvm_fail "creating $RVM_VOLUME_PATH failed"
 dd if="$RVM_VOLUME_DEVICE" of=` + guestVolumeHead + ` bs=4096 count=16 || rvm_fail "reading the start of $RVM_VOLUME_DEVICE failed"
 tr -d '\000' <` + guestVolumeHead + ` >` + guestVolumeUsed + ` || rvm_fail "checking whether $RVM_VOLUME_DEVICE is blank failed"
@@ -554,19 +668,55 @@ fi
 `
 
 // guestVolumeTeardown follows the command, once its status is kept in
-// rvm_status: it flushes and unmounts the volume. A failed unmount loses
-// nothing, because the mount is synchronous and sync has run, so it is
-// reported and the status stays the command's.
-const guestVolumeTeardown = `sync
+// rvm_status: it flushes and unmounts the volume. sync -f flushes the
+// volume's filesystem only, so that the guest root's dirty pages never take
+// up the time the guest has to stop. A failed unmount loses nothing,
+// because the mount is synchronous and the sync has run, so it is reported
+// and the status stays the command's.
+const guestVolumeTeardown = `sync -f "$RVM_VOLUME_PATH"
 umount "$RVM_VOLUME_PATH" 2>/dev/null || echo "vm-launch guest: unmounting $RVM_VOLUME_PATH failed; data was already synced"
 `
 
-// mountsFile returns the guest /rvm/mounts, which /init sources before it
+// mountsFile returns the guest /rvm/mounts, which stage 2 sources before it
 // mounts the volume.
 func mountsFile(v *guestVolume) string {
-	return "RVM_VOLUME_DEVICE=" + guestVolumeDevice + "\n" +
-		"RVM_VOLUME_PATH=" + shellQuote(v.ContainerDir) + "\n" +
+	return "RVM_VOLUME_PATH=" + shellQuote(v.ContainerDir) + "\n" +
 		"RVM_VOLUME_IMAGE=" + shellQuote(v.ImageName) + "\n"
+}
+
+// sectorBytes is the unit in which sysfs gives a block device's size.
+const sectorBytes = 512
+
+// disksFile returns the guest /rvm/disks, which stage 1 sources to find the
+// guest's drives by their size in sectors (see guestRootInit): the guest
+// root image's size and inode ratio when g has one, and the volume image's
+// size, defaultImageSize, which openVolumeImage checks, when g has a volume.
+// A guest with neither gets an empty file. Sizes that the guest could not
+// tell apart, or that are not whole sectors, are an error, because stage 1
+// would then refuse to boot, and a guess could format the volume.
+func disksFile(g guestContents) (string, error) {
+	var b strings.Builder
+	switch {
+	case g.rootBytes < 0 || g.rootInodeRatio < 0:
+		return "", fmt.Errorf("the guest root image of %d bytes at %d bytes per inode has a negative size", g.rootBytes, g.rootInodeRatio)
+	case g.rootBytes == 0 && g.rootInodeRatio != 0:
+		return "", fmt.Errorf("an inode ratio of %d bytes per inode for no guest root image", g.rootInodeRatio)
+	case g.rootBytes > 0:
+		if g.rootBytes%sectorBytes != 0 {
+			return "", fmt.Errorf("the guest root image of %d bytes is not a whole number of %d-byte sectors", g.rootBytes, sectorBytes)
+		}
+		if g.rootInodeRatio == 0 {
+			return "", fmt.Errorf("the guest root image of %d bytes has no inode ratio", g.rootBytes)
+		}
+		if g.vol != nil && g.rootBytes == defaultImageSize {
+			return "", fmt.Errorf("the guest root image and the volume image are both %d bytes, so the guest could not tell them apart", g.rootBytes)
+		}
+		fmt.Fprintf(&b, "RVM_ROOT_SECTORS=%d\nRVM_ROOT_INODE_RATIO=%d\n", g.rootBytes/sectorBytes, g.rootInodeRatio)
+	}
+	if g.vol != nil {
+		fmt.Fprintf(&b, "RVM_VOLUME_SECTORS=%d\n", defaultImageSize/sectorBytes)
+	}
+	return b.String(), nil
 }
 
 // initramfsName names the initramfs memfd. Its /proc/PID/fd link reads
@@ -618,6 +768,11 @@ type guestContents struct {
 	caBundle []byte
 	// nofile is the command's open-files limit (see guestNofile), /rvm/limits.
 	nofile nofileLimit
+	// rootBytes is the size of the guest root image (see rootDiskSize), or
+	// 0 when the guest root stays in RAM, and rootInodeRatio is the bytes
+	// per inode of its filesystem, or 0 without one; both go in /rvm/disks.
+	rootBytes      int64
+	rootInodeRatio int64
 }
 
 // newInitramfs builds the guest initramfs (see writeInitramfs) in a sealed
@@ -662,11 +817,12 @@ func addSeals(f *os.File, seals int) error {
 // static busybox, the console and null device nodes, the command script at
 // /rvm/cmd, the guest network's /rvm/net and /etc/resolv.conf, the guest
 // environment as /rvm/env with mode 0600, the command's limits as
-// /rvm/limits, and the /init that runs it. With a volume it also holds
+// /rvm/limits, the drive sizes as /rvm/disks, and the two stages of the
+// guest's boot that run it, /init and /rvm/init. With a volume it also holds
 // /rvm/mounts, and with a CA bundle it holds that at
 // /etc/ssl/certs/ca-certificates.crt. A hard open-files limit of 0 is an
 // error, because it is a limit no caller can have meant: vm-launch itself
-// could not run under it.
+// could not run under it. So are drive sizes that disksFile rejects.
 func writeInitramfs(dst *os.File, busyboxPath string, g guestContents) error {
 	if g.nw == nil {
 		return errors.New("writing the initramfs: no guest network")
@@ -701,7 +857,11 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, g 
 		return func() error { return cw.File(name, perm, int64(len(content)), strings.NewReader(content)) }
 	}
 
-	init := initScript(g.nonce, g.vol != nil)
+	disks, err := disksFile(g)
+	if err != nil {
+		return err
+	}
+	stage2 := initScript(g.nonce, g.vol != nil)
 	steps := []func() error{
 		func() error { return cw.Dir("bin", 0o755) },
 		func() error { return cw.Dir("dev", 0o755) },
@@ -734,7 +894,9 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, g 
 		)
 	}
 	steps = append(steps,
-		func() error { return cw.File("init", 0o755, int64(len(init)), strings.NewReader(init)) },
+		file("rvm/disks", 0o644, disks),
+		file(strings.TrimPrefix(guestStage2, "/"), 0o755, stage2),
+		file("init", 0o755, guestRootInit),
 		cw.Close,
 		gz.Close,
 		buf.Flush,

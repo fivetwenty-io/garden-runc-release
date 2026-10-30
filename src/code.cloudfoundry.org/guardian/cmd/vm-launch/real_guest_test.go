@@ -28,22 +28,66 @@ import (
 )
 
 // bootRealGuest boots a guest with contents g, the guest's busybox, and the
-// real kernel under TCG, as vm-launch would with QEMU, and returns the
-// console output. It fails the spec unless QEMU exits 0, and skips it
-// where the real kernel, the guest's busybox, or an x86 QEMU is missing.
+// real kernel under TCG, as vm-launch would with QEMU for an app with a
+// disk quota, so the guest boots through the overlay root on a root image
+// of realRootBytes (see withRealRoot). It returns the console output. It
+// fails the spec unless QEMU exits 0, and skips it where the real kernel,
+// the guest's busybox, or an x86 QEMU is missing.
 func bootRealGuest(g guestContents) string {
+	withRealRoot(&g)
+	return bootRealGuestWith(g, nil, realRootImage())
+}
+
+// bootRealGuestWith is bootRealGuest with the volume image vol and the guest
+// root image root, either of which can be nil, and with g as it is, so g
+// names the root image's size when root is not nil.
+func bootRealGuestWith(g guestContents, vol, root *os.File) string {
 	art := realArtifacts()
 	qemu := realQEMU()
 	requireMicrovm(qemu)
 	f, err := newInitramfs(guestBusybox(), g)
 	Expect(err).NotTo(HaveOccurred())
 	DeferCleanup(f.Close)
-	files, _, initrdPath, _, _ := hypervisorFiles(nil, withUserspaceMark(f), nil, nil)
-	argv := markedArgv(tcgArgv(qemu, qemuArgv(art, initrdPath, minGuestMemoryMiB, g.nw, "", 0)))
+	files, drivePath, initrdPath, _, rootPath := hypervisorFiles(vol, withUserspaceMark(f), nil, root)
+	argv := markedArgv(tcgArgv(qemu, withRealRootDrive(qemuArgv(art, initrdPath, minGuestMemoryMiB, g.nw, drivePath, 0), rootPath)))
 	code, stdout, stderr := bootRealQEMU(argv, files)
 	Expect(code).To(Equal(0), "QEMU failed: %s\n%s", stderr, stdout)
 	Expect(stdout).To(ContainSubstring(startTag(testNonce)), stdout)
 	return stdout
+}
+
+// realRootBytes is the size of the guest root image of the specs that boot a
+// real guest: room for what their commands write, and a size that no volume
+// image has.
+const realRootBytes = 64 << 20
+
+// withRealRoot gives g a guest root image of realRootBytes, at the inode
+// ratio run would pick, as run does for an app with a disk quota. g must
+// get it before its initramfs is built, because /rvm/disks names it.
+func withRealRoot(g *guestContents) {
+	g.rootBytes = realRootBytes
+	g.rootInodeRatio = inodeRatioFor(realRootBytes)
+}
+
+// realRootImage returns a blank guest root image of realRootBytes, created
+// as vm-launch creates it, closed when the spec ends. A boot that is
+// retried because its guest never started userspace can keep the image,
+// because only the guest's /init writes it.
+func realRootImage() *os.File {
+	root, err := createRootImage(GinkgoT().TempDir(), realRootBytes)
+	Expect(err).NotTo(HaveOccurred())
+	DeferCleanup(root.Close)
+	return root
+}
+
+// withRealRootDrive returns QEMU's argv with the guest root image, which
+// QEMU opens as rootPath, attached as vm-launch attaches it, or argv as it
+// is when rootPath is empty.
+func withRealRootDrive(argv []string, rootPath string) []string {
+	if rootPath == "" {
+		return argv
+	}
+	return slices.Concat(argv, qemuRootDrive(rootPath))
 }
 
 // A real guest under TCG boots in a few seconds, but now and then, on a
@@ -459,6 +503,7 @@ wait $h
 sleep 6
 echo served`)
 		g.nw = nw
+		withRealRoot(&g)
 		f, err := newInitramfs(guestBusybox(), g)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(f.Close)
@@ -481,9 +526,9 @@ echo served`)
 			// The supervisor closes vm-launch's copy of QEMU's end once
 			// QEMU has it; this closes it when QEMU never started.
 			DeferCleanup(func() { _ = qemuEnd.Close() })
-			files, _, initrdPath, monitorFD, _ := hypervisorFiles(nil, withUserspaceMark(f), qemuEnd, nil)
+			files, _, initrdPath, monitorFD, rootPath := hypervisorFiles(nil, withUserspaceMark(f), qemuEnd, realRootImage())
 			consoleLog := filepath.Join(GinkgoT().TempDir(), "console.log")
-			argv := consoleLogArgv(markedArgv(tcgArgv(qemu, qemuArgv(art, initrdPath, minGuestMemoryMiB, nw, "", monitorFD))), consoleLog)
+			argv := consoleLogArgv(markedArgv(tcgArgv(qemu, withRealRootDrive(qemuArgv(art, initrdPath, minGuestMemoryMiB, nw, "", monitorFD), rootPath))), consoleLog)
 			cmd := newHypervisorCmd(argv, files)
 			stderr = &safeBuffer{}
 			cmd.Stderr = stderr
@@ -667,6 +712,7 @@ kill $h1 $h2
 wait $h1 $h2
 echo served`)
 		g.nw = nw
+		withRealRoot(&g)
 		f, err := newInitramfs(guestBusybox(), g)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(f.Close)
@@ -688,9 +734,9 @@ echo served`)
 			Expect(err).NotTo(HaveOccurred())
 			DeferCleanup(monitor.Close)
 			DeferCleanup(func() { _ = qemuEnd.Close() })
-			files, _, initrdPath, monitorFD, _ := hypervisorFiles(nil, withUserspaceMark(f), qemuEnd, nil)
+			files, _, initrdPath, monitorFD, rootPath := hypervisorFiles(nil, withUserspaceMark(f), qemuEnd, realRootImage())
 			consoleLog := filepath.Join(GinkgoT().TempDir(), "console.log")
-			argv := consoleLogArgv(markedArgv(tcgArgv(qemu, qemuArgv(art, initrdPath, minGuestMemoryMiB, nw, "", monitorFD))), consoleLog)
+			argv := consoleLogArgv(markedArgv(tcgArgv(qemu, withRealRootDrive(qemuArgv(art, initrdPath, minGuestMemoryMiB, nw, "", monitorFD), rootPath))), consoleLog)
 			cmd := newHypervisorCmd(argv, files)
 			stderr = &safeBuffer{}
 			cmd.Stderr = stderr

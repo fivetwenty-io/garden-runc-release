@@ -303,7 +303,7 @@ var _ = Describe("the CA bundle in the initramfs", func() {
 		names, byName := archiveEntries(fileBytes(f))
 		Expect(names).To(Equal([]string{"bin", "dev", "dev/console", "dev/null", "etc", "proc", "sys", "tmp", "rvm",
 			"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "rvm/limits", "etc/resolv.conf",
-			"etc/ssl", "etc/ssl/certs", "etc/ssl/certs/ca-certificates.crt", "init", cpioTrailer}))
+			"etc/ssl", "etc/ssl/certs", "etc/ssl/certs/ca-certificates.crt", "rvm/disks", "rvm/init", "init", cpioTrailer}))
 		Expect(byName["etc/ssl"].mode).To(Equal(uint32(0o040755)))
 		Expect(byName["etc/ssl/certs"].mode).To(Equal(uint32(0o040755)))
 		Expect(byName["etc/ssl/certs/ca-certificates.crt"].mode).To(Equal(uint32(0o100644)))

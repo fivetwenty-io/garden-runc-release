@@ -13,8 +13,10 @@
 // guest runs START-COMMAND. Otherwise it runs PATH and ARGS, shell-quoted.
 // The guest's busybox sh runs the command with sh -c, as the launcher runs
 // it with bash -c, so the command may have at most 131071 bytes.
-// The guest has a busybox userland and none of the app's files. It has no
-// disk unless the app has a volume (see Volumes below).
+// The guest has a busybox userland and none of the app's files. Its root
+// is the initramfs, which lives in guest RAM, with a disk image laid over it
+// when the app has a disk quota (see Guest root disk below), and it gets a
+// volume's disk when the app has a volume (see Volumes below).
 //
 // Every guest gets a NIC, a default route, and DNS, and its traffic leaves
 // from the container's network namespace with the container's address, so
@@ -97,9 +99,9 @@
 // for as long as the VM runs, waiting up to 30 seconds for another instance
 // to release it, checks after the wait that the name still refers to the
 // locked file, and passes the image to the hypervisor as file descriptor 3.
-// The guest formats the image as ext2 when its first 64 KiB are all zero and
-// mounts it synchronously; a non-blank image that does not mount is never
-// formatted. A VM app supports one read-write volume mount, and it must be a
+// The guest finds the image by its size, which no guest root image shares,
+// formats it as ext2 when its first 64 KiB are all zero, and mounts it
+// synchronously; a non-blank image that does not mount is never formatted. A VM app supports one read-write volume mount, and it must be a
 // JuiceFS mount. Cloud Controller strips the driver name from volume_mounts,
 // so vm-launch reads the filesystem type of the mount at the volume path from
 // /proc/self/mountinfo, and any type other than fuse.juicefs, or a path with
@@ -195,6 +197,19 @@
 // that says why. A missing or malformed limits.disk leaves the guest root in
 // RAM, with a line that says the disk quota does not apply to it.
 //
+// The guest's /init finds the image by its size in sectors, which vm-launch
+// writes in the initramfs, formats it as ext2 with online discard, and
+// mounts an overlay with the initramfs as its lower layer and the image as
+// its upper. It moves /proc, /sys, and /dev into the overlay, moves the
+// overlay onto /, and runs the rest of its setup and the command inside it,
+// so everything the guest writes outside /dev and the volume lands on
+// the image and counts against the quota. Every boot formats a fresh image,
+// as every start of a runc app gets a fresh container. /init formats only
+// the one device of the image's size, and only when it reads as blank, so
+// it never formats the volume; when it cannot find, check, format, or mount
+// the image, the guest reboots before it starts the command, and vm-launch
+// exits 123 with the console output, which ends with the step that failed.
+//
 // The initramfs that holds the guest's /init, busybox, command, and
 // environment is built in a sealed memfd and never written to disk. The
 // hypervisor gets it as the file descriptor after the volume image's, 3
@@ -223,6 +238,7 @@
 //	0-255  the guest command's exit status
 //	123    the hypervisor exited cleanly, but the guest never reported a status,
 //	       as when the guest cannot find, format, or mount the volume image
+//	       or the guest root image
 //	124    the hypervisor failed: it exited non-zero before the guest reported a
 //	       status, as QEMU does when it cannot open the volume image
 //	125    vm-launch could not start the guest: core dumps it could not
@@ -572,7 +588,7 @@ func run(argv []string, logger *log.Logger) int {
 	if vol != nil {
 		volumeBytes = defaultImageSize
 	}
-	rootSize, _, err := rootDiskSize(workDir, lookupEnv, unix.Statfs, volumeBytes, logger)
+	rootSize, rootInodeRatio, err := rootDiskSize(workDir, lookupEnv, unix.Statfs, volumeBytes, logger)
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError
@@ -600,13 +616,15 @@ func run(argv []string, logger *log.Logger) int {
 	}
 
 	initrd, err = newInitramfs(filepath.Join(cfg.artifacts, artBusybox), guestContents{
-		command:  cfg.command,
-		nonce:    nonce,
-		nw:       nw,
-		env:      envFile,
-		vol:      vol,
-		caBundle: caBundle,
-		nofile:   nofile,
+		command:        cfg.command,
+		nonce:          nonce,
+		nw:             nw,
+		env:            envFile,
+		vol:            vol,
+		caBundle:       caBundle,
+		nofile:         nofile,
+		rootBytes:      rootSize,
+		rootInodeRatio: rootInodeRatio,
 	})
 	if err != nil {
 		logger.Print(err)

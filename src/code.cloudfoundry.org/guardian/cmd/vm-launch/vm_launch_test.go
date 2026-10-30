@@ -288,7 +288,7 @@ var _ = Describe("initramfs", func() {
 			byName[e.name] = e
 		}
 		Expect(names).To(Equal([]string{"bin", "dev", "dev/console", "dev/null", "etc", "proc", "sys", "tmp", "rvm",
-			"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "rvm/limits", "etc/resolv.conf", "init", cpioTrailer}))
+			"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "rvm/limits", "etc/resolv.conf", "rvm/disks", "rvm/init", "init", cpioTrailer}))
 
 		Expect(byName["bin"].mode).To(Equal(uint32(0o040755)))
 		Expect(byName["tmp"].mode).To(Equal(uint32(0o041777)))
@@ -299,7 +299,11 @@ var _ = Describe("initramfs", func() {
 		Expect(byName["bin/busybox"].data).To(Equal(busybox))
 		Expect(string(byName["rvm/cmd"].data)).To(Equal("echo 'hi there'; exit 3\n"))
 		Expect(byName["init"].mode).To(Equal(uint32(0o100755)))
-		Expect(string(byName["init"].data)).To(Equal(initScript(testNonce, false)))
+		Expect(string(byName["init"].data)).To(Equal(guestRootInit))
+		Expect(byName["rvm/init"].mode).To(Equal(uint32(0o100755)))
+		Expect(string(byName["rvm/init"].data)).To(Equal(initScript(testNonce, false)))
+		Expect(byName["rvm/disks"].mode).To(Equal(uint32(0o100644)))
+		Expect(byName["rvm/disks"].data).To(BeEmpty())
 	})
 
 	It("writes an /init that brackets the command with nonce markers and reboots", func() {
@@ -321,7 +325,7 @@ var _ = Describe("initramfs", func() {
 		list, err := exec.Command("sh", "-c", `"$0" -t --quiet < "$1"`, cpioBin, plain).CombinedOutput()
 		Expect(err).NotTo(HaveOccurred(), string(list))
 		Expect(strings.Fields(string(list))).To(Equal([]string{"bin", "dev", "dev/console", "dev/null", "etc", "proc", "sys", "tmp", "rvm",
-			"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "rvm/limits", "etc/resolv.conf", "init"}))
+			"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "rvm/limits", "etc/resolv.conf", "rvm/disks", "rvm/init", "init"}))
 
 		if os.Geteuid() != 0 {
 			Skip("extracting device nodes needs root")
@@ -333,7 +337,8 @@ var _ = Describe("initramfs", func() {
 		Expect(err).NotTo(HaveOccurred(), string(out))
 
 		Expect(os.ReadFile(filepath.Join(dest, "bin/busybox"))).To(Equal(busybox))
-		Expect(os.ReadFile(filepath.Join(dest, "init"))).To(Equal([]byte(initScript(testNonce, false))))
+		Expect(os.ReadFile(filepath.Join(dest, "init"))).To(Equal([]byte(guestRootInit)))
+		Expect(os.ReadFile(filepath.Join(dest, "rvm/init"))).To(Equal([]byte(initScript(testNonce, false))))
 		Expect(os.ReadFile(filepath.Join(dest, "rvm/cmd"))).To(Equal([]byte("echo 'hi there'; exit 3\n")))
 		info, err := os.Stat(filepath.Join(dest, "init"))
 		Expect(err).NotTo(HaveOccurred())

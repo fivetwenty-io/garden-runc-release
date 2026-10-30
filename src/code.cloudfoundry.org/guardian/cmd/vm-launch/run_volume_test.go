@@ -293,6 +293,42 @@ var _ = Describe("run with a volume", func() {
 		noWorkDirs()
 	})
 
+	It("tells the guest root image and the volume image apart in /rvm/disks by the sizes of the drives the hypervisor gets", func() {
+		requireOpenat2()
+		// With room in the work directory, this quota would make the root
+		// image exactly the volume image's size.
+		limit := defaultImageSize/bytesPerMiB + rootDiskHeadroomMiB
+		GinkgoT().Setenv("VCAP_APPLICATION", `{"application_id":"`+testAppID+`","process_type":"web","name":"app","limits":{"disk":`+strconv.Itoa(limit)+`}}`)
+		initrdCopy := filepath.Join(GinkgoT().TempDir(), "initrd")
+		sizesFile := filepath.Join(GinkgoT().TempDir(), "sizes")
+		writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), fdThreeChecks(img)+initramfsAt("4")+
+			`cp "$initrd" `+shellQuote(initrdCopy)+` || exit 1
+stat -L -c %s /proc/self/fd/3 /proc/self/fd/5 >`+shellQuote(sizesFile)+` || exit 1
+`)
+		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
+
+		raw, err := os.ReadFile(sizesFile)
+		Expect(err).NotTo(HaveOccurred())
+		sizes := strings.Fields(string(raw))
+		Expect(sizes).To(HaveLen(2))
+		Expect(sizes[0]).To(Equal(strconv.Itoa(defaultImageSize)))
+		root, err := strconv.ParseInt(sizes[1], 10, 64)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(root).NotTo(Equal(int64(defaultImageSize)))
+		var st syscall.Statfs_t
+		Expect(syscall.Statfs(tmp, &st)).To(Succeed())
+		if int64(st.Bavail)*st.Bsize/bytesPerMiB >= int64(limit) {
+			Expect(root).To(Equal(int64(defaultImageSize - bytesPerMiB)))
+		}
+
+		initrd, err := os.ReadFile(initrdCopy)
+		Expect(err).NotTo(HaveOccurred())
+		_, byName := archiveEntries(initrd)
+		Expect(string(byName["rvm/disks"].data)).To(Equal(fmt.Sprintf("RVM_ROOT_SECTORS=%d\nRVM_ROOT_INODE_RATIO=%d\nRVM_VOLUME_SECTORS=%d\n", root/512, inodeRatioFor(root), defaultImageSize/512)))
+		Expect(string(byName["rvm/mounts"].data)).NotTo(ContainSubstring("RVM_VOLUME_DEVICE"))
+		noWorkDirs()
+	})
+
 	It("gives Firecracker the locked image as its one drive", func() {
 		requireOpenat2()
 		fcCopy := filepath.Join(GinkgoT().TempDir(), "fc.json")

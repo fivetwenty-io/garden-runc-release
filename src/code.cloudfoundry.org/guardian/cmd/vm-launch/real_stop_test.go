@@ -53,15 +53,16 @@ func superviseRealStop(command, ready string, later ...laterSignal) realStop {
 	qemu := realQEMU()
 	requireMicrovm(qemu)
 	g := taskGuest(command)
+	withRealRoot(&g)
 	f, err := newInitramfs(guestBusybox(), g)
 	Expect(err).NotTo(HaveOccurred())
 	DeferCleanup(f.Close)
 
 	var r realStop
 	bootWithRetry(func() bool {
-		files, _, initrdPath, _, _ := hypervisorFiles(nil, withUserspaceMark(f), nil, nil)
+		files, _, initrdPath, _, rootPath := hypervisorFiles(nil, withUserspaceMark(f), nil, realRootImage())
 		consoleLog := filepath.Join(GinkgoT().TempDir(), "console.log")
-		argv := consoleLogArgv(markedArgv(tcgArgv(qemu, qemuArgv(art, initrdPath, minGuestMemoryMiB, g.nw, "", 0))), consoleLog)
+		argv := consoleLogArgv(markedArgv(tcgArgv(qemu, withRealRootDrive(qemuArgv(art, initrdPath, minGuestMemoryMiB, g.nw, "", 0), rootPath))), consoleLog)
 		cmd := newHypervisorCmd(argv, files)
 		stderr := &safeBuffer{}
 		cmd.Stderr = stderr

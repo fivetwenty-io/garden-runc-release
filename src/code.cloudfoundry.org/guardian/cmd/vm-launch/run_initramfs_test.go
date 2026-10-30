@@ -83,6 +83,36 @@ var _ = Describe("run with the initramfs in a memfd", func() {
 		Expect(os.ReadDir(tmp)).To(BeEmpty())
 	})
 
+	// initrdOf runs a QEMU guest whose fake hypervisor copies the initramfs
+	// it gets, and returns the archive's entries by name.
+	initrdOf := func() map[string]cpioEntry {
+		initrdCopy := filepath.Join(art, "initrd-copy")
+		writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), `cp "$initrd" `+shellQuote(initrdCopy)+` || exit 1
+`)
+		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
+		raw, err := os.ReadFile(initrdCopy)
+		Expect(err).NotTo(HaveOccurred())
+		_, byName := archiveEntries(raw)
+		return byName
+	}
+
+	It("gives the guest the root image's size in sectors and its inode ratio in /rvm/disks, with both boot stages", func() {
+		// A 64 MiB quota leaves 32 MiB after the headroom.
+		GinkgoT().Setenv("VCAP_APPLICATION", `{"limits":{"disk":64}}`)
+		byName := initrdOf()
+		Expect(string(byName["rvm/disks"].data)).To(Equal("RVM_ROOT_SECTORS=65536\nRVM_ROOT_INODE_RATIO=16384\n"))
+		Expect(string(byName["init"].data)).To(Equal(guestRootInit))
+		Expect(byName).To(HaveKey("rvm/init"))
+	})
+
+	It("names no root disk in /rvm/disks without a disk quota, so the guest root stays in RAM", func() {
+		GinkgoT().Setenv("VCAP_APPLICATION", `{"limits":{"mem":512}}`)
+		byName := initrdOf()
+		Expect(byName).To(HaveKey("rvm/disks"))
+		Expect(byName["rvm/disks"].data).To(BeEmpty())
+		Expect(string(byName["init"].data)).To(Equal(guestRootInit))
+	})
+
 	It("closes its copy of the initramfs when the hypervisor cannot be started", func() {
 		Expect(os.Remove(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"))).To(Succeed())
 		Expect(os.WriteFile(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), []byte("not runnable"), 0o644)).To(Succeed())

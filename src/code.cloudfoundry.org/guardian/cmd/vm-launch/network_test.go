@@ -374,14 +374,14 @@ var _ = Describe("guest network", func() {
 		It("adds the network and environment files", func() {
 			names, byName := archiveEntries(buildInitramfsWithEnv([]byte("busybox"), "httpd -f -p $PORT", nw, "export PORT='8080'\n", nil))
 			Expect(names).To(Equal([]string{"bin", "dev", "dev/console", "dev/null", "etc", "proc", "sys", "tmp", "rvm",
-				"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "rvm/limits", "etc/resolv.conf", "rvm/listen-tick", "init", cpioTrailer}))
+				"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "rvm/limits", "etc/resolv.conf", "rvm/listen-tick", "rvm/disks", "rvm/init", "init", cpioTrailer}))
 			Expect(byName["rvm/listen-tick"].mode).To(Equal(uint32(0o010600)))
 			Expect(string(byName["rvm/net"].data)).To(Equal("RVM_ADDRESS='10.0.2.15/24'\nRVM_GATEWAY='10.0.2.2'\nRVM_PORTS='8080'\n"))
 			Expect(string(byName["rvm/env"].data)).To(Equal("export PORT='8080'\n"))
 			Expect(byName["rvm/env"].mode).To(Equal(uint32(0o100600)))
 			Expect(string(byName["etc/resolv.conf"].data)).To(Equal("nameserver 10.0.2.3\n"))
 			Expect(byName["etc/resolv.conf"].mode).To(Equal(uint32(0o100644)))
-			Expect(string(byName["init"].data)).To(Equal(initScript(testNonce, false)))
+			Expect(string(byName["rvm/init"].data)).To(Equal(initScript(testNonce, false)))
 		})
 
 		It("configures the network and environment before the start tag", func() {
@@ -444,8 +444,10 @@ var _ = Describe("guest network", func() {
 			task := &network{address: qemuGuestCIDR, gateway: qemuGateway, resolvConf: "nameserver 10.0.2.3\n"}
 			names, byName := archiveEntries(buildInitramfs([]byte("busybox"), "true", task, nil))
 			lrpNames, lrp := archiveEntries(buildInitramfs([]byte("busybox"), "true", nw, nil))
-			Expect(lrpNames).To(Equal(slices.Insert(slices.Clone(names), slices.Index(names, "init"), "rvm/listen-tick")))
+			Expect(lrpNames).To(Equal(slices.Insert(slices.Clone(names), slices.Index(names, "rvm/disks"), "rvm/listen-tick")))
 			Expect(byName["init"].data).To(Equal(lrp["init"].data))
+			Expect(byName["rvm/init"].data).To(Equal(lrp["rvm/init"].data))
+			Expect(byName["rvm/disks"].data).To(Equal(lrp["rvm/disks"].data))
 			Expect(string(lrp["rvm/net"].data)).To(Equal(string(byName["rvm/net"].data) + "RVM_PORTS='8080'\n"))
 			Expect(byName["etc/resolv.conf"].data).To(Equal(lrp["etc/resolv.conf"].data))
 			Expect(byName["rvm/env"].data).To(Equal(lrp["rvm/env"].data))
