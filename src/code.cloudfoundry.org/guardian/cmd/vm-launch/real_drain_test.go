@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -188,7 +189,15 @@ while :; do sleep 0.1; done`)
 		Expect(signalled.IsZero()).To(BeFalse(), "the app never served PORT\n%s", logBuf.String())
 		code, reason := exitCode(res)
 		Expect(code).To(Equal(0), "%s\n%s\n%s", reason, logBuf.String(), out.String())
-		Expect(out.String()).To(Equal("ready\ndraining\nclosed\ndrained\n"))
+		// The guest's sh prints "Terminated" for a child that the stop's
+		// SIGTERM or the app's kill ends, depending on what runs at the time.
+		var said []string
+		for _, line := range strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n") {
+			if line != "Terminated" {
+				said = append(said, line)
+			}
+		}
+		Expect(said).To(Equal([]string{"ready", "draining", "closed", "drained"}), out.String())
 
 		// A connection made a second into the drain, well after the stop
 		// request reached the guest, still reached the app; and once the
