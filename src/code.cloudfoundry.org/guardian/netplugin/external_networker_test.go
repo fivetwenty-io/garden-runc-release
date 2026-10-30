@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"code.cloudfoundry.org/commandrunner/fake_command_runner"
@@ -319,11 +320,11 @@ var _ = Describe("ExternalNetworker", func() {
 					containerSpec.Properties[backend.AnnotationKey] = string(backend.VMFirecracker)
 				})
 
-				It("creates tap0 for the group, filters the guest, then raises it, enables forwarding and translates egress to the container IP, in order", func() {
+				It("creates tap0 for the group, filters the guest, routes the proxy's replies, then raises it, enables forwarding and translates egress to the container IP, in order", func() {
 					Expect(plugin.Network(logger, containerSpec, 42)).To(Succeed())
 
 					cmds := fakeCommandRunner.ExecutedCommands()
-					Expect(cmds).To(HaveLen(11))
+					Expect(cmds).To(HaveLen(14))
 					Expect(cmds[0].Path).To(Equal("some/path"))
 
 					iptables := "/var/vcap/data/gdn/assets/sbin/iptables"
@@ -339,6 +340,9 @@ var _ = Describe("ExternalNetworker", func() {
 						nsenterArgs(iptables, "-A", "FORWARD", "-i", "tap0", "!", "-s", "169.254.100.2/32", "-j", "DROP"),
 						nsenterArgs(iptables, "-A", "INPUT", "-i", "tap0", "!", "-s", "169.254.100.2/32", "-j", "DROP"),
 						nsenterArgs(iptables, "-A", "FORWARD", "-o", "tap0", "-m", "conntrack", "!", "--ctstate", "ESTABLISHED,RELATED", "-j", "DROP"),
+						nsenterArgs("ip", "route", "add", "local", "0.0.0.0/0", "dev", "lo", "table", "100"),
+						nsenterArgs("ip", "rule", "add", "fwmark", "0x52564d", "lookup", "100"),
+						nsenterArgs(iptables, "-t", "mangle", "-A", "PREROUTING", "-i", "tap0", "-p", "tcp", "-m", "socket", "--transparent", "-j", "MARK", "--set-mark", "0x52564d"),
 						nsenterArgs("ip", "addr", "add", "169.254.100.1/30", "dev", "tap0"),
 						nsenterArgs("ip", "link", "set", "tap0", "up"),
 						nsenterArgs("sysctl", "-w", "net.ipv4.ip_forward=1"),
@@ -439,6 +443,86 @@ var _ = Describe("ExternalNetworker", func() {
 					}
 				})
 
+				It("routes the proxy's replies after the filters, and before tap0 has an address, is up, or forwards", func() {
+					Expect(plugin.Network(logger, containerSpec, 42)).To(Succeed())
+
+					var inNetns []string
+					for _, cmd := range fakeCommandRunner.ExecutedCommands()[1:] {
+						inNetns = append(inNetns, strings.Join(cmd.Args[3:], " "))
+					}
+					iptables := "/var/vcap/data/gdn/assets/sbin/iptables"
+					route := "ip route add local 0.0.0.0/0 dev lo table 100"
+					rule := "ip rule add fwmark 0x52564d lookup 100"
+					mark := iptables + " -t mangle -A PREROUTING -i tap0 -p tcp -m socket --transparent -j MARK --set-mark 0x52564d"
+					Expect(inNetns).To(ContainElements(route, rule, mark))
+					// Each prefix of the three is inert: a route nothing looks up,
+					// then a rule nothing matches, then the mark.
+					Expect(slices.Index(inNetns, route)).To(BeNumerically("<", slices.Index(inNetns, rule)))
+					Expect(slices.Index(inNetns, rule)).To(BeNumerically("<", slices.Index(inNetns, mark)))
+					lastFilter := slices.Index(inNetns, iptables+" -A FORWARD -o tap0 -m conntrack ! --ctstate ESTABLISHED,RELATED -j DROP")
+					Expect(lastFilter).To(BeNumerically("<", slices.Index(inNetns, route)))
+					for _, later := range []string{"ip addr add 169.254.100.1/30 dev tap0", "ip link set tap0 up", "sysctl -w net.ipv4.ip_forward=1"} {
+						Expect(slices.Index(inNetns, mark)).To(BeNumerically("<", slices.Index(inNetns, later)), later)
+					}
+				})
+
+				It("runs the reply routing that FirecrackerReplyRouting names, with the configured iptables", func() {
+					Expect(plugin.Network(logger, containerSpec, 42)).To(Succeed())
+
+					var inNetns [][]string
+					for _, cmd := range fakeCommandRunner.ExecutedCommands()[1:] {
+						inNetns = append(inNetns, cmd.Args[3:])
+					}
+					steps := netplugin.FirecrackerReplyRouting("/var/vcap/data/gdn/assets/sbin/iptables")
+					Expect(steps).To(HaveLen(3))
+					for _, step := range steps {
+						Expect(inNetns).To(ContainElement(step.Args), step.Description)
+					}
+				})
+
+				It("marks only TCP from tap0 that belongs to a transparent socket, so guest egress is untouched", func() {
+					steps := netplugin.FirecrackerReplyRouting("iptables")
+					mark := steps[2].Args
+					Expect(mark).To(ContainElements("-i", "tap0", "-p", "tcp", "--transparent"))
+					Expect(mark).NotTo(ContainElement("--nowildcard"))
+					Expect(netplugin.FirecrackerProxyMark).To(Equal("0x52564d"))
+					Expect(netplugin.FirecrackerProxyRouteTable).To(Equal("100"))
+				})
+
+				DescribeTable("when a reply routing step fails",
+					func(index int, description string) {
+						step := netplugin.FirecrackerReplyRouting("/var/vcap/data/gdn/assets/sbin/iptables")[index]
+						Expect(step.Description).To(Equal(description))
+						fakeCommandRunner.WhenRunning(fake_command_runner.CommandSpec{
+							Path: "nsenter",
+							Args: nsenterArgs(step.Args...),
+						}, func(cmd *exec.Cmd) error {
+							cmd.Stderr.Write([]byte("routing-stderr-bytes"))
+							return errors.New("routing-failed")
+						})
+
+						err := plugin.Network(logger, containerSpec, 42)
+						Expect(err).To(MatchError(ContainSubstring(description + " in container netns of pid 42")))
+						Expect(err).To(MatchError(ContainSubstring("routing-failed")))
+						Expect(logger).To(gbytes.Say(`setup-firecracker-tap.failed.*routing-stderr-bytes`))
+						// The plugin, the mtu query, tap0, its mtu, the three
+						// filters, and the routing steps up to the failed one ran.
+						Expect(fakeCommandRunner.ExecutedCommands()).To(HaveLen(7 + index + 1))
+						// tap0 never gets an address or comes up, and forwarding is
+						// never enabled, behind routing that did not apply.
+						for _, cmd := range fakeCommandRunner.ExecutedCommands() {
+							joined := strings.Join(cmd.Args, " ")
+							Expect(joined).NotTo(ContainSubstring("net.ipv4.ip_forward=1"))
+							Expect(joined).NotTo(ContainSubstring("tap0 up"))
+							Expect(joined).NotTo(ContainSubstring("ip addr add"))
+						}
+						Expect(resolvConfigurer.ConfigureCallCount()).To(Equal(0))
+					},
+					Entry("the local route", 0, "adding the local route for the port proxy's replies"),
+					Entry("the policy rule", 1, "routing the port proxy's replies through their table"),
+					Entry("the mark, as when xt_socket cannot be loaded", 2, "marking the guest's replies to the transparent port proxy (the socket match needs the xt_socket kernel module)"),
+				)
+
 				It("uses the host gid of an unprivileged mapping that does not start at 0", func() {
 					writeGIDMap("0 100000 65536\n")
 					Expect(plugin.Network(logger, containerSpec, 42)).To(Succeed())
@@ -461,7 +545,8 @@ var _ = Describe("ExternalNetworker", func() {
 					Expect(cmds[4].Args).To(ContainElement("/sbin/iptables"))
 					Expect(cmds[5].Args).To(ContainElement("/sbin/iptables"))
 					Expect(cmds[6].Args).To(ContainElement("/sbin/iptables"))
-					Expect(cmds[10].Args).To(ContainElement("/sbin/iptables"))
+					Expect(cmds[9].Args).To(ContainElement("/sbin/iptables"))
+					Expect(cmds[13].Args).To(ContainElement("/sbin/iptables"))
 				})
 
 				It("does not pass the backend property to the plugin", func() {
@@ -575,7 +660,7 @@ var _ = Describe("ExternalNetworker", func() {
 						Expect(err).To(MatchError(ContainSubstring("addr-failed")))
 						Expect(logger).To(gbytes.Say(`setup-firecracker-tap.failed.*addr-stderr-bytes`))
 
-						Expect(fakeCommandRunner.ExecutedCommands()).To(HaveLen(8))
+						Expect(fakeCommandRunner.ExecutedCommands()).To(HaveLen(11))
 						Expect(resolvConfigurer.ConfigureCallCount()).To(Equal(0))
 					})
 				})
@@ -622,7 +707,7 @@ var _ = Describe("ExternalNetworker", func() {
 						Expect(logger).To(gbytes.Say(`setup-firecracker-tap.failed.*snat-stderr-bytes`))
 
 						// The SNAT rule is the last step, so every earlier one ran.
-						Expect(fakeCommandRunner.ExecutedCommands()).To(HaveLen(11))
+						Expect(fakeCommandRunner.ExecutedCommands()).To(HaveLen(14))
 						Expect(resolvConfigurer.ConfigureCallCount()).To(Equal(0))
 					})
 				})

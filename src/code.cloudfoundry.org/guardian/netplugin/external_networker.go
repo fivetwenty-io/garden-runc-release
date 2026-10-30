@@ -33,6 +33,14 @@ const (
 	FirecrackerTapCIDR = "169.254.100.1/30"
 	FirecrackerGuestIP = "169.254.100.2"
 
+	// FirecrackerProxyMark marks a packet from the guest that belongs to a
+	// connection of vm-launch's transparent port proxy, and
+	// FirecrackerProxyRouteTable is the routing table that delivers such a
+	// packet locally. Nothing else in the container's network namespace uses
+	// either. The mark spells "RVM".
+	FirecrackerProxyMark       = "0x52564d"
+	FirecrackerProxyRouteTable = "100"
+
 	DefaultIPTablesBin = "/sbin/iptables"
 	defaultProcRoot    = "/proc"
 
@@ -297,8 +305,10 @@ func setupLoopback(log lager.Logger, pid int) error {
 // groups and Diego know the container by. MASQUERADE would not do: it takes
 // the first address of universe scope on the outgoing device, and silk gives
 // eth0 its address with link scope, so the kernel falls back to another device
-// and picks tap0's address, which silk then drops. Destroying the netns removes
-// the device and the rules.
+// and picks tap0's address, which silk then drops. The reply routing steps
+// (see FirecrackerReplyRouting) come after the filters and before tap0 has
+// an address or is up. Destroying the netns removes the device, the rules,
+// and the routes, and Garden destroys the container when a step fails.
 func (p *externalBinaryNetworker) setupFirecrackerTap(log lager.Logger, handle string, pid int, containerIP string) error {
 	log = log.Session("setup-firecracker-tap", lager.Data{"handle": handle, "pid": pid})
 
@@ -319,30 +329,72 @@ func (p *externalBinaryNetworker) setupFirecrackerTap(log lager.Logger, handle s
 		return fmt.Errorf("reading the eth0 mtu in container netns of pid %d: %w", pid, err)
 	}
 
-	tap := FirecrackerTapName
-	guest := FirecrackerGuestIP + "/32"
-	steps := []struct {
-		description string
-		args        []string
-	}{
-		{"creating " + tap, []string{"ip", "tuntap", "add", "dev", tap, "mode", "tap", "group", strconv.FormatUint(uint64(hostGID), 10)}},
-		{"setting the mtu of " + tap, []string{"ip", "link", "set", tap, "mtu", strconv.Itoa(mtu)}},
-		{"dropping spoofed guest sources", []string{p.iptablesBin, "-A", "FORWARD", "-i", tap, "!", "-s", guest, "-j", "DROP"}},
-		{"dropping spoofed guest sources to the container", []string{p.iptablesBin, "-A", "INPUT", "-i", tap, "!", "-s", guest, "-j", "DROP"}},
-		{"dropping connections opened towards the guest", []string{p.iptablesBin, "-A", "FORWARD", "-o", tap, "-m", "conntrack", "!", "--ctstate", "ESTABLISHED,RELATED", "-j", "DROP"}},
-		{"addressing " + tap, []string{"ip", "addr", "add", FirecrackerTapCIDR, "dev", tap}},
-		{"bringing up " + tap, []string{"ip", "link", "set", tap, "up"}},
-		{"enabling ip forwarding", []string{"sysctl", "-w", "net.ipv4.ip_forward=1"}},
-		{"translating guest egress to the container IP", []string{p.iptablesBin, "-t", "nat", "-A", "POSTROUTING", "-s", guest, "-o", "eth0", "-j", "SNAT", "--to-source", egressSource}},
-	}
-	for _, step := range steps {
-		if _, err := p.runInNetns(log, pid, step.args...); err != nil {
-			return fmt.Errorf("%s in container netns of pid %d: %w", step.description, pid, err)
+	for _, step := range FirecrackerTapSteps(p.iptablesBin, hostGID, mtu, egressSource) {
+		if _, err := p.runInNetns(log, pid, step.Args...); err != nil {
+			return fmt.Errorf("%s in container netns of pid %d: %w", step.Description, pid, err)
 		}
 	}
 
 	log.Info("success", lager.Data{"host-gid": hostGID, "mtu": mtu, "egress-source": egressSource})
 	return nil
+}
+
+// FirecrackerTapSteps returns the commands, in the order Garden runs them in
+// a vm-firecracker container's network namespace, that create tap0 for the
+// group hostGID with the given mtu, confine the guest behind it, route the
+// replies to the transparent port proxy, and translate guest egress to
+// egressSource (see setupFirecrackerTap).
+func FirecrackerTapSteps(iptablesBin string, hostGID uint32, mtu int, egressSource string) []NetnsStep {
+	tap := FirecrackerTapName
+	guest := FirecrackerGuestIP + "/32"
+	steps := []NetnsStep{
+		{"creating " + tap, []string{"ip", "tuntap", "add", "dev", tap, "mode", "tap", "group", strconv.FormatUint(uint64(hostGID), 10)}},
+		{"setting the mtu of " + tap, []string{"ip", "link", "set", tap, "mtu", strconv.Itoa(mtu)}},
+		{"dropping spoofed guest sources", []string{iptablesBin, "-A", "FORWARD", "-i", tap, "!", "-s", guest, "-j", "DROP"}},
+		{"dropping spoofed guest sources to the container", []string{iptablesBin, "-A", "INPUT", "-i", tap, "!", "-s", guest, "-j", "DROP"}},
+		{"dropping connections opened towards the guest", []string{iptablesBin, "-A", "FORWARD", "-o", tap, "-m", "conntrack", "!", "--ctstate", "ESTABLISHED,RELATED", "-j", "DROP"}},
+	}
+	steps = append(steps, FirecrackerReplyRouting(iptablesBin)...)
+	return append(steps,
+		NetnsStep{"addressing " + tap, []string{"ip", "addr", "add", FirecrackerTapCIDR, "dev", tap}},
+		NetnsStep{"bringing up " + tap, []string{"ip", "link", "set", tap, "up"}},
+		NetnsStep{"enabling ip forwarding", []string{"sysctl", "-w", "net.ipv4.ip_forward=1"}},
+		NetnsStep{"translating guest egress to the container IP", []string{iptablesBin, "-t", "nat", "-A", "POSTROUTING", "-s", guest, "-o", "eth0", "-j", "SNAT", "--to-source", egressSource}},
+	)
+}
+
+// NetnsStep is one command that Garden runs in a container's network
+// namespace, and what it does, for the error when it fails.
+type NetnsStep struct {
+	Description string
+	Args        []string
+}
+
+// FirecrackerReplyRouting returns the commands, in the order Garden runs
+// them, that deliver the guest's replies on a connection of vm-launch's
+// transparent port proxy to the proxy's socket. That proxy dials the guest
+// from the address of the client it serves (IP_TRANSPARENT), so that the
+// guest sees the client's address, as a runc app or a QEMU guest does.
+// Without these steps the guest's reply to such an address, which is not one
+// of the container's, would be forwarded out of eth0. The mangle rule marks
+// a TCP packet from tap0 when the socket match (xt_socket) finds a
+// transparent socket for it, such as the proxy's, and the policy rule sends
+// a marked packet to a table whose one route delivers every address
+// locally. Only a transparent socket matches, and the match ignores
+// listeners bound to the wildcard address, so guest egress and the guest's
+// connections to the container are routed as before.
+//
+// The order makes every prefix harmless: a route nothing looks up, then a
+// rule no packet matches, and only then the mark. The mark step is the one
+// that needs xt_socket, which iptables loads through the kernel's module
+// autoloader when the rule is added, as it does for conntrack; a kernel that
+// cannot load it fails that step, and with it the container.
+func FirecrackerReplyRouting(iptablesBin string) []NetnsStep {
+	return []NetnsStep{
+		{"adding the local route for the port proxy's replies", []string{"ip", "route", "add", "local", "0.0.0.0/0", "dev", "lo", "table", FirecrackerProxyRouteTable}},
+		{"routing the port proxy's replies through their table", []string{"ip", "rule", "add", "fwmark", FirecrackerProxyMark, "lookup", FirecrackerProxyRouteTable}},
+		{"marking the guest's replies to the transparent port proxy (the socket match needs the xt_socket kernel module)", []string{iptablesBin, "-t", "mangle", "-A", "PREROUTING", "-i", FirecrackerTapName, "-p", "tcp", "-m", "socket", "--transparent", "-j", "MARK", "--set-mark", FirecrackerProxyMark}},
+	}
 }
 
 // containerMTU reads the MTU of eth0 in the network namespace of pid. It goes

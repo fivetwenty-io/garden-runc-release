@@ -45,9 +45,20 @@ func hasCapability(c uint) bool {
 }
 
 // The unit specs for the Firecracker tap check commands and arguments only.
-// This one applies the SNAT rule to a real kernel, in a network namespace of
-// its own, and reads the rule back.
+// These apply the whole tap setup to a real kernel, in a network namespace of
+// its own, and read the SNAT rule and the reply routing back. They run with
+// each iptables flavour that is on PATH: iptables-legacy is the one Garden
+// ships, and plain iptables is often the nf_tables one.
 var _ = Describe("ExternalNetworker Firecracker egress on a real kernel", func() {
+	for _, flavour := range []string{"iptables", "iptables-legacy"} {
+		flavour := flavour
+		Context("with "+flavour, func() {
+			firecrackerOnRealKernel(flavour)
+		})
+	}
+})
+
+func firecrackerOnRealKernel(flavour string) {
 	const (
 		containerIP = "10.255.0.5"
 		// decoyIP is a global address on eth0 that the kernel can list
@@ -85,8 +96,8 @@ var _ = Describe("ExternalNetworker Firecracker egress on a real kernel", func()
 			}
 		}
 		var err error
-		if iptables, err = exec.LookPath("iptables"); err != nil {
-			Skip("iptables is not on PATH")
+		if iptables, err = exec.LookPath(flavour); err != nil {
+			Skip(flavour + " is not on PATH")
 		}
 
 		sleeper := exec.Command("sleep", "60")
@@ -149,4 +160,20 @@ var _ = Describe("ExternalNetworker Firecracker egress on a real kernel", func()
 		Expect(rules).NotTo(ContainElement(ContainSubstring(decoyIP)))
 		Expect(inNetns("ip", "-o", "link", "show", "dev", netplugin.FirecrackerTapName)).To(ContainSubstring("UP"))
 	})
-})
+
+	It("routes the guest's replies to transparent sockets, loading the socket match the kernel needs", func() {
+		spec := garden.ContainerSpec{
+			Handle:     "reply-routing-handle",
+			Network:    "potato",
+			Properties: garden.Properties{backend.AnnotationKey: string(backend.VMFirecracker)},
+		}
+		Expect(plugin.Network(runnerLog, spec, pid)).To(Succeed())
+
+		mangle := strings.Split(strings.TrimSpace(inNetns(iptables, "-t", "mangle", "-S", "PREROUTING")), "\n")
+		Expect(mangle).To(ContainElement(
+			"-A PREROUTING -i "+netplugin.FirecrackerTapName+" -p tcp -m socket --transparent -j MARK --set-xmark "+netplugin.FirecrackerProxyMark+"/0xffffffff"),
+			"iptables -t mangle -S PREROUTING showed %q", mangle)
+		Expect(inNetns("ip", "rule", "show")).To(MatchRegexp(`(?m)^\d+:\s+from all fwmark ` + netplugin.FirecrackerProxyMark + ` lookup ` + netplugin.FirecrackerProxyRouteTable + `\s*$`))
+		Expect(strings.TrimSpace(inNetns("ip", "route", "show", "table", netplugin.FirecrackerProxyRouteTable))).To(Equal("local default dev lo scope host"))
+	})
+}
