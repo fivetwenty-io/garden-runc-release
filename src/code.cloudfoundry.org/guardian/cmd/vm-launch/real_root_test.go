@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"syscall"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -52,6 +53,55 @@ func extLabel(f *os.File) string {
 	Expect(err).NotTo(HaveOccurred())
 	return string(bytes.TrimRight(b, "\x00"))
 }
+
+// allocatedBytes returns the bytes that the host file f holds blocks for, as
+// st_blocks counts them, which is what the container's quota charges.
+func allocatedBytes(f *os.File) int64 {
+	info, err := f.Stat()
+	Expect(err).NotTo(HaveOccurred())
+	st, ok := info.Sys().(*syscall.Stat_t)
+	Expect(ok).To(BeTrue())
+	Expect(info.Size()).To(Equal(int64(realRootBytes)), "the root image changed size")
+	return st.Blocks * 512
+}
+
+// requireHolePunching skips the spec where the file system under the spec's
+// temporary files cannot punch holes, because the host file could not shrink
+// there whatever the guest and QEMU do.
+func requireHolePunching() {
+	f, err := os.CreateTemp(GinkgoT().TempDir(), "holes")
+	Expect(err).NotTo(HaveOccurred())
+	defer f.Close()
+	Expect(f.Truncate(1 << 20)).To(Succeed())
+	if err := syscall.Fallocate(int(f.Fd()), 0x3 /* PUNCH_HOLE|KEEP_SIZE */, 0, 1<<20); err != nil {
+		Skip("the file system under the temporary directory cannot punch holes: " + err.Error())
+	}
+}
+
+// guestBytes reads the value of the key= line in out, a count of bytes the
+// guest printed, as MiB.
+func guestBytes(out, key string) int64 {
+	m := regexp.MustCompile(`(?m)^` + key + `=([0-9]+)\r?$`).FindStringSubmatch(out)
+	Expect(m).NotTo(BeNil(), "no %s= line in\n%s", key, out)
+	n, err := strconv.ParseInt(m[1], 10, 64)
+	Expect(err).NotTo(HaveOccurred())
+	return n
+}
+
+// fillRootCommand fills the guest's root with dd, through /tmp, /, and /var
+// in turn, the last of them asked for far more than the root image holds. It
+// prints each dd's status, the bytes in the files it wrote as written=, and
+// the status of a later 8 MiB write to each of the first two places. dd's own
+// messages go to the console.
+const fillRootCommand = `mkdir -p /var
+dd if=/dev/zero of=/tmp/a bs=1M count=16 2>&1; echo "dd-tmp=$?"
+dd if=/dev/zero of=/b bs=1M count=16 2>&1; echo "dd-root=$?"
+dd if=/dev/zero of=/var/c bs=1M count=200 2>&1; echo "dd-var=$?"
+dd if=/dev/zero of=/tmp/d bs=1M count=8 2>&1; echo "dd-after-tmp=$?"
+dd if=/dev/zero of=/e bs=1M count=8 2>&1; echo "dd-after-root=$?"
+echo "written=$(( $(wc -c </tmp/a) + $(wc -c </b) + $(wc -c </var/c) ))"
+sync
+`
 
 var _ = Describe("the guest root against a real QEMU", func() {
 	It("boots through the overlay root, with the initramfs below and the root image above, and runs the command in it", func() {
@@ -123,4 +173,99 @@ echo "root=$(cat /root-only 2>/dev/null || echo gone)"
 		Expect(extLabel(vol)).To(Equal("rvm-volume"))
 		Expect(out).To(ContainSubstring(exitTag(testNonce) + "0"))
 	})
+
+	Describe("the root image's quota", func() {
+		It("fails a write past the image's capacity with ENOSPC wherever it goes, and never grows the image", func() {
+			g := taskGuest(fillRootCommand + "df -k / | tail -n 1\ndmesg 2>&1 | grep -c overlayfs\necho \"kmsg=$(dmesg 2>&1 | wc -l)\"\n")
+			withRealRoot(&g)
+			root := realRootImage()
+			out := bootRealGuestWith(g, nil, root)
+
+			Expect(out).To(MatchRegexp(`(?m)^dd-tmp=0\r?$`), out)
+			Expect(out).To(MatchRegexp(`(?m)^dd-root=0\r?$`), out)
+			Expect(out).To(MatchRegexp(`(?m)^dd-var=1\r?$`), out)
+			Expect(out).To(MatchRegexp(`(?m)^dd: error writing '/var/c': No space left on device\r?$`), out)
+			Expect(out).To(MatchRegexp(`(?m)^dd-after-tmp=1\r?$`), out)
+			Expect(out).To(MatchRegexp(`(?m)^dd-after-root=1\r?$`), out)
+			Expect(out).NotTo(ContainSubstring("Input/output error"), out)
+
+			// The 64 MiB image holds a little less than 64 MiB of file data.
+			written := guestBytes(out, "written")
+			Expect(written).To(BeNumerically(">", 32<<20+1), out)
+			Expect(written).To(BeNumerically("<", realRootBytes), out)
+			Expect(written).To(BeNumerically(">", realRootBytes-8<<20), "ENOSPC came more than 8 MiB short of the image's size\n"+out)
+
+			// Nothing grew the image, and the host holds blocks for what the
+			// guest wrote.
+			Expect(allocatedBytes(root)).To(BeNumerically(">=", written), out)
+
+			// No overlayfs warning, which would mean the upper layer lacks
+			// d_type or xattrs, and the kernel log was readable to say so.
+			Expect(guestBytes(out, "kmsg")).To(BeNumerically(">", 0), out)
+			Expect(out).To(MatchRegexp(`(?m)^0\r?$`), "grep counted overlayfs lines in the kernel log\n"+out)
+			Expect(out).To(ContainSubstring(exitTag(testNonce) + "0"))
+		})
+
+		It("reports the command's exit status when the command fills the root first", func() {
+			g := taskGuest(fillRootCommand + "exit 7\n")
+			withRealRoot(&g)
+			out := bootRealGuestWith(g, nil, realRootImage())
+
+			Expect(out).To(MatchRegexp(`(?m)^dd-var=1\r?$`), out)
+			Expect(out).To(ContainSubstring("No space left on device"), out)
+			Expect(out).To(ContainSubstring(exitTag(testNonce) + "7"))
+		})
+
+		It("returns the space of files the guest deletes to the host, which discard makes happen", func() {
+			requireHolePunching()
+			const fileMiB = 32
+			write := "dd if=/dev/zero of=/tmp/big bs=1M count=32 2>&1; echo \"dd=$?\"\nsync\n"
+
+			kept := realRootImage()
+			out := bootRealGuestWith(withRealRootGuest(write), nil, kept)
+			Expect(out).To(MatchRegexp(`(?m)^dd=0\r?$`), out)
+			Expect(out).To(ContainSubstring(exitTag(testNonce) + "0"))
+
+			deleted := realRootImage()
+			out = bootRealGuestWith(withRealRootGuest(write+"rm /tmp/big\nsync\nsleep 1\nsync\n"), nil, deleted)
+			Expect(out).To(MatchRegexp(`(?m)^dd=0\r?$`), out)
+			Expect(out).To(ContainSubstring(exitTag(testNonce) + "0"))
+
+			keptBytes, deletedBytes := allocatedBytes(kept), allocatedBytes(deleted)
+			GinkgoWriter.Printf("allocated with the file kept: %d KiB, after the guest deleted it: %d KiB\n", keptBytes/1024, deletedBytes/1024)
+			// The image that kept the file holds its blocks, and the file's
+			// blocks are most of what the other image gave back.
+			Expect(keptBytes).To(BeNumerically(">=", fileMiB<<20), "the host holds no blocks for the file the guest wrote")
+			Expect(keptBytes-deletedBytes).To(BeNumerically(">=", fileMiB<<20*3/4), "discard returned less than three quarters of the file's blocks")
+			// What is left is the file system's metadata and the guest's
+			// small files, an eighth of the image at most.
+			Expect(deletedBytes).To(BeNumerically("<", realRootBytes/8))
+		})
+	})
+
+	It("flushes the volume with sync -f, which the guest's busybox runs on a volume mount", func() {
+		volPath := filepath.Join(GinkgoT().TempDir(), "volume.img")
+		vol, err := os.OpenFile(volPath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(vol.Close)
+		Expect(vol.Truncate(defaultImageSize)).To(Succeed())
+		g := taskGuest(`echo flushed >/home/vcap/data/f
+sync -f /home/vcap/data
+echo "sync-f-volume=$?"
+`)
+		g.vol = &guestVolume{ContainerDir: "/home/vcap/data", ImageName: "volume.img"}
+		withRealRoot(&g)
+		out := bootRealGuestWith(g, vol, realRootImage())
+
+		Expect(out).To(MatchRegexp(`(?m)^sync-f-volume=0\r?$`), out)
+		Expect(out).To(ContainSubstring(exitTag(testNonce) + "0"))
+		Expect(out).NotTo(ContainSubstring("vm-launch guest setup"), out)
+	})
 })
+
+// withRealRootGuest returns a guest that runs command on a real root image.
+func withRealRootGuest(command string) guestContents {
+	g := taskGuest(command)
+	withRealRoot(&g)
+	return g
+}
