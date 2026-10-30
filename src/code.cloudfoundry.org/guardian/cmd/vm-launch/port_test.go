@@ -486,28 +486,52 @@ var _ = Describe("the port gate", func() {
 			"the guest no longer listens on port 8080; it is closed in the container\n"))
 	})
 
-	It("ends while an open is in progress without logging its outcome", func() {
-		release := make(chan struct{})
-		opening := make(chan struct{}, 1)
-		opener.open = func() error {
-			opening <- struct{}{}
-			<-release
-			return errors.New("the hypervisor is gone")
-		}
+	DescribeTable("ends while an open is in progress without logging its outcome",
+		func(fails bool) {
+			release := make(chan struct{})
+			opening := make(chan struct{}, 1)
+			opener.open = func() error {
+				opening <- struct{}{}
+				<-release
+				if fails {
+					return errors.New("the hypervisor is gone")
+				}
+				return nil
+			}
+			start()
+			var releaseOnce sync.Once
+			DeferCleanup(func() { releaseOnce.Do(func() { close(release) }) })
+			gate.set(true)
+			Eventually(opening).Should(Receive())
+			ended := make(chan struct{})
+			go func() {
+				gate.end()
+				close(ended)
+			}()
+			// The open finishes only once end has closed the gate's ended
+			// channel, which is what makes the gate drop its log line.
+			Eventually(gate.ended).Should(BeClosed())
+			Consistently(ended, 50*time.Millisecond).ShouldNot(BeClosed())
+			releaseOnce.Do(func() { close(release) })
+			Eventually(ended).Should(BeClosed())
+			// An open that went through and was never shown as open leaves
+			// nothing for end to say closes.
+			Expect(logBuf.String()).To(BeEmpty())
+		},
+		Entry("an open that fails", true),
+		Entry("an open that succeeds", false),
+	)
+
+	It("does not say at end that a port closes when its close was logged at shutDown", func() {
 		start()
-		var releaseOnce sync.Once
-		DeferCleanup(func() { releaseOnce.Do(func() { close(release) }) })
 		gate.set(true)
-		Eventually(opening).Should(Receive())
-		ended := make(chan struct{})
-		go func() {
-			gate.end()
-			close(ended)
-		}()
-		Consistently(ended, 50*time.Millisecond).ShouldNot(BeClosed())
-		releaseOnce.Do(func() { close(release) })
-		Eventually(ended).Should(BeClosed())
-		Expect(logBuf.String()).To(BeEmpty())
+		Eventually(opener.got).Should(Equal([]string{"open"}))
+		gate.shutDown()
+		Eventually(logBuf.String).Should(HaveSuffix("vm-launch is stopping; port 8080 is closed in the container\n"))
+		gate.end()
+		Expect(opener.got()).To(Equal([]string{"open", "close"}))
+		Expect(logBuf.String()).To(Equal("the guest listens on port 8080; it is open in the container\n" +
+			"vm-launch is stopping; port 8080 is closed in the container\n"))
 	})
 })
 
