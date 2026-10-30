@@ -534,7 +534,7 @@ func run(argv []string, logger *log.Logger) int {
 		// no-op.
 		gates = startPortGates(nw.ports, open, gateRetry, logger)
 		defer gates.end()
-		sup.stopping = gates.shutDown
+		sup.closePorts = gates.shutDown
 		sup.listen = gates.set
 	}
 	res, err := sup.run(cmd, nonce)

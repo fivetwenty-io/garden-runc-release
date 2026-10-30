@@ -360,6 +360,24 @@ var _ = Describe("the port gate", func() {
 			"the guest no longer listens on port 8080; it is closed in the container\n"))
 	})
 
+	It("takes each report as the port's state, so a repeated report changes nothing and a later report makes good one that was lost", func() {
+		start()
+		// The guest's full reports repeat the port's state.
+		for i := 0; i < 3; i++ {
+			gate.set(true)
+		}
+		Eventually(opener.got).Should(Equal([]string{"open"}))
+		Consistently(opener.got, 100*time.Millisecond).Should(Equal([]string{"open"}))
+		// The line that said the app stopped listening was lost, and the
+		// next full report says it.
+		gate.set(false)
+		Eventually(opener.got).Should(Equal([]string{"open", "close"}))
+		gate.set(false)
+		Consistently(opener.got, 100*time.Millisecond).Should(Equal([]string{"open", "close"}))
+		Expect(logBuf.String()).To(Equal("the guest listens on port 8080; it is open in the container\n" +
+			"the guest no longer listens on port 8080; it is closed in the container\n"))
+	})
+
 	It("acts on the latest state only, and never blocks the guest console", func() {
 		release := make(chan struct{})
 		opening := make(chan struct{}, 1)
@@ -1404,6 +1422,40 @@ var _ = Describe("the guest listen watcher", func() {
 echo() { if [ -z "${rvm_failed_once:-}" ]; then rvm_failed_once=1; return 1; fi; command echo "$@"; }
 `
 			Expect(watchRound(shell, 8080, procNetLine("00000000:1F90", "0A"), "", prelude, "0")).To(Equal(listening), shell.name)
+		},
+		shellEntries(""),
+	)
+
+	// rounds is a prelude that ends the watcher after n rounds.
+	rounds := func(n int) string {
+		return `rvm_rounds=0
+rvm_round_end() { rvm_rounds=$((rvm_rounds + 1)); [ "$rvm_rounds" -lt ` + strconv.Itoa(n) + ` ] || exit 0; }
+`
+	}
+
+	DescribeTable("reports every port, changed or not, once in every guestListenRefresh looks",
+		func(shellOf func() guestShell) {
+			shell := shellOf()
+			ports := []int{8080, 8081}
+			up := procNetLine("00000000:1F90", "0A")
+			// 8080 listens all along and 8081 never does; neither changes.
+			all := listenLine(8080, true) + listenLine(8081, false)
+			Expect(watchPorts(shell, ports, up, "", rounds(guestListenRefresh-1), []int{8080})).To(BeEmpty(), shell.name)
+			Expect(watchPorts(shell, ports, up, "", rounds(guestListenRefresh), []int{8080})).To(Equal(all), shell.name)
+			Expect(watchPorts(shell, ports, up, "", rounds(2*guestListenRefresh-1), []int{8080})).To(Equal(all), shell.name)
+			Expect(watchPorts(shell, ports, up, "", rounds(2*guestListenRefresh), []int{8080})).To(Equal(all+all), shell.name)
+			// A change in the first look is reported then, and again in the
+			// full report.
+			Expect(watchPorts(shell, ports, up, "", rounds(guestListenRefresh), nil)).To(Equal(listenLine(8080, true)+all), shell.name)
+		},
+		shellEntries(""),
+	)
+
+	DescribeTable("reports the last answer in the full report when that look fails",
+		func(shellOf func() guestShell) {
+			shell := shellOf()
+			Expect(watchPorts(shell, []int{8080}, unreadable, "", rounds(guestListenRefresh), []int{8080})).To(Equal(listening), shell.name)
+			Expect(watchPorts(shell, []int{8080}, unreadable, "", rounds(guestListenRefresh), nil)).To(Equal(notListening), shell.name)
 		},
 		shellEntries(""),
 	)

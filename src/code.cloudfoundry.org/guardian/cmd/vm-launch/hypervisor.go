@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"code.cloudfoundry.org/guardian/backend"
+	"golang.org/x/sys/unix"
 )
 
 // Artifact layout below the artifacts directory. It must match
@@ -745,11 +746,13 @@ type runResult struct {
 	state *os.ProcessState
 }
 
-// supervisor runs one hypervisor process: it streams the serial console
-// through a serialFilter, stops the guest command or forwards signals, and
-// kills the hypervisor when it outlives deadline after the first signal, or
-// grace after the guest reported its status without a signal (a guest that
-// hangs on its way down must not hang the app process).
+// supervisor runs one hypervisor process: it reads the serial console
+// through a serialFilter as fast as the guest writes it, passes the guest
+// command's output on to stdout through an outputQueue, stops the guest
+// command or forwards signals, and kills the hypervisor when it outlives
+// deadline after the first signal, or grace after the guest reported its
+// status without a signal (a guest that hangs on its way down must not hang
+// the app process).
 //
 // The supervisor acts on the first signal according to what the guest has
 // reported so far. While the guest's command runs, after the start tag and
@@ -765,6 +768,15 @@ type runResult struct {
 // changes nothing when a stop request was written, so it never cuts a drain
 // short. No later signal moves the deadline, and nothing the guest writes
 // moves it either: the supervisor never acts on stop data from the guest.
+//
+// While the command drains, its ports stay as the guest reports them, so a
+// new connection still reaches an app that still listens, as it would in a
+// container while the route goes away. The supervisor runs closePorts when
+// the drain ends: when the guest reports the command's status, or when the
+// deadline kills the hypervisor. A port the app stops listening on during
+// the drain closes before that, on the guest's listen report. A signal that
+// the supervisor forwards runs closePorts at once, because the hypervisor
+// may end at once.
 type supervisor struct {
 	stdout  io.Writer
 	logger  *log.Logger
@@ -775,11 +787,15 @@ type supervisor struct {
 	// deadline bounds how long the hypervisor may run after the first
 	// signal, whatever the supervisor did with it.
 	deadline time.Duration
-	// stopping, when set, runs once at the first signal, after the signal
-	// is logged and before the supervisor forwards it or asks the guest
-	// command to stop, so what stopping logs comes after the signal's line.
-	// vm-launch uses it to stop accepting guest connections.
-	stopping func()
+	// closePorts, when set, runs once, when the guest is about to go: at a
+	// signal the supervisor forwards, after the signal is logged and before
+	// it is forwarded; when the guest reports its status after a stop
+	// request; or when the deadline runs out, before the kill. vm-launch uses
+	// it to stop accepting guest connections.
+	closePorts func()
+	// outputLimit bounds the guest output waiting for stdout (see
+	// outputQueue). Zero means guestOutputLimit.
+	outputLimit int
 	// started, when set, runs once the hypervisor has started and before
 	// anything else. vm-launch uses it to close its copies of the files the
 	// hypervisor inherited.
@@ -787,6 +803,10 @@ type supervisor struct {
 	// listen, when set, gets the guest's listen lines (see serialFilter). It
 	// must not block.
 	listen func(port int, up bool)
+	// reported, when set, runs once the supervisor has acted on the guest's
+	// status line, so a spec can send a signal that comes after it. It must
+	// not block. vm-launch leaves it unset.
+	reported func()
 }
 
 // run starts cmd and waits for it. The error is non-nil only when the
@@ -799,25 +819,32 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 	if cmd.Stdin != nil {
 		return runResult{}, errors.New("the hypervisor's stdin is already set")
 	}
-	filter := newSerialFilter(s.stdout, nonce)
-	if s.listen != nil {
-		filter.onListen(nonce, s.listen)
+	if cmd.Stdout != nil {
+		return runResult{}, errors.New("the hypervisor's stdout is already set")
 	}
-	pipe, err := cmd.StdoutPipe()
+	serial, serialOut, err := os.Pipe()
 	if err != nil {
 		return runResult{}, fmt.Errorf("creating serial pipe: %w", err)
 	}
+	defer serial.Close()
 	console, consoleIn, err := os.Pipe()
 	if err != nil {
+		serialOut.Close()
 		return runResult{}, fmt.Errorf("creating the hypervisor's stdin pipe: %w", err)
 	}
 	defer consoleIn.Close()
-	cmd.Stdin = console
+	growPipe(serial, s.logger)
+	cmd.Stdin, cmd.Stdout = console, serialOut
 	err = cmd.Start()
-	// Only the hypervisor keeps the read end, so a write after it has gone
-	// fails at once instead of filling the pipe.
+	// Only the hypervisor keeps the read end of its stdin, so a write after
+	// it has gone fails at once instead of filling the pipe; and only the
+	// hypervisor keeps the write end of its stdout, so the console reaches
+	// its end when the hypervisor exits.
 	if cerr := console.Close(); cerr != nil {
 		s.logger.Printf("closing vm-launch's copy of the hypervisor's stdin: %v", cerr)
+	}
+	if cerr := serialOut.Close(); cerr != nil {
+		s.logger.Printf("closing vm-launch's copy of the hypervisor's stdout: %v", cerr)
 	}
 	if err != nil {
 		return runResult{}, fmt.Errorf("starting hypervisor %s: %w", cmd.Path, err)
@@ -826,10 +853,21 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 		s.started()
 	}
 
+	limit := s.outputLimit
+	if limit <= 0 {
+		limit = guestOutputLimit
+	}
+	output := newOutputQueue(s.stdout, limit, s.logger)
+	filter := newSerialFilter(output, nonce)
+	if s.listen != nil {
+		filter.onListen(nonce, s.listen)
+	}
 	type ended struct{ copyErr, waitErr error }
 	done := make(chan ended, 1)
 	go func() {
-		_, copyErr := io.Copy(filter, pipe)
+		// The filter writes to the queue, which never blocks, so this reads
+		// the console as fast as the guest writes it.
+		_, copyErr := io.Copy(filter, serial)
 		done <- ended{copyErr: copyErr, waitErr: cmd.Wait()}
 	}()
 
@@ -840,6 +878,12 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 	// signalled is set at the first signal, and asked once the stop request
 	// for it is written.
 	signalled, asked := false, false
+	closePorts := func() {
+		if s.closePorts != nil {
+			s.closePorts()
+			s.closePorts = nil
+		}
+	}
 	forward := func(sig os.Signal) {
 		if err := cmd.Process.Signal(sig); err != nil && !errors.Is(err, os.ErrProcessDone) {
 			s.logger.Printf("forwarding %v to the hypervisor: %v", sig, err)
@@ -873,18 +917,18 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 			default:
 				s.logger.Printf("received %v, asking the guest command to stop", sig)
 			}
-			if s.stopping != nil {
-				s.stopping()
-				s.stopping = nil
-			}
 			if started && !reported {
 				if err := requestStop(consoleIn, nonce); err != nil {
 					s.logger.Printf("sending the stop request to the guest failed: %v; forwarding %v to the hypervisor", err, sig)
-					forward(sig)
 				} else {
 					asked = true
 				}
-			} else {
+			}
+			// The ports stay as the guest reports them while the guest
+			// command drains, and close at once when the hypervisor gets the
+			// signal, which may end it at once.
+			if !asked {
+				closePorts()
 				forward(sig)
 			}
 			if kill == nil {
@@ -893,13 +937,23 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 			}
 		case <-markerSeen:
 			markerSeen = nil
+			// After a stop request, the guest's status ends the drain.
+			// Without one, the ports close when the guest ends, as they do
+			// when the guest command ends of its own accord.
+			if asked {
+				closePorts()
+			}
 			if kill == nil {
 				kill = time.After(s.grace)
 				killReason = fmt.Sprintf("hypervisor still running %v later, killing it", s.grace)
 			}
+			if s.reported != nil {
+				s.reported()
+			}
 		case <-kill:
 			kill = nil
 			s.logger.Print(killReason)
+			closePorts()
 			if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 				s.logger.Printf("killing the hypervisor: %v", err)
 			}
@@ -912,8 +966,9 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 				s.logger.Printf("waiting for the hypervisor: %v", e.waitErr)
 			}
 			filter.finish()
-			if filter.writeErr != nil {
-				s.logger.Printf("writing guest output: %v", filter.writeErr)
+			output.close(outputFlushTimeout)
+			if err := output.err(); err != nil {
+				s.logger.Printf("writing guest output: %v", err)
 			}
 			switch {
 			case filter.started():
@@ -931,6 +986,28 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 			res.state = cmd.ProcessState
 			return res, nil
 		}
+	}
+}
+
+// serialPipeSize is the size vm-launch asks for the serial console's pipe:
+// what the guest may write while vm-launch is not scheduled before
+// Firecracker, which drops what it cannot write at once, loses any of it.
+const serialPipeSize = 1 << 20
+
+// growPipe asks the kernel for a pipe of serialPipeSize behind f, and logs a
+// refusal, after which the pipe keeps the size it has.
+func growPipe(f *os.File, logger *log.Logger) {
+	raw, err := f.SyscallConn()
+	if err == nil {
+		cerr := raw.Control(func(fd uintptr) {
+			_, err = unix.FcntlInt(fd, unix.F_SETPIPE_SZ, serialPipeSize)
+		})
+		if cerr != nil {
+			err = cerr
+		}
+	}
+	if err != nil {
+		logger.Printf("enlarging the serial console's pipe to %d bytes: %v", serialPipeSize, err)
 	}
 }
 

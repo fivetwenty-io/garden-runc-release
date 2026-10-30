@@ -893,52 +893,107 @@ sleep 0.3
 		Expect(logBuf.String()).To(ContainSubstring("the guest no longer listens on port " + f + "; it is closed in the container\n"))
 	})
 
-	It("removes QEMU's forwarding rule at SIGTERM while the hypervisor still runs", func() {
-		port := freePort()
-		p := strconv.Itoa(port)
-		// The fake QEMU never reads the stop request that vm-launch writes
-		// at the signal, and ignores SIGTERM, so only the gate's shutDown
-		// at the signal can remove the rule.
-		_, qmpLog := portHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), port, `trap '' TERM
-`+qmpGreeting+`listen 1
+	// runSignalledVM runs vm-launch on the fake QEMU in a helper process,
+	// which the fake's SIGTERM stops in place of this test process, and
+	// returns the helper's log.
+	runSignalledVM := func(kind backend.Kind, p string) (*exec.Cmd, string) {
+		ctx, cancel := context.WithTimeout(context.Background(), runVMTimeout)
+		defer cancel()
+		var stderr bytes.Buffer
+		cmd := exec.CommandContext(ctx, os.Args[0])
+		cmd.Env = []string{helperArtifacts + "=" + art, helperBackend + "=" + string(kind), "PORT=" + p, "TMPDIR=" + tmp, "PATH=" + os.Getenv("PATH")}
+		cmd.Stderr = &stderr
+		_ = cmd.Run()
+		Expect(ctx.Err()).NotTo(HaveOccurred(), "vm-launch was still running after %v; its log so far:\n%s", runVMTimeout, stderr.String())
+		Expect(cmd.ProcessState.Sys().(syscall.WaitStatus).Signaled()).To(BeFalse(), stderr.String())
+		return cmd, stderr.String()
+	}
+	// drainStart has the fake QEMU open the port, signal vm-launch, and
+	// check that the stop request comes and that the forwarding rule stays
+	// for a while after it.
+	drainStart := func() string {
+		return `trap '' TERM
+` + qmpGreeting + `listen 1
 qmp_recv
 qmp_reply '{"return": {}}'
 qmp_recv
 qmp_reply '{"return": ""}'
 kill -TERM "$PPID"
+IFS= read -r -t 10 stop || { echo "no stop request came in 10 seconds" >&2; exit 1; }
+[ "$stop" = "RVM_STOP_$nonce" ] || { echo "the stop request was $stop" >&2; exit 1; }
+if IFS= read -r -t 0.5 line <&"$qmp"; then echo "QMP request during the drain: $line" >&2; exit 1; fi
+`
+	}
+
+	It("keeps QEMU's forwarding rule while the guest command drains, and removes it when the guest stops listening", func() {
+		port := freePort()
+		p := strconv.Itoa(port)
+		_, qmpLog := portHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), port, drainStart()+`listen 0
+qmp_recv
+qmp_reply '{"return": "host forwarding rule for tcp:0.0.0.0:`+p+` removed\r\n"}'
+sleep 0.3
+`)
+		cmd, stderr := runSignalledVM(backend.VMQemu, p)
+		Expect(cmd.ProcessState.ExitCode()).To(Equal(0), stderr)
+		Expect(os.ReadFile(qmpLog)).To(Equal([]byte(qmpCapabilities + "\n" + hostfwdAdd(2, port) + "\n" + hostfwdRemove(3, port) + "\n")))
+		lines := strings.SplitAfter(stderr, "\n")
+		received := slices.Index(lines, "vm-launch: received terminated, asking the guest command to stop\n")
+		closed := slices.Index(lines, "vm-launch: the guest no longer listens on port "+p+"; it is closed in the container\n")
+		Expect([]int{received, closed}).NotTo(ContainElement(-1), stderr)
+		Expect(closed).To(BeNumerically(">", received), stderr)
+		Expect(stderr).NotTo(ContainSubstring("vm-launch is stopping"))
+	})
+
+	It("keeps QEMU's forwarding rule while the guest command drains, and removes it when the guest reports its status", func() {
+		port := freePort()
+		p := strconv.Itoa(port)
+		// The fake reports the status while the rule is still up, and then
+		// waits for the remove that the status brings.
+		_, qmpLog := portHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), port, drainStart()+`echo "RVM_EXIT_$nonce=0"
 qmp_recv
 qmp_reply '{"return": "host forwarding rule for tcp:0.0.0.0:`+p+` removed\r\n"}'
 exit 0
 `)
-		// vm-launch runs in a helper process, which the signal stops in
-		// place of this test process.
-		ctx, cancel := context.WithTimeout(context.Background(), runVMTimeout)
-		defer cancel()
-		var stderr bytes.Buffer
-		cmd := exec.CommandContext(ctx, os.Args[0])
-		cmd.Env = []string{helperArtifacts + "=" + art, "PORT=" + p, "TMPDIR=" + tmp, "PATH=" + os.Getenv("PATH")}
-		cmd.Stderr = &stderr
-		err := cmd.Run()
-		Expect(ctx.Err()).NotTo(HaveOccurred(), "vm-launch was still running after %v; its log so far:\n%s", runVMTimeout, stderr.String())
-		Expect(err).To(HaveOccurred(), stderr.String())
-		Expect(cmd.ProcessState.Sys().(syscall.WaitStatus).Signaled()).To(BeFalse(), stderr.String())
-		Expect(cmd.ProcessState.ExitCode()).To(Equal(143), stderr.String())
+		cmd, stderr := runSignalledVM(backend.VMQemu, p)
+		Expect(cmd.ProcessState.ExitCode()).To(Equal(0), stderr)
 		Expect(os.ReadFile(qmpLog)).To(Equal([]byte(qmpCapabilities + "\n" + hostfwdAdd(2, port) + "\n" + hostfwdRemove(3, port) + "\n")))
-		// The gate logs the open while the signal comes, so either line may
-		// come first. The close follows both, and is logged at shutDown, or
-		// at the gate's end when QEMU exits before the gate reads the reply.
-		lines := strings.SplitAfter(stderr.String(), "\n")
-		opened := slices.Index(lines, "vm-launch: the guest listens on port "+p+"; it is open in the container\n")
+		// The close is logged at shutDown, or at the gate's end when QEMU
+		// exits before the gate reads the reply.
+		lines := strings.SplitAfter(stderr, "\n")
 		received := slices.Index(lines, "vm-launch: received terminated, asking the guest command to stop\n")
 		closed := slices.IndexFunc(lines, func(l string) bool {
 			return l == "vm-launch: vm-launch is stopping; port "+p+" is closed in the container\n" ||
 				l == "vm-launch: the guest has stopped, so port "+p+" closes in the container\n"
 		})
-		Expect([]int{opened, received, closed}).NotTo(ContainElement(-1), stderr.String())
-		Expect(closed).To(BeNumerically(">", max(opened, received)), stderr.String())
-		Expect(strings.Count(stderr.String(), "it is open in the container")).To(Equal(1), stderr.String())
-		Expect(strings.Count(stderr.String(), "closed in the container")+strings.Count(stderr.String(), "closes in the container")).To(Equal(1), stderr.String())
-		Expect(stderr.String()).To(HaveSuffix("\nvm-launch: stopped by terminated before the guest reported a status; exiting 143\n"))
+		Expect([]int{received, closed}).NotTo(ContainElement(-1), stderr)
+		Expect(closed).To(BeNumerically(">", received), stderr)
+		Expect(strings.Count(stderr, "closed in the container")+strings.Count(stderr, "closes in the container")).To(Equal(1), stderr)
+	})
+
+	It("keeps a Firecracker guest's port open while the guest command drains, and closes it when the guest stops listening", func() {
+		port := freePort()
+		p := strconv.Itoa(port)
+		// The fake Firecracker checks the port from the container's side,
+		// where vm-launch's proxy holds it.
+		portHypervisor(filepath.Join(art, "firecracker/firecracker"), port, `trap '' TERM
+listen 1
+await open
+kill -TERM "$PPID"
+IFS= read -r -t 10 stop || { echo "no stop request came in 10 seconds" >&2; exit 1; }
+[ "$stop" = "RVM_STOP_$nonce" ] || { echo "the stop request was $stop" >&2; exit 1; }
+sleep 0.5
+await open
+listen 0
+await closed
+`)
+		cmd, stderr := runSignalledVM(backend.VMFirecracker, p)
+		Expect(cmd.ProcessState.ExitCode()).To(Equal(0), stderr)
+		lines := strings.SplitAfter(stderr, "\n")
+		received := slices.Index(lines, "vm-launch: received terminated, asking the guest command to stop\n")
+		closed := slices.Index(lines, "vm-launch: the guest no longer listens on port "+p+"; it is closed in the container\n")
+		Expect([]int{received, closed}).NotTo(ContainElement(-1), stderr)
+		Expect(closed).To(BeNumerically(">", received), stderr)
+		Expect(stderr).NotTo(ContainSubstring("vm-launch is stopping"))
 	})
 
 	It("names the port conflict when QEMU cannot add the forwarding rule, and keeps the guest running", func() {

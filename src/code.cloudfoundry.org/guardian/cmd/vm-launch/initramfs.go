@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -302,8 +303,13 @@ const guestSetLimits = `ulimit -n "$RVM_NOFILE_HARD" && ulimit -S -n "$RVM_NOFIL
 // than loopback, which is what a connection forwarded from the container
 // reaches, in one pass over the tables, and prints a listen line, the listen
 // tag, the port, a colon, and 1 or 0, each time the answer for a port
-// changes. The ports change independently of each other. It starts after the start tag, so vm-launch reads
-// every listen line as part of the command's run. The kernel writes an IPv4
+// changes. The ports change independently of each other. Every
+// guestListenRefresh looks, it prints the answer for every port whether or
+// not it changed, so a listen line that vm-launch lost, as when the console
+// dropped it, is made good within that many seconds; vm-launch takes each
+// line as the port's state, so a line that repeats the state changes
+// nothing. It starts after the start tag, so vm-launch reads every listen
+// line as part of the command's run. The kernel writes an IPv4
 // address in /proc/net/tcp as eight hex digits in host byte order, so a
 // loopback address, 127.0.0.0/8, ends in 7F; ::1 and ::ffff:127.0.0.0/104
 // are the IPv6 loopback forms.
@@ -362,6 +368,7 @@ if [ -n "${RVM_PORTS:-}" ]; then
 			rvm_pause() { sleep 1; }
 		fi
 		rvm_upset=" "
+		rvm_look=0
 		while :; do
 			rvm_seen=" "
 			rvm_failed=
@@ -384,6 +391,12 @@ if [ -n "${RVM_PORTS:-}" ]; then
 				done 2>/dev/null <"$rvm_table"
 				[ -n "$rvm_head" ] || rvm_failed=1
 			done
+			rvm_look=$((rvm_look + 1))
+			rvm_all=
+			if [ "$rvm_look" -ge ` + strconv.Itoa(guestListenRefresh) + ` ]; then
+				rvm_all=1
+				rvm_look=0
+			fi
 			rvm_nextup=" "
 			for rvm_pp in $rvm_ports; do
 				rvm_hex=${rvm_pp#*:}
@@ -398,7 +411,7 @@ if [ -n "${RVM_PORTS:-}" ]; then
 				if [ "$rvm_now" = 0 ] && [ -n "$rvm_failed" ]; then
 					rvm_now=$rvm_was
 				fi
-				if [ "$rvm_now" != "$rvm_was" ]; then
+				if [ "$rvm_now" != "$rvm_was" ] || [ -n "$rvm_all" ]; then
 					echo "` + listenTag(nonce) + `${rvm_pp%:*}:$rvm_now" >/dev/console && rvm_was=$rvm_now
 				fi
 				if [ "$rvm_was" = 1 ]; then
@@ -413,6 +426,10 @@ if [ -n "${RVM_PORTS:-}" ]; then
 fi
 `
 }
+
+// guestListenRefresh is how many looks the listen watcher makes between the
+// lines in which it reports every port, changed or not.
+const guestListenRefresh = 5
 
 // guestListenTick is the FIFO the listen watcher waits on. The initramfs of
 // a guest with ports holds it, and nothing ever writes it.

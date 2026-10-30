@@ -38,6 +38,10 @@ const testNonce = "0123456789abcdef"
 // for a spec that needs vm-launch's own stdout or signals.
 const helperArtifacts = "VM_LAUNCH_TEST_ARTIFACTS"
 
+// helperBackend names the backend of a helper process that helperArtifacts
+// starts. It is vm-qemu when unset.
+const helperBackend = "VM_LAUNCH_TEST_BACKEND"
+
 // helperStopCheck marks a helper process that calls run, which fails at
 // once on its arguments, with a logger whose first write also goes to the
 // broken stdout. run only logs once it has registered SIGPIPE, so that write
@@ -72,7 +76,11 @@ func init() {
 		os.Exit(0)
 	}
 	if art := os.Getenv(helperArtifacts); art != "" {
-		os.Exit(run([]string{"--backend", "vm-qemu", "--artifacts", art, "--", "true"}, log.New(os.Stderr, "vm-launch: ", 0)))
+		kind := string(backend.VMQemu)
+		if k := os.Getenv(helperBackend); k != "" {
+			kind = k
+		}
+		os.Exit(run([]string{"--backend", kind, "--artifacts", art, "--", "true"}, log.New(os.Stderr, "vm-launch: ", 0)))
 	}
 }
 
@@ -773,36 +781,36 @@ var _ = Describe("supervisor", func() {
 	}
 	startLine := `printf 'boot noise\r\nRVM_START_` + testNonce + `\r\n'; `
 
-	It("streams output and reports the guest status", func() {
+	It("streams output and reports the guest status", func(ctx SpecContext) {
 		res, err := sup.run(fakeHypervisor(startLine+`printf 'out\r\nRVM_EXIT_`+testNonce+`=42\r\n'`), testNonce)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(out.String()).To(Equal("out\n"))
 		Expect(codeOf(res)).To(Equal(42))
-	})
+	}, SpecTimeout(time.Minute))
 
-	It("kills a hypervisor that hangs after the guest reported", func() {
+	It("kills a hypervisor that hangs after the guest reported", func(ctx SpecContext) {
 		began := time.Now()
 		res, err := sup.run(fakeHypervisor(startLine+`printf 'RVM_EXIT_`+testNonce+`=7\n'; exec sleep 60`), testNonce)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(time.Since(began)).To(BeNumerically("<", 10*time.Second))
 		Expect(codeOf(res)).To(Equal(7))
 		Expect(logBuf.String()).To(ContainSubstring("killing it"))
-	})
+	}, SpecTimeout(time.Minute))
 
-	It("forwards SIGTERM that comes before the guest started its command and exits 128+15", func() {
+	It("forwards SIGTERM that comes before the guest started its command and exits 128+15", func(ctx SpecContext) {
 		signals <- syscall.SIGTERM
 		res, err := sup.run(fakeHypervisor(`exec sleep 60`), testNonce)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(res.received).To(Equal(syscall.SIGTERM))
 		Expect(codeOf(res)).To(Equal(143))
 		Expect(logBuf.String()).To(HavePrefix("received terminated before the guest started its command, forwarding it to the hypervisor\n"))
-	})
+	}, SpecTimeout(time.Minute))
 
-	It("runs the stopping hook once, at the first signal, after the signal's line", func() {
+	It("runs the port-closing hook once, when the deadline kills a guest it asked to stop, after the kill's line", func(ctx SpecContext) {
 		calls := 0
-		sup.stopping = func() {
+		sup.closePorts = func() {
 			calls++
-			sup.logger.Print("stopping")
+			sup.logger.Print("closing the ports")
 		}
 		sent := false
 		// Two signals once the traps are installed, which the first guest
@@ -820,10 +828,13 @@ var _ = Describe("supervisor", func() {
 		Expect(calls).To(Equal(1))
 		Expect(res.received).To(Equal(syscall.SIGINT))
 		Expect(codeOf(res)).To(Equal(130))
-		Expect(logBuf.String()).To(HavePrefix("received interrupt, asking the guest command to stop\nstopping\nreceived terminated again; the guest is already stopping\n"))
-	})
+		Expect(logBuf.String()).To(Equal("received interrupt, asking the guest command to stop\n" +
+			"received terminated again; the guest is already stopping\n" +
+			"the guest did not stop within 200ms of the signal; killing the hypervisor\n" +
+			"closing the ports\n"))
+	}, SpecTimeout(time.Minute))
 
-	It("kills a hypervisor that ignores the forwarded signal", func() {
+	It("kills a hypervisor that ignores the forwarded signal", func(ctx SpecContext) {
 		trapped := filepath.Join(GinkgoT().TempDir(), "trapped")
 		// Signal only once the trap is installed, which the file proves.
 		sup.started = func() {
@@ -837,28 +848,28 @@ var _ = Describe("supervisor", func() {
 		Expect(logBuf.String()).To(Equal("received interrupt before the guest started its command, forwarding it to the hypervisor\n" +
 			"the guest did not stop within 200ms of the signal; killing the hypervisor\n" +
 			"guest never started its command and wrote no console output\n"))
-	})
+	}, SpecTimeout(time.Minute))
 
-	It("reports a failing hypervisor with its console output", func() {
+	It("reports a failing hypervisor with its console output", func(ctx SpecContext) {
 		res, err := sup.run(fakeHypervisor(`printf 'Could not access KVM kernel module\n'; exit 1`), testNonce)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(codeOf(res)).To(Equal(exitHypervisorFailed))
 		Expect(out.String()).To(BeEmpty())
 		Expect(logBuf.String()).To(ContainSubstring("guest never started its command"))
 		Expect(logBuf.String()).To(ContainSubstring("Could not access KVM kernel module"))
-	})
+	}, SpecTimeout(time.Minute))
 
-	It("reports a guest that ends without a status", func() {
+	It("reports a guest that ends without a status", func(ctx SpecContext) {
 		res, err := sup.run(fakeHypervisor(startLine+`printf 'partial'`), testNonce)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(out.String()).To(Equal("partial"))
 		Expect(codeOf(res)).To(Equal(exitMissingMarker))
-	})
+	}, SpecTimeout(time.Minute))
 
-	It("fails when the hypervisor cannot be started", func() {
+	It("fails when the hypervisor cannot be started", func(ctx SpecContext) {
 		_, err := sup.run(exec.Command("/nonexistent/qemu"), testNonce)
 		Expect(err).To(MatchError(ContainSubstring("starting hypervisor /nonexistent/qemu")))
-	})
+	}, SpecTimeout(time.Minute))
 })
 
 var _ = Describe("run", func() {
