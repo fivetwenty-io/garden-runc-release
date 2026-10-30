@@ -763,7 +763,7 @@ var _ = Describe("supervisor", func() {
 		out = &bytes.Buffer{}
 		logBuf = &bytes.Buffer{}
 		signals = make(chan os.Signal, 1)
-		sup = supervisor{stdout: out, logger: log.New(logBuf, "", 0), signals: signals, grace: 200 * time.Millisecond}
+		sup = supervisor{stdout: out, logger: log.New(logBuf, "", 0), signals: signals, grace: 200 * time.Millisecond, deadline: 200 * time.Millisecond}
 	})
 
 	// fakeHypervisor stands in for QEMU or Firecracker: a shell that writes
@@ -789,13 +789,13 @@ var _ = Describe("supervisor", func() {
 		Expect(logBuf.String()).To(ContainSubstring("killing it"))
 	})
 
-	It("forwards SIGTERM and exits 128+15", func() {
+	It("forwards SIGTERM that comes before the guest started its command and exits 128+15", func() {
 		signals <- syscall.SIGTERM
-		res, err := sup.run(fakeHypervisor(startLine+`exec sleep 60`), testNonce)
+		res, err := sup.run(fakeHypervisor(`exec sleep 60`), testNonce)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(res.received).To(Equal(syscall.SIGTERM))
 		Expect(codeOf(res)).To(Equal(143))
-		Expect(logBuf.String()).To(ContainSubstring("forwarding it to the hypervisor"))
+		Expect(logBuf.String()).To(HavePrefix("received terminated before the guest started its command, forwarding it to the hypervisor\n"))
 	})
 
 	It("runs the stopping hook once, at the first signal, after the signal's line", func() {
@@ -820,17 +820,23 @@ var _ = Describe("supervisor", func() {
 		Expect(calls).To(Equal(1))
 		Expect(res.received).To(Equal(syscall.SIGINT))
 		Expect(codeOf(res)).To(Equal(130))
-		Expect(logBuf.String()).To(HavePrefix("received interrupt, forwarding it to the hypervisor\nstopping\nreceived terminated, forwarding it to the hypervisor\n"))
+		Expect(logBuf.String()).To(HavePrefix("received interrupt, asking the guest command to stop\nstopping\nreceived terminated again; the guest is already stopping\n"))
 	})
 
 	It("kills a hypervisor that ignores the forwarded signal", func() {
-		// Signal only once the trap is installed, which the first guest
-		// output proves.
-		sup.stdout = &signalOnWrite{w: out, signals: signals, sig: syscall.SIGINT}
-		res, err := sup.run(fakeHypervisor(`trap '' INT; `+startLine+`echo ready; exec sleep 60`), testNonce)
+		trapped := filepath.Join(GinkgoT().TempDir(), "trapped")
+		// Signal only once the trap is installed, which the file proves.
+		sup.started = func() {
+			defer GinkgoRecover()
+			Eventually(trapped, 10*time.Second, 5*time.Millisecond).Should(BeAnExistingFile())
+			signals <- syscall.SIGINT
+		}
+		res, err := sup.run(fakeHypervisor(`trap '' INT; : >'`+trapped+`'; exec sleep 60`), testNonce)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(codeOf(res)).To(Equal(130))
-		Expect(logBuf.String()).To(ContainSubstring("killing it"))
+		Expect(logBuf.String()).To(Equal("received interrupt before the guest started its command, forwarding it to the hypervisor\n" +
+			"the guest did not stop within 200ms of the signal; killing the hypervisor\n" +
+			"guest never started its command and wrote no console output\n"))
 	})
 
 	It("reports a failing hypervisor with its console output", func() {

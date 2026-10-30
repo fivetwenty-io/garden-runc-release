@@ -466,10 +466,11 @@ echo served`)
 			var qemuProc *os.Process
 			running := make(chan struct{})
 			sup := supervisor{
-				stdout:  out,
-				logger:  log.New(logBuf, "", 0),
-				signals: make(chan os.Signal),
-				grace:   killGrace,
+				stdout:   out,
+				logger:   log.New(logBuf, "", 0),
+				signals:  make(chan os.Signal),
+				grace:    killGrace,
+				deadline: stopDeadline,
 				started: func() {
 					_ = qemuEnd.Close()
 					qemuProc = cmd.Process

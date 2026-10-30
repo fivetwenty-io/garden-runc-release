@@ -112,7 +112,7 @@ var _ = Describe("newHypervisorCmd", func() {
 
 		It("lets the supervised hypervisor open the locked image through /proc/self/fd/3", func() {
 			var out, logBuf bytes.Buffer
-			sup := supervisor{stdout: &out, logger: log.New(&logBuf, "", 0), signals: make(chan os.Signal), grace: time.Second}
+			sup := supervisor{stdout: &out, logger: log.New(&logBuf, "", 0), signals: make(chan os.Signal), grace: time.Second, deadline: time.Second}
 			cmd := newHypervisorCmd([]string{script(fdThreeChecks(img) +
 				"printf 'RVM_START_" + testNonce + "\\nvolume ok\\nRVM_EXIT_" + testNonce + "=0\\n'\n")}, []*os.File{f})
 			res, err := sup.run(cmd, testNonce)

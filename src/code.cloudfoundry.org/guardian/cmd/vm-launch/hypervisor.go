@@ -390,16 +390,20 @@ type serialFilter struct {
 	status   int
 	writeErr error
 
+	// startSeen is closed when the start tag is parsed, before any of the
+	// command's output is written.
+	startSeen chan struct{}
 	// exited is closed when the exit marker is parsed.
 	exited chan struct{}
 }
 
 func newSerialFilter(out io.Writer, nonce string) *serialFilter {
 	return &serialFilter{
-		out:      out,
-		startTag: []byte(startTag(nonce)),
-		exitTag:  []byte(exitTag(nonce)),
-		exited:   make(chan struct{}),
+		out:       out,
+		startTag:  []byte(startTag(nonce)),
+		exitTag:   []byte(exitTag(nonce)),
+		startSeen: make(chan struct{}),
+		exited:    make(chan struct{}),
 	}
 }
 
@@ -450,6 +454,7 @@ func (f *serialFilter) processBoot(eof bool) {
 		if bytes.Contains(line, f.startTag) {
 			f.phase = phaseRun
 			f.bootLog = nil
+			close(f.startSeen)
 			return
 		}
 		f.keepBootLog(line)
@@ -640,25 +645,47 @@ func tagPrefixSuffix(b, tag []byte) int {
 type runResult struct {
 	markerFound bool
 	guestStatus int
-	// received is the first forwarded signal, or 0.
+	// received is the first signal vm-launch received, whether it was
+	// forwarded or became a stop request, or 0.
 	received syscall.Signal
 	// state is the hypervisor's reaped state.
 	state *os.ProcessState
 }
 
 // supervisor runs one hypervisor process: it streams the serial console
-// through a serialFilter, forwards signals, and kills the hypervisor when it
-// outlives grace after a forwarded signal or after the guest reported its
-// status (a guest that hangs on its way down must not hang the app process).
+// through a serialFilter, stops the guest command or forwards signals, and
+// kills the hypervisor when it outlives deadline after the first signal, or
+// grace after the guest reported its status without a signal (a guest that
+// hangs on its way down must not hang the app process).
+//
+// The supervisor acts on the first signal according to what the guest has
+// reported so far. While the guest's command runs, after the start tag and
+// before the exit marker, the supervisor writes the stop request (see
+// stopTag) once to the hypervisor's stdin, which is the guest's serial
+// console, and does not forward the signal. The guest's stop reader then
+// sends SIGTERM to the command, which may finish its work, and /init reports
+// the command's status and powers off as after any other end of the command.
+// Before the start tag there is no command to stop, and after the exit
+// marker the guest is already on its way down, so the supervisor forwards
+// the signal to the hypervisor, as it does when the stop request cannot be
+// written. A later signal is forwarded too when the first one was, and
+// changes nothing when a stop request was written, so it never cuts a drain
+// short. No later signal moves the deadline, and nothing the guest writes
+// moves it either: the supervisor never acts on stop data from the guest.
 type supervisor struct {
 	stdout  io.Writer
 	logger  *log.Logger
 	signals <-chan os.Signal
-	grace   time.Duration
+	// grace bounds how long the hypervisor may run after the guest reported
+	// its status, when no signal came first.
+	grace time.Duration
+	// deadline bounds how long the hypervisor may run after the first
+	// signal, whatever the supervisor did with it.
+	deadline time.Duration
 	// stopping, when set, runs once at the first signal, after the signal
-	// is logged and before it is forwarded, so what stopping logs comes
-	// after the signal's line. vm-launch uses it to stop accepting guest
-	// connections.
+	// is logged and before the supervisor forwards it or asks the guest
+	// command to stop, so what stopping logs comes after the signal's line.
+	// vm-launch uses it to stop accepting guest connections.
 	stopping func()
 	// started, when set, runs once the hypervisor has started and before
 	// anything else. vm-launch uses it to close its copies of the files the
@@ -670,8 +697,15 @@ type supervisor struct {
 }
 
 // run starts cmd and waits for it. The error is non-nil only when the
-// hypervisor could not be started.
+// hypervisor could not be started. cmd's stdin must be unset: run gives the
+// hypervisor a pipe as its stdin, whose write end only vm-launch holds.
 func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
+	if s.grace <= 0 || s.deadline <= 0 {
+		return runResult{}, fmt.Errorf("the hypervisor's kill grace %v and stop deadline %v must both be positive", s.grace, s.deadline)
+	}
+	if cmd.Stdin != nil {
+		return runResult{}, errors.New("the hypervisor's stdin is already set")
+	}
 	filter := newSerialFilter(s.stdout, nonce)
 	if s.listen != nil {
 		filter.onListen(nonce, s.listen)
@@ -680,7 +714,19 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 	if err != nil {
 		return runResult{}, fmt.Errorf("creating serial pipe: %w", err)
 	}
-	if err := cmd.Start(); err != nil {
+	console, consoleIn, err := os.Pipe()
+	if err != nil {
+		return runResult{}, fmt.Errorf("creating the hypervisor's stdin pipe: %w", err)
+	}
+	defer consoleIn.Close()
+	cmd.Stdin = console
+	err = cmd.Start()
+	// Only the hypervisor keeps the read end, so a write after it has gone
+	// fails at once instead of filling the pipe.
+	if cerr := console.Close(); cerr != nil {
+		s.logger.Printf("closing vm-launch's copy of the hypervisor's stdin: %v", cerr)
+	}
+	if err != nil {
 		return runResult{}, fmt.Errorf("starting hypervisor %s: %w", cmd.Path, err)
 	}
 	if s.started != nil {
@@ -697,31 +743,70 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 	var res runResult
 	markerSeen := filter.exited
 	var kill <-chan time.Time
+	var killReason string
+	// signalled is set at the first signal, and asked once the stop request
+	// for it is written.
+	signalled, asked := false, false
+	forward := func(sig os.Signal) {
+		if err := cmd.Process.Signal(sig); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			s.logger.Printf("forwarding %v to the hypervisor: %v", sig, err)
+		}
+	}
 	for {
 		select {
 		case sig := <-s.signals:
-			if ss, ok := sig.(syscall.Signal); ok && res.received == 0 {
+			if signalled {
+				if asked {
+					s.logger.Printf("received %v again; the guest is already stopping", sig)
+				} else {
+					s.logger.Printf("received %v, forwarding it to the hypervisor", sig)
+					forward(sig)
+				}
+				continue
+			}
+			signalled = true
+			if ss, ok := sig.(syscall.Signal); ok {
 				res.received = ss
 			}
-			s.logger.Printf("received %v, forwarding it to the hypervisor", sig)
+			// The filter closes these channels in the console goroutine, so
+			// the supervisor learns the guest's progress without touching the
+			// filter's state.
+			reported, started := isClosed(filter.exited), isClosed(filter.startSeen)
+			switch {
+			case reported:
+				s.logger.Printf("received %v after the guest reported its status, forwarding it to the hypervisor", sig)
+			case !started:
+				s.logger.Printf("received %v before the guest started its command, forwarding it to the hypervisor", sig)
+			default:
+				s.logger.Printf("received %v, asking the guest command to stop", sig)
+			}
 			if s.stopping != nil {
 				s.stopping()
 				s.stopping = nil
 			}
-			if err := cmd.Process.Signal(sig); err != nil && !errors.Is(err, os.ErrProcessDone) {
-				s.logger.Printf("forwarding %v to the hypervisor: %v", sig, err)
+			if started && !reported {
+				if err := requestStop(consoleIn, nonce); err != nil {
+					s.logger.Printf("sending the stop request to the guest failed: %v; forwarding %v to the hypervisor", err, sig)
+					forward(sig)
+				} else {
+					asked = true
+				}
+			} else {
+				forward(sig)
 			}
 			if kill == nil {
-				kill = time.After(s.grace)
+				kill = time.After(s.deadline)
+				killReason = fmt.Sprintf("the guest did not stop within %v of the signal; killing the hypervisor", s.deadline)
 			}
 		case <-markerSeen:
 			markerSeen = nil
 			if kill == nil {
 				kill = time.After(s.grace)
+				killReason = fmt.Sprintf("hypervisor still running %v later, killing it", s.grace)
 			}
 		case <-kill:
 			kill = nil
-			s.logger.Printf("hypervisor still running %v later, killing it", s.grace)
+			s.logger.Print(killReason)
 			if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 				s.logger.Printf("killing the hypervisor: %v", err)
 			}
@@ -753,4 +838,30 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 			return res, nil
 		}
 	}
+}
+
+// isClosed reports whether ch, which is only ever closed, is closed.
+func isClosed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+// stopRequestTimeout bounds the write of the stop request. The request is
+// one short write into a pipe that nothing else writes, so it does not
+// block; the bound only keeps a hypervisor that never reads its stdin, with
+// the pipe full, from holding up the supervisor.
+const stopRequestTimeout = time.Second
+
+// requestStop writes the stop request (see stopTag), one line, to the
+// hypervisor's stdin w.
+func requestStop(w *os.File, nonce string) error {
+	if err := w.SetWriteDeadline(time.Now().Add(stopRequestTimeout)); err != nil && !errors.Is(err, os.ErrNoDeadline) {
+		return err
+	}
+	_, err := w.WriteString(stopTag(nonce) + "\n")
+	return err
 }

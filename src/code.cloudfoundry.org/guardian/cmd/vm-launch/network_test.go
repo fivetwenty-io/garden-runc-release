@@ -681,8 +681,9 @@ sleep 0.3
 	It("removes QEMU's forwarding rule at SIGTERM while the hypervisor still runs", func() {
 		port := freePort()
 		p := strconv.Itoa(port)
-		// The fake QEMU ignores the SIGTERM that vm-launch passes on, so
-		// only the gate's shutDown at the signal can remove the rule.
+		// The fake QEMU never reads the stop request that vm-launch writes
+		// at the signal, and ignores SIGTERM, so only the gate's shutDown
+		// at the signal can remove the rule.
 		_, qmpLog := portHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), port, `trap '' TERM
 `+qmpGreeting+`listen 1
 qmp_recv
@@ -713,7 +714,7 @@ exit 0
 		// at the gate's end when QEMU exits before the gate reads the reply.
 		lines := strings.SplitAfter(stderr.String(), "\n")
 		opened := slices.Index(lines, "vm-launch: the guest listens on port "+p+"; it is open in the container\n")
-		received := slices.Index(lines, "vm-launch: received terminated, forwarding it to the hypervisor\n")
+		received := slices.Index(lines, "vm-launch: received terminated, asking the guest command to stop\n")
 		closed := slices.IndexFunc(lines, func(l string) bool {
 			return l == "vm-launch: vm-launch is stopping; port "+p+" is closed in the container\n" ||
 				l == "vm-launch: the guest has stopped, so port "+p+" closes in the container\n"

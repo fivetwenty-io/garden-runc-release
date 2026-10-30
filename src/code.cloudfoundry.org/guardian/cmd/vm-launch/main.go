@@ -33,6 +33,20 @@
 // good; open connections close when the guest stops. Without PORT, as for a
 // task, nothing outside can connect to the guest, as for a runc task.
 //
+// Stopping: at the first SIGTERM or SIGINT while the guest's command runs,
+// vm-launch asks the guest, over its serial console, to stop the command,
+// and the guest sends SIGTERM to the command's top process, as runc does to
+// a container's first process. For a simple command, that process is the
+// app itself. The command may finish its work, and vm-launch then exits with
+// the command's status, so an app that drains and exits 0 makes vm-launch
+// exit 0. Before the guest has started its command, or once it has reported
+// the command's status, vm-launch forwards the signal to the hypervisor
+// instead, as it also does when it cannot send the request. Either way,
+// vm-launch kills a hypervisor that still runs 8 seconds after the first
+// signal, which leaves vm-launch the time to clean up and report before
+// Garden's 10 second stop timeout ends it. A later signal never moves that
+// deadline, and while the guest stops, vm-launch does nothing else with it.
+//
 // Volumes: when VCAP_SERVICES names a volume mount, as it does for an app
 // bound to a volume service, the guest gets that volume at the same path the
 // container sees, backed by a raw image file
@@ -162,9 +176,10 @@
 //	       status, as QEMU does when it cannot open the volume image
 //	125    vm-launch could not start the guest: core dumps it could not
 //	       disable, an open files limit it could not read, bad arguments,
-//	       a guest command over 131071 bytes, a missing artifact, a work file, initramfs, or QMP socket it
-//	       could not create, a hypervisor it could not run, PORT already
-//	       in use in the container, or a volume it cannot use:
+//	       a guest command over 131071 bytes, a missing artifact, a work
+//	       file, initramfs, or QMP socket it could not create, a
+//	       hypervisor it could not run, PORT already in use in the
+//	       container, or a volume it cannot use:
 //	       VCAP_SERVICES that is not valid JSON, more than one volume
 //	       mount, a read-only mount, a bad volume path,
 //	       CF_INSTANCE_INDEX, application_id, or process_type, a task with
@@ -180,7 +195,8 @@
 //	128+N  vm-launch received signal N (SIGTERM or SIGINT), or the hypervisor
 //	       died from signal N, before the guest reported a status; this
 //	       includes a signal while vm-launch waits for the volume image or
-//	       resolves CredHub references
+//	       resolves CredHub references, and a guest command that did not
+//	       stop within 8 seconds of the signal
 //
 // A guest command can exit with any of these values itself; whenever vm-launch
 // picks the status, it also writes a "vm-launch:" line to stderr.
@@ -223,10 +239,16 @@ const (
 
 const defaultArtifactsDir = "/opt/garden-vm/artifacts"
 
-// killGrace is how long the hypervisor may keep running after a forwarded
-// signal or after the guest reported its status. It is shorter than garden's
-// 10 second stop timeout, so vm-launch still cleans up before it is killed.
+// killGrace is how long the hypervisor may keep running after the guest
+// reported its status, when no signal came first.
 const killGrace = 5 * time.Second
+
+// stopDeadline is how long the hypervisor may keep running after the first
+// SIGTERM or SIGINT, which is all the time a guest command gets to stop. Diego
+// sends SIGKILL 10 seconds after its SIGTERM, and the 2 seconds left cover
+// the kernel freeing the guest's memory and vm-launch's own cleanup and exit
+// line, for every guest size vm-launch allows.
+const stopDeadline = 8 * time.Second
 
 const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--artifacts DIR] -- PATH [ARGS...]\n"
 
@@ -458,7 +480,7 @@ func run(argv []string, logger *log.Logger) int {
 	}
 
 	cmd := newHypervisorCmd(hvArgv, files)
-	sup := supervisor{stdout: os.Stdout, logger: logger, signals: sigs, grace: killGrace, started: closeInherited}
+	sup := supervisor{stdout: os.Stdout, logger: logger, signals: sigs, grace: killGrace, deadline: stopDeadline, started: closeInherited}
 	var gate *portGate
 	if nw.port > 0 {
 		var opener portOpener
