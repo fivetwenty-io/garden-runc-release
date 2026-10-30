@@ -323,13 +323,16 @@ func (g *portGate) logf(format string, args ...any) bool {
 // proxyPort opens the port as the listener of the Firecracker port proxy.
 type proxyPort struct {
 	proxy *tcpProxy
-	addr  string
+	// addr is where the port listens in the container, and upstream the
+	// guest address its connections go to.
+	addr     string
+	upstream string
 }
 
-func (p proxyPort) openPort() error { return p.proxy.Listen(p.addr) }
+func (p proxyPort) openPort() error { return p.proxy.Listen(p.addr, p.upstream) }
 
 func (p proxyPort) closePort() error {
-	p.proxy.StopListening()
+	p.proxy.StopListening(p.addr)
 	return nil
 }
 

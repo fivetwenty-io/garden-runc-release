@@ -27,8 +27,8 @@ var testDialPolicy = dialPolicy{
 
 // startProxy returns a proxy for upstream that listens on listenAddr.
 func startProxy(listenAddr, upstream string, policy dialPolicy, logger *log.Logger) (*tcpProxy, error) {
-	p := newProxy(upstream, policy, logger)
-	if err := p.Listen(listenAddr); err != nil {
+	p := newProxy(policy, logger)
+	if err := p.Listen(listenAddr, upstream); err != nil {
 		p.Close()
 		return nil, err
 	}
@@ -39,10 +39,10 @@ func startProxy(listenAddr, upstream string, policy dialPolicy, logger *log.Logg
 func (p *tcpProxy) Addr() net.Addr {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.listener == nil {
-		return nil
+	for _, ln := range p.listeners {
+		return ln.Addr()
 	}
-	return p.listener.Addr()
+	return nil
 }
 
 // serve accepts connections on l and runs handle for each until l closes.
@@ -347,13 +347,13 @@ var _ = Describe("tcpProxy", func() {
 	It("stops listening and listens again, keeping open connections in between", func() {
 		up := listenLocal()
 		serve(up, echo)
-		p := newProxy(up.Addr().String(), testDialPolicy, logger)
+		p := newProxy(testDialPolicy, logger)
 		DeferCleanup(p.Close)
 		Expect(p.Addr()).To(BeNil())
-		p.StopListening()
+		p.StopListening("127.0.0.1:0")
 
-		Expect(p.Listen("127.0.0.1:0")).To(Succeed())
-		Expect(p.Listen("127.0.0.1:0")).To(MatchError("the port proxy is already listening"))
+		Expect(p.Listen("127.0.0.1:0", up.Addr().String())).To(Succeed())
+		Expect(p.Listen("127.0.0.1:0", up.Addr().String())).To(MatchError("the port proxy is already listening"))
 		addr := p.Addr().String()
 		c := dialProxy(p)
 		_, err := c.Write([]byte("a"))
@@ -361,8 +361,8 @@ var _ = Describe("tcpProxy", func() {
 		_, err = io.ReadFull(c, make([]byte, 1))
 		Expect(err).NotTo(HaveOccurred())
 
-		p.StopListening()
-		p.StopListening()
+		p.StopListening("127.0.0.1:0")
+		p.StopListening("127.0.0.1:0")
 		Expect(p.Addr()).To(BeNil())
 		_, err = net.Dial("tcp", addr)
 		Expect(err).To(MatchError(ContainSubstring("connection refused")))
@@ -373,7 +373,7 @@ var _ = Describe("tcpProxy", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(string(buf)).To(Equal("b"))
 
-		Expect(p.Listen(addr)).To(Succeed())
+		Expect(p.Listen(addr, up.Addr().String())).To(Succeed())
 		again := dialProxy(p)
 		_, err = again.Write([]byte("c"))
 		Expect(err).NotTo(HaveOccurred())
@@ -383,16 +383,108 @@ var _ = Describe("tcpProxy", func() {
 		Expect(logBuf.String()).To(BeEmpty())
 	})
 
+	Describe("with several listeners", func() {
+		// tagged serves a one-line banner naming the upstream, then closes.
+		tagged := func(name string) string {
+			l := listenLocal()
+			serve(l, func(c *net.TCPConn) { _, _ = c.Write([]byte(name)) })
+			return l.Addr().String()
+		}
+		banner := func(addr string) string {
+			c, err := net.Dial("tcp", addr)
+			Expect(err).NotTo(HaveOccurred())
+			defer c.Close()
+			b, err := io.ReadAll(c)
+			Expect(err).NotTo(HaveOccurred())
+			return string(b)
+		}
+		freeAddr := func() string {
+			l, err := net.Listen("tcp", "127.0.0.1:0")
+			Expect(err).NotTo(HaveOccurred())
+			defer l.Close()
+			return l.Addr().String()
+		}
+
+		It("sends each listener's connections to its own upstream", func() {
+			first, second := tagged("first"), tagged("second")
+			p := newProxy(testDialPolicy, logger)
+			DeferCleanup(p.Close)
+			a, b := freeAddr(), freeAddr()
+			Expect(p.Listen(a, first)).To(Succeed())
+			Expect(p.Listen(b, second)).To(Succeed())
+			Expect(banner(a)).To(Equal("first"))
+			Expect(banner(b)).To(Equal("second"))
+		})
+
+		It("stops one listener and leaves the other open", func() {
+			first, second := tagged("first"), tagged("second")
+			p := newProxy(testDialPolicy, logger)
+			DeferCleanup(p.Close)
+			a, b := freeAddr(), freeAddr()
+			Expect(p.Listen(a, first)).To(Succeed())
+			Expect(p.Listen(b, second)).To(Succeed())
+
+			p.StopListening(a)
+			_, err := net.Dial("tcp", a)
+			Expect(err).To(MatchError(ContainSubstring("connection refused")))
+			Expect(banner(b)).To(Equal("second"))
+
+			Expect(p.Listen(a, first)).To(Succeed())
+			Expect(banner(a)).To(Equal("first"))
+		})
+
+		It("stops every listener at StopAccepting", func() {
+			first, second := tagged("first"), tagged("second")
+			p := newProxy(testDialPolicy, logger)
+			DeferCleanup(p.Close)
+			a, b := freeAddr(), freeAddr()
+			Expect(p.Listen(a, first)).To(Succeed())
+			Expect(p.Listen(b, second)).To(Succeed())
+
+			p.StopAccepting()
+			for _, addr := range []string{a, b} {
+				_, err := net.Dial("tcp", addr)
+				Expect(err).To(MatchError(ContainSubstring("connection refused")))
+			}
+		})
+
+		It("closes every listener at Close", func() {
+			first, second := tagged("first"), tagged("second")
+			p := newProxy(testDialPolicy, logger)
+			a, b := freeAddr(), freeAddr()
+			Expect(p.Listen(a, first)).To(Succeed())
+			Expect(p.Listen(b, second)).To(Succeed())
+			p.Close()
+			for _, addr := range []string{a, b} {
+				_, err := net.Dial("tcp", addr)
+				Expect(err).To(MatchError(ContainSubstring("connection refused")))
+			}
+		})
+
+		It("names the upstream in the give-up line of its own connection", func() {
+			dead := unusedAddr()
+			p := newProxy(dialPolicy{attemptTimeout: 50 * time.Millisecond, firstBackoff: 5 * time.Millisecond, maxBackoff: 10 * time.Millisecond, giveUp: 50 * time.Millisecond, unansweredGiveUp: 50 * time.Millisecond}, logger)
+			DeferCleanup(p.Close)
+			a := freeAddr()
+			Expect(p.Listen(a, dead)).To(Succeed())
+			c, err := net.Dial("tcp", a)
+			Expect(err).NotTo(HaveOccurred())
+			defer c.Close()
+			_, _ = io.ReadAll(c)
+			Eventually(logBuf.String).Should(ContainSubstring("giving up on the guest at " + dead))
+		})
+	})
+
 	It("refuses to listen after StopAccepting or Close", func() {
-		p := newProxy(unusedAddr(), testDialPolicy, logger)
+		p := newProxy(testDialPolicy, logger)
 		DeferCleanup(p.Close)
 		p.StopAccepting()
-		Expect(p.Listen("127.0.0.1:0")).To(MatchError(errProxyStopped))
+		Expect(p.Listen("127.0.0.1:0", unusedAddr())).To(MatchError(errProxyStopped))
 		Expect(p.Addr()).To(BeNil())
 
-		closed := newProxy(unusedAddr(), testDialPolicy, logger)
+		closed := newProxy(testDialPolicy, logger)
 		closed.Close()
-		Expect(closed.Listen("127.0.0.1:0")).To(MatchError(errProxyStopped))
+		Expect(closed.Listen("127.0.0.1:0", unusedAddr())).To(MatchError(errProxyStopped))
 	})
 
 	It("fails to start when the address is taken", func() {

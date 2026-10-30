@@ -495,9 +495,9 @@ func run(argv []string, logger *log.Logger) int {
 	if nw.port > 0 {
 		var opener portOpener
 		if cfg.backend == backend.VMFirecracker {
-			proxy := newProxy(nw.upstream(), upstreamDialPolicy, logger)
+			proxy := newProxy(upstreamDialPolicy, logger)
 			defer proxy.Close()
-			opener = proxyPort{proxy: proxy, addr: nw.listenAddr()}
+			opener = proxyPort{proxy: proxy, addr: nw.listenAddr(), upstream: nw.upstream()}
 		} else {
 			opener = qmpPort{monitor: newQMPMonitor(monitor), port: nw.port}
 		}
