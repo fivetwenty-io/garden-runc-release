@@ -25,8 +25,8 @@ import (
 // output bytes to a stdout that it makes non-blocking, and loses whatever
 // stdout does not take at once, as Firecracker does (its serial device logs
 // "Failed the write to serial" and drops the byte). It reports on stderr how
-// many console bytes it lost, and then creates the file that
-// helperFakeFirecrackerWritten names.
+// many bytes its stdout pipe holds and how many console bytes it lost, and
+// then creates the file that helperFakeFirecrackerWritten names.
 const (
 	helperFakeFirecracker        = "VM_LAUNCH_TEST_FAKE_FIRECRACKER"
 	helperFakeFirecrackerNonce   = "VM_LAUNCH_TEST_FAKE_FIRECRACKER_NONCE"
@@ -54,6 +54,12 @@ func fakeFirecracker(burstArg string) int {
 		fmt.Fprintf(os.Stderr, "making stdout non-blocking: %v\n", err)
 		return 2
 	}
+	size, err := unix.FcntlInt(1, unix.F_GETPIPE_SZ, 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "reading the size of the stdout pipe: %v\n", err)
+		return 2
+	}
+	fmt.Fprintf(os.Stderr, "the fake Firecracker's stdout pipe holds %d bytes\n", size)
 	lost := 0
 	serial := func(b []byte) {
 		for len(b) > 0 {
@@ -153,7 +159,8 @@ var _ = Describe("the supervisor with a Firecracker that loses what stdout does 
 		cmd, stderr := fakeFirecrackerCmd()
 		res, err := sup.run(cmd, testNonce)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(stderr.String()).To(Equal("the fake Firecracker lost 0 console bytes\n"))
+		Expect(stderr.String()).To(Equal(fmt.Sprintf("the fake Firecracker's stdout pipe holds %d bytes\n", serialPipeSize) +
+			"the fake Firecracker lost 0 console bytes\n"))
 		Expect(res.markerFound).To(BeTrue(), logBuf.String())
 		Expect(res.guestOOMKills).To(Equal(2))
 		Expect(codeOf(res)).To(Equal(0))
@@ -180,7 +187,8 @@ var _ = Describe("the supervisor with a Firecracker that loses what stdout does 
 		cmd, stderr := fakeFirecrackerCmd()
 		res, err := sup.run(cmd, testNonce)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(stderr.String()).To(Equal("the fake Firecracker lost 0 console bytes\n"))
+		Expect(stderr.String()).To(Equal(fmt.Sprintf("the fake Firecracker's stdout pipe holds %d bytes\n", serialPipeSize) +
+			"the fake Firecracker lost 0 console bytes\n"))
 		Expect(res.markerFound).To(BeTrue())
 		Expect(out.Len()).To(Equal(burst))
 		Expect(logBuf.String()).To(BeEmpty())

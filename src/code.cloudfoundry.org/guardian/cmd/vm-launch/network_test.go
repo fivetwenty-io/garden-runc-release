@@ -974,8 +974,11 @@ exit 0
 		port := freePort()
 		p := strconv.Itoa(port)
 		// The fake Firecracker checks the port from the container's side,
-		// where vm-launch's proxy holds it.
+		// where vm-launch's proxy holds it. Firecracker reads serial input
+		// only from a stdin that is a terminal or a FIFO, so the fake checks
+		// that its stdin is a FIFO.
 		portHypervisor(filepath.Join(art, "firecracker/firecracker"), port, `trap '' TERM
+[ -p /dev/stdin ] || { echo "stdin is not a FIFO, so Firecracker would not read the stop request" >&2; exit 1; }
 listen 1
 await open
 kill -TERM "$PPID"

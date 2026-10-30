@@ -102,8 +102,12 @@ var _ = Describe("the supervisor's stop path", func() {
 			waitForFile(trapped)
 			signals <- syscall.SIGTERM
 		}
-		// The ports close before the hypervisor gets the signal.
-		sup.closePorts = func() { appendTo(stdin, "closed the ports\n") }
+		// The ports close before the hypervisor gets the signal. The pause
+		// gives the fake time to note a signal forwarded too early first.
+		sup.closePorts = func() {
+			time.Sleep(200 * time.Millisecond)
+			appendTo(stdin, "closed the ports\n")
+		}
 		// A stop request would show in stdin after the forwarded signal.
 		res, err := sup.run(fakeHypervisor(onForwardedTERM()+`printf 'boot noise\r\n'; : >'`+trapped+`'; while :; do sleep 0.02; done`), testNonce)
 		Expect(err).NotTo(HaveOccurred())
