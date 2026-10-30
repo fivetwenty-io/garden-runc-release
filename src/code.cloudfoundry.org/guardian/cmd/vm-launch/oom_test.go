@@ -178,13 +178,13 @@ var _ = Describe("serialFilter with an OOM line", func() {
 
 	It("handles an OOM line and a listen line in either order", func() {
 		for _, lines := range [][]string{
-			{oomTagLine("2") + "\r\n", listenTag(testNonce) + "1\r\n"},
-			{listenTag(testNonce) + "1\r\n", oomTagLine("2") + "\r\n"},
+			{oomTagLine("2") + "\r\n", listenTag(testNonce) + "8080:1\r\n"},
+			{listenTag(testNonce) + "8080:1\r\n", oomTagLine("2") + "\r\n"},
 		} {
 			var out bytes.Buffer
 			var ups []bool
 			f := newSerialFilter(&out, testNonce)
-			f.onListen(testNonce, func(up bool) { ups = append(ups, up) })
+			f.onListen(testNonce, func(port int, up bool) { ups = append(ups, up) })
 			for _, c := range append(append([]string{start, "a\r\n"}, lines...), "b\r\n", marker) {
 				_, _ = f.Write([]byte(c))
 			}
@@ -197,13 +197,13 @@ var _ = Describe("serialFilter with an OOM line", func() {
 
 	It("handles an OOM line and a listen line that arrive in one write, in either order", func() {
 		for _, lines := range []string{
-			oomTagLine("2") + "\r\n" + listenTag(testNonce) + "1\r\n",
-			listenTag(testNonce) + "1\r\n" + oomTagLine("2") + "\r\n",
+			oomTagLine("2") + "\r\n" + listenTag(testNonce) + "8080:1\r\n",
+			listenTag(testNonce) + "8080:1\r\n" + oomTagLine("2") + "\r\n",
 		} {
 			var out bytes.Buffer
 			var ups []bool
 			f := newSerialFilter(&out, testNonce)
-			f.onListen(testNonce, func(up bool) { ups = append(ups, up) })
+			f.onListen(testNonce, func(port int, up bool) { ups = append(ups, up) })
 			_, _ = f.Write([]byte(start + "a\r\n" + lines + "b\r\n" + marker))
 			f.finish()
 			Expect(out.String()).To(Equal("a\nb\n"))

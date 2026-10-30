@@ -21,18 +21,20 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// The container's PORT opens only while the guest listens on it, as a
-// container's port refuses connections until its app listens: Diego's port
-// health check counts an instance as running once a connection to PORT
-// succeeds, so a port that accepts before the guest app listens would pass
-// the check for an app that is still booting or never listens at all.
+// Each of the container's forwarded ports, PORT first, opens only while the
+// guest listens on it, as a container's port refuses connections until its
+// app listens: Diego's port health check counts an instance as running once
+// a connection to PORT succeeds, so a port that accepts before the guest app
+// listens would pass the check for an app that is still booting or never
+// listens at all. A port the app never listens on stays closed.
 //
-// vm-launch reserves PORT when it starts (see reservePort), the guest
-// reports whether anything listens on the port (see guestListenWatch), and
-// a portGate opens and closes PORT to match, through a portOpener: the port
-// proxy for Firecracker and a QEMU forwarding rule for QEMU.
+// vm-launch reserves each port when it starts (see reservePort), the guest
+// reports whether anything listens on each port (see guestListenWatch), and
+// a portGate for each port opens and closes it to match, through a
+// portOpener: a listener of the port proxy for Firecracker and a QEMU
+// forwarding rule for QEMU.
 
-// portOpener opens and closes the container's PORT for the guest.
+// portOpener opens and closes one port of the container for the guest.
 type portOpener interface {
 	openPort() error
 	closePort() error
@@ -52,7 +54,7 @@ func isPortConflict(err error) bool {
 	return errors.Is(err, syscall.EADDRINUSE) || errors.Is(err, errHostfwdFailed)
 }
 
-// portGate keeps the container's PORT open while the guest listens on it,
+// portGate keeps one port of the container open while the guest listens on it,
 // and closed otherwise. It acts on the guest's latest state only, one change
 // at a time, in its own goroutine, so a slow change never holds up the guest
 // console.
@@ -91,6 +93,49 @@ type portGate struct {
 	// is open. Only the loop writes it, and end reads it once the loop
 	// has returned.
 	shownOpen bool
+}
+
+// portGates runs a portGate for each forwarded port. The gates share the
+// opener's proxy or monitor, and nothing else: one port's state never
+// reaches another's gate.
+type portGates struct {
+	// gates are in the order of the ports they were started for.
+	gates  []*portGate
+	byPort map[int]*portGate
+}
+
+// startPortGates returns running gates for ports, each with the opener that
+// open returns for its port. Every gate starts closed.
+func startPortGates(ports []int, open func(port int) portOpener, retry backoff, logger *log.Logger) *portGates {
+	p := &portGates{byPort: map[int]*portGate{}}
+	for _, port := range ports {
+		g := startPortGate(open(port), port, retry, logger)
+		p.gates = append(p.gates, g)
+		p.byPort[port] = g
+	}
+	return p
+}
+
+// set records whether the guest listens on port, for that port's gate only.
+// A port with no gate is ignored. It never blocks.
+func (p *portGates) set(port int, up bool) {
+	if g, ok := p.byPort[port]; ok {
+		g.set(up)
+	}
+}
+
+// shutDown closes every port for good, as the guest stops.
+func (p *portGates) shutDown() {
+	for _, g := range p.gates {
+		g.shutDown()
+	}
+}
+
+// end ends every gate once the hypervisor has exited, and waits for them.
+func (p *portGates) end() {
+	for _, g := range p.gates {
+		g.end()
+	}
 }
 
 // backoff is how long the gate waits before it tries a failed change again:
@@ -391,7 +436,7 @@ const qmpTimeout = 10 * time.Second
 
 // qmpMonitor is a client of QEMU's QMP monitor on a connected stream socket.
 // It negotiates capabilities before its first command, skips asynchronous
-// events, and is used by one goroutine at a time. It sends each command with
+// events, and runs one command at a time. It sends each command with
 // an id of its own and takes as the reply only the message with that id, so
 // a command that timed out leaves the monitor usable: its late reply, when
 // it comes, is skipped, and a line cut off by the timeout is completed by
@@ -404,6 +449,9 @@ const qmpTimeout = 10 * time.Second
 // cannot happen on a socket that only vm-launch uses, so a refusal means a
 // monitor that vm-launch cannot use, and sending them again would not help.
 type qmpMonitor struct {
+	// mu serializes commands, which the gates of different ports send from
+	// their own goroutines.
+	mu      sync.Mutex
 	conn    net.Conn
 	r       *bufio.Reader
 	timeout time.Duration
@@ -439,6 +487,8 @@ type qmpError struct {
 
 // humanCommand runs a human monitor command and returns its output.
 func (m *qmpMonitor) humanCommand(line string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.broken != nil {
 		return "", m.broken
 	}

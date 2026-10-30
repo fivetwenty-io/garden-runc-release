@@ -446,7 +446,7 @@ var _ = Describe("the port gate against a real QEMU", func() {
 		DeferCleanup(reservation.Close)
 
 		nw := taskNetwork()
-		nw.port = port
+		nw.ports = []int{port}
 		// The guest boots, waits, serves PORT for a while, and stops
 		// serving it well before it exits.
 		g := taskGuest(`mkdir -p /tmp/www && echo hello >/tmp/www/index.html
@@ -509,7 +509,7 @@ echo served`)
 					qemuProc = cmd.Process
 					close(running)
 				},
-				listen: gate.set,
+				listen: func(_ int, up bool) { gate.set(up) },
 			}
 			kill := func() {
 				select {

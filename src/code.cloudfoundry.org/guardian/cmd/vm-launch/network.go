@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -10,6 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -56,15 +58,29 @@ const containerResolvConf = "/etc/resolv.conf"
 // maxNameservers is the number of nameservers a resolver reads (MAXNS).
 const maxNameservers = 3
 
+// instancePortsEnv lists the ports of the app instance, as Diego sets it:
+// a JSON array of objects whose internal member is the port in the container.
+const instancePortsEnv = "CF_INSTANCE_PORTS"
+
+const (
+	// sshPort is where Diego's SSH daemon listens, in the container and
+	// outside the guest, so it is never forwarded.
+	sshPort = 2222
+	// maxForwardedPorts caps the ports of one guest, and with them the
+	// watcher's work and the gates.
+	maxForwardedPorts = 16
+)
+
 // network is the guest network. Every guest has one. A process that serves
-// on PORT, an LRP, also gets connections to PORT forwarded to the guest. A
-// process started without PORT, such as a task, has port 0: its guest
-// reaches out exactly as an LRP's does, and nothing outside can connect to
-// it, as for a runc task.
+// on PORT, an LRP, also gets connections to its ports forwarded to the
+// guest: PORT first, then the other ports of CF_INSTANCE_PORTS. A process
+// started without PORT, such as a task, has no ports: its guest reaches out
+// exactly as an LRP's does, and nothing outside can connect to it, as for a
+// runc task.
 type network struct {
-	// port is the guest port that connections to PORT on the container reach,
-	// or 0 for a process without PORT.
-	port int
+	// ports are the guest ports that connections to the same ports on the
+	// container reach, PORT first, or none for a process without PORT.
+	ports []int
 	// address is the guest eth0 address in CIDR form, gateway its default route.
 	address string
 	gateway string
@@ -77,22 +93,22 @@ type network struct {
 	mtu int
 }
 
-// upstream is the guest address the Firecracker port proxy connects to. It
-// is meaningful only when port is set.
-func (n *network) upstream() string {
-	return net.JoinHostPort(fcGuestIP, strconv.Itoa(n.port))
+// upstream is the guest address the Firecracker port proxy connects to for
+// port.
+func (n *network) upstream(port int) string {
+	return net.JoinHostPort(fcGuestIP, strconv.Itoa(port))
 }
 
-// listenAddr is where the port proxy listens in the container. It is
-// meaningful only when port is set.
-func (n *network) listenAddr() string {
-	return net.JoinHostPort("0.0.0.0", strconv.Itoa(n.port))
+// listenAddr is where the port proxy listens in the container for port.
+func (n *network) listenAddr(port int) string {
+	return net.JoinHostPort("0.0.0.0", strconv.Itoa(port))
 }
 
 // networkFor returns the guest network for kind. lookupEnv reads the
 // environment that every part of vm-launch shares (see lastWinsEnv). Without
-// PORT, as for a task, the network has port 0 and is otherwise the same. A
-// PORT that is set but not a TCP port number is an error. The network holds
+// PORT, as for a task, the network has no ports and is otherwise the same. A
+// PORT that is set but not a TCP port number is an error. The other ports
+// come from CF_INSTANCE_PORTS (see forwardedPorts). The network holds
 // only the NIC, routes, MTU, and resolver; the guest environment is built
 // separately (see buildGuestEnv).
 // The container resolver configuration supplies the guest's search domains
@@ -102,13 +118,13 @@ func (n *network) listenAddr() string {
 // The same holds for the container's eth0 MTU, which lookupMTU reads for the
 // Firecracker guest: without it the guest keeps the default MTU.
 func networkFor(kind backend.Kind, lookupEnv func(string) (string, bool), resolvConfPath string, lookupMTU func(name string) (int, error), logger *log.Logger) (*network, error) {
-	port := 0
+	var ports []int
 	if portValue, ok := lookupEnv(portEnv); ok {
 		p, err := parsePort(portValue)
 		if err != nil {
 			return nil, err
 		}
-		port = p
+		ports = forwardedPorts(p, lookupEnv, logger)
 	}
 
 	data, err := os.ReadFile(resolvConfPath)
@@ -120,7 +136,7 @@ func networkFor(kind backend.Kind, lookupEnv func(string) (string, bool), resolv
 	}
 	conf := parseResolvConf(data)
 
-	n := &network{port: port}
+	n := &network{ports: ports}
 	switch kind {
 	case backend.VMQemu:
 		n.address, n.gateway = qemuGuestCIDR, qemuGateway
@@ -139,6 +155,42 @@ func networkFor(kind backend.Kind, lookupEnv func(string) (string, bool), resolv
 		return nil, fmt.Errorf("unsupported backend %q", kind)
 	}
 	return n, nil
+}
+
+// forwardedPorts returns the ports to forward: port, which is PORT, first,
+// then each distinct internal port of CF_INSTANCE_PORTS except the SSH port,
+// up to maxForwardedPorts in all. A value that is not the JSON that Diego
+// writes gives PORT alone, with a line saying so, and so does an entry
+// without a usable port number.
+func forwardedPorts(port int, lookupEnv func(string) (string, bool), logger *log.Logger) []int {
+	ports := []int{port}
+	value, ok := lookupEnv(instancePortsEnv)
+	if !ok {
+		return ports
+	}
+	var entries []struct {
+		Internal int `json:"internal"`
+	}
+	if err := json.Unmarshal([]byte(value), &entries); err != nil {
+		logger.Printf("%s is not a JSON array of ports: %v; forwarding only PORT", instancePortsEnv, err)
+		return ports
+	}
+	var dropped []int
+	for _, e := range entries {
+		switch {
+		case e.Internal < 1 || e.Internal > 65535:
+			logger.Printf("%s has an entry with the internal port %d, which is not a TCP port number; not forwarding it", instancePortsEnv, e.Internal)
+		case e.Internal == sshPort, slices.Contains(ports, e.Internal), slices.Contains(dropped, e.Internal):
+		case len(ports) == maxForwardedPorts:
+			dropped = append(dropped, e.Internal)
+		default:
+			ports = append(ports, e.Internal)
+		}
+	}
+	if len(dropped) > 0 {
+		logger.Printf("%s lists %d more ports than the %d that vm-launch forwards; not forwarding them", instancePortsEnv, len(dropped), maxForwardedPorts)
+	}
+	return ports
 }
 
 // guestMTU returns the MTU of the container's eth0, or 0 when it cannot be
@@ -231,16 +283,21 @@ func formatResolvConf(nameservers, search []string) string {
 }
 
 // netFile returns the guest /rvm/net, which /init sources before it
-// configures eth0. A network with a port also names it as RVM_PORT, which
-// the guest's listen watcher reads (see guestListenWatch).
+// configures eth0. A network with ports also names them as RVM_PORTS, a
+// space separated list, which the guest's listen watcher reads (see
+// guestListenWatch).
 func netFile(n *network) string {
 	s := "RVM_ADDRESS=" + shellQuote(n.address) + "\n" +
 		"RVM_GATEWAY=" + shellQuote(n.gateway) + "\n"
 	if n.mtu > 0 {
 		s += "RVM_MTU=" + shellQuote(strconv.Itoa(n.mtu)) + "\n"
 	}
-	if n.port > 0 {
-		s += "RVM_PORT=" + shellQuote(strconv.Itoa(n.port)) + "\n"
+	if len(n.ports) > 0 {
+		list := make([]string, len(n.ports))
+		for i, p := range n.ports {
+			list[i] = strconv.Itoa(p)
+		}
+		s += "RVM_PORTS=" + shellQuote(strings.Join(list, " ")) + "\n"
 	}
 	return s
 }

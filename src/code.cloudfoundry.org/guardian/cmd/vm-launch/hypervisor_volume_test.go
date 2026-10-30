@@ -99,7 +99,7 @@ func concat(parts ...[]string) []string {
 }
 
 var _ = Describe("hypervisor volume drive", func() {
-	nw := &network{port: 8080}
+	nw := &network{ports: []int{8080}}
 	task := &network{}
 
 	It("passes the image as file descriptor 3 by its /proc/self/fd path", func() {
@@ -147,7 +147,7 @@ var _ = Describe("hypervisor volume drive", func() {
 		for _, n := range []*network{task, nw} {
 			raw, err := firecrackerConfigJSON(goldenArt, goldenInitrd, goldenMemMiB, n, "")
 			Expect(err).NotTo(HaveOccurred())
-			Expect(string(raw)).To(Equal(goldenFCNet), "port %d", n.port)
+			Expect(string(raw)).To(Equal(goldenFCNet), "ports %v", n.ports)
 		}
 	})
 

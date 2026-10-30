@@ -111,7 +111,7 @@ func (c *cpioWriter) pad(n int64) error {
 // impossible to forge by accident from guest command output. The guest
 // command runs as root and can read the nonce from /init, so it can forge
 // them on purpose, which changes only what vm-launch reports for that
-// command: its exit status, whether its own port is open, and whether vm-launch
+// command: its exit status, whether its own ports are open, and whether vm-launch
 // reports that the guest ran out of memory.
 func startTag(nonce string) string  { return "RVM_START_" + nonce }
 func exitTag(nonce string) string   { return "RVM_EXIT_" + nonce + "=" }
@@ -150,8 +150,8 @@ func stopTag(nonce string) string { return "RVM_STOP_" + nonce }
 // and through the shared console only when that open fails. The guest
 // environment applies only inside that subshell, never to /init's own steps,
 // such as the unquoted status in the exit line or the volume teardown. A
-// guest with a port watches, while the command runs, whether anything
-// listens on it (see guestListenWatch). With a volume, /init syncs and
+// guest with ports watches, while the command runs, whether anything
+// listens on each (see guestListenWatch). With a volume, /init syncs and
 // unmounts it after the command and before it reports the status.
 func initScript(nonce string, volume bool) string {
 	setup := guestFailFunc + guestConsoleSetup + guestShmSetup + guestNetworkSetup + guestLimitsSetup + guestEnvChecks
@@ -293,15 +293,16 @@ fi
 // falls, and then the soft one.
 const guestSetLimits = `ulimit -n "$RVM_NOFILE_HARD" && ulimit -S -n "$RVM_NOFILE_SOFT"`
 
-// guestListenWatch starts, in a guest with a port (RVM_PORT in /rvm/net),
+// guestListenWatch starts, in a guest with ports (RVM_PORTS in /rvm/net),
 // a background watcher that tells vm-launch whether anything in the guest
-// listens on that port, so that vm-launch opens the container's PORT only
-// while it does, as a container's port refuses connections until its app
-// listens. Once a second, the watcher looks in /proc/net/tcp and
-// /proc/net/tcp6 for a listening socket on the port at an address other
+// listens on each port, so that vm-launch opens a port of the container only
+// while the guest listens on it, as a container's port refuses connections
+// until its app listens. Once a second, the watcher looks in /proc/net/tcp
+// and /proc/net/tcp6 for listening sockets on the ports at an address other
 // than loopback, which is what a connection forwarded from the container
-// reaches, and prints a listen line, the listen tag and 1 or 0, each time
-// the answer changes. It starts after the start tag, so vm-launch reads
+// reaches, in one pass over the tables, and prints a listen line, the listen
+// tag, the port, a colon, and 1 or 0, each time the answer for a port
+// changes. The ports change independently of each other. It starts after the start tag, so vm-launch reads
 // every listen line as part of the command's run. The kernel writes an IPv4
 // address in /proc/net/tcp as eight hex digits in host byte order, so a
 // loopback address, 127.0.0.0/8, ends in 7F; ::1 and ::ffff:127.0.0.0/104
@@ -321,7 +322,8 @@ const guestSetLimits = `ulimit -n "$RVM_NOFILE_HARD" && ulimit -S -n "$RVM_NOFIL
 // that is not a listening socket. A look therefore costs time in proportion
 // to the listening sockets, and not to the connections the guest has. The
 // shell's read makes one system call for each byte, so in the guest's
-// busybox a look costs about 0.09 ms of CPU for each listening socket.
+// busybox a look costs about 0.09 ms of CPU for each listening socket, and
+// a little more for each port, which is checked once per look.
 // Measured over 20 seconds, an idle guest used 6 ticks of CPU, a guest with
 // 201 listening sockets and 2000 connections used 62 ticks, about 3% of a
 // core, and a guest with 2001 listening sockets used 372 ticks, about 19%.
@@ -330,8 +332,8 @@ const guestSetLimits = `ulimit -n "$RVM_NOFILE_HARD" && ulimit -S -n "$RVM_NOFIL
 // header line; the kernel allocates its buffer for a table at the first
 // read, so a read that succeeds once does not fail later. A listening
 // socket that the watcher finds is an answer, whatever the other table gave.
-// Otherwise a look that failed keeps the last answer, so a look that fails
-// never closes the port of an app that still listens. The watcher reads
+// Otherwise a look that failed keeps the last answer of each port, so a look
+// that fails never closes the port of an app that still listens. The watcher reads
 // only the tables the guest kernel has, as /proc/net/tcp6 is missing from a
 // kernel without IPv6.
 //
@@ -341,8 +343,14 @@ const guestSetLimits = `ulimit -n "$RVM_NOFILE_HARD" && ulimit -S -n "$RVM_NOFIL
 // line is written, so a line that fails is written again a second later.
 func guestListenWatch(nonce string) string {
 	return `rvm_watch=
-if [ -n "${RVM_PORT:-}" ]; then
-	rvm_port_hex=$(printf '%04X' "$RVM_PORT")
+if [ -n "${RVM_PORTS:-}" ]; then
+	rvm_ports=
+	rvm_hexes=" "
+	for rvm_dec in $RVM_PORTS; do
+		rvm_hex=$(printf '%04X' "$rvm_dec")
+		rvm_ports="$rvm_ports $rvm_dec:$rvm_hex"
+		rvm_hexes="$rvm_hexes$rvm_hex "
+	done
 	rvm_tables=
 	for rvm_table in /proc/net/tcp /proc/net/tcp6; do
 		[ -e "$rvm_table" ] && rvm_tables="$rvm_tables $rvm_table"
@@ -353,9 +361,9 @@ if [ -n "${RVM_PORT:-}" ]; then
 		else
 			rvm_pause() { sleep 1; }
 		fi
-		rvm_up=0
+		rvm_upset=" "
 		while :; do
-			rvm_now=0
+			rvm_seen=" "
 			rvm_failed=
 			for rvm_table in $rvm_tables; do
 				rvm_head=
@@ -365,23 +373,39 @@ if [ -n "${RVM_PORT:-}" ]; then
 						continue
 					fi
 					[ "$rvm_st" = 0A ] || break
-					case $rvm_local in
-					*:"$rvm_port_hex") ;;
+					case "$rvm_hexes" in
+					*" ${rvm_local##*:} "*) ;;
 					*) continue ;;
 					esac
 					case ${rvm_local%:*} in
 					??????7F | 00000000000000000000000001000000 | 0000000000000000FFFF0000??????7F) ;;
-					*) rvm_now=1 ;;
+					*) rvm_seen="$rvm_seen${rvm_local##*:} " ;;
 					esac
 				done 2>/dev/null <"$rvm_table"
 				[ -n "$rvm_head" ] || rvm_failed=1
 			done
-			if [ "$rvm_now" = 0 ] && [ -n "$rvm_failed" ]; then
-				rvm_now=$rvm_up
-			fi
-			if [ "$rvm_now" != "$rvm_up" ]; then
-				echo "` + listenTag(nonce) + `$rvm_now" >/dev/console && rvm_up=$rvm_now
-			fi
+			rvm_nextup=" "
+			for rvm_pp in $rvm_ports; do
+				rvm_hex=${rvm_pp#*:}
+				case "$rvm_seen" in
+				*" $rvm_hex "*) rvm_now=1 ;;
+				*) rvm_now=0 ;;
+				esac
+				case "$rvm_upset" in
+				*" $rvm_hex "*) rvm_was=1 ;;
+				*) rvm_was=0 ;;
+				esac
+				if [ "$rvm_now" = 0 ] && [ -n "$rvm_failed" ]; then
+					rvm_now=$rvm_was
+				fi
+				if [ "$rvm_now" != "$rvm_was" ]; then
+					echo "` + listenTag(nonce) + `${rvm_pp%:*}:$rvm_now" >/dev/console && rvm_was=$rvm_now
+				fi
+				if [ "$rvm_was" = 1 ]; then
+					rvm_nextup="$rvm_nextup$rvm_hex "
+				fi
+			done
+			rvm_upset=$rvm_nextup
 			rvm_pause
 		done
 	) </dev/null &
@@ -391,7 +415,7 @@ fi
 }
 
 // guestListenTick is the FIFO the listen watcher waits on. The initramfs of
-// a guest with a port holds it, and nothing ever writes it.
+// a guest with ports holds it, and nothing ever writes it.
 const guestListenTick = "/rvm/listen-tick"
 
 // guestListenStop stops the listen watcher once the command has ended and
@@ -678,7 +702,7 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, g 
 		file("rvm/limits", 0o644, limitsFile(g.nofile)),
 		file("etc/resolv.conf", 0o644, g.nw.resolvConf),
 	}
-	if g.nw != nil && g.nw.port > 0 {
+	if g.nw != nil && len(g.nw.ports) > 0 {
 		steps = append(steps, func() error { return cw.FIFO(strings.TrimPrefix(guestListenTick, "/"), 0o600) })
 	}
 	if g.vol != nil {

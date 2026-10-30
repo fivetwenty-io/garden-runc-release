@@ -248,29 +248,33 @@ var _ = Describe("the supervisor's stop path", func() {
 		Expect(openFDs()).To(Equal(before))
 	})
 
-	It("closes the port at the first signal and never opens it again for a listen report during the stop", func() {
-		opener := &fakeOpener{}
-		gate := startPortGate(opener, 8080, backoff{first: 5 * time.Millisecond, max: 20 * time.Millisecond}, sup.logger)
-		DeferCleanup(gate.end)
-		sup.stopping = gate.shutDown
-		sup.listen = gate.set
+	It("closes every port at the first signal and never opens one again for a listen report during the stop", func() {
+		openers := map[int]*fakeOpener{8080: {}, 8081: {}}
+		gates := startPortGates([]int{8080, 8081}, func(port int) portOpener { return openers[port] }, backoff{first: 5 * time.Millisecond, max: 20 * time.Millisecond}, sup.logger)
+		DeferCleanup(gates.end)
+		sup.stopping = gates.shutDown
+		sup.listen = gates.set
 		sent := false
 		sup.stdout = writerFunc(func(p []byte) (int, error) {
 			if !sent {
 				sent = true
 				defer GinkgoRecover()
-				Eventually(opener.got, 10*time.Second, 5*time.Millisecond).Should(Equal([]string{"open"}))
+				Eventually(openers[8080].got, 10*time.Second, 5*time.Millisecond).Should(Equal([]string{"open"}))
+				Eventually(openers[8081].got, 10*time.Second, 5*time.Millisecond).Should(Equal([]string{"open"}))
 				signals <- syscall.SIGTERM
 			}
 			return out.Write(p)
 		})
-		listen := func(up string) string { return `printf 'RVM_LISTEN_` + testNonce + `=` + up + `\r\n'; ` }
-		res, err := sup.run(fakeHypervisor(startLine+listen("1")+`echo ready; `+readRequest()+listen("0")+listen("1")+`sleep 0.3; `+exitLine("0")), testNonce)
+		listen := func(port, up string) string {
+			return `printf 'RVM_LISTEN_` + testNonce + `=` + port + `:` + up + `\r\n'; `
+		}
+		res, err := sup.run(fakeHypervisor(startLine+listen("8080", "1")+listen("8081", "1")+`echo ready; `+readRequest()+listen("8080", "0")+listen("8080", "1")+listen("8081", "1")+`sleep 0.3; `+exitLine("0")), testNonce)
 		Expect(err).NotTo(HaveOccurred())
-		gate.end()
+		gates.end()
 		Expect(codeOf(res)).To(Equal(0), logBuf.String())
 		Expect(out.String()).To(Equal("ready\n"))
-		Expect(opener.got()).To(Equal([]string{"open", "close"}))
+		Expect(openers[8080].got()).To(Equal([]string{"open", "close"}))
+		Expect(openers[8081].got()).To(Equal([]string{"open", "close"}))
 	})
 
 	DescribeTable("refuses a kill grace or stop deadline that is not positive, before it starts anything",

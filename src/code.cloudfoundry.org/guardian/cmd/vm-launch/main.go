@@ -20,18 +20,23 @@
 // from the container's network namespace with the container's address, so
 // network policies and application security groups apply as they do to the
 // container. With PORT, as for an LRP, connections to PORT on the container
-// also reach PORT in the guest. QEMU forwards them itself (user-mode
-// networking), with a rule that vm-launch adds on QEMU's QMP monitor; for
-// Firecracker, vm-launch listens on PORT and proxies each connection to the
-// guest over Garden's tap device. vm-launch reserves PORT when it starts, so
-// connections are refused, and it opens PORT only while something in the
-// guest listens on the port at an address other than loopback, which the
-// guest reports within a second of a change, even once the app has used up
-// the processes the guest can start. So, as for a runc app, a
-// connection to PORT, and with it Diego's port health check, succeeds only
-// once the app listens. At the first SIGTERM or SIGINT, PORT closes for
-// good; open connections close when the guest stops. Without PORT, as for a
-// task, nothing outside can connect to the guest, as for a runc task.
+// also reach PORT in the guest, and so do connections to each other port in
+// CF_INSTANCE_PORTS except 2222, where Diego's SSH daemon listens, up to 16
+// ports in all with PORT first; more are left out with a line that says how
+// many. QEMU forwards them itself (user-mode networking), with a rule for
+// each port that vm-launch adds on QEMU's QMP monitor; for Firecracker,
+// vm-launch listens on each port and proxies each connection to the guest
+// over Garden's tap device. vm-launch reserves each port when it starts, so
+// connections are refused, and it opens a port only while something in the
+// guest listens on it at an address other than loopback, which the guest
+// reports within a second of a change, even once the app has used up the
+// processes the guest can start. Each port opens and closes on its own, so a
+// port that the app never listens on stays closed for the whole run. So, as
+// for a runc app, a connection to a port, and with it Diego's port health
+// check on PORT, succeeds only once the app listens. At the first SIGTERM or
+// SIGINT, every port closes for good; open connections close when the guest
+// stops. Without PORT, as for a task, nothing outside can connect to the
+// guest, as for a runc task.
 //
 // Stopping: at the first SIGTERM or SIGINT while the guest's command runs,
 // vm-launch asks the guest, over its serial console, to stop the command,
@@ -209,10 +214,13 @@
 // A container runs one VM per port: a second vm-launch for the same PORT, such
 // as a CF sidecar that gets the app's PORT, cannot reserve it and exits 125,
 // as does a vm-launch whose PORT another process already listens on, with a
-// line that names the port conflict. A process that starts listening on PORT
-// after vm-launch reserved it keeps the guest's port closed while it listens,
-// with the same line once when the guest listens. vm-launch keeps trying to
-// open the port, and opens it once the other process stops listening.
+// line that names the port conflict. A process that starts listening on a
+// port after vm-launch reserved it keeps the guest's port closed while it
+// listens, with the same line once when the guest listens. vm-launch keeps
+// trying to open the port, and opens it once the other process stops
+// listening. A conflict on another port of CF_INSTANCE_PORTS at start is
+// logged the same way and does not stop the launch, because the port opens
+// later when it frees up.
 package main
 
 import (
@@ -396,18 +404,24 @@ func run(argv []string, logger *log.Logger) int {
 		logger.Print(err)
 		return exitLaunchError
 	}
-	if nw.port > 0 {
-		reservation, err := reservePort(nw.port)
+	for i, port := range nw.ports {
+		reservation, err := reservePort(port)
 		if err != nil {
 			logger.Print(err)
 			if errors.Is(err, syscall.EADDRINUSE) {
-				logger.Print(portConflictMessage(nw.port))
+				logger.Print(portConflictMessage(port))
 			}
-			return exitLaunchError
+			// PORT is the one the app and Diego's health check need. Another
+			// port that is taken stays closed, and its gate opens it when
+			// the other process lets go.
+			if i == 0 {
+				return exitLaunchError
+			}
+			continue
 		}
 		defer func() {
 			if err := reservation.Close(); err != nil {
-				logger.Printf("releasing port %d: %v", nw.port, err)
+				logger.Printf("releasing port %d: %v", port, err)
 			}
 		}()
 	}
@@ -464,10 +478,10 @@ func run(argv []string, logger *log.Logger) int {
 		qemuMonitor = nil
 	}
 	defer closeInherited()
-	// QEMU forwards PORT through rules that vm-launch adds and removes on
-	// its QMP monitor.
+	// QEMU forwards the ports through rules that vm-launch adds and removes
+	// on its QMP monitor.
 	var monitor net.Conn
-	if nw.port > 0 && cfg.backend == backend.VMQemu {
+	if len(nw.ports) > 0 && cfg.backend == backend.VMQemu {
 		monitor, qemuMonitor, err = newQMPSocket()
 		if err != nil {
 			logger.Print(err)
@@ -491,30 +505,35 @@ func run(argv []string, logger *log.Logger) int {
 
 	cmd := newHypervisorCmd(hvArgv, files)
 	sup := supervisor{stdout: os.Stdout, logger: logger, signals: sigs, grace: killGrace, deadline: stopDeadline, started: closeInherited}
-	var gate *portGate
-	if nw.port > 0 {
-		var opener portOpener
+	var gates *portGates
+	if len(nw.ports) > 0 {
+		// One proxy or one monitor serves every port's opener.
+		var open func(port int) portOpener
 		if cfg.backend == backend.VMFirecracker {
 			proxy := newProxy(upstreamDialPolicy, logger)
 			defer proxy.Close()
-			opener = proxyPort{proxy: proxy, addr: nw.listenAddr(), upstream: nw.upstream()}
+			open = func(port int) portOpener {
+				return proxyPort{proxy: proxy, addr: nw.listenAddr(port), upstream: nw.upstream(port)}
+			}
 		} else {
-			opener = qmpPort{monitor: newQMPMonitor(monitor), port: nw.port}
+			qmp := newQMPMonitor(monitor)
+			open = func(port int) portOpener { return qmpPort{monitor: qmp, port: port} }
 		}
-		// The explicit gate.end after sup.run is the one that ends the gate,
-		// as it must come before the exit line. A panic out of sup.run skips
-		// it, and this deferred call covers that one path: deferred calls
-		// run last first, so the gate still ends before the proxy closes
-		// and before the monitor closes. A second end is a no-op.
-		gate = startPortGate(opener, nw.port, gateRetry, logger)
-		defer gate.end()
-		sup.stopping = gate.shutDown
-		sup.listen = gate.set
+		// The explicit gates.end after sup.run is the one that ends the
+		// gates, as it must come before the exit line. A panic out of
+		// sup.run skips it, and this deferred call covers that one path:
+		// deferred calls run last first, so the gates still end before the
+		// proxy closes and before the monitor closes. A second end is a
+		// no-op.
+		gates = startPortGates(nw.ports, open, gateRetry, logger)
+		defer gates.end()
+		sup.stopping = gates.shutDown
+		sup.listen = gates.set
 	}
 	res, err := sup.run(cmd, nonce)
-	if gate != nil {
-		// The gate's last line about the port comes before the exit line.
-		gate.end()
+	if gates != nil {
+		// The gates' last lines about the ports come before the exit line.
+		gates.end()
 	}
 	if err != nil {
 		logger.Print(err)

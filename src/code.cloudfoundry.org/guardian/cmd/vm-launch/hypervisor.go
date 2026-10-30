@@ -366,6 +366,9 @@ const maxBootLog = 64 * 1024
 // maxStatusDigits is the longest decimal exit status a shell reports (255).
 const maxStatusDigits = 3
 
+// maxPortDigits is the longest decimal TCP port number (65535).
+const maxPortDigits = 5
+
 // maxOOMDigits is the most digits an OOM count may have, which keeps the
 // count far inside an int.
 const maxOOMDigits = 9
@@ -388,7 +391,7 @@ type serialFilter struct {
 	exitTag   []byte
 	listenTag []byte
 	oomTag    []byte
-	listen    func(up bool)
+	listen    func(port int, up bool)
 
 	phase    int
 	pending  []byte
@@ -416,7 +419,7 @@ func newSerialFilter(out io.Writer, nonce string) *serialFilter {
 }
 
 // onListen makes the filter pass listen lines to listen.
-func (f *serialFilter) onListen(nonce string, listen func(up bool)) {
+func (f *serialFilter) onListen(nonce string, listen func(port int, up bool)) {
 	f.listenTag = []byte(listenTag(nonce))
 	f.listen = listen
 }
@@ -547,7 +550,7 @@ func (f *serialFilter) indexListen() int {
 // line goes to the callback and leaves the output, its line ending
 // included. Anything else after the tag is output, like the tag itself.
 func (f *serialFilter) processListen(idx int, eof bool) bool {
-	up, n, ok, needMore := parseListen(f.pending[idx+len(f.listenTag):])
+	port, up, n, ok, needMore := parseListen(f.pending[idx+len(f.listenTag):])
 	if needMore && !eof {
 		f.emitPending(idx, false)
 		return false
@@ -560,7 +563,7 @@ func (f *serialFilter) processListen(idx int, eof bool) bool {
 	}
 	f.emitPending(idx, true)
 	f.pending = append([]byte(nil), f.pending[len(f.listenTag)+n:]...)
-	f.listen(up)
+	f.listen(port, up)
 	return true
 }
 
@@ -671,27 +674,45 @@ func parseCount(b []byte) (count, n int, ok, needMore bool) {
 	}
 }
 
-// parseListen parses the bytes after a listen tag: 1 or 0, then LF or CRLF.
-// n is the length of what it parsed. needMore reports that b ends before
-// that can be decided.
-func parseListen(b []byte) (up bool, n int, ok, needMore bool) {
+// parseListen parses the bytes after a listen tag: a port of 1 to 5 decimal
+// digits and a value of at most 65535, a colon, 1 or 0, then LF or CRLF. n is
+// the length of what it parsed. needMore reports that b ends before that can
+// be decided.
+func parseListen(b []byte) (port int, up bool, n int, ok, needMore bool) {
+	i := 0
+	for i < len(b) && i <= maxPortDigits && b[i] >= '0' && b[i] <= '9' {
+		i++
+	}
+	switch {
+	case i > maxPortDigits:
+		return 0, false, 0, false, false
+	case i == len(b):
+		return 0, false, 0, false, true
+	case i == 0 || b[i] != ':':
+		return 0, false, 0, false, false
+	}
+	port, err := strconv.Atoi(string(b[:i]))
+	if err != nil || port < 1 || port > 65535 {
+		return 0, false, 0, false, false
+	}
+	b = b[i+1:]
 	switch {
 	case len(b) == 0:
-		return false, 0, false, true
+		return 0, false, 0, false, true
 	case b[0] != '0' && b[0] != '1':
-		return false, 0, false, false
+		return 0, false, 0, false, false
 	case len(b) == 1:
-		return false, 0, false, true
+		return 0, false, 0, false, true
 	case b[1] == '\n':
-		return b[0] == '1', 2, true, false
+		return port, b[0] == '1', i + 3, true, false
 	case b[1] != '\r':
-		return false, 0, false, false
+		return 0, false, 0, false, false
 	case len(b) == 2:
-		return false, 0, false, true
+		return 0, false, 0, false, true
 	case b[2] == '\n':
-		return b[0] == '1', 3, true, false
+		return port, b[0] == '1', i + 4, true, false
 	default:
-		return false, 0, false, false
+		return 0, false, 0, false, false
 	}
 }
 
@@ -765,7 +786,7 @@ type supervisor struct {
 	started func()
 	// listen, when set, gets the guest's listen lines (see serialFilter). It
 	// must not block.
-	listen func(up bool)
+	listen func(port int, up bool)
 }
 
 // run starts cmd and waits for it. The error is non-nil only when the

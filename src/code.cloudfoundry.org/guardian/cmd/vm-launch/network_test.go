@@ -102,7 +102,7 @@ var _ = Describe("guest network", func() {
 	Describe("networkFor", func() {
 		const resolv = "# silk\nnameserver 169.254.0.2\nsearch service.cf.internal apps.internal\noptions ndots:1\n"
 
-		It("gives a QEMU process without PORT the full guest network with port 0", func() {
+		It("gives a QEMU process without PORT the full guest network with no ports", func() {
 			nw, err := networkFor(backend.VMQemu, envMap(map[string]string{"CF_INSTANCE_GUID": "g"}), writeTempFile("resolv.conf", resolv), fixedMTU(1450), logger)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(*nw).To(Equal(network{
@@ -113,7 +113,7 @@ var _ = Describe("guest network", func() {
 			Expect(logBuf.String()).To(BeEmpty())
 		})
 
-		It("gives a Firecracker process without PORT the full guest network with port 0", func() {
+		It("gives a Firecracker process without PORT the full guest network with no ports", func() {
 			nw, err := networkFor(backend.VMFirecracker, envMap(map[string]string{"CF_INSTANCE_GUID": "g"}), writeTempFile("resolv.conf", resolv), fixedMTU(1450), logger)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(*nw).To(Equal(network{
@@ -125,6 +125,96 @@ var _ = Describe("guest network", func() {
 			Expect(logBuf.String()).To(BeEmpty())
 		})
 
+		Describe("the forwarded ports", func() {
+			instancePorts := func(internal ...int) string {
+				entries := make([]string, len(internal))
+				for i, p := range internal {
+					entries[i] = fmt.Sprintf(`{"external":%d,"internal":%d}`, p, p)
+				}
+				return "[" + strings.Join(entries, ",") + "]"
+			}
+			portsFor := func(env map[string]string) []int {
+				nw, err := networkFor(backend.VMQemu, envMap(env), writeTempFile("resolv.conf", resolv), fixedMTU(1450), logger)
+				Expect(err).NotTo(HaveOccurred())
+				return nw.ports
+			}
+
+			It("forwards PORT alone when CF_INSTANCE_PORTS is not set", func() {
+				Expect(portsFor(map[string]string{"PORT": "8080"})).To(Equal([]int{8080}))
+			})
+
+			It("forwards PORT first, then each other port of CF_INSTANCE_PORTS in order", func() {
+				Expect(portsFor(map[string]string{"PORT": "8080", "CF_INSTANCE_PORTS": instancePorts(9000, 8080, 8081)})).To(Equal([]int{8080, 9000, 8081}))
+				Expect(logBuf.String()).NotTo(ContainSubstring("CF_INSTANCE_PORTS"))
+			})
+
+			It("keeps PORT first when CF_INSTANCE_PORTS lists it later", func() {
+				Expect(portsFor(map[string]string{"PORT": "9000", "CF_INSTANCE_PORTS": instancePorts(8080, 9000)})).To(Equal([]int{9000, 8080}))
+			})
+
+			It("leaves out duplicates", func() {
+				Expect(portsFor(map[string]string{"PORT": "8080", "CF_INSTANCE_PORTS": instancePorts(8081, 8081, 8080, 8081)})).To(Equal([]int{8080, 8081}))
+			})
+
+			It("leaves out the SSH port of Diego", func() {
+				Expect(portsFor(map[string]string{"PORT": "8080", "CF_INSTANCE_PORTS": instancePorts(2222, 8081)})).To(Equal([]int{8080, 8081}))
+			})
+
+			It("reads only the internal port of an entry", func() {
+				value := `[{"external":61001,"internal":8081,"external_tls_proxy_port":61002,"internal_tls_proxy_port":61001}]`
+				Expect(portsFor(map[string]string{"PORT": "8080", "CF_INSTANCE_PORTS": value})).To(Equal([]int{8080, 8081}))
+			})
+
+			It("forwards nothing for a task, whether CF_INSTANCE_PORTS is empty or lists ports", func() {
+				Expect(portsFor(map[string]string{"CF_INSTANCE_PORTS": "[]"})).To(BeEmpty())
+				Expect(portsFor(map[string]string{"CF_INSTANCE_PORTS": instancePorts(8081)})).To(BeEmpty())
+				Expect(logBuf.String()).To(BeEmpty())
+			})
+
+			It("forwards PORT alone for an empty CF_INSTANCE_PORTS", func() {
+				Expect(portsFor(map[string]string{"PORT": "8080", "CF_INSTANCE_PORTS": "[]"})).To(Equal([]int{8080}))
+				Expect(logBuf.String()).To(BeEmpty())
+			})
+
+			It("accepts 16 ports and no more, and says how many it left out", func() {
+				var wanted []int
+				for p := 8080; p < 8080+19; p++ {
+					wanted = append(wanted, p)
+				}
+				got := portsFor(map[string]string{"PORT": "8080", "CF_INSTANCE_PORTS": instancePorts(append(wanted, 8100, 8100)...)})
+				Expect(got).To(Equal(wanted[:16]))
+				Expect(logBuf.String()).To(Equal("CF_INSTANCE_PORTS lists 4 more ports than the 16 that vm-launch forwards; not forwarding them\n"))
+			})
+
+			It("accepts exactly 16 ports without a line", func() {
+				var wanted []int
+				for p := 8080; p < 8080+16; p++ {
+					wanted = append(wanted, p)
+				}
+				Expect(portsFor(map[string]string{"PORT": "8080", "CF_INSTANCE_PORTS": instancePorts(wanted...)})).To(Equal(wanted))
+				Expect(logBuf.String()).To(BeEmpty())
+			})
+
+			DescribeTable("treats a value that is not Diego's JSON as PORT alone, and logs it",
+				func(value string) {
+					Expect(portsFor(map[string]string{"PORT": "8080", "CF_INSTANCE_PORTS": value})).To(Equal([]int{8080}))
+					Expect(logBuf.String()).To(ContainSubstring("CF_INSTANCE_PORTS is not a JSON array of ports"))
+					Expect(logBuf.String()).To(ContainSubstring("forwarding only PORT"))
+				},
+				Entry("not JSON", "8080,8081"),
+				Entry("empty", ""),
+				Entry("an object", `{"internal":8081}`),
+				Entry("a string port", `[{"internal":"8081"}]`),
+				Entry("cut off", `[{"internal":8081}`),
+			)
+
+			It("skips an entry whose port is not a TCP port number and keeps the rest", func() {
+				value := `[{"internal":0},{"internal":70000},{"internal":-3},{"external":9},{"internal":8081}]`
+				Expect(portsFor(map[string]string{"PORT": "8080", "CF_INSTANCE_PORTS": value})).To(Equal([]int{8080, 8081}))
+				Expect(strings.Count(logBuf.String(), "not a TCP port number; not forwarding it")).To(Equal(4))
+			})
+		})
+
 		It("rejects a PORT that is not a port number", func() {
 			_, err := networkFor(backend.VMQemu, envMap(map[string]string{"PORT": "eighty"}), "/nonexistent", fixedMTU(1450), logger)
 			Expect(err).To(MatchError(`PORT "eighty" is not a TCP port number from 1 to 65535`))
@@ -134,7 +224,7 @@ var _ = Describe("guest network", func() {
 			nw, err := networkFor(backend.VMQemu, envMap(map[string]string{"PORT": "8080"}), writeTempFile("resolv.conf", resolv), fixedMTU(1450), logger)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(*nw).To(Equal(network{
-				port:       8080,
+				ports:      []int{8080},
 				address:    "10.0.2.15/24",
 				gateway:    "10.0.2.2",
 				resolvConf: "search service.cf.internal apps.internal\nnameserver 10.0.2.3\n",
@@ -196,8 +286,8 @@ var _ = Describe("guest network", func() {
 			Expect(nw.gateway).To(Equal("169.254.100.1"))
 			Expect(nw.resolvConf).To(Equal("search service.cf.internal apps.internal\nnameserver 169.254.0.2\n"))
 			Expect(nw.mtu).To(Equal(1450))
-			Expect(nw.upstream()).To(Equal("169.254.100.2:61000"))
-			Expect(nw.listenAddr()).To(Equal("0.0.0.0:61000"))
+			Expect(nw.upstream(61000)).To(Equal("169.254.100.2:61000"))
+			Expect(nw.listenAddr(61000)).To(Equal("0.0.0.0:61000"))
 			Expect(logBuf.String()).To(BeEmpty())
 		})
 
@@ -264,14 +354,18 @@ var _ = Describe("guest network", func() {
 			Expect(netFile(&network{address: qemuGuestCIDR, gateway: qemuGateway})).To(Equal("RVM_ADDRESS='10.0.2.15/24'\nRVM_GATEWAY='10.0.2.2'\n"))
 		})
 
+		It("names every port in /rvm/net, space separated, so the guest can watch them", func() {
+			Expect(netFile(&network{ports: []int{8080, 8081, 9000}, address: qemuGuestCIDR, gateway: qemuGateway})).To(Equal("RVM_ADDRESS='10.0.2.15/24'\nRVM_GATEWAY='10.0.2.2'\nRVM_PORTS='8080 8081 9000'\n"))
+		})
+
 		It("names the port in /rvm/net for a guest with one, so the guest can watch it", func() {
-			Expect(netFile(&network{port: 8080, address: qemuGuestCIDR, gateway: qemuGateway, mtu: 9001})).To(Equal("RVM_ADDRESS='10.0.2.15/24'\nRVM_GATEWAY='10.0.2.2'\nRVM_MTU='9001'\nRVM_PORT='8080'\n"))
+			Expect(netFile(&network{ports: []int{8080}, address: qemuGuestCIDR, gateway: qemuGateway, mtu: 9001})).To(Equal("RVM_ADDRESS='10.0.2.15/24'\nRVM_GATEWAY='10.0.2.2'\nRVM_MTU='9001'\nRVM_PORTS='8080'\n"))
 		})
 	})
 
 	Describe("networked initramfs", func() {
 		nw := &network{
-			port:       8080,
+			ports:      []int{8080},
 			address:    qemuGuestCIDR,
 			gateway:    qemuGateway,
 			resolvConf: "nameserver 10.0.2.3\n",
@@ -282,7 +376,7 @@ var _ = Describe("guest network", func() {
 			Expect(names).To(Equal([]string{"bin", "dev", "dev/console", "dev/null", "etc", "proc", "sys", "tmp", "rvm",
 				"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "rvm/limits", "etc/resolv.conf", "rvm/listen-tick", "init", cpioTrailer}))
 			Expect(byName["rvm/listen-tick"].mode).To(Equal(uint32(0o010600)))
-			Expect(string(byName["rvm/net"].data)).To(Equal("RVM_ADDRESS='10.0.2.15/24'\nRVM_GATEWAY='10.0.2.2'\nRVM_PORT='8080'\n"))
+			Expect(string(byName["rvm/net"].data)).To(Equal("RVM_ADDRESS='10.0.2.15/24'\nRVM_GATEWAY='10.0.2.2'\nRVM_PORTS='8080'\n"))
 			Expect(string(byName["rvm/env"].data)).To(Equal("export PORT='8080'\n"))
 			Expect(byName["rvm/env"].mode).To(Equal(uint32(0o100600)))
 			Expect(string(byName["etc/resolv.conf"].data)).To(Equal("nameserver 10.0.2.3\n"))
@@ -352,7 +446,7 @@ var _ = Describe("guest network", func() {
 			lrpNames, lrp := archiveEntries(buildInitramfs([]byte("busybox"), "true", nw, nil))
 			Expect(lrpNames).To(Equal(slices.Insert(slices.Clone(names), slices.Index(names, "init"), "rvm/listen-tick")))
 			Expect(byName["init"].data).To(Equal(lrp["init"].data))
-			Expect(string(lrp["rvm/net"].data)).To(Equal(string(byName["rvm/net"].data) + "RVM_PORT='8080'\n"))
+			Expect(string(lrp["rvm/net"].data)).To(Equal(string(byName["rvm/net"].data) + "RVM_PORTS='8080'\n"))
 			Expect(byName["etc/resolv.conf"].data).To(Equal(lrp["etc/resolv.conf"].data))
 			Expect(byName["rvm/env"].data).To(Equal(lrp["rvm/env"].data))
 		})
@@ -375,7 +469,7 @@ var _ = Describe("guest network", func() {
 
 	Describe("hypervisor command lines with a network", func() {
 		const art = "/opt/garden-vm/artifacts"
-		nw := &network{port: 8080}
+		nw := &network{ports: []int{8080}}
 
 		It("adds a user-mode NIC with no forward, and for PORT a QMP monitor on the inherited socket", func() {
 			argv, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/proc/self/fd/3", 128, nw, "", 4)
@@ -414,7 +508,7 @@ var _ = Describe("guest network", func() {
 					"iface_id":      "eth0",
 					"guest_mac":     "06:00:a9:fe:64:02",
 					"host_dev_name": "tap0",
-				}}), "port %d", n.port)
+				}}), "ports %v", n.ports)
 				Expect(cfg["boot-source"]).To(HaveKeyWithValue("boot_args", "console=ttyS0 reboot=k panic=1 rdinit=/init quiet"))
 			}
 		})
@@ -521,8 +615,9 @@ var _ = Describe("run with PORT", func() {
 
 	// portHypervisor writes a fake hypervisor that runs body between the
 	// start tag and the exit tag, with these shell functions: listen 1|0
-	// writes a listen line; await open|closed waits up to 10 seconds for
-	// port to accept or refuse connections; qmp_send writes a line to the
+	// writes a listen line for port, and listenp P 1|0 for P; await
+	// open|closed waits up to 10 seconds for port to accept or refuse
+	// connections, and awaitp P open|closed for P; qmp_send writes a line to the
 	// QMP socket; qmp_recv waits up to 10 seconds for one, reads it, and
 	// appends it to the returned QMP log; and qmp_reply writes a JSON object
 	// as the reply to the request qmp_recv read last, with its id. A wait
@@ -540,17 +635,19 @@ for a in "$@"; do
 done
 nonce=$(gzip -dc "$initrd" | grep -a -o 'RVM_START_[0-9a-f]*' | head -n 1 | cut -d_ -f3)
 port=` + strconv.Itoa(port) + `
-listen() { echo "RVM_LISTEN_${nonce}=$1"; }
-probe() { (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; }
-await() {
+listenp() { echo "RVM_LISTEN_${nonce}=$1:$2"; }
+listen() { listenp "$port" "$1"; }
+probep() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+awaitp() {
 	for i in $(seq 200); do
-		if probe; then got=open; else got=closed; fi
-		[ "$got" = "$1" ] && return 0
+		if probep "$1"; then got=open; else got=closed; fi
+		[ "$got" = "$2" ] && return 0
 		sleep 0.05
 	done
-	echo "port $port stayed $got, want $1" >&2
+	echo "port $1 stayed $got, want $2" >&2
 	exit 1
 }
+await() { awaitp "$port" "$1"; }
 qmp_send() { printf '%s\n' "$1" >&"$qmp"; }
 qmp_recv() { IFS= read -r -t 10 line <&"$qmp" || { echo "no QMP request came in 10 seconds, or the QMP socket closed" >&2; exit 1; }; qid=${line##*'"id":'}; qid=${qid%\}}; printf '%s\n' "$line" >>` + shellQuote(qmpLog) + `; }
 qmp_reply() { qmp_send "{\"id\": $qid, ${1#\{}"; }
@@ -676,6 +773,113 @@ sleep 0.3
 		Expect(logBuf.String()).To(ContainSubstring("the guest no longer listens on port " + p + "; it is closed in the container\n"))
 		Expect(logBuf.String()).NotTo(ContainSubstring("closes in the container"))
 		Expect(logBuf.String()).NotTo(ContainSubstring("QMP"))
+	})
+
+	It("opens each port of CF_INSTANCE_PORTS on its own for Firecracker, and leaves SSH and a port the app never listens on closed", func() {
+		first, second, unused := freePort(), freePort(), freePort()
+		argvFile, _ := portHypervisor(filepath.Join(art, "firecracker/firecracker"), first, `awaitp `+strconv.Itoa(first)+` closed
+awaitp `+strconv.Itoa(second)+` closed
+awaitp `+strconv.Itoa(unused)+` closed
+listenp `+strconv.Itoa(second)+` 1
+awaitp `+strconv.Itoa(second)+` open
+awaitp `+strconv.Itoa(first)+` closed
+awaitp `+strconv.Itoa(unused)+` closed
+listenp `+strconv.Itoa(first)+` 1
+awaitp `+strconv.Itoa(first)+` open
+listenp `+strconv.Itoa(second)+` 0
+awaitp `+strconv.Itoa(second)+` closed
+awaitp `+strconv.Itoa(first)+` open
+awaitp `+strconv.Itoa(unused)+` closed
+`)
+		GinkgoT().Setenv("PORT", strconv.Itoa(first))
+		GinkgoT().Setenv("CF_INSTANCE_PORTS", fmt.Sprintf(`[{"internal":%d},{"internal":%d},{"internal":2222},{"internal":%d}]`, first, second, unused))
+
+		Expect(runVM(backend.VMFirecracker)).To(Equal(0), logBuf.String())
+		Expect(gateLoops()).To(BeZero())
+		Expect(argvFile).To(BeAnExistingFile())
+		for _, port := range []int{first, second, unused} {
+			_, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+			Expect(err).To(HaveOccurred())
+		}
+		f, s, u := strconv.Itoa(first), strconv.Itoa(second), strconv.Itoa(unused)
+		Expect(logBuf.String()).To(ContainSubstring("the guest listens on port " + s + "; it is open in the container\n"))
+		Expect(logBuf.String()).To(ContainSubstring("the guest no longer listens on port " + s + "; it is closed in the container\n"))
+		Expect(logBuf.String()).To(ContainSubstring("the guest listens on port " + f + "; it is open in the container\n"))
+		Expect(logBuf.String()).To(HaveSuffix("the guest has stopped, so port " + f + " closes in the container\n"))
+		Expect(logBuf.String()).NotTo(ContainSubstring("port " + u))
+		Expect(logBuf.String()).NotTo(ContainSubstring("2222"))
+		Expect(os.ReadDir(tmp)).To(BeEmpty())
+	})
+
+	It("runs with a port of CF_INSTANCE_PORTS that something else holds, and logs the conflict", func() {
+		first, taken := freePort(), freePort()
+		l, err := net.Listen("tcp", "0.0.0.0:"+strconv.Itoa(taken))
+		Expect(err).NotTo(HaveOccurred())
+		defer l.Close()
+		argvFile, _ := portHypervisor(filepath.Join(art, "firecracker/firecracker"), first, `listen 1
+await open
+`)
+		GinkgoT().Setenv("PORT", strconv.Itoa(first))
+		GinkgoT().Setenv("CF_INSTANCE_PORTS", fmt.Sprintf(`[{"internal":%d},{"internal":%d}]`, first, taken))
+
+		Expect(runVM(backend.VMFirecracker)).To(Equal(0), logBuf.String())
+		Expect(argvFile).To(BeAnExistingFile())
+		t := strconv.Itoa(taken)
+		Expect(logBuf.String()).To(ContainSubstring("reserving port " + t + ": bind: address already in use\n"))
+		Expect(logBuf.String()).To(ContainSubstring("port " + t + " already in use in this container; VM backends run one app process per container\n"))
+	})
+
+	It("exits 125 when PORT is held, whatever the other ports are", func() {
+		taken, other := freePort(), freePort()
+		l, err := net.Listen("tcp", "0.0.0.0:"+strconv.Itoa(taken))
+		Expect(err).NotTo(HaveOccurred())
+		defer l.Close()
+		argvFile := fakeHypervisor(filepath.Join(art, "firecracker/firecracker"), "")
+		GinkgoT().Setenv("PORT", strconv.Itoa(taken))
+		GinkgoT().Setenv("CF_INSTANCE_PORTS", fmt.Sprintf(`[{"internal":%d},{"internal":%d}]`, other, taken))
+
+		Expect(runVM(backend.VMFirecracker)).To(Equal(exitLaunchError))
+		Expect(argvFile).NotTo(BeAnExistingFile())
+	})
+
+	It("releases every reserved port when it exits", func() {
+		first, second := freePort(), freePort()
+		fakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+		GinkgoT().Setenv("PORT", strconv.Itoa(first))
+		GinkgoT().Setenv("CF_INSTANCE_PORTS", fmt.Sprintf(`[{"internal":%d},{"internal":%d}]`, first, second))
+		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
+		for _, port := range []int{first, second} {
+			r, err := reservePort(port)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(r.Close()).To(Succeed())
+		}
+	})
+
+	It("adds and removes a QEMU forwarding rule for each port that the guest reports", func() {
+		first, second := freePort(), freePort()
+		f, s := strconv.Itoa(first), strconv.Itoa(second)
+		_, qmpLog := portHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), first, qmpGreeting+`listen 1
+qmp_recv
+qmp_reply '{"return": {}}'
+qmp_recv
+qmp_reply '{"return": ""}'
+listenp `+s+` 1
+qmp_recv
+qmp_reply '{"return": ""}'
+listen 0
+qmp_recv
+qmp_reply '{"return": "host forwarding rule for tcp:0.0.0.0:`+f+` removed\r\n"}'
+sleep 0.3
+`)
+		GinkgoT().Setenv("PORT", f)
+		GinkgoT().Setenv("CF_INSTANCE_PORTS", fmt.Sprintf(`[{"internal":%d},{"internal":%d}]`, first, second))
+
+		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
+		Expect(gateLoops()).To(BeZero())
+		Expect(os.ReadFile(qmpLog)).To(Equal([]byte(qmpCapabilities + "\n" + hostfwdAdd(2, first) + "\n" + hostfwdAdd(3, second) + "\n" + hostfwdRemove(4, first) + "\n")))
+		Expect(logBuf.String()).To(ContainSubstring("the guest listens on port " + f + "; it is open in the container\n"))
+		Expect(logBuf.String()).To(ContainSubstring("the guest listens on port " + s + "; it is open in the container\n"))
+		Expect(logBuf.String()).To(ContainSubstring("the guest no longer listens on port " + f + "; it is closed in the container\n"))
 	})
 
 	It("removes QEMU's forwarding rule at SIGTERM while the hypervisor still runs", func() {
@@ -816,7 +1020,7 @@ sleep 0.3
 	})
 
 	It("says nothing about a port when the process has none", func() {
-		fakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "echo RVM_LISTEN_${nonce}=1")
+		fakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "echo RVM_LISTEN_${nonce}=8080:1")
 		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
 		Expect(logBuf.String()).NotTo(ContainSubstring("port"))
 	})

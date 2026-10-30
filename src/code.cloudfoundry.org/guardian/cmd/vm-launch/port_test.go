@@ -27,28 +27,34 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// listenRecorder records the listen states a serial filter passes on.
+// listenReport is one listen line the serial filter passed on.
+type listenReport struct {
+	port int
+	up   bool
+}
+
+// listenRecorder records the listen reports a serial filter passes on.
 type listenRecorder struct {
-	mu     sync.Mutex
-	states []bool
+	mu      sync.Mutex
+	reports []listenReport
 }
 
-func (r *listenRecorder) record(up bool) {
+func (r *listenRecorder) record(port int, up bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.states = append(r.states, up)
+	r.reports = append(r.reports, listenReport{port, up})
 }
 
-func (r *listenRecorder) got() []bool {
+func (r *listenRecorder) got() []listenReport {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return append([]bool(nil), r.states...)
+	return append([]listenReport(nil), r.reports...)
 }
 
 // feedListen pushes chunks through a serial filter that passes listen lines
 // to a recorder, finishes it, and returns the filter, its output, and the
-// listen states.
-func feedListen(chunks ...string) (*serialFilter, string, []bool) {
+// listen reports.
+func feedListen(chunks ...string) (*serialFilter, string, []listenReport) {
 	var out bytes.Buffer
 	var rec listenRecorder
 	f := newSerialFilter(&out, testNonce)
@@ -67,80 +73,186 @@ var _ = Describe("listen lines on the serial console", func() {
 
 	// console is a run with listen lines at the start of a line, after
 	// output with no newline yet, and malformed ones that are output.
-	console := "boot " + listen + "1\r\n" +
+	console := "boot " + listen + "8080:1\r\n" +
 		"RVM_START_" + testNonce + "\r\n" +
 		"one\r\n" +
-		listen + "1\r\n" +
-		"partial" + listen + "0\r\n" +
+		listen + "8080:1\r\n" +
+		"partial" + listen + "8081:0\r\n" +
 		"rest\r\n" +
-		listen + "2\r\n" +
-		listen + "1x\r\n" +
+		listen + "8080:2\r\n" +
+		listen + "8080:1x\r\n" +
+		listen + "1\r\n" +
 		listen + "\r\n" +
-		listen + "1\n" +
+		listen + "0:1\r\n" +
+		listen + "65536:1\r\n" +
+		listen + "123456:1\r\n" +
+		listen + ":1\r\n" +
+		listen + "80 80:1\r\n" +
+		listen + "9000:1\n" +
 		"RVM_EXIT_" + testNonce + "=7\r\n" +
-		listen + "0\r\n"
-	wantOut := "one\npartialrest\n" + listen + "2\n" + listen + "1x\n" + listen + "\n"
-	wantStates := []bool{true, false, true}
+		listen + "8080:0\r\n"
+	wantOut := "one\npartialrest\n" + listen + "8080:2\n" + listen + "8080:1x\n" + listen + "1\n" + listen + "\n" +
+		listen + "0:1\n" + listen + "65536:1\n" + listen + "123456:1\n" + listen + ":1\n" + listen + "80 80:1\n"
+	wantReports := []listenReport{{8080, true}, {8081, false}, {9000, true}}
 
 	It("passes each listen line of the run to the callback and keeps the output around it", func() {
-		f, out, states := feedListen(console)
+		f, out, reports := feedListen(console)
 		Expect(out).To(Equal(wantOut))
-		Expect(states).To(Equal(wantStates))
+		Expect(reports).To(Equal(wantReports))
 		Expect(f.markerFound()).To(BeTrue())
 		Expect(f.status).To(Equal(7))
 	})
 
 	It("gives the same result however the console is split", func() {
 		for i := 0; i <= len(console); i++ {
-			_, out, states := feedListen(console[:i], console[i:])
+			_, out, reports := feedListen(console[:i], console[i:])
 			Expect(out).To(Equal(wantOut), "split at %d", i)
-			Expect(states).To(Equal(wantStates), "split at %d", i)
+			Expect(reports).To(Equal(wantReports), "split at %d", i)
 		}
 		chunks := make([]string, len(console))
 		for i := range console {
 			chunks[i] = console[i : i+1]
 		}
-		_, out, states := feedListen(chunks...)
+		_, out, reports := feedListen(chunks...)
 		Expect(out).To(Equal(wantOut))
-		Expect(states).To(Equal(wantStates))
+		Expect(reports).To(Equal(wantReports))
 	})
 
 	It("treats a listen line cut off by the end of the console as output", func() {
-		for _, tail := range []string{"", "1", "1\r"} {
+		for _, tail := range []string{"", "8", "8080", "8080:", "8080:1", "8080:1\r"} {
 			start := "RVM_START_" + testNonce + "\n"
-			_, out, states := feedListen(start + "x" + listen + tail)
+			_, out, reports := feedListen(start + "x" + listen + tail)
 			Expect(out).To(Equal("x"+listen+tail), "tail %q", tail)
-			Expect(states).To(BeEmpty(), "tail %q", tail)
+			Expect(reports).To(BeEmpty(), "tail %q", tail)
 		}
 	})
 
 	It("finds the exit marker right after a listen line in the same write", func() {
-		f, out, states := feedListen("RVM_START_" + testNonce + "\n" + listen + "1\nRVM_EXIT_" + testNonce + "=0\n")
+		f, out, reports := feedListen("RVM_START_" + testNonce + "\n" + listen + "8080:1\nRVM_EXIT_" + testNonce + "=0\n")
 		Expect(out).To(BeEmpty())
-		Expect(states).To(Equal([]bool{true}))
+		Expect(reports).To(Equal([]listenReport{{8080, true}}))
 		Expect(f.status).To(Equal(0))
 	})
 
+	It("keeps the reports of different ports apart and in order", func() {
+		_, out, reports := feedListen("RVM_START_"+testNonce+"\n", listen+"8081:1\n", listen+"8080:1\n", listen+"8081:0\n", listen+"8080:0\n")
+		Expect(out).To(BeEmpty())
+		Expect(reports).To(Equal([]listenReport{{8081, true}, {8080, true}, {8081, false}, {8080, false}}))
+	})
+
 	It("leaves listen lines in the output when nothing asked for them", func() {
-		f, out := feed("RVM_START_"+testNonce+"\n", listen+"1\r\n", "RVM_EXIT_"+testNonce+"=0\n")
-		Expect(out).To(Equal(listen + "1\n"))
+		f, out := feed("RVM_START_"+testNonce+"\n", listen+"8080:1\r\n", "RVM_EXIT_"+testNonce+"=0\n")
+		Expect(out).To(Equal(listen + "8080:1\n"))
 		Expect(f.markerFound()).To(BeTrue())
 	})
 
 	DescribeTable("parses the bytes after the tag",
-		func(b string, up bool, n int, ok, needMore bool) {
-			gotUp, gotN, gotOK, gotMore := parseListen([]byte(b))
-			Expect([]any{gotUp, gotN, gotOK, gotMore}).To(Equal([]any{up, n, ok, needMore}))
+		func(b string, port int, up bool, n int, ok, needMore bool) {
+			gotPort, gotUp, gotN, gotOK, gotMore := parseListen([]byte(b))
+			Expect([]any{gotPort, gotUp, gotN, gotOK, gotMore}).To(Equal([]any{port, up, n, ok, needMore}))
 		},
-		Entry("nothing yet", "", false, 0, false, true),
-		Entry("a digit without its line ending", "1", false, 0, false, true),
-		Entry("a CR without its LF", "0\r", false, 0, false, true),
-		Entry("1 and LF", "1\nmore", true, 2, true, false),
-		Entry("0 and CRLF", "0\r\nmore", false, 3, true, false),
-		Entry("another digit", "2\n", false, 0, false, false),
-		Entry("two digits", "10\n", false, 0, false, false),
-		Entry("a CR and something else", "1\rx", false, 0, false, false),
+		Entry("nothing yet", "", 0, false, 0, false, true),
+		Entry("a port without its colon", "8080", 0, false, 0, false, true),
+		Entry("a colon without its value", "8080:", 0, false, 0, false, true),
+		Entry("a value without its line ending", "8080:1", 0, false, 0, false, true),
+		Entry("a CR without its LF", "8080:0\r", 0, false, 0, false, true),
+		Entry("1 and LF", "8080:1\nmore", 8080, true, 7, true, false),
+		Entry("0 and CRLF", "443:0\r\nmore", 443, false, 7, true, false),
+		Entry("the lowest port", "1:1\n", 1, true, 4, true, false),
+		Entry("the highest port", "65535:1\n", 65535, true, 8, true, false),
+		Entry("port zero", "0:1\n", 0, false, 0, false, false),
+		Entry("a port above 65535", "65536:1\n", 0, false, 0, false, false),
+		Entry("six digits", "100000:1\n", 0, false, 0, false, false),
+		Entry("no port", ":1\n", 0, false, 0, false, false),
+		Entry("a port and no colon", "8080 1\n", 0, false, 0, false, false),
+		Entry("the old form without a port", "1\n", 0, false, 0, false, false),
+		Entry("another digit", "8080:2\n", 0, false, 0, false, false),
+		Entry("two digits", "8080:10\n", 0, false, 0, false, false),
+		Entry("a CR and something else", "8080:1\rx", 0, false, 0, false, false),
 	)
+})
+
+var _ = Describe("the gates of several ports", func() {
+	var (
+		openers map[int]*fakeOpener
+		logBuf  *safeBuffer
+		gates   *portGates
+	)
+	fastRetry := backoff{first: 5 * time.Millisecond, max: 20 * time.Millisecond}
+
+	BeforeEach(func() {
+		openers = map[int]*fakeOpener{8080: {}, 8081: {}, 9000: {}}
+		logBuf = &safeBuffer{}
+		gates = startPortGates([]int{8080, 8081, 9000}, func(port int) portOpener { return openers[port] }, fastRetry, log.New(logBuf, "", 0))
+		DeferCleanup(gates.end)
+	})
+
+	It("starts every gate closed", func() {
+		Consistently(func() int { return openers[8080].count() + openers[8081].count() + openers[9000].count() }, 100*time.Millisecond).Should(BeZero())
+	})
+
+	It("sends each report to its own port's gate only", func() {
+		gates.set(8081, true)
+		Eventually(openers[8081].got).Should(Equal([]string{"open"}))
+		Consistently(openers[8080].got, 100*time.Millisecond).Should(BeEmpty())
+		Consistently(openers[9000].got, 100*time.Millisecond).Should(BeEmpty())
+
+		gates.set(9000, true)
+		Eventually(openers[9000].got).Should(Equal([]string{"open"}))
+		gates.set(8081, false)
+		Eventually(openers[8081].got).Should(Equal([]string{"open", "close"}))
+		Consistently(openers[9000].got, 100*time.Millisecond).Should(Equal([]string{"open"}))
+		Expect(openers[8080].got()).To(BeEmpty())
+	})
+
+	It("names the port in each gate's lines", func() {
+		gates.set(8081, true)
+		gates.set(9000, true)
+		Eventually(logBuf.String).Should(ContainSubstring("the guest listens on port 8081; it is open in the container\n"))
+		Eventually(logBuf.String).Should(ContainSubstring("the guest listens on port 9000; it is open in the container\n"))
+		Expect(logBuf.String()).NotTo(ContainSubstring("port 8080"))
+	})
+
+	It("ignores a report for a port that has no gate", func() {
+		gates.set(8082, true)
+		gates.set(0, true)
+		Consistently(func() int { return openers[8080].count() + openers[8081].count() + openers[9000].count() }, 100*time.Millisecond).Should(BeZero())
+	})
+
+	It("keeps a failing port from holding up the others", func() {
+		openers[8080].setOpen(func() error { return syscall.EADDRINUSE })
+		gates.set(8080, true)
+		gates.set(8081, true)
+		Eventually(openers[8081].got).Should(Equal([]string{"open"}))
+		Eventually(logBuf.String).Should(ContainSubstring("port 8080 already in use in this container"))
+	})
+
+	It("closes every open port at shutDown and opens none again", func() {
+		gates.set(8080, true)
+		gates.set(9000, true)
+		Eventually(openers[8080].got).Should(Equal([]string{"open"}))
+		Eventually(openers[9000].got).Should(Equal([]string{"open"}))
+
+		gates.shutDown()
+		Eventually(openers[8080].got).Should(Equal([]string{"open", "close"}))
+		Eventually(openers[9000].got).Should(Equal([]string{"open", "close"}))
+		gates.set(8081, true)
+		gates.set(8080, true)
+		Consistently(openers[8081].got, 100*time.Millisecond).Should(BeEmpty())
+		Expect(openers[8080].got()).To(Equal([]string{"open", "close"}))
+	})
+
+	It("ends every gate and says which ports were open", func() {
+		gates.set(8080, true)
+		gates.set(9000, true)
+		Eventually(openers[8080].got).Should(Equal([]string{"open"}))
+		Eventually(openers[9000].got).Should(Equal([]string{"open"}))
+		gates.end()
+		Expect(gateLoops()).To(BeZero())
+		Expect(logBuf.String()).To(ContainSubstring("the guest has stopped, so port 8080 closes in the container\n"))
+		Expect(logBuf.String()).To(ContainSubstring("the guest has stopped, so port 9000 closes in the container\n"))
+		Expect(logBuf.String()).NotTo(ContainSubstring("port 8081 closes"))
+	})
 })
 
 // fakeOpener is a portOpener that records its calls. open, when set, runs
@@ -635,6 +747,41 @@ var _ = Describe("the QMP monitor", func() {
 		Eventually(done).Should(BeClosed())
 	})
 
+	It("runs the commands of several goroutines one at a time, each getting its own reply", func() {
+		m, qemu := newFakeQMP()
+		const callers, each = 4, 10
+		done := qemu.serve(func() {
+			qemu.send(fakeGreeting)
+			qemu.recv()
+			qemu.reply(`{"return": {}}`)
+			for i := 0; i < callers*each; i++ {
+				var req struct {
+					Arguments struct {
+						CommandLine string `json:"command-line"`
+					} `json:"arguments"`
+				}
+				Expect(json.Unmarshal([]byte(qemu.recv()), &req)).To(Succeed())
+				reply, err := json.Marshal(req.Arguments.CommandLine)
+				Expect(err).NotTo(HaveOccurred())
+				qemu.reply(`{"return": ` + string(reply) + `}`)
+			}
+		})
+		var wg sync.WaitGroup
+		for c := 0; c < callers; c++ {
+			wg.Add(1)
+			go func() {
+				defer GinkgoRecover()
+				defer wg.Done()
+				for i := 0; i < each; i++ {
+					line := fmt.Sprintf("caller %d command %d", c, i)
+					Expect(m.humanCommand(line)).To(Equal(line))
+				}
+			}()
+		}
+		wg.Wait()
+		Eventually(done).Should(BeClosed())
+	})
+
 	It("returns an error reply as an error and stays usable", func() {
 		m, qemu := newFakeQMP()
 		done := qemu.serve(func() {
@@ -1054,13 +1201,14 @@ var _ = Describe("the guest listen watcher", func() {
 		unreadable = "\x01"
 	)
 
-	// watchRound runs the watcher for port, after the shell code prelude,
+	// watchPorts runs the watcher for ports, after the shell code prelude,
 	// against fake /proc/net/tcp and tcp6 contents, either of which may be
 	// noTable or unreadable, with its listen lines on stdout. The watcher
-	// starts in the state wasUp, "0" or "1", and calls rvm_round_end in
-	// place of its pause, which ends it after one round unless prelude
-	// defines it again. watchRound returns what the watcher printed.
-	watchRound := func(shell guestShell, port int, tcp, tcp6, prelude, wasUp string) string {
+	// starts in the state that exactly the ports of was are up, and calls
+	// rvm_round_end in place of its pause, which ends it after one round
+	// unless prelude defines it again. watchPorts returns what the watcher
+	// printed.
+	watchPorts := func(shell guestShell, ports []int, tcp, tcp6, prelude string, was []int) string {
 		dir := GinkgoT().TempDir()
 		tcpPath, tcp6Path := filepath.Join(dir, "tcp"), filepath.Join(dir, "tcp6")
 		for path, table := range map[string]string{tcpPath: tcp, tcp6Path: tcp6} {
@@ -1073,20 +1221,39 @@ var _ = Describe("the guest listen watcher", func() {
 				Expect(os.WriteFile(path, []byte(procNetHeader+table), 0o644)).To(Succeed())
 			}
 		}
+		upSet := " "
+		for _, p := range was {
+			upSet += fmt.Sprintf("%04X ", p)
+		}
 		watch := watchOnStdout(newTick())
-		for _, s := range []string{" /proc/net/tcp /proc/net/tcp6;", "\n\t\trvm_up=0\n", "\n\t\t\trvm_pause\n"} {
+		const startState = "\n\t\trvm_upset=\" \"\n"
+		for _, s := range []string{" /proc/net/tcp /proc/net/tcp6;", startState, "\n\t\t\trvm_pause\n"} {
 			Expect(watch).To(ContainSubstring(s))
 		}
 		watch = strings.NewReplacer(
 			" /proc/net/tcp /proc/net/tcp6;", " "+tcpPath+" "+tcp6Path+";",
-			"\n\t\trvm_up=0\n", "\n\t\trvm_up="+wasUp+"\n",
+			startState, "\n\t\trvm_upset=\""+upSet+"\"\n",
 			"\n\t\t\trvm_pause\n", "\n\t\t\trvm_round_end\n",
 		).Replace(watch)
 		script := "rvm_round_end() { exit 0; }\n" + prelude + watch + `wait "$rvm_watch"` + "\n"
+		list := make([]string, len(ports))
+		for i, p := range ports {
+			list[i] = strconv.Itoa(p)
+		}
 		out, err := runBounded(shell.argv[0], append(shell.argv[1:], "-c", script),
-			[]string{"PATH=" + watcherPath(shell), "RVM_PORT=" + strconv.Itoa(port)})
+			[]string{"PATH=" + watcherPath(shell), "RVM_PORTS=" + strings.Join(list, " ")})
 		Expect(err).NotTo(HaveOccurred(), "%s: %s", shell.name, out)
 		return string(out)
+	}
+
+	// watchRound runs the watcher for one port, which was up before the
+	// round when wasUp is "1".
+	watchRound := func(shell guestShell, port int, tcp, tcp6, prelude, wasUp string) string {
+		var was []int
+		if wasUp == "1" {
+			was = []int{port}
+		}
+		return watchPorts(shell, []int{port}, tcp, tcp6, prelude, was)
 	}
 
 	// checkOnce runs one round of the watcher, from the state not
@@ -1095,8 +1262,15 @@ var _ = Describe("the guest listen watcher", func() {
 		return watchRound(shell, port, tcp, tcp6, "", "0")
 	}
 
-	listening := "RVM_LISTEN_" + testNonce + "=1\n"
-	notListening := "RVM_LISTEN_" + testNonce + "=0\n"
+	// listenLine is the line the watcher prints when port goes up or down.
+	listenLine := func(port int, up bool) string {
+		state := "0"
+		if up {
+			state = "1"
+		}
+		return "RVM_LISTEN_" + testNonce + "=" + strconv.Itoa(port) + ":" + state + "\n"
+	}
+	listening, notListening := listenLine(8080, true), listenLine(8080, false)
 
 	type socketCase struct {
 		port      int
@@ -1127,11 +1301,61 @@ var _ = Describe("the guest listen watcher", func() {
 			for name, c := range cases {
 				out := checkOnce(shell, c.port, c.tcp, c.tcp6)
 				if c.want {
-					Expect(out).To(Equal(listening), "%s: %s", shell.name, name)
+					Expect(out).To(Equal(listenLine(c.port, true)), "%s: %s", shell.name, name)
 				} else {
 					Expect(out).To(BeEmpty(), "%s: %s", shell.name, name)
 				}
 			}
+		},
+		shellEntries(""),
+	)
+
+	DescribeTable("reports each port on its own, from one pass over the tables",
+		func(shellOf func() guestShell) {
+			shell := shellOf()
+			ports := []int{8080, 8081, 9000}
+			a, b := procNetLine("00000000:1F90", "0A"), procNetLine("00000000:1F91", "0A")
+			loopback9000 := procNetLine("0100007F:2328", "0A")
+			// Only 8080 listens: 8081 and 9000 stay down and say nothing.
+			Expect(watchPorts(shell, ports, a, "", "", nil)).To(Equal(listenLine(8080, true)), shell.name)
+			// Both 8080 and 8081 listen, and 9000 listens on loopback only.
+			Expect(watchPorts(shell, ports, a+b+loopback9000, "", "", nil)).To(Equal(listenLine(8080, true)+listenLine(8081, true)), shell.name)
+			// A port that is up and still listens says nothing, and one that
+			// stopped says so alone.
+			Expect(watchPorts(shell, ports, a, "", "", []int{8080, 8081})).To(Equal(listenLine(8081, false)), shell.name)
+			Expect(watchPorts(shell, ports, a+b, "", "", []int{8080, 8081})).To(BeEmpty(), shell.name)
+			// A port in the second table counts too.
+			Expect(watchPorts(shell, ports, a, procNetLine(wildcard6+":2328", "0A"), "", []int{8080})).To(Equal(listenLine(9000, true)), shell.name)
+			// Every port that was up goes down when nothing listens.
+			Expect(watchPorts(shell, ports, "", "", "", []int{8080, 9000})).To(Equal(listenLine(8080, false)+listenLine(9000, false)), shell.name)
+		},
+		shellEntries(""),
+	)
+
+	DescribeTable("keeps the last answer of every port when a look fails",
+		func(shellOf func() guestShell) {
+			shell := shellOf()
+			ports := []int{8080, 8081}
+			a := procNetLine("00000000:1F90", "0A")
+			Expect(watchPorts(shell, ports, unreadable, "", "", []int{8080, 8081})).To(BeEmpty(), shell.name)
+			// A port found in the look that worked is up, and the one that
+			// the failed table might have held keeps its answer.
+			Expect(watchPorts(shell, ports, unreadable, "", "", []int{8081})).To(BeEmpty(), shell.name)
+			Expect(watchPorts(shell, ports, a, unreadable, "", []int{8081})).To(Equal(listenLine(8080, true)), shell.name)
+		},
+		shellEntries(""),
+	)
+
+	DescribeTable("repeats the listen line of one port that failed to write without touching another",
+		func(shellOf func() guestShell) {
+			shell := shellOf()
+			ports := []int{8080, 8081}
+			both := procNetLine("00000000:1F90", "0A") + procNetLine("00000000:1F91", "0A")
+			// The write of the 8080 line fails: echo is a function that
+			// fails for that line only, so 8080 stays down and the 8081
+			// line still goes out.
+			prelude := `echo() { case "$*" in *=8080:*) return 1 ;; esac; printf '%s\n' "$*"; }` + "\n"
+			Expect(watchPorts(shell, ports, both, "", prelude, nil)).To(Equal(listenLine(8081, true)), shell.name)
 		},
 		shellEntries(""),
 	)
@@ -1235,7 +1459,7 @@ echo() { if [ -z "${rvm_failed_once:-}" ]; then rvm_failed_once=1; return 1; fi;
 			// the start of its loop, run as the watcher runs it, in a
 			// subshell with its stdin on /dev/null.
 			watch := watchOnStdout(tick)
-			from, to := strings.Index(watch, "\t\tif [ -p "), strings.Index(watch, "\n\t\trvm_up=0\n")
+			from, to := strings.Index(watch, "\t\tif [ -p "), strings.Index(watch, "\n\t\trvm_upset=\" \"\n")
 			Expect(from).To(BeNumerically(">=", 0), watch)
 			Expect(to).To(BeNumerically(">", from), watch)
 			script := "(\n" + watch[from:to] + `
@@ -1268,7 +1492,7 @@ echo() { if [ -z "${rvm_failed_once:-}" ]; then rvm_failed_once=1; return 1; fi;
 	// would wait for a watcher that never ends.
 	startWatcher := func(shell guestShell, port int, script string, attr *syscall.SysProcAttr) (*exec.Cmd, io.Writer, *safeBuffer, <-chan string) {
 		c := exec.Command(shell.argv[0], append(shell.argv[1:], "-c", script)...)
-		c.Env = []string{"PATH=" + watcherPath(shell), "RVM_PORT=" + strconv.Itoa(port)}
+		c.Env = []string{"PATH=" + watcherPath(shell), "RVM_PORTS=" + strconv.Itoa(port)}
 		stdin, err := c.StdinPipe()
 		Expect(err).NotTo(HaveOccurred())
 		stdout, err := c.StdoutPipe()
@@ -1317,9 +1541,9 @@ echo() { if [ -z "${rvm_failed_once:-}" ]; then rvm_failed_once=1; return 1; fi;
 		Consistently(lines, 1500*time.Millisecond).ShouldNot(Receive())
 		wild, err := net.Listen("tcp6", "[::]:"+strconv.Itoa(port))
 		Expect(err).NotTo(HaveOccurred())
-		Eventually(lines, 5*time.Second).Should(Receive(Equal("RVM_LISTEN_" + testNonce + "=1")))
+		Eventually(lines, 5*time.Second).Should(Receive(Equal("RVM_LISTEN_" + testNonce + "=" + strconv.Itoa(port) + ":1")))
 		Expect(wild.Close()).To(Succeed())
-		Eventually(lines, 5*time.Second).Should(Receive(Equal("RVM_LISTEN_" + testNonce + "=0")))
+		Eventually(lines, 5*time.Second).Should(Receive(Equal("RVM_LISTEN_" + testNonce + "=" + strconv.Itoa(port) + ":0")))
 	}
 
 	DescribeTable("follows real sockets, among connections, and stops before /init reports the status",
