@@ -529,12 +529,12 @@ var _ = Describe("Rundmc", func() {
 			}
 		}
 
-		// The vm-launch options each backend's wrapped launcher runs with:
-		// a Firecracker one dials forwarded connections from their clients'
-		// addresses.
+		// The vm-launch options each backend's wrapped launcher runs with.
+		// The process builder adds the transparent proxy flag for a
+		// Firecracker one with PORT, so the containerizer passes none.
 		wrapperOptions := map[backend.Kind][]string{
 			backend.VMQemu:        {"--backend", "vm-qemu"},
-			backend.VMFirecracker: {"--backend", "vm-firecracker", "--transparent-proxy"},
+			backend.VMFirecracker: {"--backend", "vm-firecracker"},
 		}
 
 		for _, kind := range []backend.Kind{backend.VMQemu, backend.VMFirecracker} {

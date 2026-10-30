@@ -409,13 +409,18 @@ var _ = Describe("ProcBuilder", func() {
 		}
 	})
 
-	Describe("CAP_NET_RAW for the transparent port proxy", func() {
+	Describe("CAP_NET_RAW and the flag for the transparent port proxy", func() {
 		var (
 			annotations  map[string]string
 			marked       bool
 			preparedProc *specs.Process
 			maxCaps      []string
+			// builtEnv is the environment the env determiner builds, which
+			// is what the runtime gives the process.
+			builtEnv []string
 		)
+
+		launcherArgs := []string{"--backend", "vm-firecracker", "--", "/tmp/lifecycle/launcher", "app", "true", ""}
 
 		BeforeEach(func() {
 			// The caps a non-root app user gets in an unprivileged container.
@@ -423,12 +428,15 @@ var _ = Describe("ProcBuilder", func() {
 			maxCaps = []string{"CAP_CHOWN", "CAP_NET_RAW", "CAP_SETGID", "CAP_KILL"}
 			annotations = map[string]string{backend.AnnotationKey: string(backend.VMFirecracker)}
 			processSpec.Path = processes.VMLaunchPath
+			processSpec.Args = launcherArgs
 			processSpec.Env = []string{"A=b"}
+			builtEnv = []string{"A=b", "PORT=8080", `CF_INSTANCE_PORTS=[{"internal":8080}]`}
 			user.Uid, user.Gid = 2000, 2000
 			marked = true
 		})
 
 		JustBeforeEach(func() {
+			envDeterminer.EnvForReturns(builtEnv)
 			bndl.Spec.Annotations = annotations
 			if marked {
 				processSpec = processes.MarkVMLaunch(processSpec)
@@ -447,6 +455,24 @@ var _ = Describe("ProcBuilder", func() {
 			Expect(caps.Effective).To(Equal([]string{"CAP_NET_RAW"}))
 			Expect(caps.Ambient).To(Equal([]string{"CAP_NET_RAW"}))
 			Expect(preparedProc.NoNewPrivileges).To(BeTrue())
+		})
+
+		It("passes the flag to that vm-launch, before its own arguments", func() {
+			Expect(preparedProc.Args).To(Equal(append([]string{processes.VMLaunchPath, "--transparent-proxy"}, launcherArgs...)))
+			Expect(preparedProc.Env).To(Equal(builtEnv))
+		})
+
+		// vm-launch reads an empty PORT as set, and exits because it is no
+		// port, so the grant follows presence alone.
+		Context("when PORT is set but empty", func() {
+			BeforeEach(func() {
+				builtEnv = []string{"A=b", "PORT="}
+			})
+
+			It("still grants it and passes the flag", func() {
+				Expect(preparedProc.Capabilities.Ambient).To(Equal([]string{"CAP_NET_RAW"}))
+				Expect(preparedProc.Args).To(ContainElement("--transparent-proxy"))
+			})
 		})
 
 		It("is the capability named CAP_NET_RAW, and the flag vm-launch reads", func() {
@@ -503,7 +529,43 @@ var _ = Describe("ProcBuilder", func() {
 			caps := preparedProc.Capabilities
 			Expect(caps.Effective).To(BeNil())
 			Expect(caps.Ambient).To(BeNil())
+			Expect(preparedProc.Args).NotTo(ContainElement("--transparent-proxy"))
+			Expect(preparedProc.Args).To(Equal(append([]string{processSpec.Path}, processSpec.Args...)))
 		}
+
+		// A task, or any other process without PORT, has nothing for the
+		// proxy to forward.
+		Context("for the wrapped vm-launch of a process without PORT", func() {
+			BeforeEach(func() {
+				builtEnv = []string{"A=b", `CF_INSTANCE_PORTS=[{"internal":8080}]`}
+			})
+
+			It("grants nothing and passes no flag", func() {
+				expectNoGrant()
+				Expect(preparedProc.Capabilities.Bounding).To(Equal([]string{"CAP_CHOWN", "CAP_NET_RAW", "CAP_KILL"}))
+			})
+		})
+
+		Context("when only names that merely contain PORT are set", func() {
+			BeforeEach(func() {
+				builtEnv = []string{"PORTS=8080", "PORT_X=8080", "XPORT=8080", "CF_INSTANCE_PORT=8080"}
+			})
+
+			It("grants nothing and passes no flag", func() {
+				expectNoGrant()
+			})
+		})
+
+		Context("when PORT is in the spec but not in the environment the process gets", func() {
+			BeforeEach(func() {
+				processSpec.Env = []string{"PORT=8080"}
+				builtEnv = []string{"A=b"}
+			})
+
+			It("goes by the environment the process gets, and grants nothing", func() {
+				expectNoGrant()
+			})
+		})
 
 		Context("for the wrapped vm-launch in a vm-qemu bundle", func() {
 			BeforeEach(func() {

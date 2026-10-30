@@ -346,11 +346,12 @@ func (c *Containerizer) Run(log lager.Logger, handle string, spec garden.Process
 // wrapVMLauncher rewrites the CF launcher process of a vm-* container so that
 // it runs through vm-launch, which boots the workload inside a microVM, and
 // marks it so that the process builder grants it the kvm gid. In a
-// vm-firecracker container it also asks vm-launch to dial each forwarded
-// connection from its client's address, which the process builder grants
-// CAP_NET_RAW for and the networker routes the replies of. Every other
-// process, and every container on another backend, is returned as is. It
-// reports whether it wrapped the process.
+// vm-firecracker container the process builder also decides, from the
+// environment it builds, whether vm-launch dials each forwarded connection
+// from its client's address, which takes CAP_NET_RAW (see
+// processes.VMLaunchTransparentProxyFlag). Every other process, and every
+// container on another backend, is returned as is. It reports whether it
+// wrapped the process.
 func (c *Containerizer) wrapVMLauncher(log lager.Logger, handle string, spec garden.ProcessSpec) (garden.ProcessSpec, bool, error) {
 	_, bundle, err := c.runtime.BundleInfo(log, handle)
 	if err != nil {
@@ -365,11 +366,8 @@ func (c *Containerizer) wrapVMLauncher(log lager.Logger, handle string, spec gar
 
 	log.Info("vm-wrap-launcher", lager.Data{"backend": string(kind)})
 
-	args := make([]string, 0, len(spec.Args)+5)
+	args := make([]string, 0, len(spec.Args)+4)
 	args = append(args, "--backend", string(kind))
-	if kind == backend.VMFirecracker {
-		args = append(args, processes.VMLaunchTransparentProxyFlag)
-	}
 	args = append(args, "--", spec.Path)
 	args = append(args, spec.Args...)
 

@@ -43,16 +43,24 @@ const (
 
 	// CapNetRaw lets a process open raw sockets and set IP_TRANSPARENT in its
 	// network namespace. The wrapped vm-launch of a vm-firecracker container
-	// gets it in every set, so that its port proxy can dial the guest from
-	// the client's own address (see VMLaunchTransparentProxyFlag).
+	// gets it in every set when the process has PORT, so that its port proxy
+	// can dial the guest from the client's own address (see
+	// VMLaunchTransparentProxyFlag).
 	CapNetRaw = "CAP_NET_RAW"
 
 	// VMLaunchTransparentProxyFlag tells vm-launch that its Firecracker port
 	// proxy may dial the guest from each client's address, because Garden has
-	// granted it CapNetRaw and routes the guest's replies back to it. The
-	// containerizer passes it to the wrapped vm-launch of a vm-firecracker
-	// container, the one process BuildProcess grants CapNetRaw.
+	// granted it CapNetRaw and routes the guest's replies back to it.
+	// BuildProcess passes it, together with the grant, to the wrapped
+	// vm-launch of a vm-firecracker container whose environment sets PORT,
+	// which is the one condition under which vm-launch forwards ports. A
+	// process without PORT, such as a task, gets neither.
 	VMLaunchTransparentProxyFlag = "--transparent-proxy"
+
+	// portEnvPrefix starts the environment entry that names the port of a
+	// process that serves one. vm-launch forwards ports only when the entry
+	// is present, whatever its value, and exits when the value is no port.
+	portEnvPrefix = "PORT="
 
 	// CapDacOverride lets a process read and write files whatever their
 	// permissions say. It is the one capability a helper process (pea) of a
@@ -197,10 +205,12 @@ func (p *ProcBuilder) CheckUser(bndl goci.Bndl, spec garden.ProcessSpec, user *u
 // supplementary gids the image gives the user, so Garden does not hand it out
 // either. Only the vm-launch process that carries the containerizer's
 // provenance marker gets the kvm gid and, in a vm-qemu bundle, runs without
-// the bundle's AppArmor profile, and in a vm-firecracker bundle gets
-// CAP_NET_RAW in every capability set, ambient included, so that it holds the
-// capability as the non-root app user (vm-launch keeps the hypervisor from
-// inheriting it). The marker is removed before the process is built.
+// the bundle's AppArmor profile, and in a vm-firecracker bundle with PORT in
+// its environment gets CAP_NET_RAW in every capability set, ambient
+// included, so that it holds the capability as the non-root app user, and
+// the --transparent-proxy flag before its own arguments (vm-launch keeps the
+// hypervisor from inheriting the capability). The marker is removed before
+// the process is built.
 // Callers check the resolved user with CheckUser first, because a kvm primary
 // gid cannot be removed here.
 func (p *ProcBuilder) BuildProcess(bndl goci.Bndl, spec garden.ProcessSpec, user *users.ExecUser) *specs.Process {
@@ -233,14 +243,18 @@ func (p *ProcBuilder) BuildProcess(bndl goci.Bndl, spec garden.ProcessSpec, user
 	if vm {
 		capabilities = WithoutCapability(capabilities, CapSetGID)
 	}
-	if wrapped && kind == backend.VMFirecracker {
+
+	env := p.envDeterminer.EnvFor(bndl, spec, user.Uid)
+	args := append([]string{spec.Path}, spec.Args...)
+	if wrapped && kind == backend.VMFirecracker && hasPort(env) {
 		capabilities = WithCapability(capabilities, CapNetRaw)
+		args = append([]string{spec.Path, VMLaunchTransparentProxyFlag}, spec.Args...)
 	}
 
 	return &specs.Process{
-		Args:        append([]string{spec.Path}, spec.Args...),
+		Args:        args,
 		ConsoleSize: console(spec),
-		Env:         p.envDeterminer.EnvFor(bndl, spec, user.Uid),
+		Env:         env,
 		User: specs.User{
 			// #nosec G115 - uids should be positive and 32bit on linux, but libcontainer uses an int for them
 			UID: uint32(user.Uid),
@@ -367,6 +381,19 @@ func without(set []string, capability string) []string {
 		}
 	}
 	return kept
+}
+
+// hasPort reports whether env, the environment the runtime gives a process,
+// sets PORT. The runtime keeps the last of several entries for one name, and
+// vm-launch reads that one, but any PORT entry, even an empty one, means that
+// the process serves ports or that vm-launch exits, so presence is enough.
+func hasPort(env []string) bool {
+	for _, e := range env {
+		if strings.HasPrefix(e, portEnvPrefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // supplementaryGids returns the supplementary gids of a process. Outside a
