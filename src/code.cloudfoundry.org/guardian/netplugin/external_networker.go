@@ -206,7 +206,7 @@ func (p *externalBinaryNetworker) Network(log lager.Logger, containerSpec garden
 	// Firecracker only attaches to a tap device, so the guest NIC is created here
 	// while the host still has the privileges the unprivileged container lacks.
 	if kind == backend.VMFirecracker {
-		if err = p.setupFirecrackerTap(log, containerSpec.Handle, pid); err != nil {
+		if err = p.setupFirecrackerTap(log, containerSpec.Handle, pid, outputs.Properties[gardener.ContainerIPKey]); err != nil {
 			return err
 		}
 	}
@@ -292,10 +292,21 @@ func setupLoopback(log lager.Logger, pid int) error {
 // host that sets it to loose mode would make the device setting a no-op. The
 // FORWARD source rule is the spoofing control for traffic that leaves the
 // container, and the INPUT source rule is the one for traffic that stays in
-// it. Destroying the netns removes
+// it. Guest egress is translated with SNAT to containerIP, the container IP
+// the network plugin reported, which is the address that application security
+// groups and Diego know the container by. MASQUERADE would not do: it takes
+// the first address of universe scope on the outgoing device, and silk gives
+// eth0 its address with link scope, so the kernel falls back to another device
+// and picks tap0's address, which silk then drops. Destroying the netns removes
 // the device and the rules.
-func (p *externalBinaryNetworker) setupFirecrackerTap(log lager.Logger, handle string, pid int) error {
+func (p *externalBinaryNetworker) setupFirecrackerTap(log lager.Logger, handle string, pid int, containerIP string) error {
 	log = log.Session("setup-firecracker-tap", lager.Data{"handle": handle, "pid": pid})
+
+	egressSource, err := guestEgressSource(containerIP)
+	if err != nil {
+		log.Error("guest-egress-source-failed", err)
+		return fmt.Errorf("choosing the guest egress source for container netns of pid %d: %w", pid, err)
+	}
 
 	hostGID, err := p.tapHostGID(pid)
 	if err != nil {
@@ -322,7 +333,7 @@ func (p *externalBinaryNetworker) setupFirecrackerTap(log lager.Logger, handle s
 		{"addressing " + tap, []string{"ip", "addr", "add", FirecrackerTapCIDR, "dev", tap}},
 		{"bringing up " + tap, []string{"ip", "link", "set", tap, "up"}},
 		{"enabling ip forwarding", []string{"sysctl", "-w", "net.ipv4.ip_forward=1"}},
-		{"masquerading guest egress", []string{p.iptablesBin, "-t", "nat", "-A", "POSTROUTING", "-s", guest, "-o", "eth0", "-j", "MASQUERADE"}},
+		{"translating guest egress to the eth0 address", []string{p.iptablesBin, "-t", "nat", "-A", "POSTROUTING", "-s", guest, "-o", "eth0", "-j", "SNAT", "--to-source", egressSource}},
 	}
 	for _, step := range steps {
 		if _, err := p.runInNetns(log, pid, step.args...); err != nil {
@@ -330,7 +341,7 @@ func (p *externalBinaryNetworker) setupFirecrackerTap(log lager.Logger, handle s
 		}
 	}
 
-	log.Info("success", lager.Data{"host-gid": hostGID, "mtu": mtu})
+	log.Info("success", lager.Data{"host-gid": hostGID, "mtu": mtu, "egress-source": egressSource})
 	return nil
 }
 
@@ -352,6 +363,20 @@ func (p *externalBinaryNetworker) containerMTU(log lager.Logger, pid int) (int, 
 		return 0, fmt.Errorf("mtu %s is outside %d to %d", match[1], minTapMTU, maxTapMTU)
 	}
 	return mtu, nil
+}
+
+// guestEgressSource returns the address guest egress is translated to: the
+// container IP the network plugin reported, in dotted-quad form. The guest
+// network is IPv4 only, so a container without an IPv4 container IP has none.
+func guestEgressSource(containerIP string) (string, error) {
+	if containerIP == "" {
+		return "", fmt.Errorf("the network plugin reported no %s", gardener.ContainerIPKey)
+	}
+	ip := net.ParseIP(containerIP).To4()
+	if ip == nil || ip.IsUnspecified() || ip.IsLoopback() {
+		return "", fmt.Errorf("the network plugin reported %s %q, which is not an IPv4 address guest egress can leave with", gardener.ContainerIPKey, containerIP)
+	}
+	return ip.String(), nil
 }
 
 // runInNetns runs args with the network namespace of pid entered, returning the

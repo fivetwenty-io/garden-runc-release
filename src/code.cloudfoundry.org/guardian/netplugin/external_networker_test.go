@@ -284,6 +284,16 @@ var _ = Describe("ExternalNetworker", func() {
 			)
 			answerEth0Link := func(link string) { eth0Link = link }
 
+			// answerContainerIP makes the plugin's up reply report ip as the
+			// container IP, or report no container IP when ip is empty.
+			answerContainerIP := func(ip string) {
+				if ip == "" {
+					pluginOutput = `{"properties": {"foo": "bar"}}`
+					return
+				}
+				pluginOutput = `{"properties": {"garden.network.container-ip": "` + ip + `"}}`
+			}
+
 			BeforeEach(func() {
 				procRoot = GinkgoT().TempDir()
 				writeGIDMap("         0 4294967294          1\n         1          1 4294967293\n")
@@ -301,6 +311,7 @@ var _ = Describe("ExternalNetworker", func() {
 					return err
 				})
 				answerEth0Link("2: eth0@if7: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue state UP mode DEFAULT group default \\    link/ether 02:42:0a:ff:00:02 brd ff:ff:ff:ff:ff:ff link-netnsid 0\n")
+				answerContainerIP("10.255.220.111")
 			})
 
 			Context("when the container backend is vm-firecracker", func() {
@@ -308,7 +319,7 @@ var _ = Describe("ExternalNetworker", func() {
 					containerSpec.Properties[backend.AnnotationKey] = string(backend.VMFirecracker)
 				})
 
-				It("creates tap0 for the group, filters the guest, then raises it, enables forwarding and masquerades egress, in order", func() {
+				It("creates tap0 for the group, filters the guest, then raises it, enables forwarding and translates egress to the container IP, in order", func() {
 					Expect(plugin.Network(logger, containerSpec, 42)).To(Succeed())
 
 					cmds := fakeCommandRunner.ExecutedCommands()
@@ -331,9 +342,50 @@ var _ = Describe("ExternalNetworker", func() {
 						nsenterArgs("ip", "addr", "add", "169.254.100.1/30", "dev", "tap0"),
 						nsenterArgs("ip", "link", "set", "tap0", "up"),
 						nsenterArgs("sysctl", "-w", "net.ipv4.ip_forward=1"),
-						nsenterArgs(iptables, "-t", "nat", "-A", "POSTROUTING", "-s", "169.254.100.2/32", "-o", "eth0", "-j", "MASQUERADE"),
+						nsenterArgs(iptables, "-t", "nat", "-A", "POSTROUTING", "-s", "169.254.100.2/32", "-o", "eth0", "-j", "SNAT", "--to-source", "10.255.220.111"),
 					}))
 				})
+
+				// MASQUERADE asks the kernel for a universe scope address on eth0.
+				// silk's is of link scope, so the kernel picks tap0's address
+				// instead, and silk drops guest packets from 169.254.100.1.
+				It("never masquerades guest egress", func() {
+					Expect(plugin.Network(logger, containerSpec, 42)).To(Succeed())
+
+					for _, cmd := range fakeCommandRunner.ExecutedCommands() {
+						Expect(cmd.Args).NotTo(ContainElement("MASQUERADE"))
+					}
+				})
+
+				DescribeTable("translates guest egress to the container IP the plugin reported",
+					func(reported string, expected string) {
+						answerContainerIP(reported)
+						Expect(plugin.Network(logger, containerSpec, 42)).To(Succeed())
+
+						cmds := fakeCommandRunner.ExecutedCommands()
+						Expect(cmds[len(cmds)-1].Args).To(Equal(append([]string{"nsenter"}, nsenterArgs("/var/vcap/data/gdn/assets/sbin/iptables", "-t", "nat", "-A", "POSTROUTING", "-s", "169.254.100.2/32", "-o", "eth0", "-j", "SNAT", "--to-source", expected)...)))
+					},
+					Entry("a dotted-quad address", "10.255.0.7", "10.255.0.7"),
+					Entry("an IPv4-mapped IPv6 address, in dotted-quad form", "::ffff:10.255.0.7", "10.255.0.7"),
+				)
+
+				DescribeTable("when the plugin reports no usable IPv4 container IP",
+					func(reported string, expected string) {
+						answerContainerIP(reported)
+						err := plugin.Network(logger, containerSpec, 42)
+						Expect(err).To(MatchError(ContainSubstring("choosing the guest egress source for container netns of pid 42")))
+						Expect(err).To(MatchError(ContainSubstring(expected)))
+						Expect(logger).To(gbytes.Say(`setup-firecracker-tap.guest-egress-source-failed`))
+						// Only the plugin ran; the netns was never touched.
+						Expect(fakeCommandRunner.ExecutedCommands()).To(HaveLen(1))
+						Expect(resolvConfigurer.ConfigureCallCount()).To(Equal(0))
+					},
+					Entry("no container IP", "", "reported no garden.network.container-ip"),
+					Entry("not an address", "not-an-ip", `"not-an-ip", which is not an IPv4 address`),
+					Entry("an IPv6 address", "fd00::5", `"fd00::5", which is not an IPv4 address`),
+					Entry("a loopback address", "127.0.0.2", `"127.0.0.2", which is not an IPv4 address`),
+					Entry("the unspecified address", "0.0.0.0", `"0.0.0.0", which is not an IPv4 address`),
+				)
 
 				It("sets no per-device reverse path filter, which the inherited all setting would override", func() {
 					Expect(plugin.Network(logger, containerSpec, 42)).To(Succeed())
