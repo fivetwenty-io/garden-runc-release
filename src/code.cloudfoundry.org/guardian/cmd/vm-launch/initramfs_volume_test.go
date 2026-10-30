@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -17,7 +19,7 @@ import (
 // guest environment sources, and runs the command in a subshell with the guest
 // environment. A guest without a volume must keep getting exactly this.
 const (
-	goldenInitNet = "#!/bin/busybox sh\n/bin/busybox --install -s /bin\nexport PATH=/bin\nmount -t proc proc /proc\nmount -t sysfs sys /sys\nmount -t devtmpfs dev /dev 2>/dev/null\nrvm_fail() { echo \"vm-launch guest setup: $1\"; reboot -f; exit 1; }\nmkdir -p /dev/shm && mount -t tmpfs -o noexec,nosuid,nodev,mode=1777,size=50% tmpfs /dev/shm || rvm_fail \"mounting /dev/shm failed\"\n. /rvm/net\nip link set lo up || rvm_fail \"bringing up lo failed\"\nn=0\nwhile [ ! -e /sys/class/net/eth0 ]; do\n\tn=$((n + 1))\n\t[ \"$n\" -gt 5 ] && rvm_fail \"no eth0 network device\"\n\tsleep 1\ndone\nif [ -n \"${RVM_MTU:-}\" ]; then\n\tip link set eth0 mtu \"$RVM_MTU\" || echo \"vm-launch guest setup: setting the mtu of eth0 to $RVM_MTU failed; keeping the default mtu\"\nfi\nip link set eth0 up || rvm_fail \"bringing up eth0 failed\"\nip addr add \"$RVM_ADDRESS\" dev eth0 || rvm_fail \"adding $RVM_ADDRESS to eth0 failed\"\nip route add default via \"$RVM_GATEWAY\" dev eth0 || rvm_fail \"adding the default route via $RVM_GATEWAY failed\"\n. /rvm/limits\necho 9223372036854775807 >/proc/sys/fs/file-max || echo \"vm-launch guest setup: raising fs.file-max failed; keeping the default\"\nrvm_nr_open=$(cat /proc/sys/fs/nr_open) || rvm_fail \"reading fs.nr_open failed\"\nif [ \"$rvm_nr_open\" -lt \"$RVM_NOFILE_HARD\" ]; then\n\techo \"$RVM_NOFILE_HARD\" >/proc/sys/fs/nr_open || rvm_fail \"raising fs.nr_open to $RVM_NOFILE_HARD failed\"\nfi\n( ulimit -n \"$RVM_NOFILE_HARD\" && ulimit -S -n \"$RVM_NOFILE_SOFT\" ) || rvm_fail \"setting the open files limit to $RVM_NOFILE_SOFT soft and $RVM_NOFILE_HARD hard failed\"\n( . /rvm/env ) || rvm_fail \"reading /rvm/env failed\"\necho RVM_START_0123456789abcdef\nrvm_watch=\nif [ -n \"${RVM_PORT:-}\" ]; then\n\trvm_port_hex=$(printf '%04X' \"$RVM_PORT\")\n\trvm_tables=\n\tfor rvm_table in /proc/net/tcp /proc/net/tcp6; do\n\t\t[ -e \"$rvm_table\" ] && rvm_tables=\"$rvm_tables $rvm_table\"\n\tdone\n\t(\n\t\tif [ -p /rvm/listen-tick ] && command exec 3<>/rvm/listen-tick; then\n\t\t\trvm_pause() { read -t 1 -u 3 rvm_tick; }\n\t\telse\n\t\t\trvm_pause() { sleep 1; }\n\t\tfi\n\t\trvm_up=0\n\t\twhile :; do\n\t\t\trvm_now=0\n\t\t\trvm_failed=\n\t\t\tfor rvm_table in $rvm_tables; do\n\t\t\t\trvm_head=\n\t\t\t\twhile read -r rvm_sl rvm_local rvm_remote rvm_st rvm_rest; do\n\t\t\t\t\tif [ -z \"$rvm_head\" ]; then\n\t\t\t\t\t\trvm_head=1\n\t\t\t\t\t\tcontinue\n\t\t\t\t\tfi\n\t\t\t\t\t[ \"$rvm_st\" = 0A ] || break\n\t\t\t\t\tcase $rvm_local in\n\t\t\t\t\t*:\"$rvm_port_hex\") ;;\n\t\t\t\t\t*) continue ;;\n\t\t\t\t\tesac\n\t\t\t\t\tcase ${rvm_local%:*} in\n\t\t\t\t\t??????7F | 00000000000000000000000001000000 | 0000000000000000FFFF0000??????7F) ;;\n\t\t\t\t\t*) rvm_now=1 ;;\n\t\t\t\t\tesac\n\t\t\t\tdone 2>/dev/null <\"$rvm_table\"\n\t\t\t\t[ -n \"$rvm_head\" ] || rvm_failed=1\n\t\t\tdone\n\t\t\tif [ \"$rvm_now\" = 0 ] && [ -n \"$rvm_failed\" ]; then\n\t\t\t\trvm_now=$rvm_up\n\t\t\tfi\n\t\t\tif [ \"$rvm_now\" != \"$rvm_up\" ]; then\n\t\t\t\techo \"RVM_LISTEN_0123456789abcdef=$rvm_now\" >/dev/console && rvm_up=$rvm_now\n\t\t\tfi\n\t\t\trvm_pause\n\t\tdone\n\t) </dev/null &\n\trvm_watch=$!\nfi\n( ulimit -n \"$RVM_NOFILE_HARD\" && ulimit -S -n \"$RVM_NOFILE_SOFT\" && . /rvm/env && exec sh /rvm/cmd ) </dev/null\nrvm_status=$?\nif [ -n \"$rvm_watch\" ]; then\n\tkill \"$rvm_watch\"\n\twait \"$rvm_watch\"\nfi\necho RVM_EXIT_0123456789abcdef=$rvm_status >/dev/console || echo RVM_EXIT_0123456789abcdef=$rvm_status\nreboot -f\n"
+	goldenInitNet = "#!/bin/busybox sh\n/bin/busybox --install -s /bin\nexport PATH=/bin\nmount -t proc proc /proc\nmount -t sysfs sys /sys\nmount -t devtmpfs dev /dev 2>/dev/null\nrvm_fail() { echo \"vm-launch guest setup: $1\"; reboot -f; exit 1; }\nmkdir -p /dev/shm && mount -t tmpfs -o noexec,nosuid,nodev,mode=1777,size=50% tmpfs /dev/shm || rvm_fail \"mounting /dev/shm failed\"\n. /rvm/net\nip link set lo up || rvm_fail \"bringing up lo failed\"\nn=0\nwhile [ ! -e /sys/class/net/eth0 ]; do\n\tn=$((n + 1))\n\t[ \"$n\" -gt 5 ] && rvm_fail \"no eth0 network device\"\n\tsleep 1\ndone\nif [ -n \"${RVM_MTU:-}\" ]; then\n\tip link set eth0 mtu \"$RVM_MTU\" || echo \"vm-launch guest setup: setting the mtu of eth0 to $RVM_MTU failed; keeping the default mtu\"\nfi\nip link set eth0 up || rvm_fail \"bringing up eth0 failed\"\nip addr add \"$RVM_ADDRESS\" dev eth0 || rvm_fail \"adding $RVM_ADDRESS to eth0 failed\"\nip route add default via \"$RVM_GATEWAY\" dev eth0 || rvm_fail \"adding the default route via $RVM_GATEWAY failed\"\n. /rvm/limits\necho 9223372036854775807 >/proc/sys/fs/file-max || echo \"vm-launch guest setup: raising fs.file-max failed; keeping the default\"\nrvm_nr_open=$(cat /proc/sys/fs/nr_open) || rvm_fail \"reading fs.nr_open failed\"\nif [ \"$rvm_nr_open\" -lt \"$RVM_NOFILE_HARD\" ]; then\n\techo \"$RVM_NOFILE_HARD\" >/proc/sys/fs/nr_open || rvm_fail \"raising fs.nr_open to $RVM_NOFILE_HARD failed\"\nfi\n( ulimit -n \"$RVM_NOFILE_HARD\" && ulimit -S -n \"$RVM_NOFILE_SOFT\" ) || rvm_fail \"setting the open files limit to $RVM_NOFILE_SOFT soft and $RVM_NOFILE_HARD hard failed\"\n( . /rvm/env ) || rvm_fail \"reading /rvm/env failed\"\necho RVM_START_0123456789abcdef\nrvm_watch=\nif [ -n \"${RVM_PORT:-}\" ]; then\n\trvm_port_hex=$(printf '%04X' \"$RVM_PORT\")\n\trvm_tables=\n\tfor rvm_table in /proc/net/tcp /proc/net/tcp6; do\n\t\t[ -e \"$rvm_table\" ] && rvm_tables=\"$rvm_tables $rvm_table\"\n\tdone\n\t(\n\t\tif [ -p /rvm/listen-tick ] && command exec 3<>/rvm/listen-tick; then\n\t\t\trvm_pause() { read -t 1 -u 3 rvm_tick; }\n\t\telse\n\t\t\trvm_pause() { sleep 1; }\n\t\tfi\n\t\trvm_up=0\n\t\twhile :; do\n\t\t\trvm_now=0\n\t\t\trvm_failed=\n\t\t\tfor rvm_table in $rvm_tables; do\n\t\t\t\trvm_head=\n\t\t\t\twhile read -r rvm_sl rvm_local rvm_remote rvm_st rvm_rest; do\n\t\t\t\t\tif [ -z \"$rvm_head\" ]; then\n\t\t\t\t\t\trvm_head=1\n\t\t\t\t\t\tcontinue\n\t\t\t\t\tfi\n\t\t\t\t\t[ \"$rvm_st\" = 0A ] || break\n\t\t\t\t\tcase $rvm_local in\n\t\t\t\t\t*:\"$rvm_port_hex\") ;;\n\t\t\t\t\t*) continue ;;\n\t\t\t\t\tesac\n\t\t\t\t\tcase ${rvm_local%:*} in\n\t\t\t\t\t??????7F | 00000000000000000000000001000000 | 0000000000000000FFFF0000??????7F) ;;\n\t\t\t\t\t*) rvm_now=1 ;;\n\t\t\t\t\tesac\n\t\t\t\tdone 2>/dev/null <\"$rvm_table\"\n\t\t\t\t[ -n \"$rvm_head\" ] || rvm_failed=1\n\t\t\tdone\n\t\t\tif [ \"$rvm_now\" = 0 ] && [ -n \"$rvm_failed\" ]; then\n\t\t\t\trvm_now=$rvm_up\n\t\t\tfi\n\t\t\tif [ \"$rvm_now\" != \"$rvm_up\" ]; then\n\t\t\t\techo \"RVM_LISTEN_0123456789abcdef=$rvm_now\" >/dev/console && rvm_up=$rvm_now\n\t\t\tfi\n\t\t\trvm_pause\n\t\tdone\n\t) </dev/null &\n\trvm_watch=$!\nfi\n( { read -r rvm_self rvm_rest </proc/self/stat && echo \"$rvm_self\" >/rvm/app-pid; } || echo \"vm-launch guest: recording the command's pid in /rvm/app-pid failed; a stop request cannot reach the command\"; ulimit -n \"$RVM_NOFILE_HARD\" && ulimit -S -n \"$RVM_NOFILE_SOFT\" && . /rvm/env && exec sh -c \"$(cat /rvm/cmd)\" ) </dev/null\nrvm_status=$?\nif [ -n \"$rvm_watch\" ]; then\n\tkill \"$rvm_watch\"\n\twait \"$rvm_watch\"\nfi\necho RVM_EXIT_0123456789abcdef=$rvm_status >/dev/console || echo RVM_EXIT_0123456789abcdef=$rvm_status\nreboot -f\n"
 )
 
 // archiveEntries parses a gzip newc archive into its entry names, in order,
@@ -94,7 +96,7 @@ var _ = Describe("guest volume initramfs", func() {
 		Expect(setup + len(guestVolumeSetup)).To(BeNumerically("<=", start+1))
 		Expect(strings.Index(script, guestEnvChecks)).To(BeNumerically("<", strings.Index(script, ". /rvm/mounts\n")))
 		Expect(script).To(HaveSuffix("\necho RVM_START_" + testNonce + "\n" + guestListenWatch(testNonce) +
-			"( ulimit -n \"$RVM_NOFILE_HARD\" && ulimit -S -n \"$RVM_NOFILE_SOFT\" && . /rvm/env && exec sh /rvm/cmd ) </dev/null\nrvm_status=$?\n" +
+			"( { read -r rvm_self rvm_rest </proc/self/stat && echo \"$rvm_self\" >/rvm/app-pid; } || echo \"vm-launch guest: recording the command's pid in /rvm/app-pid failed; a stop request cannot reach the command\"; ulimit -n \"$RVM_NOFILE_HARD\" && ulimit -S -n \"$RVM_NOFILE_SOFT\" && . /rvm/env && exec sh -c \"$(cat /rvm/cmd)\" ) </dev/null\nrvm_status=$?\n" +
 			guestListenStop + guestVolumeTeardown + "echo RVM_EXIT_" + testNonce + "=$rvm_status >/dev/console || echo RVM_EXIT_" + testNonce + "=$rvm_status\nreboot -f\n"))
 	})
 
@@ -291,5 +293,95 @@ esac`)
 				Expect(r.out).To(Equal("vm-launch guest: unmounting " + mnt + " failed; data was already synced\nstatus=0\n"))
 			})
 		})
+	})
+})
+
+var _ = Describe("the command's subshell in /init", func() {
+	// runCommandLine runs the command line of /init in shell, with cmd as
+	// /rvm/cmd, the limits the shell already has, and pidFile as the pid
+	// file, or the spec's own one when pidFile is empty. It returns the
+	// console output, the exit status, and the pid file's path.
+	runCommandLine := func(shell guestShell, cmd, pidFile string) (string, int, string) {
+		paths := guestFiles(noGuestEnv, cmd)
+		script := paths.Replace(guestRunCommand)
+		if pidFile != "" {
+			script = strings.NewReplacer(paths.Replace(guestAppPid), pidFile).Replace(script)
+		} else {
+			pidFile = paths.Replace(guestAppPid)
+		}
+		Expect(pidFile).NotTo(Equal(guestAppPid))
+		limits := "RVM_NOFILE_SOFT=$(ulimit -S -n)\nRVM_NOFILE_HARD=$(ulimit -H -n)\n"
+		c := exec.Command(shell.argv[0], append(shell.argv[1:], "-c", limits+script+"echo \"status=$?\"\n")...)
+		c.Env = []string{"PATH=" + guestBin(shell)}
+		out, err := c.CombinedOutput()
+		Expect(err).NotTo(HaveOccurred(), "%s: %s", shell.name, out)
+		m := regexp.MustCompile(`status=(\d+)\n$`).FindStringSubmatch(string(out))
+		Expect(m).NotTo(BeNil(), "%s: %s", shell.name, out)
+		code, err := strconv.Atoi(m[1])
+		Expect(err).NotTo(HaveOccurred())
+		return strings.TrimSuffix(string(out), m[0]), code, pidFile
+	}
+
+	readPid := func(path string) string {
+		raw, err := os.ReadFile(path)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(raw)).To(MatchRegexp(`^[1-9][0-9]*\n$`))
+		return strings.TrimSpace(string(raw))
+	}
+
+	DescribeTable("records the pid of the shell that runs the command",
+		func(shellOf func() guestShell) {
+			shell := shellOf()
+			// $$ in sh -c is the pid of that shell, which the subshell
+			// became with exec.
+			out, code, pidFile := runCommandLine(shell, "echo \"shell=$$\"\nexit 9\n", "")
+			Expect(code).To(Equal(9), "%s: %s", shell.name, out)
+			Expect(out).To(Equal("shell=" + readPid(pidFile) + "\n"))
+		},
+		shellEntries(""),
+	)
+
+	DescribeTable("runs /rvm/cmd as one sh -c argument, byte for byte, with sh as $0",
+		func(shellOf func() guestShell) {
+			shell := shellOf()
+			cmd := "printf '[%s]\\n' \"a  b\" '$HOME' '`x`' \"$0\"\n\necho second line\nexit 4\n\n\n"
+			out, code, _ := runCommandLine(shell, cmd, "")
+			Expect(code).To(Equal(4), "%s: %s", shell.name, out)
+			Expect(out).To(Equal("[a  b]\n[$HOME]\n[`x`]\n[sh]\nsecond line\n"))
+		},
+		shellEntries(""),
+	)
+
+	DescribeTable("still runs the command, and says so, when the pid cannot be recorded",
+		func(shellOf func() guestShell) {
+			shell := shellOf()
+			missing := filepath.Join(GinkgoT().TempDir(), "missing", "app-pid")
+			out, code, _ := runCommandLine(shell, "echo ran\nexit 6\n", missing)
+			Expect(code).To(Equal(6), "%s: %s", shell.name, out)
+			Expect(out).To(ContainSubstring("vm-launch guest: recording the command's pid in " + missing + " failed; a stop request cannot reach the command\n"))
+			Expect(out).To(HaveSuffix("ran\n"))
+			Expect(missing).NotTo(BeAnExistingFile())
+		},
+		shellEntries(""),
+	)
+
+	// statPid returns the pid at the start of the /proc/PID/stat line that
+	// the command printed.
+	statPid := func(out string) string {
+		m := regexp.MustCompile(`^([1-9][0-9]*) \(`).FindStringSubmatch(out)
+		Expect(m).NotTo(BeNil(), out)
+		return m[1]
+	}
+
+	It("makes a simple command the top process in the guest's busybox, and a pipeline keeps the shell", func() {
+		shell := guestBusyboxShell()
+		out, code, pidFile := runCommandLine(shell, "cat /proc/self/stat\n", "")
+		Expect(code).To(Equal(0), out)
+		Expect(statPid(out)).To(Equal(readPid(pidFile)), "the simple command is not the process whose pid /init recorded")
+
+		// The control shows that the probe tells the two shapes apart.
+		out, code, pidFile = runCommandLine(shell, "cat /proc/self/stat | cat\n", "")
+		Expect(code).To(Equal(0), out)
+		Expect(statPid(out)).NotTo(Equal(readPid(pidFile)))
 	})
 })

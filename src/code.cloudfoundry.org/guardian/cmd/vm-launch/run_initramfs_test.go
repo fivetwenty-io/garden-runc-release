@@ -120,3 +120,33 @@ var _ = Describe("the initramfs release check", func() {
 		Expect(time.Since(began)).To(BeNumerically("<", 5*time.Second))
 	})
 })
+
+var _ = Describe("the guest command's length", func() {
+	It("takes a command of 131071 bytes and rejects one of 131072, in either form, naming the size only", func() {
+		for _, wrap := range []func(string) []string{
+			func(c string) []string { return []string{"/tmp/lifecycle/launcher", "app", c, ""} },
+			// shellJoin quotes the one argument, which adds two bytes.
+			func(c string) []string { return []string{c[2:]} },
+		} {
+			fits := strings.Repeat("x", maxGuestCommandBytes)
+			command, _, err := guestCommand(wrap(fits))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(command).To(HaveLen(maxGuestCommandBytes))
+
+			_, _, err = guestCommand(wrap(secretSentinel + fits[len(secretSentinel)-1:]))
+			Expect(err).To(MatchError("the guest command is 131072 bytes, over the 131071 bytes a guest can run as one shell argument"))
+		}
+	})
+
+	It("exits 125 before the hypervisor starts", func() {
+		art := makeArtifacts()
+		GinkgoT().Setenv("TMPDIR", GinkgoT().TempDir())
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+		var logBuf bytes.Buffer
+		code := run([]string{"--backend", "vm-qemu", "--artifacts", art, "--", "/tmp/lifecycle/launcher", "app", strings.Repeat("y", maxGuestCommandBytes+1), ""}, log.New(&logBuf, "", 0))
+		Expect(code).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(HavePrefix("the guest command is 131072 bytes, over the 131071 bytes a guest can run as one shell argument\n"))
+		Expect(logBuf.String()).NotTo(ContainSubstring("yyyy"))
+		Expect(argvFile).NotTo(BeAnExistingFile())
+	})
+})

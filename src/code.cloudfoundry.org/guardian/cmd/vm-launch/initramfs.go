@@ -130,9 +130,9 @@ func listenTag(nonce string) string { return "RVM_LISTEN_" + nonce + "=" }
 // reports a guest that never started its command and shows the console
 // output, which ends with the failed step.
 //
-// The command runs in a subshell that sets its open-files limit, sources
-// /rvm/env, and then becomes the shell that runs /rvm/cmd, so its status is
-// the command's. /init writes the exit line through its own open of
+// The command runs in a subshell that records its pid, sets its open-files
+// limit, sources /rvm/env, and then becomes the shell that runs /rvm/cmd
+// with sh -c, so its status is the command's (see guestRunCommand). /init writes the exit line through its own open of
 // /dev/console, because the command may have left the console that it
 // shares with /init non-blocking, and through the shared console only when
 // that open fails. The guest environment applies only inside that subshell,
@@ -343,7 +343,25 @@ const guestEnvChecks = `( . /rvm/env ) || rvm_fail "reading /rvm/env failed"
 // guest environment, in a subshell that becomes the shell running the
 // command. Only that subshell gets the limit, so /init's own steps never run
 // short of descriptors under a low one.
-const guestRunCommand = "( " + guestSetLimits + " && . /rvm/env && exec sh /rvm/cmd ) </dev/null\n"
+//
+// The subshell first records its own pid in guestAppPid, which it reads
+// from /proc/self/stat with the shell's builtin read, so the pid is the
+// subshell's and not that of a child. It then runs the command as the
+// argument of sh -c, under the same pid, since exec keeps it. The guest's
+// busybox sh execs the last simple command of a -c string, after a list or
+// inside an if too, so the recorded pid is then the command itself, as it is
+// under the CF launcher's bash -c. A pipeline, or a string that sets a trap,
+// keeps the shell as that process. sh FILE would keep the shell even for a
+// single simple command. The command
+// substitution drops the trailing newlines of /rvm/cmd, which the shell
+// ignores anyway. A pid that cannot be recorded is reported, and the
+// command still runs.
+const guestRunCommand = "( { read -r rvm_self rvm_rest </proc/self/stat && echo \"$rvm_self\" >" + guestAppPid + "; } || echo \"vm-launch guest: recording the command's pid in " + guestAppPid + " failed; a stop request cannot reach the command\"; " +
+	guestSetLimits + " && . /rvm/env && exec sh -c \"$(cat /rvm/cmd)\" ) </dev/null\n"
+
+// guestAppPid is the file in which the command's subshell records its pid,
+// which is the pid of the command's top process.
+const guestAppPid = "/rvm/app-pid"
 
 // guestVolumeDevice is the guest block device of the volume image. The guest
 // boots from the initramfs and has no other drive, so the image is the first

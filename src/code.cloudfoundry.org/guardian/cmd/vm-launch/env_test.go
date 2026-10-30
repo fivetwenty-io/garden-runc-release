@@ -87,20 +87,29 @@ func sourceAndDumpEnv(shell []string, file string) map[string]string {
 	return parseEnvDump(out)
 }
 
-// guestBin returns a directory holding sh for shell, to be the whole PATH
-// of a guest run, as /bin is in the guest.
+// guestBin returns a directory holding sh for shell, and the cat that the
+// command line of /init reads /rvm/cmd with, to be the whole PATH of a guest
+// run, as /bin is in the guest. The guest's busybox runs cat as an applet of
+// the same binary; /bin/sh gets the host's cat.
 func guestBin(shell guestShell) string {
 	bin := filepath.Join(GinkgoT().TempDir(), "bin")
 	Expect(os.Mkdir(bin, 0o755)).To(Succeed())
 	// busybox runs as the applet its link names, as it does in the guest.
 	Expect(os.Symlink(shell.argv[0], filepath.Join(bin, "sh"))).To(Succeed())
+	cat := shell.argv[0]
+	if shell.argv[0] == hostShell().argv[0] {
+		var err error
+		cat, err = exec.LookPath("cat")
+		Expect(err).NotTo(HaveOccurred())
+	}
+	Expect(os.Symlink(cat, filepath.Join(bin, "cat"))).To(Succeed())
 	return bin
 }
 
 // guestFiles writes envFile and the command cmd where a guest run reads
-// them, and returns a replacer from the guest paths to them. The guest's
-// console becomes the spec's stdout, which /init then opens on its own, as
-// it opens the console in the guest.
+// them, and returns a replacer from the guest paths to them, the command's
+// pid file included. The guest's console becomes the spec's stdout, which
+// /init then opens on its own, as it opens the console in the guest.
 func guestFiles(envFile, cmd string) *strings.Replacer {
 	dir := GinkgoT().TempDir()
 	Expect(os.WriteFile(filepath.Join(dir, "env"), []byte(envFile), 0o600)).To(Succeed())
@@ -108,6 +117,7 @@ func guestFiles(envFile, cmd string) *strings.Replacer {
 	return strings.NewReplacer(
 		"/rvm/env", filepath.Join(dir, "env"),
 		"/rvm/cmd", filepath.Join(dir, "cmd"),
+		guestAppPid, filepath.Join(dir, "app-pid"),
 		"reboot -f", "echo REBOOT",
 		"/dev/console", "/dev/stdout",
 	)

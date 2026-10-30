@@ -137,18 +137,9 @@ var _ = Describe("the open files setup of /init", func() {
 			"/proc/sys/fs/file-max", p.fileMax,
 		)...)
 		script := files.Replace(paths.Replace(guestFailFunc + guestLimitsSetup + guestRunCommand))
-		bin := guestBin(shell)
-		// /init reads fs.nr_open with cat, which the guest's busybox runs as
-		// an applet of the same binary.
-		cat := shell.argv[0]
-		if shell.argv[0] == hostShell().argv[0] {
-			var err error
-			cat, err = exec.LookPath("cat")
-			Expect(err).NotTo(HaveOccurred())
-		}
-		Expect(os.Symlink(cat, filepath.Join(bin, "cat"))).To(Succeed())
+		// /init reads fs.nr_open with the cat that guestBin provides.
 		c := exec.Command(shell.argv[0], append(shell.argv[1:], "-c", script)...)
-		c.Env = []string{"PATH=" + bin}
+		c.Env = []string{"PATH=" + guestBin(shell)}
 		out, err := c.CombinedOutput()
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			return string(out), exitErr.ExitCode()

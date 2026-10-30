@@ -11,6 +11,8 @@
 //
 // When PATH is the CF launcher ("launcher APP-DIR START-COMMAND ..."), the
 // guest runs START-COMMAND. Otherwise it runs PATH and ARGS, shell-quoted.
+// The guest's busybox sh runs the command with sh -c, as the launcher runs
+// it with bash -c, so the command may have at most 131071 bytes.
 // The guest has a busybox userland and none of the app's files. It has no
 // disk unless the app has a volume (see Volumes below).
 //
@@ -160,7 +162,7 @@
 //	       status, as QEMU does when it cannot open the volume image
 //	125    vm-launch could not start the guest: core dumps it could not
 //	       disable, an open files limit it could not read, bad arguments,
-//	       a missing artifact, a work file, initramfs, or QMP socket it
+//	       a guest command over 131071 bytes, a missing artifact, a work file, initramfs, or QMP socket it
 //	       could not create, a hypervisor it could not run, PORT already
 //	       in use in the container, or a volume it cannot use:
 //	       VCAP_SERVICES that is not valid JSON, more than one volume
@@ -555,10 +557,30 @@ func parseArgs(argv []string) (config, error) {
 	return cfg, nil
 }
 
+// maxGuestCommandBytes caps the guest command. The guest runs it as the
+// argument of sh -c (see guestRunCommand), and Linux limits one argument to
+// 128 KiB including its NUL.
+const maxGuestCommandBytes = 128<<10 - 1
+
 // guestCommand returns the shell command the guest runs for the wrapped
 // process argv, and the CredHub retry settings: the launcher's CredHub flags
-// for the CF launcher, and the launcher's defaults for any other command.
+// for the CF launcher, and the launcher's defaults for any other command. A
+// command over maxGuestCommandBytes is an error, because the guest could not
+// start it.
 func guestCommand(args []string) (string, credhubRetry, error) {
+	command, retry, err := wrappedCommand(args)
+	if err != nil {
+		return "", credhubRetry{}, err
+	}
+	if len(command) > maxGuestCommandBytes {
+		return "", credhubRetry{}, fmt.Errorf("the guest command is %d bytes, over the %d bytes a guest can run as one shell argument", len(command), maxGuestCommandBytes)
+	}
+	return command, retry, nil
+}
+
+// wrappedCommand returns the shell command and the CredHub retry settings
+// for the wrapped process argv (see guestCommand).
+func wrappedCommand(args []string) (string, credhubRetry, error) {
 	if len(args) == 0 {
 		return "", credhubRetry{}, errors.New("no guest command given after --")
 	}
