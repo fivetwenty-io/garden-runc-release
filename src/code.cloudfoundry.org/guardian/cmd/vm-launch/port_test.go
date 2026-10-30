@@ -627,13 +627,23 @@ var _ = Describe("the guest listen watcher", func() {
 		return bin
 	}
 
+	// watchOnStdout is the watcher with its listen lines on stdout in
+	// place of the console.
+	watchOnStdout := func() string {
+		watch := guestListenWatch(testNonce)
+		Expect(watch).To(ContainSubstring(" >/dev/console "))
+		return strings.ReplaceAll(watch, " >/dev/console ", " ")
+	}
+
 	// noTable stands for a /proc/net table the guest kernel lacks.
 	const noTable = "\x00"
 
-	// watchRound runs one round of the watcher for port, after the shell
-	// code prelude, against fake /proc/net/tcp and tcp6 contents, either of
-	// which may be noTable. The watcher starts in the state wasUp, "0" or
-	// "1", and watchRound returns what it printed.
+	// watchRound runs the watcher for port, after the shell code prelude,
+	// against fake /proc/net/tcp and tcp6 contents, either of which may be
+	// noTable, with its listen lines on stdout. The watcher starts in the
+	// state wasUp, "0" or "1", and calls rvm_round_end in place of its
+	// sleep, which ends it after one round unless prelude defines it again.
+	// watchRound returns what the watcher printed.
 	watchRound := func(shell guestShell, port int, tcp, tcp6, prelude, wasUp string) string {
 		dir := GinkgoT().TempDir()
 		tcpPath, tcp6Path := filepath.Join(dir, "tcp"), filepath.Join(dir, "tcp6")
@@ -642,16 +652,17 @@ var _ = Describe("the guest listen watcher", func() {
 				Expect(os.WriteFile(path, []byte(procNetHeader+table), 0o644)).To(Succeed())
 			}
 		}
-		watch := guestListenWatch(testNonce)
+		watch := watchOnStdout()
 		for _, s := range []string{" /proc/net/tcp /proc/net/tcp6;", "\n\t\trvm_up=0\n", "\n\t\t\tsleep 1\n"} {
 			Expect(watch).To(ContainSubstring(s))
 		}
 		watch = strings.NewReplacer(
 			" /proc/net/tcp /proc/net/tcp6;", " "+tcpPath+" "+tcp6Path+";",
 			"\n\t\trvm_up=0\n", "\n\t\trvm_up="+wasUp+"\n",
-			"\n\t\t\tsleep 1\n", "\n\t\t\texit 0\n",
+			"\n\t\t\tsleep 1\n", "\n\t\t\trvm_round_end\n",
 		).Replace(watch)
-		c := exec.Command(shell.argv[0], append(shell.argv[1:], "-c", prelude+watch+`wait "$rvm_watch"`+"\n")...)
+		script := "rvm_round_end() { exit 0; }\n" + prelude + watch + `wait "$rvm_watch"` + "\n"
+		c := exec.Command(shell.argv[0], append(shell.argv[1:], "-c", script)...)
 		c.Env = []string{"PATH=" + watcherPath(shell), "RVM_PORT=" + strconv.Itoa(port)}
 		out, err := c.CombinedOutput()
 		Expect(err).NotTo(HaveOccurred(), "%s: %s", shell.name, out)
@@ -729,6 +740,17 @@ var _ = Describe("the guest listen watcher", func() {
 		shellEntries(""),
 	)
 
+	DescribeTable("writes a listen line that failed again in the next round",
+		func(shellOf func() guestShell) {
+			shell := shellOf()
+			prelude := `rvm_round_end() { [ -n "${rvm_again:-}" ] && exit 0; rvm_again=1; }
+echo() { if [ -z "${rvm_failed:-}" ]; then rvm_failed=1; return 1; fi; command echo "$@"; }
+`
+			Expect(watchRound(shell, 8080, procNetLine("00000000:1F90", "0A"), "", prelude, "0")).To(Equal(listening), shell.name)
+		},
+		shellEntries(""),
+	)
+
 	It("does nothing in a guest without a port", func() {
 		c := exec.Command("/bin/sh", "-c", guestListenWatch(testNonce)+guestListenStop+`echo "watch=[$rvm_watch]"`)
 		c.Env = []string{"PATH=/usr/bin:/bin"}
@@ -745,7 +767,7 @@ var _ = Describe("the guest listen watcher", func() {
 			defer loopback.Close()
 			port := loopback.Addr().(*net.TCPAddr).Port
 
-			script := guestListenWatch(testNonce) + "read rvm_go\n" + guestListenStop + "echo stopped\n"
+			script := watchOnStdout() + "read rvm_go\n" + guestListenStop + "echo stopped\n"
 			c := exec.Command(shell.argv[0], append(shell.argv[1:], "-c", script)...)
 			c.Env = []string{"PATH=" + watcherPath(shell), "RVM_PORT=" + strconv.Itoa(port)}
 			stdin, err := c.StdinPipe()

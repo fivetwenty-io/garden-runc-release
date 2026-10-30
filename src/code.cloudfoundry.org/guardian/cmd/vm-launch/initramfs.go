@@ -232,6 +232,11 @@ const guestSetLimits = `ulimit -n "$RVM_NOFILE_HARD" && ulimit -S -n "$RVM_NOFIL
 // listens. The watcher reads only the tables the guest kernel has, because
 // grep fails for a file that is missing, as /proc/net/tcp6 is in a kernel
 // without IPv6.
+//
+// The watcher opens /dev/console for each listen line, so it writes through
+// its own open file and not the one it shares with the command, which the
+// command may have made non-blocking. It takes a new state only once the
+// line is written, so a line that fails is written again a second later.
 func guestListenWatch(nonce string) string {
 	return `rvm_watch=
 if [ -n "${RVM_PORT:-}" ]; then
@@ -256,8 +261,7 @@ if [ -n "${RVM_PORT:-}" ]; then
 			1) rvm_now=0 ;;
 			esac
 			if [ "$rvm_now" != "$rvm_up" ]; then
-				echo "` + listenTag(nonce) + `$rvm_now"
-				rvm_up=$rvm_now
+				echo "` + listenTag(nonce) + `$rvm_now" >/dev/console && rvm_up=$rvm_now
 			fi
 			sleep 1
 		done
