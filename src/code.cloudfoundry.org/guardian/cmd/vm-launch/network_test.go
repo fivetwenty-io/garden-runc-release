@@ -584,11 +584,22 @@ var _ = Describe("run with PORT", func() {
 
 	fakeHypervisor := writeFakeHypervisor
 
+	// freePort returns a port that nothing holds and that an earlier call in
+	// the same spec did not return, since the kernel may hand a closed
+	// port out again.
+	handed := map[int]bool{}
+	BeforeEach(func() { handed = map[int]bool{} })
 	freePort := func() int {
-		l, err := net.Listen("tcp", "127.0.0.1:0")
-		Expect(err).NotTo(HaveOccurred())
-		defer l.Close()
-		return l.Addr().(*net.TCPAddr).Port
+		for {
+			l, err := net.Listen("tcp", "127.0.0.1:0")
+			Expect(err).NotTo(HaveOccurred())
+			port := l.Addr().(*net.TCPAddr).Port
+			l.Close()
+			if !handed[port] {
+				handed[port] = true
+				return port
+			}
+		}
 	}
 
 	// runVM runs vm-launch and fails the spec when it is still running
