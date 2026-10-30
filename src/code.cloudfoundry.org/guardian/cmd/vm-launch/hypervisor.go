@@ -807,6 +807,12 @@ type supervisor struct {
 	// status line, so a spec can send a signal that comes after it. It must
 	// not block. vm-launch leaves it unset.
 	reported func()
+	// prepare, when set, makes the supervisor start the hypervisor from an
+	// OS thread of its own, after prepare has run on it (see
+	// startConfined). vm-launch uses it to keep CAP_NET_RAW, which its
+	// transparent port proxy needs, from the hypervisor. A failure of
+	// prepare is a failure to start the hypervisor.
+	prepare func() error
 }
 
 // run starts cmd and waits for it. The error is non-nil only when the
@@ -835,7 +841,12 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 	defer consoleIn.Close()
 	growPipe(serial, s.logger)
 	cmd.Stdin, cmd.Stdout = console, serialOut
-	err = cmd.Start()
+	var release func()
+	if s.prepare != nil {
+		release, err = startConfined(cmd, s.prepare)
+	} else {
+		err = cmd.Start()
+	}
 	// Only the hypervisor keeps the read end of its stdin, so a write after
 	// it has gone fails at once instead of filling the pipe; and only the
 	// hypervisor keeps the write end of its stdout, so the console reaches
@@ -848,6 +859,11 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 	}
 	if err != nil {
 		return runResult{}, fmt.Errorf("starting hypervisor %s: %w", cmd.Path, err)
+	}
+	if release != nil {
+		// run returns only once the hypervisor has been reaped, or on a
+		// panic, after which vm-launch ends anyway.
+		defer release()
 	}
 	if s.started != nil {
 		s.started()

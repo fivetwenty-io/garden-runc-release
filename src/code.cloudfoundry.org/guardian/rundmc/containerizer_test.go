@@ -529,8 +529,19 @@ var _ = Describe("Rundmc", func() {
 			}
 		}
 
+		// The vm-launch options each backend's wrapped launcher runs with:
+		// a Firecracker one dials forwarded connections from their clients'
+		// addresses.
+		wrapperOptions := map[backend.Kind][]string{
+			backend.VMQemu:        {"--backend", "vm-qemu"},
+			backend.VMFirecracker: {"--backend", "vm-firecracker", "--transparent-proxy"},
+		}
+
 		for _, kind := range []backend.Kind{backend.VMQemu, backend.VMFirecracker} {
 			kind := kind
+			wrapped := func(command ...string) []string {
+				return append(append(append([]string{}, wrapperOptions[kind]...), "--"), command...)
+			}
 
 			Context(fmt.Sprintf("with a %s bundle", kind), func() {
 				BeforeEach(func() {
@@ -545,7 +556,7 @@ var _ = Describe("Rundmc", func() {
 					_, id, actual, _ := fakeOCIRuntime.ExecArgsForCall(0)
 					Expect(id).To(Equal("some-handle"))
 					Expect(actual.Path).To(Equal(bundlerules.VMLaunchMountPath))
-					Expect(actual.Args).To(Equal([]string{"--backend", string(kind), "--", launcher, "app", "echo hi", ""}))
+					Expect(actual.Args).To(Equal(wrapped(launcher, "app", "echo hi", "")))
 					Expect(actual.Env).To(Equal([]string{"A=b", marker}))
 					Expect(actual.User).To(Equal("vcap"))
 					Expect(actual.Dir).To(Equal("/home/vcap"))
@@ -557,7 +568,7 @@ var _ = Describe("Rundmc", func() {
 
 					_, _, actual, _ := fakeOCIRuntime.ExecArgsForCall(0)
 					Expect(actual.Path).To(Equal(bundlerules.VMLaunchMountPath))
-					Expect(actual.Args).To(Equal([]string{"--backend", string(kind), "--", launcher}))
+					Expect(actual.Args).To(Equal(wrapped(launcher)))
 				})
 
 				It("does not modify the caller's spec", func() {

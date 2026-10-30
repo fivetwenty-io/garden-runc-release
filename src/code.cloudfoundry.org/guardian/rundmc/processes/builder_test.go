@@ -1,6 +1,7 @@
 package processes_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -406,6 +407,201 @@ var _ = Describe("ProcBuilder", func() {
 				})
 			})
 		}
+	})
+
+	Describe("CAP_NET_RAW for the transparent port proxy", func() {
+		var (
+			annotations  map[string]string
+			marked       bool
+			preparedProc *specs.Process
+			maxCaps      []string
+		)
+
+		BeforeEach(func() {
+			// The caps a non-root app user gets in an unprivileged container.
+			bndl = bndl.WithCapabilities("CAP_CHOWN", "CAP_NET_RAW", "CAP_SETGID", "CAP_KILL")
+			maxCaps = []string{"CAP_CHOWN", "CAP_NET_RAW", "CAP_SETGID", "CAP_KILL"}
+			annotations = map[string]string{backend.AnnotationKey: string(backend.VMFirecracker)}
+			processSpec.Path = processes.VMLaunchPath
+			processSpec.Env = []string{"A=b"}
+			user.Uid, user.Gid = 2000, 2000
+			marked = true
+		})
+
+		JustBeforeEach(func() {
+			bndl.Spec.Annotations = annotations
+			if marked {
+				processSpec = processes.MarkVMLaunch(processSpec)
+			}
+			procBuilder = processes.NewBuilder(envDeterminer, maxCaps, processes.WithKVMGid(108))
+			preparedProc = procBuilder.BuildProcess(bndl, processSpec, user)
+		})
+
+		It("puts it in every set of the wrapped vm-launch in a vm-firecracker bundle, ambient and effective included", func() {
+			caps := preparedProc.Capabilities
+			Expect(caps.Bounding).To(Equal([]string{"CAP_CHOWN", "CAP_NET_RAW", "CAP_KILL"}))
+			Expect(caps.Inheritable).To(Equal([]string{"CAP_CHOWN", "CAP_NET_RAW", "CAP_KILL"}))
+			Expect(caps.Permitted).To(Equal([]string{"CAP_CHOWN", "CAP_NET_RAW", "CAP_KILL"}))
+			// Effective and ambient hold nothing else, so the non-root
+			// vm-launch can use CAP_NET_RAW and no other capability.
+			Expect(caps.Effective).To(Equal([]string{"CAP_NET_RAW"}))
+			Expect(caps.Ambient).To(Equal([]string{"CAP_NET_RAW"}))
+			Expect(preparedProc.NoNewPrivileges).To(BeTrue())
+		})
+
+		It("is the capability named CAP_NET_RAW, and the flag vm-launch reads", func() {
+			Expect(processes.CapNetRaw).To(Equal("CAP_NET_RAW"))
+			Expect(processes.VMLaunchTransparentProxyFlag).To(Equal("--transparent-proxy"))
+		})
+
+		Context("when the container's sets lack CAP_NET_RAW", func() {
+			BeforeEach(func() {
+				bndl = bndl.WithCapabilities("CAP_CHOWN", "CAP_KILL")
+			})
+
+			It("adds it at the end of every set", func() {
+				caps := preparedProc.Capabilities
+				Expect(caps.Bounding).To(Equal([]string{"CAP_CHOWN", "CAP_KILL", "CAP_NET_RAW"}))
+				Expect(caps.Inheritable).To(Equal([]string{"CAP_CHOWN", "CAP_KILL", "CAP_NET_RAW"}))
+				Expect(caps.Permitted).To(Equal([]string{"CAP_CHOWN", "CAP_KILL", "CAP_NET_RAW"}))
+				Expect(caps.Effective).To(Equal([]string{"CAP_NET_RAW"}))
+				Expect(caps.Ambient).To(Equal([]string{"CAP_NET_RAW"}))
+			})
+		})
+
+		Context("when the container has no capabilities", func() {
+			BeforeEach(func() {
+				bndl = bndl.WithCapabilities()
+			})
+
+			It("grants CAP_NET_RAW alone rather than the runtime's default", func() {
+				Expect(preparedProc.Capabilities).To(Equal(&specs.LinuxCapabilities{
+					Bounding:    []string{"CAP_NET_RAW"},
+					Effective:   []string{"CAP_NET_RAW"},
+					Inheritable: []string{"CAP_NET_RAW"},
+					Permitted:   []string{"CAP_NET_RAW"},
+					Ambient:     []string{"CAP_NET_RAW"},
+				}))
+			})
+		})
+
+		Context("for root", func() {
+			BeforeEach(func() {
+				user.Uid, user.Gid = 0, 0
+			})
+
+			It("grants it the same way, still without CAP_SETGID", func() {
+				caps := preparedProc.Capabilities
+				Expect(caps.Bounding).To(Equal([]string{"CAP_CHOWN", "CAP_NET_RAW", "CAP_KILL"}))
+				Expect(caps.Effective).To(Equal([]string{"CAP_NET_RAW"}))
+				Expect(caps.Ambient).To(Equal([]string{"CAP_NET_RAW"}))
+			})
+		})
+
+		expectNoGrant := func() {
+			GinkgoHelper()
+			caps := preparedProc.Capabilities
+			Expect(caps.Effective).To(BeNil())
+			Expect(caps.Ambient).To(BeNil())
+		}
+
+		Context("for the wrapped vm-launch in a vm-qemu bundle", func() {
+			BeforeEach(func() {
+				annotations = map[string]string{backend.AnnotationKey: string(backend.VMQemu)}
+			})
+
+			It("grants nothing", func() {
+				expectNoGrant()
+				Expect(preparedProc.Capabilities.Bounding).To(Equal([]string{"CAP_CHOWN", "CAP_NET_RAW", "CAP_KILL"}))
+			})
+		})
+
+		Context("for vm-launch without the containerizer's marker", func() {
+			BeforeEach(func() {
+				marked = false
+			})
+
+			It("grants nothing", func() {
+				expectNoGrant()
+			})
+		})
+
+		Context("for another process that carries the marker", func() {
+			BeforeEach(func() {
+				processSpec.Path = "/tmp/lifecycle/diego-sshd"
+			})
+
+			It("grants nothing", func() {
+				expectNoGrant()
+			})
+		})
+
+		for _, annotation := range []map[string]string{
+			nil,
+			{backend.AnnotationKey: string(backend.OCIRunc)},
+			{backend.AnnotationKey: string(backend.OCIGvisor)},
+		} {
+			annotation := annotation
+
+			Context(fmt.Sprintf("for a marked vm-launch path in a bundle annotated %v", annotation), func() {
+				BeforeEach(func() {
+					annotations = annotation
+				})
+
+				It("grants nothing", func() {
+					expectNoGrant()
+					// Outside a vm-* bundle the marker is not even removed.
+					_, envSpec, _ := envDeterminer.EnvForArgsForCall(0)
+					Expect(envSpec.Env).To(ContainElement("__GARDEN_VM_LAUNCH_WRAPPED=1"))
+				})
+			})
+		}
+	})
+
+	Describe("WithCapability", func() {
+		It("adds the capability to every set without touching the input", func() {
+			shared := []string{"CAP_A"}
+			caps := &specs.LinuxCapabilities{Bounding: shared, Effective: nil, Inheritable: shared, Permitted: shared, Ambient: []string{}}
+
+			out := processes.WithCapability(caps, "CAP_NET_RAW")
+			Expect(out).To(Equal(&specs.LinuxCapabilities{
+				Bounding:    []string{"CAP_A", "CAP_NET_RAW"},
+				Effective:   []string{"CAP_NET_RAW"},
+				Inheritable: []string{"CAP_A", "CAP_NET_RAW"},
+				Permitted:   []string{"CAP_A", "CAP_NET_RAW"},
+				Ambient:     []string{"CAP_NET_RAW"},
+			}))
+			Expect(shared).To(Equal([]string{"CAP_A"}))
+			Expect(caps.Effective).To(BeNil())
+			Expect(caps.Ambient).To(BeEmpty())
+		})
+
+		It("never adds the capability twice", func() {
+			caps := &specs.LinuxCapabilities{Bounding: []string{"CAP_NET_RAW", "CAP_A"}, Ambient: []string{"CAP_NET_RAW"}}
+			out := processes.WithCapability(caps, "CAP_NET_RAW")
+			Expect(out.Bounding).To(Equal([]string{"CAP_NET_RAW", "CAP_A"}))
+			Expect(out.Ambient).To(Equal([]string{"CAP_NET_RAW"}))
+		})
+
+		It("does not share a slice with the input, even with spare capacity", func() {
+			backing := make([]string, 1, 4)
+			backing[0] = "CAP_A"
+			caps := &specs.LinuxCapabilities{Bounding: backing}
+			out := processes.WithCapability(caps, "CAP_NET_RAW")
+			out.Bounding[0] = "CAP_CHANGED"
+			Expect(backing[:1]).To(Equal([]string{"CAP_A"}))
+			Expect(backing[:2][1]).To(BeEmpty())
+		})
+
+		It("holds the capability alone for nil", func() {
+			Expect(processes.WithCapability(nil, "CAP_NET_RAW")).To(Equal(&specs.LinuxCapabilities{
+				Bounding:    []string{"CAP_NET_RAW"},
+				Effective:   []string{"CAP_NET_RAW"},
+				Inheritable: []string{"CAP_NET_RAW"},
+				Permitted:   []string{"CAP_NET_RAW"},
+				Ambient:     []string{"CAP_NET_RAW"},
+			}))
+		})
 	})
 
 	Describe("CheckUser", func() {

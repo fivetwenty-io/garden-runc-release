@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"code.cloudfoundry.org/guardian/backend"
+	"code.cloudfoundry.org/guardian/rundmc/processes"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"golang.org/x/sys/unix"
@@ -74,6 +75,17 @@ func init() {
 		_, err := os.Stdout.WriteString("written after run\n")
 		fmt.Fprintf(os.Stderr, "a write to a broken stdout after run returned: %v\n", err)
 		os.Exit(0)
+	}
+	if ports := os.Getenv(helperEchoPorts); ports != "" {
+		os.Exit(echoPeers(ports))
+	}
+	if art := os.Getenv(helperTransparentRun); art != "" {
+		argv := []string{"--backend", string(backend.VMFirecracker), "--artifacts", art}
+		if os.Getenv(helperTransparentFlag) != "" {
+			argv = append(argv, "--transparent-proxy")
+		}
+		argv = append(argv, "--", "/tmp/lifecycle/launcher", "app", "true", "")
+		os.Exit(run(argv, log.New(os.Stderr, "vm-launch: ", 0)))
 	}
 	if art := os.Getenv(helperArtifacts); art != "" {
 		kind := string(backend.VMQemu)
@@ -666,7 +678,23 @@ var _ = Describe("parseArgs", func() {
 		Entry("no command", []string{"--backend", "vm-qemu", "--"}, "no guest command"),
 		Entry("short launcher argv", []string{"--backend", "vm-qemu", "--", "/tmp/lifecycle/launcher", "app"}, "launcher argv has 1 arguments"),
 		Entry("empty start command", []string{"--backend", "vm-qemu", "--", "/tmp/lifecycle/launcher", "app", " ", ""}, "empty start command"),
+		Entry("transparent proxy for QEMU", []string{"--backend", "vm-qemu", "--transparent-proxy", "--", "true"}, "--transparent-proxy is for vm-firecracker only"),
 	)
+
+	It("takes --transparent-proxy for vm-firecracker, and leaves it off by default", func() {
+		cfg, err := parseArgs([]string{"--backend", "vm-firecracker", "--transparent-proxy", "--", "true"})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cfg.transparent).To(BeTrue())
+
+		cfg, err = parseArgs([]string{"--backend", "vm-firecracker", "--", "true"})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cfg.transparent).To(BeFalse())
+	})
+
+	It("names the flag Garden's process builder passes", func() {
+		Expect("--" + transparentProxyFlag).To(Equal(processes.VMLaunchTransparentProxyFlag))
+		Expect(usage).To(ContainSubstring("[" + processes.VMLaunchTransparentProxyFlag + "]"))
+	})
 
 	It("reports help as flag.ErrHelp", func() {
 		_, err := parseArgs([]string{"-h"})

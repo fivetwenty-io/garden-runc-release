@@ -41,6 +41,19 @@ const (
 	// gid with setgroups. No process of a vm-* container keeps it.
 	CapSetGID = "CAP_SETGID"
 
+	// CapNetRaw lets a process open raw sockets and set IP_TRANSPARENT in its
+	// network namespace. The wrapped vm-launch of a vm-firecracker container
+	// gets it in every set, so that its port proxy can dial the guest from
+	// the client's own address (see VMLaunchTransparentProxyFlag).
+	CapNetRaw = "CAP_NET_RAW"
+
+	// VMLaunchTransparentProxyFlag tells vm-launch that its Firecracker port
+	// proxy may dial the guest from each client's address, because Garden has
+	// granted it CapNetRaw and routes the guest's replies back to it. The
+	// containerizer passes it to the wrapped vm-launch of a vm-firecracker
+	// container, the one process BuildProcess grants CapNetRaw.
+	VMLaunchTransparentProxyFlag = "--transparent-proxy"
+
 	// CapDacOverride lets a process read and write files whatever their
 	// permissions say. It is the one capability a helper process (pea) of a
 	// vm-* container may keep (see VMPeaCapabilities).
@@ -184,9 +197,12 @@ func (p *ProcBuilder) CheckUser(bndl goci.Bndl, spec garden.ProcessSpec, user *u
 // supplementary gids the image gives the user, so Garden does not hand it out
 // either. Only the vm-launch process that carries the containerizer's
 // provenance marker gets the kvm gid and, in a vm-qemu bundle, runs without
-// the bundle's AppArmor profile. The marker is removed before the process is
-// built. Callers check the resolved user with CheckUser first, because a kvm
-// primary gid cannot be removed here.
+// the bundle's AppArmor profile, and in a vm-firecracker bundle gets
+// CAP_NET_RAW in every capability set, ambient included, so that it holds the
+// capability as the non-root app user (vm-launch keeps the hypervisor from
+// inheriting it). The marker is removed before the process is built.
+// Callers check the resolved user with CheckUser first, because a kvm primary
+// gid cannot be removed here.
 func (p *ProcBuilder) BuildProcess(bndl goci.Bndl, spec garden.ProcessSpec, user *users.ExecUser) *specs.Process {
 	kind := backend.FromBundle(bndl)
 	vm := backend.IsVM(kind)
@@ -216,6 +232,9 @@ func (p *ProcBuilder) BuildProcess(bndl goci.Bndl, spec garden.ProcessSpec, user
 	capabilities := p.capabilities(bndl, user.Gid)
 	if vm {
 		capabilities = WithoutCapability(capabilities, CapSetGID)
+	}
+	if wrapped && kind == backend.VMFirecracker {
+		capabilities = WithCapability(capabilities, CapNetRaw)
 	}
 
 	return &specs.Process{
@@ -287,6 +306,37 @@ func only(set, allowed []string) []string {
 		}
 	}
 	return kept
+}
+
+// WithCapability returns a copy of caps with capability in every set, the
+// ambient and effective sets included, each set keeping its order and
+// gaining the capability at its end when it lacks it. Nil caps would leave
+// the process the runtime's default, so for them the copy holds capability
+// alone, and the grant adds nothing else. It never modifies caps or its
+// slices.
+func WithCapability(caps *specs.LinuxCapabilities, capability string) *specs.LinuxCapabilities {
+	if caps == nil {
+		caps = &specs.LinuxCapabilities{}
+	}
+
+	return &specs.LinuxCapabilities{
+		Bounding:    with(caps.Bounding, capability),
+		Effective:   with(caps.Effective, capability),
+		Inheritable: with(caps.Inheritable, capability),
+		Permitted:   with(caps.Permitted, capability),
+		Ambient:     with(caps.Ambient, capability),
+	}
+}
+
+func with(set []string, capability string) []string {
+	kept := make([]string, 0, len(set)+1)
+	kept = append(kept, set...)
+	for _, c := range set {
+		if c == capability {
+			return kept
+		}
+	}
+	return append(kept, capability)
 }
 
 // WithoutCapability returns a copy of caps with capability removed from every

@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -72,10 +73,20 @@ var upstreamDialPolicy = dialPolicy{
 // until EOF and then half-closed, so either side can finish sending while it
 // still reads. Copy errors such as a peer reset end that connection only and
 // are not logged: they are how TCP connections normally end.
+//
+// A transparent proxy (see withTransparentDial) dials the guest from the
+// address of each client that transparentSource accepts, so the guest sees
+// that address as the connection's peer. Every other client, loopback ones
+// among them, is dialled from the container's tap address as before.
 type tcpProxy struct {
 	policy dialPolicy
 	logger *log.Logger
 	dialer net.Dialer
+
+	// transparent is set by withTransparentDial, and control is the socket
+	// option hook its dials run before they bind.
+	transparent bool
+	control     func(network, address string, c syscall.RawConn) error
 
 	// ctx is cancelled by Close, which aborts upstream dials and backoff waits.
 	ctx    context.Context
@@ -93,10 +104,24 @@ type tcpProxy struct {
 // errProxyStopped reports a Listen after StopAccepting or Close.
 var errProxyStopped = errors.New("the port proxy has stopped accepting connections")
 
+// proxyOption changes how a proxy that newProxy returns dials the guest.
+type proxyOption func(*tcpProxy)
+
+// withTransparentDial makes the proxy dial the guest from its clients'
+// addresses, setting IP_TRANSPARENT on each such socket through
+// setTransparent, which takes CAP_NET_RAW. Garden routes the guest's replies
+// to these sockets (see the netplugin package's FirecrackerReplyRouting).
+func withTransparentDial() proxyOption {
+	return func(p *tcpProxy) {
+		p.transparent = true
+		p.control = setTransparent
+	}
+}
+
 // newProxy returns a proxy that does not listen yet.
-func newProxy(policy dialPolicy, logger *log.Logger) *tcpProxy {
+func newProxy(policy dialPolicy, logger *log.Logger, opts ...proxyOption) *tcpProxy {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &tcpProxy{
+	p := &tcpProxy{
 		policy:    policy,
 		logger:    logger,
 		ctx:       ctx,
@@ -104,6 +129,10 @@ func newProxy(policy dialPolicy, logger *log.Logger) *tcpProxy {
 		listeners: map[string]net.Listener{},
 		conns:     map[net.Conn]struct{}{},
 	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
 }
 
 // Listen listens on listenAddr and carries the connections it accepts to
@@ -245,7 +274,11 @@ func (p *tcpProxy) handle(client net.Conn, upstreamAddr string) {
 	defer p.wg.Done()
 	defer p.untrack(client)
 
-	upstream, err := p.dialUpstream(upstreamAddr)
+	var source *net.TCPAddr
+	if p.transparent {
+		source = transparentSource(client.RemoteAddr())
+	}
+	upstream, err := p.dialUpstream(upstreamAddr, source)
 	if err != nil {
 		if p.ctx.Err() == nil {
 			p.logger.Printf("connection from %v: giving up on the guest at %s: %v", client.RemoteAddr(), upstreamAddr, err)
@@ -269,19 +302,32 @@ func (p *tcpProxy) handle(client net.Conn, upstreamAddr string) {
 
 // dialUpstream connects to the guest at addr, retrying under the dial policy. It
 // fails with the last dial error once the policy gives up, or with the
-// context error after Close.
-func (p *tcpProxy) dialUpstream(addr string) (net.Conn, error) {
+// context error after Close. A non-nil source makes each dial a transparent
+// one from that address, and a failure to make the socket transparent ends
+// the dial at once, because no retry would let it succeed and a plain dial
+// would show the guest the wrong peer.
+func (p *tcpProxy) dialUpstream(addr string, source *net.TCPAddr) (net.Conn, error) {
+	dialer, network := p.dialer, "tcp"
+	if source != nil {
+		dialer.LocalAddr = source
+		dialer.Control = p.control
+		network = "tcp4"
+	}
 	began := time.Now()
 	backoff := p.policy.firstBackoff
 	for {
 		attempt, cancel := context.WithTimeout(p.ctx, p.policy.attemptTimeout)
-		c, err := p.dialer.DialContext(attempt, "tcp", addr)
+		c, err := dialer.DialContext(attempt, network, addr)
 		cancel()
 		if err == nil {
 			return c, nil
 		}
 		if p.ctx.Err() != nil {
 			return nil, p.ctx.Err()
+		}
+		var transparentErr *transparentError
+		if errors.As(err, &transparentErr) {
+			return nil, err
 		}
 		budget := p.policy.giveUp
 		if isUnanswered(err) {

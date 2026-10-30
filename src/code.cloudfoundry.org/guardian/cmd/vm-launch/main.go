@@ -7,7 +7,7 @@
 //
 // Usage:
 //
-//	vm-launch --backend vm-qemu|vm-firecracker [--artifacts DIR] -- PATH [ARGS...]
+//	vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--artifacts DIR] -- PATH [ARGS...]
 //
 // When PATH is the CF launcher ("launcher APP-DIR START-COMMAND ..."), the
 // guest runs START-COMMAND. Otherwise it runs PATH and ARGS, shell-quoted.
@@ -37,6 +37,24 @@
 // SIGINT, every port closes for good; open connections close when the guest
 // stops. Without PORT, as for a task, nothing outside can connect to the
 // guest, as for a runc task.
+//
+// The Firecracker proxy dials the guest from the container's tap address,
+// 169.254.100.1, so the guest sees that address as the peer of every
+// connection. With --transparent-proxy, which Garden passes to the vm-launch
+// it wraps in a vm-firecracker container, the proxy instead dials from the
+// client's own IPv4 address, so the guest sees the peer a runc app would:
+// the gorouter, another app, or the container IP for a client inside the
+// container that dials it. A loopback client still shows up as
+// 169.254.100.1, because no packet from a loopback address leaves the
+// container's loopback device. The transparent dial takes CAP_NET_RAW,
+// which Garden grants this vm-launch, and Garden routes the guest's replies
+// back to the proxy. vm-launch checks that it can make a socket transparent
+// before the guest boots and exits 125 when it cannot, and a connection whose
+// socket cannot be made transparent is closed rather than dialled from the
+// tap address. The hypervisor never holds CAP_NET_RAW: vm-launch starts it
+// from a thread that has dropped the capability from every set it could
+// pass on, and refuses to start a hypervisor binary that has file
+// capabilities.
 //
 // Stopping: at the first SIGTERM or SIGINT while the guest's command runs,
 // vm-launch asks the guest, over its serial console, to stop the command,
@@ -265,6 +283,11 @@ const defaultArtifactsDir = "/opt/garden-vm/artifacts"
 // reported its status, when no signal came first.
 const killGrace = 5 * time.Second
 
+// transparentProxyFlag names the flag that turns on the transparent port
+// proxy. Garden's process builder passes it, as --transparent-proxy, to the
+// vm-launch it wraps in a vm-firecracker container.
+const transparentProxyFlag = "transparent-proxy"
+
 // stopDeadline is how long the hypervisor may keep running after the first
 // SIGTERM or SIGINT, which is all the time a guest command gets to stop. Diego
 // sends SIGKILL 10 seconds after its SIGTERM, and the 2 seconds left cover
@@ -272,13 +295,16 @@ const killGrace = 5 * time.Second
 // line, for every guest size vm-launch allows.
 const stopDeadline = 8 * time.Second
 
-const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--artifacts DIR] -- PATH [ARGS...]\n"
+const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--artifacts DIR] -- PATH [ARGS...]\n"
 
 type config struct {
 	backend   backend.Kind
 	artifacts string
 	command   string
 	credhub   credhubRetry
+	// transparent makes the Firecracker port proxy dial the guest from its
+	// clients' addresses (see transparentSource).
+	transparent bool
 }
 
 func main() {
@@ -370,6 +396,15 @@ func run(argv []string, logger *log.Logger) int {
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError
+	}
+	// The proxy serves ports only, so only then does it need the
+	// capability, but the hypervisor is kept from it whenever vm-launch
+	// was given it.
+	if cfg.transparent && len(nw.ports) > 0 {
+		if err := checkTransparentDial(); err != nil {
+			logger.Print(transparentCheckMessage(err))
+			return exitLaunchError
+		}
 	}
 	vol, err := volumeFromEnv(lookupEnv)
 	if err == nil && vol != nil {
@@ -512,12 +547,19 @@ func run(argv []string, logger *log.Logger) int {
 
 	cmd := newHypervisorCmd(hvArgv, files)
 	sup := supervisor{stdout: os.Stdout, logger: logger, signals: sigs, grace: killGrace, deadline: stopDeadline, started: closeInherited}
+	if cfg.transparent {
+		sup.prepare = confinedPrepare(cmd)
+	}
 	var gates *portGates
 	if len(nw.ports) > 0 {
 		// One proxy or one monitor serves every port's opener.
 		var open func(port int) portOpener
 		if cfg.backend == backend.VMFirecracker {
-			proxy := newProxy(upstreamDialPolicy, logger)
+			var opts []proxyOption
+			if cfg.transparent {
+				opts = append(opts, withTransparentDial())
+			}
+			proxy := newProxy(upstreamDialPolicy, logger, opts...)
 			defer proxy.Close()
 			open = func(port int) portOpener {
 				return proxyPort{proxy: proxy, addr: nw.listenAddr(port), upstream: nw.upstream(port)}
@@ -594,13 +636,17 @@ func parseArgs(argv []string) (config, error) {
 	fs.SetOutput(io.Discard)
 	kind := fs.String("backend", "", "VM backend: vm-qemu or vm-firecracker")
 	artifacts := fs.String("artifacts", defaultArtifactsDir, "directory holding the kernel, hypervisor, and busybox")
+	transparent := fs.Bool(transparentProxyFlag, false, "dial the Firecracker guest from each client's address, which takes CAP_NET_RAW")
 	if err := fs.Parse(argv); err != nil {
 		return config{}, err
 	}
 
-	cfg := config{backend: backend.Kind(*kind)}
+	cfg := config{backend: backend.Kind(*kind), transparent: *transparent}
 	if _, err := requiredArtifacts(cfg.backend); err != nil {
 		return config{}, err
+	}
+	if cfg.transparent && cfg.backend != backend.VMFirecracker {
+		return config{}, fmt.Errorf("--%s is for vm-firecracker only, whose port proxy dials the guest", transparentProxyFlag)
 	}
 	if *artifacts == "" {
 		return config{}, errors.New("--artifacts must not be empty")
