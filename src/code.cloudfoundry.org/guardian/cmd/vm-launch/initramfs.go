@@ -249,15 +249,22 @@ const guestSetLimits = `ulimit -n "$RVM_NOFILE_HARD" && ulimit -S -n "$RVM_NOFIL
 //
 // The kernel lists every listening socket of a table before any socket in
 // another state, so the watcher reads each table only up to the first line
-// that is not a listening socket, and its look costs the same however many
-// connections the guest has. A look at a table fails when the table cannot
-// be opened or yields no header line; the kernel allocates its buffer for a
-// table at the first read, so a read that succeeds once does not fail
-// later. A listening socket that the watcher finds is an answer, whatever
-// the other table gave. Otherwise a look that failed keeps the last answer,
-// so a look that fails never closes the port of an app that still listens.
-// The watcher reads only the tables the guest kernel has, as /proc/net/tcp6
-// is missing from a kernel without IPv6.
+// that is not a listening socket. A look therefore costs time in proportion
+// to the listening sockets, and not to the connections the guest has. The
+// shell's read makes one system call for each byte, so in the guest's
+// busybox a look costs about 0.09 ms of CPU for each listening socket.
+// Measured over 20 seconds, an idle guest used 6 ticks of CPU, a guest with
+// 201 listening sockets and 2000 connections used 62 ticks, about 3% of a
+// core, and a guest with 2001 listening sockets used 372 ticks, about 19%.
+//
+// A look at a table fails when the table cannot be opened or yields no
+// header line; the kernel allocates its buffer for a table at the first
+// read, so a read that succeeds once does not fail later. A listening
+// socket that the watcher finds is an answer, whatever the other table gave.
+// Otherwise a look that failed keeps the last answer, so a look that fails
+// never closes the port of an app that still listens. The watcher reads
+// only the tables the guest kernel has, as /proc/net/tcp6 is missing from a
+// kernel without IPv6.
 //
 // The watcher opens /dev/console for each listen line, so it writes through
 // its own open file and not the one it shares with the command, which the
