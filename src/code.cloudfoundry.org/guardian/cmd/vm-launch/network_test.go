@@ -401,7 +401,7 @@ var _ = Describe("guest network", func() {
 				Expect(idx).To(BeNumerically(">", 0), step)
 				Expect(idx).To(BeNumerically("<", start), step)
 			}
-			Expect(script).To(HaveSuffix("\ncommand exec 3>&2 2>/dev/null\n( command exec 2>&3 3>&-; { read -r rvm_self rvm_rest </proc/self/stat && echo \"$rvm_self\" >/rvm/app-pid; } || echo \"vm-launch guest: recording the command's pid in /rvm/app-pid failed; a stop request cannot reach the command\"; ulimit -n \"$RVM_NOFILE_HARD\" && ulimit -S -n \"$RVM_NOFILE_SOFT\" && . /rvm/env && exec sh -c \"$(cat /rvm/cmd)\" ) </dev/null\nrvm_status=$?\ncommand exec 2>&3 3>&-\n" + guestStopReaderStop + guestListenStop + guestOOMReport(testNonce) + "echo RVM_EXIT_" + testNonce + "=$rvm_status >/dev/console || echo RVM_EXIT_" + testNonce + "=$rvm_status\nreboot -f\n"))
+			Expect(script).To(HaveSuffix("\ncommand exec 3>&2 2>/dev/null\n( command exec 2>&3 3>&-; { read -r rvm_self rvm_rest </proc/self/stat && echo \"$rvm_self\" >/rvm/app-pid; } || echo \"vm-launch guest: recording the command's pid in /rvm/app-pid failed; a stop request cannot reach the command\"; ulimit -n \"$RVM_NOFILE_HARD\" && ulimit -S -n \"$RVM_NOFILE_SOFT\" && . /rvm/env && exec sh -c \"$(cat /rvm/cmd)\" ) </dev/null\nrvm_status=$?\ncommand exec 2>&3 3>&-\n" + guestStopReaderStop + guestListenStop + guestOOMReport(testNonce) + "echo RVM_EXIT_" + testNonce + "=$rvm_status >/dev/console || echo RVM_EXIT_" + testNonce + "=$rvm_status\nreboot -nf\n"))
 		})
 
 		It("sets the mtu of eth0 only when /rvm/net names one, and before it brings eth0 up", func() {
@@ -424,7 +424,7 @@ var _ = Describe("guest network", func() {
 			setup := strings.NewReplacer(
 				"/rvm/net", filepath.Join(dir, "net"),
 				"/sys/class/net/eth0", filepath.Join(dir, "sys/class/net/eth0"),
-				"reboot -f", "echo REBOOT",
+				"reboot -nf", "echo REBOOT",
 			).Replace(guestFailFunc + guestNetworkSetup)
 
 			cmd := exec.Command("/bin/sh", "-c", setup+"echo REACHED_START")

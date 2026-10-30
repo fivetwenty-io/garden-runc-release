@@ -199,7 +199,11 @@ func buildInitramfs(busybox []byte, command string, nw *network, vol *guestVolum
 func buildInitramfsWithEnv(busybox []byte, command string, nw *network, guestEnv string, vol *guestVolume) []byte {
 	bb := filepath.Join(GinkgoT().TempDir(), "busybox")
 	Expect(os.WriteFile(bb, busybox, 0o755)).To(Succeed())
-	f, err := newInitramfs(bb, guestContents{command: command, nonce: testNonce, nw: nw, env: guestEnv, vol: vol, nofile: testNofile})
+	g := guestContents{command: command, nonce: testNonce, nw: nw, env: guestEnv, vol: vol, nofile: testNofile}
+	if vol != nil {
+		g.volumeBytes = defaultImageSize
+	}
+	f, err := newInitramfs(bb, g)
 	Expect(err).NotTo(HaveOccurred())
 	defer f.Close()
 	return fileBytes(f)
@@ -310,7 +314,7 @@ var _ = Describe("initramfs", func() {
 		script := initScript(testNonce, false)
 		Expect(script).To(HavePrefix("#!/bin/busybox sh\n"))
 		Expect(script).To(ContainSubstring("\necho RVM_START_" + testNonce + "\n"))
-		Expect(script).To(ContainSubstring("\ncommand exec 3>&2 2>/dev/null\n( command exec 2>&3 3>&-; { read -r rvm_self rvm_rest </proc/self/stat && echo \"$rvm_self\" >/rvm/app-pid; } || echo \"vm-launch guest: recording the command's pid in /rvm/app-pid failed; a stop request cannot reach the command\"; ulimit -n \"$RVM_NOFILE_HARD\" && ulimit -S -n \"$RVM_NOFILE_SOFT\" && . /rvm/env && exec sh -c \"$(cat /rvm/cmd)\" ) </dev/null\nrvm_status=$?\ncommand exec 2>&3 3>&-\n" + guestStopReaderStop + guestListenStop + guestOOMReport(testNonce) + "echo RVM_EXIT_" + testNonce + "=$rvm_status >/dev/console || echo RVM_EXIT_" + testNonce + "=$rvm_status\nreboot -f\n"))
+		Expect(script).To(ContainSubstring("\ncommand exec 3>&2 2>/dev/null\n( command exec 2>&3 3>&-; { read -r rvm_self rvm_rest </proc/self/stat && echo \"$rvm_self\" >/rvm/app-pid; } || echo \"vm-launch guest: recording the command's pid in /rvm/app-pid failed; a stop request cannot reach the command\"; ulimit -n \"$RVM_NOFILE_HARD\" && ulimit -S -n \"$RVM_NOFILE_SOFT\" && . /rvm/env && exec sh -c \"$(cat /rvm/cmd)\" ) </dev/null\nrvm_status=$?\ncommand exec 2>&3 3>&-\n" + guestStopReaderStop + guestListenStop + guestOOMReport(testNonce) + "echo RVM_EXIT_" + testNonce + "=$rvm_status >/dev/console || echo RVM_EXIT_" + testNonce + "=$rvm_status\nreboot -nf\n"))
 		Expect(script).NotTo(ContainSubstring("poweroff"))
 	})
 
@@ -1048,9 +1052,29 @@ var _ = Describe("run with a guest root image", func() {
 		GinkgoT().Setenv("VCAP_APPLICATION", `{"limits":{"disk":40}}`)
 		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
 		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
-		Expect(logBuf.String()).To(ContainSubstring("the container has 40 MiB of disk quota left, and the guest root needs at least 48 MiB of it, which is 16 MiB plus 32 MiB kept for other writers; raise the app's disk quota"))
+		Expect(logBuf.String()).To(ContainSubstring("the app's disk limit is 40 MiB, and the guest root needs at least 48 MiB of it, which is 16 MiB plus 32 MiB kept for other writers; raise the app's disk quota"))
 		Expect(argvFile).NotTo(BeAnExistingFile())
 		Expect(os.ReadDir(tmp)).To(BeEmpty())
+		Expect(heldRootImages()).To(BeZero())
+	})
+
+	It("exits 125 with a clear line, and no image, when the work directory is on another filesystem than the root", func() {
+		var root, shm unix.Stat_t
+		Expect(unix.Stat("/", &root)).To(Succeed())
+		if err := unix.Stat("/dev/shm", &shm); err != nil || shm.Dev == root.Dev {
+			Skip("/dev/shm is not on another filesystem than /")
+		}
+		other, err := os.MkdirTemp("/dev/shm", "vm-launch-spec-")
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { Expect(os.RemoveAll(other)).To(Succeed()) })
+		GinkgoT().Setenv("TMPDIR", other)
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+
+		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(ContainSubstring(other + "/vm-launch-"))
+		Expect(logBuf.String()).To(ContainSubstring("is not on the container's root filesystem, whose disk quota the guest root is sized from; unset TMPDIR or point it at a directory on the root filesystem"))
+		Expect(argvFile).NotTo(BeAnExistingFile())
+		Expect(os.ReadDir(other)).To(BeEmpty())
 		Expect(heldRootImages()).To(BeZero())
 	})
 

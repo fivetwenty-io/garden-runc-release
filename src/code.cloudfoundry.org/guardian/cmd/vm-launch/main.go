@@ -101,8 +101,9 @@
 // locked file, and passes the image to the hypervisor as file descriptor 3.
 // The guest finds the image by its size, which no guest root image shares,
 // formats it as ext2 when its first 64 KiB are all zero, and mounts it
-// synchronously; a non-blank image that does not mount is never formatted. A VM app supports one read-write volume mount, and it must be a
-// JuiceFS mount. Cloud Controller strips the driver name from volume_mounts,
+// synchronously; a non-blank image that does not mount is never formatted. A
+// VM app supports one read-write volume mount, and it must be a JuiceFS
+// mount. Cloud Controller strips the driver name from volume_mounts,
 // so vm-launch reads the filesystem type of the mount at the volume path from
 // /proc/self/mountinfo, and any type other than fuse.juicefs, or a path with
 // no mount entry, fails the launch with exit 125 before anything boots.
@@ -572,6 +573,7 @@ func run(argv []string, logger *log.Logger) int {
 
 	// The image stays open, and so locked, until the hypervisor is reaped.
 	var img *os.File
+	var volumeBytes int64
 	if vol != nil {
 		img, err = openVolumeImage(vol, defaultImageOptions, sigs)
 		if err != nil {
@@ -579,19 +581,27 @@ func run(argv []string, logger *log.Logger) int {
 			return stepExitCode(err)
 		}
 		defer img.Close()
+		info, err := img.Stat()
+		if err != nil {
+			logger.Printf("reading the size of the volume image: %v", err)
+			return exitLaunchError
+		}
+		volumeBytes = info.Size()
 	}
 
 	// The guest root image is sized from the quota the work directory has
 	// left. rootDiskSize keeps its size from equalling the volume image's,
 	// which is how the guest tells the two drives apart.
-	var volumeBytes int64
-	if vol != nil {
-		volumeBytes = defaultImageSize
-	}
 	rootSize, rootInodeRatio, err := rootDiskSize(workDir, lookupEnv, unix.Statfs, volumeBytes, logger)
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError
+	}
+	if rootSize > 0 {
+		if err := checkRootImageDir(workDir, unix.Stat); err != nil {
+			logger.Print(err)
+			return exitLaunchError
+		}
 	}
 
 	// vm-launch's copies of the files only the hypervisor uses close as soon
@@ -621,6 +631,7 @@ func run(argv []string, logger *log.Logger) int {
 		nw:             nw,
 		env:            envFile,
 		vol:            vol,
+		volumeBytes:    volumeBytes,
 		caBundle:       caBundle,
 		nofile:         nofile,
 		rootBytes:      rootSize,

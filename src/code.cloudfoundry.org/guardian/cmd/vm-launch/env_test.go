@@ -121,7 +121,7 @@ func guestFiles(envFile, cmd string) *strings.Replacer {
 		"/rvm/env", filepath.Join(dir, "env"),
 		"/rvm/cmd", filepath.Join(dir, "cmd"),
 		guestAppPid, filepath.Join(dir, "app-pid"),
-		"reboot -f", "echo REBOOT",
+		"reboot -nf", "echo REBOOT",
 		"/dev/console", "/dev/stdout",
 	)
 }

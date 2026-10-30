@@ -61,16 +61,41 @@ func rootDiskSize(workDir string, lookup func(string) (string, bool), statfs fun
 	if err := statfs(workDir, &st); err != nil {
 		return 0, 0, fmt.Errorf("checking the disk quota left in %s: %w", workDir, err)
 	}
-	quotaMiB := min(limitMiB, freeMiB(&st))
+	free := freeMiB(&st)
+	quotaMiB := min(limitMiB, free)
 	size = (quotaMiB - rootDiskHeadroomMiB) * bytesPerMiB
 	if size == volumeBytes {
 		size -= bytesPerMiB
 	}
 	if size < minRootDiskMiB*bytesPerMiB {
-		return 0, 0, fmt.Errorf("the container has %d MiB of disk quota left, and the guest root needs at least %d MiB of it, which is %d MiB plus %d MiB kept for other writers; raise the app's disk quota",
-			quotaMiB, minRootDiskMiB+rootDiskHeadroomMiB, minRootDiskMiB, rootDiskHeadroomMiB)
+		have := fmt.Sprintf("the container has %d MiB of disk quota left", quotaMiB)
+		if limitMiB <= free {
+			have = fmt.Sprintf("the app's disk limit is %d MiB", quotaMiB)
+		}
+		return 0, 0, fmt.Errorf("%s, and the guest root needs at least %d MiB of it, which is %d MiB plus %d MiB kept for other writers; raise the app's disk quota",
+			have, minRootDiskMiB+rootDiskHeadroomMiB, minRootDiskMiB, rootDiskHeadroomMiB)
 	}
 	return size, inodeRatioFor(size), nil
+}
+
+// checkRootImageDir returns an error unless workDir is on the same
+// filesystem as the container's root directory, the one whose disk quota the
+// image is sized from. The work directory comes from TMPDIR, which the app's
+// own environment can set. On a tmpfs the image's blocks would count against
+// the container's memory, and on a volume against the volume's quota, and
+// statfs would in neither case show the container's disk.
+func checkRootImageDir(workDir string, stat func(string, *unix.Stat_t) error) error {
+	var work, root unix.Stat_t
+	if err := stat(workDir, &work); err != nil {
+		return fmt.Errorf("checking the filesystem of the work directory %s: %w", workDir, err)
+	}
+	if err := stat("/", &root); err != nil {
+		return fmt.Errorf("checking the filesystem of the container's root directory: %w", err)
+	}
+	if work.Dev != root.Dev {
+		return fmt.Errorf("the work directory %s is not on the container's root filesystem, whose disk quota the guest root is sized from; unset TMPDIR or point it at a directory on the root filesystem", workDir)
+	}
+	return nil
 }
 
 // freeMiB returns the whole MiB that an unprivileged writer can still add to

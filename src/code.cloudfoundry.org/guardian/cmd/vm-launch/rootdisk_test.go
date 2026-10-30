@@ -163,38 +163,45 @@ var _ = Describe("the guest root image size", func() {
 
 		It("measures the nudged size against the smallest root", func() {
 			_, _, err := sized("48", 5000, 16*testMiB)
-			Expect(err).To(MatchError(ContainSubstring("the container has 48 MiB of disk quota left")))
+			Expect(err).To(MatchError(ContainSubstring("the app's disk limit is 48 MiB")))
 		})
 	})
 
 	Describe("a quota that is too small", func() {
-		const want = "the container has %d MiB of disk quota left, and the guest root needs at least 48 MiB of it, which is 16 MiB plus 32 MiB kept for other writers; raise the app's disk quota"
+		const (
+			needs = ", and the guest root needs at least 48 MiB of it, which is 16 MiB plus 32 MiB kept for other writers; raise the app's disk quota"
+			// wantLeft is the line when the free space is the smaller number,
+			// and wantLimit when the app's disk limit is.
+			wantLeft  = "the container has %d MiB of disk quota left" + needs
+			wantLimit = "the app's disk limit is %d MiB" + needs
+		)
 
-		DescribeTable("exits with the quota line, naming the MiB left",
-			func(diskMiB string, free uint64, leftMiB int) {
+		DescribeTable("exits with the quota line, naming the MiB left when the free space is smaller and the limit when it is",
+			func(diskMiB string, free uint64, want string, leftMiB int) {
 				size, ratio, err := sized(diskMiB, free, 0)
 				Expect(err).To(MatchError(fmt.Sprintf(want, leftMiB)))
 				Expect(size).To(BeZero())
 				Expect(ratio).To(BeZero())
 				Expect(logBuf.String()).To(BeEmpty())
 			},
-			Entry("a limit one MiB short", "47", uint64(1000), 47),
-			Entry("free space one MiB short", "1000", uint64(47), 47),
-			Entry("exactly the headroom", "32", uint64(1000), 32),
-			Entry("less than the headroom", "10", uint64(1000), 10),
-			Entry("one MiB", "1", uint64(1000), 1),
-			Entry("no free space", "1000", uint64(0), 0),
+			Entry("a limit one MiB short", "47", uint64(1000), wantLimit, 47),
+			Entry("free space one MiB short", "1000", uint64(47), wantLeft, 47),
+			Entry("exactly the headroom", "32", uint64(1000), wantLimit, 32),
+			Entry("less than the headroom", "10", uint64(1000), wantLimit, 10),
+			Entry("one MiB", "1", uint64(1000), wantLimit, 1),
+			Entry("no free space", "1000", uint64(0), wantLeft, 0),
+			Entry("a limit equal to the free space", "40", uint64(40), wantLimit, 40),
 		)
 
 		It("names the smaller of the limit and the free space", func() {
 			_, _, err := sized("40", 30, 0)
-			Expect(err).To(MatchError(fmt.Sprintf(want, 30)))
+			Expect(err).To(MatchError(fmt.Sprintf(wantLeft, 30)))
 		})
 
 		It("counts the free MiB it was cut to, not a fraction", func() {
 			var asked string
 			_, _, err := rootDiskSize("/work", vcapWithDisk("1000"), freeBlocks((47*testMiB+testMiB-4096)/4096, &asked), 0, logger)
-			Expect(err).To(MatchError(fmt.Sprintf(want, 47)))
+			Expect(err).To(MatchError(fmt.Sprintf(wantLeft, 47)))
 		})
 	})
 
@@ -272,6 +279,39 @@ var _ = Describe("the guest root image size", func() {
 			Expect(size).To(Equal(int64(16 * testGiB)))
 			Expect(ratio).To(Equal(int64(262144)))
 		})
+	})
+})
+
+var _ = Describe("the filesystem of the guest root image", func() {
+	// devs is a stat that reports the device of each path in devs, and fails
+	// for a path it does not list.
+	devs := func(devs map[string]uint64) func(string, *unix.Stat_t) error {
+		return func(path string, st *unix.Stat_t) error {
+			dev, ok := devs[path]
+			if !ok {
+				return &os.PathError{Op: "stat", Path: path, Err: syscall.ENOENT}
+			}
+			*st = unix.Stat_t{Dev: dev}
+			return nil
+		}
+	}
+
+	It("accepts a work directory on the filesystem of the container's root directory", func() {
+		Expect(checkRootImageDir("/tmp/vm-launch-1", devs(map[string]uint64{"/tmp/vm-launch-1": 42, "/": 42}))).To(Succeed())
+	})
+
+	It("rejects a work directory on another filesystem, naming it, before an image is created", func() {
+		err := checkRootImageDir("/dev/shm/vm-launch-1", devs(map[string]uint64{"/dev/shm/vm-launch-1": 7, "/": 42}))
+		Expect(err).To(MatchError("the work directory /dev/shm/vm-launch-1 is not on the container's root filesystem, whose disk quota the guest root is sized from; unset TMPDIR or point it at a directory on the root filesystem"))
+	})
+
+	It("fails when it cannot stat the work directory or the root directory", func() {
+		err := checkRootImageDir("/work", devs(map[string]uint64{"/": 42}))
+		Expect(err).To(MatchError(ContainSubstring("checking the filesystem of the work directory /work: ")))
+		Expect(err).To(MatchError(ContainSubstring("no such file or directory")))
+
+		err = checkRootImageDir("/work", devs(map[string]uint64{"/work": 42}))
+		Expect(err).To(MatchError(ContainSubstring("checking the filesystem of the container's root directory: ")))
 	})
 })
 
