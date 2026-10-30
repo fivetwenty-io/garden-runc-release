@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"code.cloudfoundry.org/guardian/backend"
 	"code.cloudfoundry.org/guardian/netplugin"
@@ -465,18 +466,22 @@ for l in /proc/$PPID/fd/*; do
 done
 `
 
+// runVMTimeout bounds one vm-launch run in the PORT specs, each of which
+// takes a few seconds.
+const runVMTimeout = 30 * time.Second
+
 var _ = Describe("run with PORT", func() {
 	var (
 		art    string
 		tmp    string
-		logBuf *bytes.Buffer
+		logBuf *safeBuffer
 	)
 
 	BeforeEach(func() {
 		art = makeArtifacts()
 		tmp = GinkgoT().TempDir()
 		GinkgoT().Setenv("TMPDIR", tmp)
-		logBuf = &bytes.Buffer{}
+		logBuf = &safeBuffer{}
 	})
 
 	fakeHypervisor := writeFakeHypervisor
@@ -488,8 +493,20 @@ var _ = Describe("run with PORT", func() {
 		return l.Addr().(*net.TCPAddr).Port
 	}
 
+	// runVM runs vm-launch and fails the spec when it is still running
+	// after runVMTimeout, so a broken port path fails its spec instead of
+	// hanging the suite.
 	runVM := func(kind backend.Kind) int {
-		return run([]string{"--backend", string(kind), "--artifacts", art, "--", "/tmp/lifecycle/launcher", "app", "true", ""}, log.New(logBuf, "", 0))
+		code := make(chan int, 1)
+		go func() {
+			defer GinkgoRecover()
+			code <- run([]string{"--backend", string(kind), "--artifacts", art, "--", "/tmp/lifecycle/launcher", "app", "true", ""}, log.New(logBuf, "", 0))
+		}()
+		var c int
+		Eventually(code, runVMTimeout).Should(Receive(&c), func() string {
+			return "vm-launch was still running after " + runVMTimeout.String() + "; its log so far:\n" + logBuf.String()
+		})
+		return c
 	}
 
 	It("exits 125 for a PORT that is not a port number", func() {
@@ -502,8 +519,9 @@ var _ = Describe("run with PORT", func() {
 	// start tag and the exit tag, with these shell functions: listen 1|0
 	// writes a listen line; await open|closed waits up to 10 seconds for
 	// port to accept or refuse connections; qmp_send writes a line to the
-	// QMP socket, and qmp_recv reads one and appends it to the returned
-	// QMP log.
+	// QMP socket, and qmp_recv waits up to 10 seconds for one, reads it, and
+	// appends it to the returned QMP log. A wait that runs out fails the
+	// fake hypervisor, and so the spec.
 	portHypervisor := func(path string, port int, body string) (argvFile, qmpLog string) {
 		argvFile = path + ".argv"
 		qmpLog = path + ".qmp"
@@ -529,7 +547,7 @@ await() {
 	exit 1
 }
 qmp_send() { printf '%s\n' "$1" >&"$qmp"; }
-qmp_recv() { IFS= read -r line <&"$qmp" || { echo "the QMP socket closed" >&2; exit 1; }; printf '%s\n' "$line" >>` + shellQuote(qmpLog) + `; }
+qmp_recv() { IFS= read -r -t 10 line <&"$qmp" || { echo "no QMP request came in 10 seconds, or the QMP socket closed" >&2; exit 1; }; printf '%s\n' "$line" >>` + shellQuote(qmpLog) + `; }
 echo "RVM_START_$nonce"
 ` + body + `
 echo "RVM_EXIT_$nonce=0"

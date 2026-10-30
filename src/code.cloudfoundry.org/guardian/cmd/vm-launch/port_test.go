@@ -216,6 +216,10 @@ var _ = Describe("the port gate", func() {
 			return nil
 		}
 		start()
+		// A spec that fails before it releases the open must not leave
+		// the gate stuck in it, or the gate's cleanup never returns.
+		var releaseOnce sync.Once
+		DeferCleanup(func() { releaseOnce.Do(func() { close(release) }) })
 		gate.set(true)
 		Eventually(opening).Should(Receive())
 		done := make(chan struct{})
@@ -227,7 +231,7 @@ var _ = Describe("the port gate", func() {
 			close(done)
 		}()
 		Eventually(done).Should(BeClosed())
-		close(release)
+		releaseOnce.Do(func() { close(release) })
 		Eventually(opener.got).Should(Equal([]string{"open", "close"}))
 		Consistently(opener.got, 100*time.Millisecond).Should(Equal([]string{"open", "close"}))
 	})
@@ -309,6 +313,8 @@ var _ = Describe("the port gate", func() {
 			return errors.New("the hypervisor is gone")
 		}
 		start()
+		var releaseOnce sync.Once
+		DeferCleanup(func() { releaseOnce.Do(func() { close(release) }) })
 		gate.set(true)
 		Eventually(opening).Should(Receive())
 		ended := make(chan struct{})
@@ -317,7 +323,7 @@ var _ = Describe("the port gate", func() {
 			close(ended)
 		}()
 		Consistently(ended, 50*time.Millisecond).ShouldNot(BeClosed())
-		close(release)
+		releaseOnce.Do(func() { close(release) })
 		Eventually(ended).Should(BeClosed())
 		Expect(logBuf.String()).To(BeEmpty())
 	})
@@ -705,8 +711,12 @@ var _ = Describe("the guest listen watcher", func() {
 			stdout, err := c.StdoutPipe()
 			Expect(err).NotTo(HaveOccurred())
 			c.Stderr = GinkgoWriter
+			// The watcher is a subshell that holds the output pipes open, so
+			// the cleanup kills the whole process group, not the shell
+			// alone, and Wait does not wait for a watcher that never ends.
+			c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 			Expect(c.Start()).To(Succeed())
-			DeferCleanup(func() { _ = c.Process.Kill(); _ = c.Wait() })
+			DeferCleanup(func() { _ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL); _ = c.Wait() })
 			lines := make(chan string, 16)
 			go func() {
 				defer close(lines)
