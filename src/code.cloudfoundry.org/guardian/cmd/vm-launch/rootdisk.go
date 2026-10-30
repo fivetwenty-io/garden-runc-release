@@ -24,10 +24,12 @@ const (
 
 	// rootDiskInodeRatio is the bytes of image for each inode that the guest
 	// gives mke2fs. It doubles until the image holds at most maxRootDiskInodes
-	// inodes, because mke2fs writes every inode table when it formats, and
-	// those blocks count against the quota from the first second.
+	// inodes, because mke2fs writes every inode table when it formats. Those
+	// blocks count against the quota from the first second, and on Firecracker
+	// each one is a first touch of guest memory, so 262144 inodes took about
+	// 4.7 seconds to format where 65536 take about 1.1.
 	rootDiskInodeRatio = 16384
-	maxRootDiskInodes  = 262144
+	maxRootDiskInodes  = 65536
 
 	// rootImageName is the root image's name while it has one.
 	rootImageName = "root.img"

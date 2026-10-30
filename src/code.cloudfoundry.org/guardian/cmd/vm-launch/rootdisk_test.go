@@ -64,7 +64,7 @@ var _ = Describe("the guest root image size", func() {
 			size, ratio, err := sized(diskMiB, free, 0)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(size).To(Equal(wantMiB * testMiB))
-			Expect(ratio).To(Equal(int64(16384)))
+			Expect(ratio).To(Equal(inodeRatioFor(wantMiB * testMiB)))
 			Expect(logBuf.String()).To(BeEmpty())
 		},
 		Entry("a limit under the free space", "512", uint64(10000), int64(480)),
@@ -243,25 +243,25 @@ var _ = Describe("the guest root image size", func() {
 	})
 
 	Describe("the inode ratio", func() {
-		DescribeTable("is 16384 bytes per inode, doubled until the image holds at most 262144 inodes",
+		DescribeTable("is 16384 bytes per inode, doubled until the image holds at most 65536 inodes",
 			func(size int64, want int64) {
 				Expect(inodeRatioFor(size)).To(Equal(want))
 			},
 			Entry("16 MiB", int64(16*testMiB), int64(16384)),
 			Entry("1 GiB, 65536 inodes", int64(testGiB), int64(16384)),
-			Entry("4 GiB, 262144 inodes", int64(4*testGiB), int64(16384)),
-			Entry("4 GiB and 1 MiB", int64(4*testGiB+testMiB), int64(32768)),
-			Entry("16 GiB", int64(16*testGiB), int64(65536)),
-			Entry("64 GiB", int64(64*testGiB), int64(262144)),
-			Entry("1 TiB", int64(1024*testGiB), int64(4194304)),
+			Entry("1 GiB and 1 MiB", int64(testGiB+testMiB), int64(32768)),
+			Entry("4 GiB", int64(4*testGiB), int64(65536)),
+			Entry("16 GiB", int64(16*testGiB), int64(262144)),
+			Entry("64 GiB", int64(64*testGiB), int64(1048576)),
+			Entry("1 TiB", int64(1024*testGiB), int64(16777216)),
 		)
 
-		It("never lets an image hold more than 262144 inodes, and never doubles more than it must", func() {
+		It("never lets an image hold more than 65536 inodes, and never doubles more than it must", func() {
 			for _, size := range []int64{16 * testMiB, 100 * testMiB, testGiB, 3 * testGiB, 4 * testGiB, 5 * testGiB, 8 * testGiB, 9 * testGiB, 100 * testGiB, 4096 * testGiB} {
 				ratio := inodeRatioFor(size)
-				Expect(size/ratio).To(BeNumerically("<=", 262144), "size %d", size)
+				Expect(size/ratio).To(BeNumerically("<=", 65536), "size %d", size)
 				if ratio > 16384 {
-					Expect(size/(ratio/2)).To(BeNumerically(">", 262144), "size %d", size)
+					Expect(size/(ratio/2)).To(BeNumerically(">", 65536), "size %d", size)
 				}
 			}
 		})
@@ -270,7 +270,7 @@ var _ = Describe("the guest root image size", func() {
 			size, ratio, err := sized("16416", 100000, 0)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(size).To(Equal(int64(16 * testGiB)))
-			Expect(ratio).To(Equal(int64(65536)))
+			Expect(ratio).To(Equal(int64(262144)))
 		})
 	})
 })
