@@ -182,7 +182,9 @@ func (g *portGate) loop() {
 		timer *time.Timer
 		wait  = g.retry.first
 		// failing is set while the changes toward goal fail, and conflict
-		// while the last of them failed on a port conflict.
+		// says whether the last of them failed on a port conflict. conflict
+		// means something only while failing is set, and every failure
+		// sets it along with failing, so a new goal needs no reset of it.
 		failing, conflict bool
 	)
 	// retryNow drops the wait before the next try.
@@ -195,7 +197,7 @@ func (g *portGate) loop() {
 	// newGoal forgets the failures of the last goal.
 	newGoal := func() {
 		retryNow()
-		wait, failing, conflict = g.retry.first, false, false
+		wait, failing = g.retry.first, false
 	}
 	for {
 		select {
