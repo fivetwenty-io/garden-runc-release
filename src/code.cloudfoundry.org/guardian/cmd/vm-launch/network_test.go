@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -279,7 +280,8 @@ var _ = Describe("guest network", func() {
 		It("adds the network and environment files", func() {
 			names, byName := archiveEntries(buildInitramfsWithEnv([]byte("busybox"), "httpd -f -p $PORT", nw, "export PORT='8080'\n", nil))
 			Expect(names).To(Equal([]string{"bin", "dev", "dev/console", "dev/null", "etc", "proc", "sys", "tmp", "rvm",
-				"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "rvm/limits", "etc/resolv.conf", "init", cpioTrailer}))
+				"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "rvm/limits", "etc/resolv.conf", "rvm/listen-tick", "init", cpioTrailer}))
+			Expect(byName["rvm/listen-tick"].mode).To(Equal(uint32(0o010600)))
 			Expect(string(byName["rvm/net"].data)).To(Equal("RVM_ADDRESS='10.0.2.15/24'\nRVM_GATEWAY='10.0.2.2'\nRVM_PORT='8080'\n"))
 			Expect(string(byName["rvm/env"].data)).To(Equal("export PORT='8080'\n"))
 			Expect(byName["rvm/env"].mode).To(Equal(uint32(0o100600)))
@@ -344,11 +346,11 @@ var _ = Describe("guest network", func() {
 			Expect(string(calls)).To(Equal("link set lo up\nlink set eth0 mtu 9001\nlink set eth0 up\naddr add 10.0.2.15/24 dev eth0\nroute add default via 10.0.2.2 dev eth0\n"))
 		})
 
-		It("gives a task the same archive and network setup as an LRP, less the port", func() {
+		It("gives a task the same archive and network setup as an LRP, less the port and the listen watcher's FIFO", func() {
 			task := &network{address: qemuGuestCIDR, gateway: qemuGateway, resolvConf: "nameserver 10.0.2.3\n"}
 			names, byName := archiveEntries(buildInitramfs([]byte("busybox"), "true", task, nil))
 			lrpNames, lrp := archiveEntries(buildInitramfs([]byte("busybox"), "true", nw, nil))
-			Expect(names).To(Equal(lrpNames))
+			Expect(lrpNames).To(Equal(slices.Insert(slices.Clone(names), slices.Index(names, "init"), "rvm/listen-tick")))
 			Expect(byName["init"].data).To(Equal(lrp["init"].data))
 			Expect(string(lrp["rvm/net"].data)).To(Equal(string(byName["rvm/net"].data) + "RVM_PORT='8080'\n"))
 			Expect(byName["etc/resolv.conf"].data).To(Equal(lrp["etc/resolv.conf"].data))

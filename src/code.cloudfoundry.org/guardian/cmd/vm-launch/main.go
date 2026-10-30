@@ -24,7 +24,8 @@
 // guest over Garden's tap device. vm-launch reserves PORT when it starts, so
 // connections are refused, and it opens PORT only while something in the
 // guest listens on the port at an address other than loopback, which the
-// guest reports within a second of a change. So, as for a runc app, a
+// guest reports within a second of a change, even once the app has used up
+// the processes the guest can start. So, as for a runc app, a
 // connection to PORT, and with it Diego's port health check, succeeds only
 // once the app listens. At the first SIGTERM or SIGINT, PORT closes for
 // good; open connections close when the guest stops. Without PORT, as for a

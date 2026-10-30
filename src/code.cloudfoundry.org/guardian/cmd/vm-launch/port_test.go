@@ -873,51 +873,74 @@ var _ = Describe("the guest listen watcher", func() {
 	wildcard6 := strings.Repeat("0", 32)
 
 	// watcherPath returns a PATH for shell holding the commands the watcher
-	// runs, as /bin holds them in the guest.
+	// may run, as /bin holds them in the guest.
 	watcherPath := func(shell guestShell) string {
 		if len(shell.argv) == 1 {
 			return "/usr/bin:/bin"
 		}
 		bin := guestBin(shell)
-		for _, applet := range []string{"grep", "printf", "sleep", "kill"} {
+		for _, applet := range []string{"printf", "sleep", "kill"} {
 			Expect(os.Symlink(shell.argv[0], filepath.Join(bin, applet))).To(Succeed())
 		}
 		return bin
 	}
 
-	// watchOnStdout is the watcher with its listen lines on stdout in
-	// place of the console.
-	watchOnStdout := func() string {
-		watch := guestListenWatch(testNonce)
-		Expect(watch).To(ContainSubstring(" >/dev/console "))
-		return strings.ReplaceAll(watch, " >/dev/console ", " ")
+	// newTick returns a FIFO for the watcher to wait on, in a directory
+	// that any user can reach.
+	newTick := func() string {
+		dir, err := os.MkdirTemp("", "vm-launch-tick-")
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(os.RemoveAll, dir)
+		Expect(os.Chmod(dir, 0o755)).To(Succeed())
+		tick := filepath.Join(dir, "tick")
+		Expect(unix.Mkfifo(tick, 0o666)).To(Succeed())
+		Expect(os.Chmod(tick, 0o666)).To(Succeed())
+		return tick
 	}
 
-	// noTable stands for a /proc/net table the guest kernel lacks.
-	const noTable = "\x00"
+	// watchOnStdout is the watcher with its listen lines on stdout in
+	// place of the console, waiting on the FIFO tick.
+	watchOnStdout := func(tick string) string {
+		watch := guestListenWatch(testNonce)
+		Expect(watch).To(ContainSubstring(" >/dev/console "))
+		Expect(strings.Count(watch, guestListenTick)).To(Equal(2))
+		return strings.NewReplacer(" >/dev/console ", " ", guestListenTick, tick).Replace(watch)
+	}
+
+	// noTable stands for a /proc/net table the guest kernel lacks, and
+	// unreadable for one that the watcher cannot read.
+	const (
+		noTable    = "\x00"
+		unreadable = "\x01"
+	)
 
 	// watchRound runs the watcher for port, after the shell code prelude,
 	// against fake /proc/net/tcp and tcp6 contents, either of which may be
-	// noTable, with its listen lines on stdout. The watcher starts in the
-	// state wasUp, "0" or "1", and calls rvm_round_end in place of its
-	// sleep, which ends it after one round unless prelude defines it again.
-	// watchRound returns what the watcher printed.
+	// noTable or unreadable, with its listen lines on stdout. The watcher
+	// starts in the state wasUp, "0" or "1", and calls rvm_round_end in
+	// place of its pause, which ends it after one round unless prelude
+	// defines it again. watchRound returns what the watcher printed.
 	watchRound := func(shell guestShell, port int, tcp, tcp6, prelude, wasUp string) string {
 		dir := GinkgoT().TempDir()
 		tcpPath, tcp6Path := filepath.Join(dir, "tcp"), filepath.Join(dir, "tcp6")
 		for path, table := range map[string]string{tcpPath: tcp, tcp6Path: tcp6} {
-			if table != noTable {
+			switch table {
+			case noTable:
+			case unreadable:
+				// A directory opens, and every read of it fails.
+				Expect(os.Mkdir(path, 0o755)).To(Succeed())
+			default:
 				Expect(os.WriteFile(path, []byte(procNetHeader+table), 0o644)).To(Succeed())
 			}
 		}
-		watch := watchOnStdout()
-		for _, s := range []string{" /proc/net/tcp /proc/net/tcp6;", "\n\t\trvm_up=0\n", "\n\t\t\tsleep 1\n"} {
+		watch := watchOnStdout(newTick())
+		for _, s := range []string{" /proc/net/tcp /proc/net/tcp6;", "\n\t\trvm_up=0\n", "\n\t\t\trvm_pause\n"} {
 			Expect(watch).To(ContainSubstring(s))
 		}
 		watch = strings.NewReplacer(
 			" /proc/net/tcp /proc/net/tcp6;", " "+tcpPath+" "+tcp6Path+";",
 			"\n\t\trvm_up=0\n", "\n\t\trvm_up="+wasUp+"\n",
-			"\n\t\t\tsleep 1\n", "\n\t\t\trvm_round_end\n",
+			"\n\t\t\trvm_pause\n", "\n\t\t\trvm_round_end\n",
 		).Replace(watch)
 		script := "rvm_round_end() { exit 0; }\n" + prelude + watch + `wait "$rvm_watch"` + "\n"
 		c := exec.Command(shell.argv[0], append(shell.argv[1:], "-c", script)...)
@@ -934,6 +957,7 @@ var _ = Describe("the guest listen watcher", func() {
 	}
 
 	listening := "RVM_LISTEN_" + testNonce + "=1\n"
+	notListening := "RVM_LISTEN_" + testNonce + "=0\n"
 
 	type socketCase struct {
 		port      int
@@ -954,6 +978,7 @@ var _ = Describe("the guest listen watcher", func() {
 		"[::ffff:127.0.0.1]":                   {port: 8080, tcp6: procNetLine("0000000000000000FFFF00000100007F:1F90", "0A")},
 		"[::ffff:10.0.2.15]":                   {port: 8080, tcp6: procNetLine("0000000000000000FFFF00000F02000A:1F90", "0A"), want: true},
 		"loopback and 0.0.0.0":                 {port: 8080, tcp: procNetLine("0100007F:1F90", "0A") + procNetLine("00000000:1F90", "0A"), want: true},
+		"other listeners first":                {port: 8080, tcp: procNetLine("00000000:0016", "0A") + procNetLine("0100007F:1F90", "0A") + procNetLine("00000000:1F90", "0A"), want: true},
 		"no sockets":                           {port: 8080},
 	}
 
@@ -972,28 +997,37 @@ var _ = Describe("the guest listen watcher", func() {
 		shellEntries(""),
 	)
 
+	DescribeTable("reads a table only up to its first socket that is not listening, as the kernel lists listening sockets first",
+		func(shellOf func() guestShell) {
+			shell := shellOf()
+			connection := procNetLine("0F02000A:1F90", "01")
+			Expect(watchRound(shell, 8080, connection+procNetLine("00000000:1F90", "0A"), "", "", "0")).To(BeEmpty(), shell.name)
+			Expect(watchRound(shell, 8080, procNetLine("00000000:1F90", "0A")+connection, "", "", "0")).To(Equal(listening), shell.name)
+		},
+		shellEntries(""),
+	)
+
 	DescribeTable("reads only the tables the guest kernel has",
 		func(shellOf func() guestShell) {
 			shell := shellOf()
 			Expect(watchRound(shell, 8080, procNetLine("00000000:1F90", "0A"), noTable, "", "0")).To(Equal(listening), shell.name)
 			Expect(watchRound(shell, 8080, noTable, procNetLine(wildcard6+":1F90", "0A"), "", "0")).To(Equal(listening), shell.name)
-			Expect(watchRound(shell, 8080, noTable, noTable, "", "1")).To(Equal("RVM_LISTEN_"+testNonce+"=0\n"), shell.name)
+			Expect(watchRound(shell, 8080, noTable, noTable, "", "1")).To(Equal(notListening), shell.name)
 		},
 		shellEntries(""),
 	)
 
-	DescribeTable("keeps its state when a grep fails instead of answering",
+	DescribeTable("keeps its state when it cannot read a table, unless the other table has a listener",
 		func(shellOf func() guestShell) {
 			shell := shellOf()
 			up := procNetLine("00000000:1F90", "0A")
-			// A shell function runs in place of the grep applet, and
-			// "command grep" runs the applet. Status 2 is grep's error.
-			for _, flags := range []string{"-hE", "-qvE"} {
-				prelude := `grep() { case "$1" in ` + flags + `) return 2 ;; esac; command grep "$@"; }` + "\n"
-				Expect(watchRound(shell, 8080, up, "", prelude, "1")).To(BeEmpty(), "%s: %s", shell.name, flags)
-				Expect(watchRound(shell, 8080, up, "", prelude, "0")).To(BeEmpty(), "%s: %s", shell.name, flags)
+			for _, wasUp := range []string{"0", "1"} {
+				Expect(watchRound(shell, 8080, unreadable, "", "", wasUp)).To(BeEmpty(), "%s: was %s", shell.name, wasUp)
+				Expect(watchRound(shell, 8080, "", unreadable, "", wasUp)).To(BeEmpty(), "%s: was %s", shell.name, wasUp)
 			}
-			Expect(watchRound(shell, 8080, "", "", "", "1")).To(Equal("RVM_LISTEN_"+testNonce+"=0\n"), shell.name)
+			Expect(watchRound(shell, 8080, unreadable, procNetLine(wildcard6+":1F90", "0A"), "", "0")).To(Equal(listening), shell.name)
+			Expect(watchRound(shell, 8080, up, unreadable, "", "0")).To(Equal(listening), shell.name)
+			Expect(watchRound(shell, 8080, "", "", "", "1")).To(Equal(notListening), shell.name)
 		},
 		shellEntries(""),
 	)
@@ -1002,7 +1036,7 @@ var _ = Describe("the guest listen watcher", func() {
 		func(shellOf func() guestShell) {
 			shell := shellOf()
 			prelude := `rvm_round_end() { [ -n "${rvm_again:-}" ] && exit 0; rvm_again=1; }
-echo() { if [ -z "${rvm_failed:-}" ]; then rvm_failed=1; return 1; fi; command echo "$@"; }
+echo() { if [ -z "${rvm_failed_once:-}" ]; then rvm_failed_once=1; return 1; fi; command echo "$@"; }
 `
 			Expect(watchRound(shell, 8080, procNetLine("00000000:1F90", "0A"), "", prelude, "0")).To(Equal(listening), shell.name)
 		},
@@ -1017,52 +1051,133 @@ echo() { if [ -z "${rvm_failed:-}" ]; then rvm_failed=1; return 1; fi; command e
 		Expect(string(out)).To(Equal("watch=[]\n"))
 	})
 
-	DescribeTable("follows real sockets and stops before /init reports the status",
+	// startWatcher starts script in shell, with the watcher's port and its
+	// own process group, and returns the command, a pipe to its stdin, and
+	// its stdout lines. A cleanup kills the whole process group, because
+	// the watcher is a subshell that holds the output pipes open, and Wait
+	// would wait for a watcher that never ends.
+	startWatcher := func(shell guestShell, port int, script string, attr *syscall.SysProcAttr) (*exec.Cmd, io.Writer, *safeBuffer, <-chan string) {
+		c := exec.Command(shell.argv[0], append(shell.argv[1:], "-c", script)...)
+		c.Env = []string{"PATH=" + watcherPath(shell), "RVM_PORT=" + strconv.Itoa(port)}
+		stdin, err := c.StdinPipe()
+		Expect(err).NotTo(HaveOccurred())
+		stdout, err := c.StdoutPipe()
+		Expect(err).NotTo(HaveOccurred())
+		stderr := &safeBuffer{}
+		c.Stderr = io.MultiWriter(stderr, GinkgoWriter)
+		attr.Setpgid = true
+		c.SysProcAttr = attr
+		Expect(c.Start()).To(Succeed())
+		DeferCleanup(func() { _ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL); _ = c.Wait() })
+		lines := make(chan string, 16)
+		go func() {
+			defer close(lines)
+			s := bufio.NewScanner(stdout)
+			for s.Scan() {
+				lines <- s.Text()
+			}
+		}()
+		return c, stdin, stderr, lines
+	}
+
+	// loopbackPort returns a port with a listener on 127.0.0.1, which the
+	// watcher does not count.
+	loopbackPort := func() int {
+		loopback, err := net.Listen("tcp4", "127.0.0.1:0")
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(loopback.Close)
+		return loopback.Addr().(*net.TCPAddr).Port
+	}
+
+	// followListener opens and closes a listener on [::]:port and expects
+	// the watcher's lines for each.
+	followListener := func(port int, lines <-chan string) {
+		Consistently(lines, 1500*time.Millisecond).ShouldNot(Receive())
+		wild, err := net.Listen("tcp6", "[::]:"+strconv.Itoa(port))
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(lines, 5*time.Second).Should(Receive(Equal("RVM_LISTEN_" + testNonce + "=1")))
+		Expect(wild.Close()).To(Succeed())
+		Eventually(lines, 5*time.Second).Should(Receive(Equal("RVM_LISTEN_" + testNonce + "=0")))
+	}
+
+	DescribeTable("follows real sockets, among connections, and stops before /init reports the status",
 		func(shellOf func() guestShell) {
 			shell := shellOf()
-			loopback, err := net.Listen("tcp4", "127.0.0.1:0")
-			Expect(err).NotTo(HaveOccurred())
-			defer loopback.Close()
-			port := loopback.Addr().(*net.TCPAddr).Port
-
-			script := watchOnStdout() + "read rvm_go\n" + guestListenStop + "echo stopped\n"
-			c := exec.Command(shell.argv[0], append(shell.argv[1:], "-c", script)...)
-			c.Env = []string{"PATH=" + watcherPath(shell), "RVM_PORT=" + strconv.Itoa(port)}
-			stdin, err := c.StdinPipe()
-			Expect(err).NotTo(HaveOccurred())
-			stdout, err := c.StdoutPipe()
-			Expect(err).NotTo(HaveOccurred())
-			c.Stderr = GinkgoWriter
-			// The watcher is a subshell that holds the output pipes open, so
-			// the cleanup kills the whole process group, not the shell
-			// alone, and Wait does not wait for a watcher that never ends.
-			c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-			Expect(c.Start()).To(Succeed())
-			DeferCleanup(func() { _ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL); _ = c.Wait() })
-			lines := make(chan string, 16)
-			go func() {
-				defer close(lines)
-				s := bufio.NewScanner(stdout)
-				for s.Scan() {
-					lines <- s.Text()
+			port := loopbackPort()
+			// Connections in both tables, which the kernel lists after
+			// the listening sockets.
+			for _, network := range []string{"tcp4", "tcp6"} {
+				l, err := net.Listen(network, "localhost:0")
+				if err != nil {
+					continue
 				}
-			}()
+				DeferCleanup(l.Close)
+				c, err := net.Dial(network, l.Addr().String())
+				Expect(err).NotTo(HaveOccurred())
+				DeferCleanup(c.Close)
+			}
+			// /bin/sh has no read with a timeout, so it gets no FIFO and
+			// waits with sleep, as the guest would without one.
+			tick := filepath.Join(GinkgoT().TempDir(), "no-tick")
+			if len(shell.argv) > 1 {
+				tick = newTick()
+			}
+			script := watchOnStdout(tick) + "read rvm_go\n" + guestListenStop + "echo stopped\n"
+			c, stdin, _, lines := startWatcher(shell, port, script, &syscall.SysProcAttr{})
 
-			Consistently(lines, 1500*time.Millisecond).ShouldNot(Receive())
-			wild, err := net.Listen("tcp6", "[::]:"+strconv.Itoa(port))
-			Expect(err).NotTo(HaveOccurred())
-			Eventually(lines, 5*time.Second).Should(Receive(Equal("RVM_LISTEN_" + testNonce + "=1")))
-			Expect(wild.Close()).To(Succeed())
-			Eventually(lines, 5*time.Second).Should(Receive(Equal("RVM_LISTEN_" + testNonce + "=0")))
+			followListener(port, lines)
 
-			_, err = stdin.Write([]byte("\n"))
+			_, err := stdin.Write([]byte("\n"))
 			Expect(err).NotTo(HaveOccurred())
 			Eventually(lines, 3*time.Second).Should(Receive(Equal("stopped")))
-			// The watcher's last sleep may hold the output open for up to
-			// a second after the watcher itself is gone.
+			// With sleep, the watcher's last sleep may hold the output
+			// open for up to a second after the watcher itself is gone.
 			Eventually(lines, 3*time.Second).Should(BeClosed())
 			Expect(c.Wait()).To(Succeed())
 		},
 		shellEntries(""),
 	)
+
+	It("goes on in the guest's busybox sh when no process can fork", func() {
+		shell := guestBusyboxShell()
+		port := loopbackPort()
+		// The shell forks once more after the watcher stops, which fails
+		// and ends it with status 2, to show that the limit holds.
+		script := watchOnStdout(newTick()) + `echo "watcher=$rvm_watch"
+read rvm_go
+` + guestListenStop + `echo stopped
+( : )
+echo forked
+`
+		// RLIMIT_NPROC binds a user without CAP_SYS_RESOURCE, so as root
+		// the shell runs as nobody.
+		attr := &syscall.SysProcAttr{}
+		if os.Getuid() == 0 {
+			attr.Credential = &syscall.Credential{Uid: 65534, Gid: 65534}
+		}
+		c, stdin, stderr, lines := startWatcher(shell, port, script, attr)
+		var watcher int
+		Eventually(lines, 5*time.Second).Should(Receive(WithTransform(func(l string) bool {
+			n, err := strconv.Atoi(strings.TrimPrefix(l, "watcher="))
+			watcher = n
+			return err == nil
+		}, BeTrue())))
+		// Each process of the user counts against a limit of one, so
+		// neither shell can fork from here on.
+		for _, pid := range []int{c.Process.Pid, watcher} {
+			Expect(unix.Prlimit(pid, unix.RLIMIT_NPROC, &unix.Rlimit{Cur: 1, Max: 1}, nil)).To(Succeed())
+		}
+
+		followListener(port, lines)
+
+		_, err := stdin.Write([]byte("\n"))
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(lines, 3*time.Second).Should(Receive(Equal("stopped")))
+		Eventually(lines, 3*time.Second).Should(BeClosed())
+		err = c.Wait()
+		Expect(err).To(HaveOccurred(), stderr.String())
+		Expect(c.ProcessState.ExitCode()).To(Equal(2), stderr.String())
+		Expect(stderr.String()).To(ContainSubstring("can't fork"))
+		Expect(strings.Count(stderr.String(), "can't fork")).To(Equal(1), stderr.String())
+	})
 })

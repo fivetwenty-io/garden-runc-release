@@ -20,6 +20,7 @@ const (
 	cpioTypeDir     = 0o040000
 	cpioTypeRegular = 0o100000
 	cpioTypeCharDev = 0o020000
+	cpioTypeFIFO    = 0o010000
 
 	cpioPermMask   = 0o7777
 	cpioHeaderSize = 110
@@ -46,6 +47,11 @@ func (c *cpioWriter) Dir(name string, perm uint32) error {
 // CharDevice adds a character device node with the given major and minor numbers.
 func (c *cpioWriter) CharDevice(name string, perm, major, minor uint32) error {
 	return c.entry(name, cpioTypeCharDev, perm, 1, 0, major, minor)
+}
+
+// FIFO adds a named pipe.
+func (c *cpioWriter) FIFO(name string, perm uint32) error {
+	return c.entry(name, cpioTypeFIFO, perm, 1, 0, 0, 0)
 }
 
 // File adds a regular file holding exactly size bytes read from r.
@@ -228,13 +234,26 @@ const guestSetLimits = `ulimit -n "$RVM_NOFILE_HARD" && ulimit -S -n "$RVM_NOFIL
 // loopback address, 127.0.0.0/8, ends in 7F; ::1 and ::ffff:127.0.0.0/104
 // are the IPv6 loopback forms.
 //
-// Each grep exits 0 when it finds a line and 1 when it finds none, and only
-// those two answers change the watcher's state. Any other status, such as a
-// grep that could not run in a guest short of memory, keeps the last
-// answer, so a look that fails never closes the port of an app that still
-// listens. The watcher reads only the tables the guest kernel has, because
-// grep fails for a file that is missing, as /proc/net/tcp6 is in a kernel
-// without IPv6.
+// The watcher runs no other process once it has started: it reads the
+// tables with the shell's read, and it waits out each second with a read
+// that times out on guestListenTick, a FIFO that nothing writes. A shell
+// exits when it cannot fork, so a watcher that ran commands would stop in a
+// guest short of memory or of processes, and leave the port as it was for
+// the rest of the VM; this one goes on. When the FIFO is missing or cannot
+// be opened, the watcher waits with sleep instead; a read that timed out on
+// any other file would return at once.
+//
+// The kernel lists every listening socket of a table before any socket in
+// another state, so the watcher reads each table only up to the first line
+// that is not a listening socket, and its look costs the same however many
+// connections the guest has. A look at a table fails when the table cannot
+// be opened or yields no header line; the kernel allocates its buffer for a
+// table at the first read, so a read that succeeds once does not fail
+// later. A listening socket that the watcher finds is an answer, whatever
+// the other table gave. Otherwise a look that failed keeps the last answer,
+// so a look that fails never closes the port of an app that still listens.
+// The watcher reads only the tables the guest kernel has, as /proc/net/tcp6
+// is missing from a kernel without IPv6.
 //
 // The watcher opens /dev/console for each listen line, so it writes through
 // its own open file and not the one it shares with the command, which the
@@ -249,30 +268,51 @@ if [ -n "${RVM_PORT:-}" ]; then
 		[ -e "$rvm_table" ] && rvm_tables="$rvm_tables $rvm_table"
 	done
 	(
+		if [ -p ` + guestListenTick + ` ] && command exec 3<>` + guestListenTick + `; then
+			rvm_pause() { read -t 1 -u 3 rvm_tick; }
+		else
+			rvm_pause() { sleep 1; }
+		fi
 		rvm_up=0
 		while :; do
-			rvm_now=$rvm_up
-			rvm_lines=$(grep -hE "^ *[0-9]+: [0-9A-F]+:$rvm_port_hex [0-9A-F]+:0000 0A " $rvm_tables 2>/dev/null)
-			case $? in
-			0)
-				printf '%s\n' "$rvm_lines" | grep -qvE '^ *[0-9]+: ([0-9A-F]{6}7F|0{24}01000000|0{16}FFFF0000[0-9A-F]{6}7F):'
-				case $? in
-				0) rvm_now=1 ;;
-				1) rvm_now=0 ;;
-				esac
-				;;
-			1) rvm_now=0 ;;
-			esac
+			rvm_now=0
+			rvm_failed=
+			for rvm_table in $rvm_tables; do
+				rvm_head=
+				while read -r rvm_sl rvm_local rvm_remote rvm_st rvm_rest; do
+					if [ -z "$rvm_head" ]; then
+						rvm_head=1
+						continue
+					fi
+					[ "$rvm_st" = 0A ] || break
+					case $rvm_local in
+					*:"$rvm_port_hex") ;;
+					*) continue ;;
+					esac
+					case ${rvm_local%:*} in
+					??????7F | 00000000000000000000000001000000 | 0000000000000000FFFF0000??????7F) ;;
+					*) rvm_now=1 ;;
+					esac
+				done 2>/dev/null <"$rvm_table"
+				[ -n "$rvm_head" ] || rvm_failed=1
+			done
+			if [ "$rvm_now" = 0 ] && [ -n "$rvm_failed" ]; then
+				rvm_now=$rvm_up
+			fi
 			if [ "$rvm_now" != "$rvm_up" ]; then
 				echo "` + listenTag(nonce) + `$rvm_now" >/dev/console && rvm_up=$rvm_now
 			fi
-			sleep 1
+			rvm_pause
 		done
 	) </dev/null &
 	rvm_watch=$!
 fi
 `
 }
+
+// guestListenTick is the FIFO the listen watcher waits on. The initramfs of
+// a guest with a port holds it, and nothing ever writes it.
+const guestListenTick = "/rvm/listen-tick"
 
 // guestListenStop stops the listen watcher once the command has ended and
 // before /init reports its status, so no listen line follows the exit line.
@@ -502,6 +542,9 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, g 
 		file("rvm/env", 0o600, g.env),
 		file("rvm/limits", 0o644, limitsFile(g.nofile)),
 		file("etc/resolv.conf", 0o644, g.nw.resolvConf),
+	}
+	if g.nw != nil && g.nw.port > 0 {
+		steps = append(steps, func() error { return cw.FIFO(strings.TrimPrefix(guestListenTick, "/"), 0o600) })
 	}
 	if g.vol != nil {
 		steps = append(steps, file("rvm/mounts", 0o644, mountsFile(g.vol)))
