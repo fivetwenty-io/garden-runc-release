@@ -36,15 +36,26 @@ type dialPolicy struct {
 // 2 seconds covers, or an app that stopped listening, whose port the gate
 // closes at the guest's next look, within a second. Either way, a client of
 // an app that stopped listening learns it within 2 seconds, so the gorouter
-// can try another instance.
+// can try another instance for a request that it retries.
 //
 // A dial that gets no answer within attemptTimeout means a guest app whose
 // accept queue is full, or a guest too busy to answer, and the app may
 // still serve. A runc app in that state would hold the gorouter's dial
 // through SYN retransmits for the gorouter's endpoint dial timeout, 5
 // seconds by default. The proxy has already accepted the gorouter's
-// connection, so that timeout no longer applies, and the proxy waits as
-// long in its place.
+// connection, so that timeout no longer applies, and the proxy waits about
+// as long in its place.
+//
+// The wait matches, but what follows it does not. The proxy checks its
+// budget after a dial has ended, and counts the wait before the next dial,
+// so when every dial goes unanswered it gives up about 5.4 seconds after
+// the client connected, and never later than the budget plus attemptTimeout,
+// which is 6 seconds. A runc app whose dial timed out would give the
+// gorouter a dial error, which the gorouter can retry on another instance
+// whatever the request's method. When the proxy gives up, the gorouter has
+// already connected and sent its request, so it sees the connection close,
+// and it is likely to retry that only for an idempotent request. The same
+// holds for the 2 second give-up on a refused dial.
 var upstreamDialPolicy = dialPolicy{
 	attemptTimeout:   time.Second,
 	firstBackoff:     25 * time.Millisecond,
