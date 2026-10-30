@@ -603,6 +603,30 @@ var _ = Describe("ExternalNetworker", func() {
 					Entry("mtu", []string{"ip", "link", "set", "tap0", "mtu", "1450"}, "setting the mtu of tap0", 4),
 				)
 
+				Context("when the egress translation fails", func() {
+					BeforeEach(func() {
+						fakeCommandRunner.WhenRunning(fake_command_runner.CommandSpec{
+							Path: "nsenter",
+							Args: nsenterArgs("/var/vcap/data/gdn/assets/sbin/iptables", "-t", "nat", "-A", "POSTROUTING", "-s", "169.254.100.2/32", "-o", "eth0", "-j", "SNAT", "--to-source", "10.255.220.111"),
+						}, func(cmd *exec.Cmd) error {
+							cmd.Stderr.Write([]byte("snat-stderr-bytes"))
+							return errors.New("snat-failed")
+						})
+					})
+
+					It("names the container IP, wraps the error, logs stderr and skips DNS", func() {
+						err := plugin.Network(logger, containerSpec, 42)
+						Expect(err).To(MatchError(ContainSubstring("translating guest egress to the container IP in container netns of pid 42")))
+						Expect(err).To(MatchError(ContainSubstring("snat-failed")))
+						Expect(err).NotTo(MatchError(ContainSubstring("eth0 address")))
+						Expect(logger).To(gbytes.Say(`setup-firecracker-tap.failed.*snat-stderr-bytes`))
+
+						// The SNAT rule is the last step, so every earlier one ran.
+						Expect(fakeCommandRunner.ExecutedCommands()).To(HaveLen(11))
+						Expect(resolvConfigurer.ConfigureCallCount()).To(Equal(0))
+					})
+				})
+
 				Context("when the plugin fails", func() {
 					BeforeEach(func() {
 						pluginErr = errors.New("plugin-failed")

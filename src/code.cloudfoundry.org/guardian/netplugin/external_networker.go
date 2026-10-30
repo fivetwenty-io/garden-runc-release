@@ -333,7 +333,7 @@ func (p *externalBinaryNetworker) setupFirecrackerTap(log lager.Logger, handle s
 		{"addressing " + tap, []string{"ip", "addr", "add", FirecrackerTapCIDR, "dev", tap}},
 		{"bringing up " + tap, []string{"ip", "link", "set", tap, "up"}},
 		{"enabling ip forwarding", []string{"sysctl", "-w", "net.ipv4.ip_forward=1"}},
-		{"translating guest egress to the eth0 address", []string{p.iptablesBin, "-t", "nat", "-A", "POSTROUTING", "-s", guest, "-o", "eth0", "-j", "SNAT", "--to-source", egressSource}},
+		{"translating guest egress to the container IP", []string{p.iptablesBin, "-t", "nat", "-A", "POSTROUTING", "-s", guest, "-o", "eth0", "-j", "SNAT", "--to-source", egressSource}},
 	}
 	for _, step := range steps {
 		if _, err := p.runInNetns(log, pid, step.args...); err != nil {
