@@ -669,6 +669,46 @@ var _ = Describe("ProcBuilder", func() {
 		})
 	})
 
+	Describe("OnlyCapabilities", func() {
+		It("returns empty sets, not nil, for nil", func() {
+			Expect(processes.OnlyCapabilities(nil, []string{"CAP_A"})).To(Equal(&specs.LinuxCapabilities{
+				Bounding:    []string{},
+				Effective:   []string{},
+				Inheritable: []string{},
+				Permitted:   []string{},
+				Ambient:     []string{},
+			}))
+		})
+
+		It("keeps only the allowed capabilities in every set, in their order, without touching the input", func() {
+			shared := []string{"CAP_B", "CAP_SYS_ADMIN", "CAP_A", "CAP_SYS_PTRACE"}
+			caps := &specs.LinuxCapabilities{Bounding: shared, Effective: shared, Inheritable: []string{"CAP_SYS_ADMIN"}, Permitted: shared}
+
+			out := processes.OnlyCapabilities(caps, []string{"CAP_A", "CAP_B", "CAP_C"})
+			Expect(out).To(Equal(&specs.LinuxCapabilities{
+				Bounding:    []string{"CAP_B", "CAP_A"},
+				Effective:   []string{"CAP_B", "CAP_A"},
+				Inheritable: []string{},
+				Permitted:   []string{"CAP_B", "CAP_A"},
+				Ambient:     nil,
+			}))
+			Expect(shared).To(Equal([]string{"CAP_B", "CAP_SYS_ADMIN", "CAP_A", "CAP_SYS_PTRACE"}))
+			out.Bounding[0] = "CAP_X"
+			Expect(shared[0]).To(Equal("CAP_B"))
+		})
+
+		It("keeps nothing when nothing is allowed", func() {
+			out := processes.OnlyCapabilities(&specs.LinuxCapabilities{Bounding: []string{"CAP_A"}, Ambient: []string{"CAP_A"}}, nil)
+			Expect(out.Bounding).To(BeEmpty())
+			Expect(out.Bounding).NotTo(BeNil())
+			Expect(out.Ambient).To(BeEmpty())
+		})
+
+		It("lets a VM sandbox's helper process keep CAP_DAC_OVERRIDE alone", func() {
+			Expect(processes.VMPeaCapabilities).To(Equal([]string{"CAP_DAC_OVERRIDE"}))
+		})
+	})
+
 	Describe("WithoutCapability", func() {
 		It("returns nil for nil", func() {
 			Expect(processes.WithoutCapability(nil, "CAP_SETGID")).To(BeNil())

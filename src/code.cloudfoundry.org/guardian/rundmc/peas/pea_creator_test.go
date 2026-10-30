@@ -457,7 +457,19 @@ var _ = Describe("PeaCreator", func() {
 		}
 
 		BeforeEach(func() {
-			allCaps = []string{"CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_SYS_CHROOT", "CAP_KILL"}
+			// The capabilities a root process in a privileged container
+			// gets (privilegedMaxCaps in guardiancmd).
+			allCaps = []string{
+				"CAP_AUDIT_CONTROL", "CAP_AUDIT_READ", "CAP_AUDIT_WRITE", "CAP_BLOCK_SUSPEND",
+				"CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_DAC_READ_SEARCH", "CAP_FOWNER",
+				"CAP_FSETID", "CAP_IPC_LOCK", "CAP_IPC_OWNER", "CAP_KILL", "CAP_LEASE",
+				"CAP_LINUX_IMMUTABLE", "CAP_MAC_ADMIN", "CAP_MAC_OVERRIDE", "CAP_MKNOD",
+				"CAP_NET_ADMIN", "CAP_NET_BIND_SERVICE", "CAP_NET_BROADCAST", "CAP_NET_RAW",
+				"CAP_SETGID", "CAP_SETFCAP", "CAP_SETPCAP", "CAP_SETUID", "CAP_SYS_ADMIN",
+				"CAP_SYS_BOOT", "CAP_SYS_CHROOT", "CAP_SYS_MODULE", "CAP_SYS_NICE",
+				"CAP_SYS_PACCT", "CAP_SYS_PTRACE", "CAP_SYS_RAWIO", "CAP_SYS_RESOURCE",
+				"CAP_SYS_TIME", "CAP_SYS_TTY_CONFIG", "CAP_SYSLOG", "CAP_WAKE_ALARM",
+			}
 			builtProcess.Capabilities = &specs.LinuxCapabilities{
 				Bounding:    append([]string{}, allCaps...),
 				Effective:   append([]string{}, allCaps...),
@@ -485,7 +497,7 @@ var _ = Describe("PeaCreator", func() {
 					Expect(handle).To(Equal(ctrHandle))
 				})
 
-				It("drops CAP_SETUID, CAP_SETGID and CAP_SYS_CHROOT from every capability set", func() {
+				It("keeps only CAP_DAC_OVERRIDE, of a privileged container's capabilities, in every capability set", func() {
 					caps := runningBundleProcess().Capabilities
 					Expect(caps).NotTo(BeNil())
 					for name, set := range map[string][]string{
@@ -495,7 +507,7 @@ var _ = Describe("PeaCreator", func() {
 						"inheritable": caps.Inheritable,
 						"ambient":     caps.Ambient,
 					} {
-						Expect(set).To(Equal([]string{"CAP_CHOWN", "CAP_KILL"}), name)
+						Expect(set).To(Equal([]string{"CAP_DAC_OVERRIDE"}), name)
 					}
 				})
 
@@ -518,10 +530,37 @@ var _ = Describe("PeaCreator", func() {
 				Expect(err).NotTo(HaveOccurred())
 			})
 
-			It("still sets NoNewPrivileges and leaves capabilities unset", func() {
+			It("sets NoNewPrivileges and gives the pea empty capability sets, not the runtime's default", func() {
 				process := runningBundleProcess()
-				Expect(process.Capabilities).To(BeNil())
+				Expect(process.Capabilities).To(Equal(&specs.LinuxCapabilities{
+					Bounding:    []string{},
+					Effective:   []string{},
+					Inheritable: []string{},
+					Permitted:   []string{},
+					Ambient:     []string{},
+				}))
 				Expect(process.NoNewPrivileges).To(BeTrue())
+			})
+		})
+
+		Context("when the process builder gives a VM sandbox's pea no CAP_DAC_OVERRIDE", func() {
+			BeforeEach(func() {
+				builtProcess.Capabilities = &specs.LinuxCapabilities{
+					Bounding:  []string{"CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_KILL"},
+					Effective: []string{"CAP_CHOWN", "CAP_KILL"},
+					Permitted: []string{"CAP_CHOWN", "CAP_DAC_OVERRIDE"},
+				}
+				bundleLoader.LoadReturns(sandboxBundle(map[string]string{backend.AnnotationKey: string(backend.VMFirecracker)}), nil)
+				_, err := peaCreator.CreatePea(log, processSpec, pio, ctrHandle)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			It("never adds it to a set, and leaves the sets the builder did not fill unset", func() {
+				Expect(runningBundleProcess().Capabilities).To(Equal(&specs.LinuxCapabilities{
+					Bounding:  []string{"CAP_DAC_OVERRIDE"},
+					Effective: []string{},
+					Permitted: []string{"CAP_DAC_OVERRIDE"},
+				}))
 			})
 		})
 

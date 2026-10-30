@@ -41,13 +41,10 @@ const (
 	// gid with setgroups. No process of a vm-* container keeps it.
 	CapSetGID = "CAP_SETGID"
 
-	// CapSetUID lets a process change its user ids. No helper process (pea) of
-	// a vm-* container keeps it.
-	CapSetUID = "CAP_SETUID"
-
-	// CapSysChroot lets a process call chroot. No helper process (pea) of a
-	// vm-* container keeps it.
-	CapSysChroot = "CAP_SYS_CHROOT"
+	// CapDacOverride lets a process read and write files whatever their
+	// permissions say. It is the one capability a helper process (pea) of a
+	// vm-* container may keep (see VMPeaCapabilities).
+	CapDacOverride = "CAP_DAC_OVERRIDE"
 
 	// unconfinedApparmorProfile is the AppArmor label every policy namespace
 	// provides without a loaded profile. runc applies the container's profile
@@ -240,6 +237,56 @@ func (p *ProcBuilder) BuildProcess(bndl goci.Bndl, spec garden.ProcessSpec, user
 		ApparmorProfile: apparmorProfile,
 		NoNewPrivileges: bndl.Process().NoNewPrivileges || vm,
 	}
+}
+
+// VMPeaCapabilities are the only capabilities that a helper process (pea) of
+// a vm-* container keeps, whatever its container's capabilities. The helpers
+// that Diego runs there, Envoy and the health check, run as the container's
+// root, connect, listen on ports above 1024, and read files that may not be
+// theirs, which takes CAP_DAC_OVERRIDE alone. Every other capability that a
+// privileged container would hand them, CAP_SYS_ADMIN, CAP_SYS_PTRACE, and
+// CAP_SETUID among them, is one a helper beside the VM never needs.
+var VMPeaCapabilities = []string{CapDacOverride}
+
+// OnlyCapabilities returns a copy of caps that keeps, in every set, only the
+// capabilities in allowed. For nil caps it returns empty sets, so the
+// process gets no capability rather than the runtime's default. It never
+// modifies caps or its slices.
+func OnlyCapabilities(caps *specs.LinuxCapabilities, allowed []string) *specs.LinuxCapabilities {
+	if caps == nil {
+		return &specs.LinuxCapabilities{
+			Bounding:    []string{},
+			Effective:   []string{},
+			Inheritable: []string{},
+			Permitted:   []string{},
+			Ambient:     []string{},
+		}
+	}
+
+	return &specs.LinuxCapabilities{
+		Bounding:    only(caps.Bounding, allowed),
+		Effective:   only(caps.Effective, allowed),
+		Inheritable: only(caps.Inheritable, allowed),
+		Permitted:   only(caps.Permitted, allowed),
+		Ambient:     only(caps.Ambient, allowed),
+	}
+}
+
+func only(set, allowed []string) []string {
+	if set == nil {
+		return nil
+	}
+
+	kept := make([]string, 0, len(set))
+	for _, c := range set {
+		for _, a := range allowed {
+			if c == a {
+				kept = append(kept, c)
+				break
+			}
+		}
+	}
+	return kept
 }
 
 // WithoutCapability returns a copy of caps with capability removed from every

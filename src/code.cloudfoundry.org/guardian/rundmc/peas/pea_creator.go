@@ -234,13 +234,13 @@ func (p *PeaCreator) CreatePea(log lager.Logger, processSpec garden.ProcessSpec,
 }
 
 // confineVMPea returns a copy of a pea's process for a VM sandbox. The pea
-// shares the sandbox's PID namespace with vm-launch, so it loses the
-// capabilities that change identity or root and may not gain privileges.
+// shares the sandbox's PID namespace with vm-launch and, in a privileged
+// container, would run with the container's full set of capabilities. So it
+// keeps only processes.VMPeaCapabilities, in every set, and may not gain
+// privileges.
 func confineVMPea(process *specs.Process) *specs.Process {
 	confined := *process
-	for _, capability := range []string{processes.CapSetUID, processes.CapSetGID, processes.CapSysChroot} {
-		confined.Capabilities = processes.WithoutCapability(confined.Capabilities, capability)
-	}
+	confined.Capabilities = processes.OnlyCapabilities(confined.Capabilities, processes.VMPeaCapabilities)
 	confined.NoNewPrivileges = true
 	return &confined
 }
