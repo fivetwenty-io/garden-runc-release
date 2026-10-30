@@ -186,8 +186,9 @@
 // as a CF sidecar that gets the app's PORT, cannot reserve it and exits 125,
 // as does a vm-launch whose PORT another process already listens on, with a
 // line that names the port conflict. A process that starts listening on PORT
-// after vm-launch reserved it keeps the guest's port closed, with the same
-// line when the guest listens.
+// after vm-launch reserved it keeps the guest's port closed while it listens,
+// with the same line once when the guest listens. vm-launch keeps trying to
+// open the port, and opens it once the other process stops listening.
 package main
 
 import (
@@ -463,7 +464,7 @@ func run(argv []string, logger *log.Logger) int {
 		}
 		// The gate ends before the proxy closes and before the monitor
 		// closes, because deferred calls run last first.
-		gate := startPortGate(opener, nw.port, logger)
+		gate := startPortGate(opener, nw.port, gateRetry, logger)
 		defer gate.end()
 		sup.stopping = gate.shutDown
 		sup.listen = gate.set

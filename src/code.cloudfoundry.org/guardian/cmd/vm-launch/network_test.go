@@ -674,20 +674,26 @@ sleep 0.3
 		Expect(logBuf.String()).NotTo(ContainSubstring("it is open in the container"))
 	})
 
-	It("logs a QMP error and keeps the port closed", func() {
+	It("logs a QMP error, keeps the port closed, and opens it at the next try", func() {
 		port := freePort()
+		p := strconv.Itoa(port)
 		_, qmpLog := portHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), port, qmpGreeting+`listen 1
 qmp_recv
 qmp_reply '{"return": {}}'
 qmp_recv
 qmp_reply '{"error": {"class": "GenericError", "desc": "no such netdev"}}'
+qmp_recv
+qmp_reply '{"return": "host forwarding rule for tcp:0.0.0.0:`+p+` not found\r\n"}'
+qmp_recv
+qmp_reply '{"return": ""}'
 sleep 0.3
 `)
-		GinkgoT().Setenv("PORT", strconv.Itoa(port))
+		GinkgoT().Setenv("PORT", p)
 
 		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
-		Expect(os.ReadFile(qmpLog)).To(Equal([]byte(qmpCapabilities + "\n" + hostfwdAdd(2, port) + "\n")))
+		Expect(os.ReadFile(qmpLog)).To(Equal([]byte(qmpCapabilities + "\n" + hostfwdAdd(2, port) + "\n" + hostfwdRemove(3, port) + "\n" + hostfwdAdd(4, port) + "\n")))
 		Expect(logBuf.String()).To(ContainSubstring("could not open it in the container: QMP human-monitor-command: GenericError: no such netdev\n"))
+		Expect(logBuf.String()).To(ContainSubstring("the guest listens on port " + p + "; it is open in the container\n"))
 		Expect(logBuf.String()).NotTo(ContainSubstring("already in use"))
 	})
 

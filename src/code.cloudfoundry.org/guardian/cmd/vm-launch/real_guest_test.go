@@ -331,7 +331,7 @@ echo served`)
 			cmd.Stderr = stderr
 
 			logBuf = &safeBuffer{}
-			gate := startPortGate(qmpPort{monitor: newQMPMonitor(monitor), port: port}, port, log.New(logBuf, "", 0))
+			gate := startPortGate(qmpPort{monitor: newQMPMonitor(monitor), port: port}, port, gateRetry, log.New(logBuf, "", 0))
 			out = newBootWriter("booted")
 			// started runs in the supervisor's goroutine once QEMU runs,
 			// and hands its process to kill.

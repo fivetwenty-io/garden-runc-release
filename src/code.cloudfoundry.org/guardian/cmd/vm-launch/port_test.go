@@ -163,6 +163,25 @@ func (o *fakeOpener) openPort() error {
 	return err
 }
 
+// setOpen sets open.
+func (o *fakeOpener) setOpen(open func() error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.open = open
+}
+
+// setCloseErr sets closeErr.
+func (o *fakeOpener) setCloseErr(err error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.closeErr = err
+}
+
+// count returns the number of calls.
+func (o *fakeOpener) count() int {
+	return len(o.got())
+}
+
 func (o *fakeOpener) closePort() error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -188,10 +207,14 @@ var _ = Describe("the port gate", func() {
 		logBuf = &safeBuffer{}
 	})
 
-	start := func() {
-		gate = startPortGate(opener, 8080, log.New(logBuf, "", 0))
+	// fastRetry tries a failed change again within a few milliseconds.
+	fastRetry := backoff{first: 5 * time.Millisecond, max: 20 * time.Millisecond}
+
+	startWith := func(retry backoff) {
+		gate = startPortGate(opener, 8080, retry, log.New(logBuf, "", 0))
 		DeferCleanup(gate.end)
 	}
+	start := func() { startWith(fastRetry) }
 
 	It("starts closed, opens when the guest listens, and closes when it stops", func() {
 		start()
@@ -236,40 +259,97 @@ var _ = Describe("the port gate", func() {
 		Consistently(opener.got, 100*time.Millisecond).Should(Equal([]string{"open", "close"}))
 	})
 
-	It("names the conflict when another process listens on the port, and tries again at the next report", func() {
+	It("names the conflict once when another process listens on the port, and opens the port once it is free", func() {
 		opener.open = func() error {
 			return &net.OpError{Op: "listen", Net: "tcp", Err: os.NewSyscallError("bind", syscall.EADDRINUSE)}
 		}
 		start()
 		gate.set(true)
-		Eventually(logBuf.String).Should(ContainSubstring("port 8080 already in use in this container; VM backends run one app process per container\n"))
-		Expect(logBuf.String()).To(HavePrefix("the guest listens on port 8080, but vm-launch could not open it in the container: listen tcp: bind: address already in use\n"))
-		gate.set(false)
-		Consistently(opener.got, 100*time.Millisecond).Should(Equal([]string{"open"}))
+		// Each try after the first closes the port of unknown state
+		// before it opens it.
+		Eventually(opener.count).Should(BeNumerically(">=", 7))
+		Expect(opener.got()[:7]).To(Equal([]string{"open", "close", "open", "close", "open", "close", "open"}))
+		Expect(logBuf.String()).To(Equal("the guest listens on port 8080, but vm-launch could not open it in the container: listen tcp: bind: address already in use\n" +
+			"port 8080 already in use in this container; VM backends run one app process per container\n"))
 
-		opener.mu.Lock()
-		opener.open = nil
-		opener.mu.Unlock()
-		gate.set(true)
-		Eventually(opener.got).Should(Equal([]string{"open", "open"}))
+		opener.setOpen(nil)
 		Eventually(logBuf.String).Should(HaveSuffix("the guest listens on port 8080; it is open in the container\n"))
+		Expect(strings.Count(logBuf.String(), "already in use")).To(Equal(2), logBuf.String())
+		n := opener.count()
+		Consistently(opener.count, 100*time.Millisecond).Should(Equal(n))
 	})
 
-	It("logs a failure that is not a conflict without the conflict line", func() {
+	It("logs a failure that is not a conflict once, without the conflict line", func() {
 		opener.open = func() error { return errors.New("QMP human-monitor-command: GenericError: boom") }
 		start()
 		gate.set(true)
-		Eventually(logBuf.String).Should(Equal("the guest listens on port 8080, but vm-launch could not open it in the container: QMP human-monitor-command: GenericError: boom\n"))
-		Consistently(logBuf.String, 100*time.Millisecond).ShouldNot(ContainSubstring("already in use"))
+		line := "the guest listens on port 8080, but vm-launch could not open it in the container: QMP human-monitor-command: GenericError: boom\n"
+		Eventually(logBuf.String).Should(Equal(line))
+		Eventually(opener.count).Should(BeNumerically(">=", 5))
+		Expect(logBuf.String()).To(Equal(line))
 	})
 
-	It("logs a port it could not close", func() {
+	It("logs a port it could not close once, and tries again until it closes", func() {
 		opener.closeErr = errors.New("QEMU did not remove the forwarding rule: nope")
 		start()
 		gate.set(true)
 		Eventually(opener.got).Should(Equal([]string{"open"}))
 		gate.set(false)
-		Eventually(logBuf.String).Should(ContainSubstring("closing port 8080 in the container: QEMU did not remove the forwarding rule: nope\n"))
+		Eventually(opener.count).Should(BeNumerically(">=", 4))
+		Expect(opener.got()[1:]).To(HaveEach("close"))
+		Expect(logBuf.String()).To(Equal("the guest listens on port 8080; it is open in the container\n" +
+			"closing port 8080 in the container: QEMU did not remove the forwarding rule: nope\n"))
+
+		opener.setCloseErr(nil)
+		Eventually(logBuf.String).Should(HaveSuffix("the guest no longer listens on port 8080; it is closed in the container\n"))
+		n := opener.count()
+		Consistently(opener.count, 100*time.Millisecond).Should(Equal(n))
+		Expect(strings.Count(logBuf.String(), "closing port")).To(Equal(1), logBuf.String())
+	})
+
+	It("waits before it tries again, and acts at once when the guest's state changes", func() {
+		opener.open = func() error { return errors.New("boom") }
+		startWith(backoff{first: time.Hour, max: time.Hour})
+		gate.set(true)
+		Eventually(opener.got).Should(Equal([]string{"open"}))
+		Consistently(opener.got, 100*time.Millisecond).Should(Equal([]string{"open"}))
+		gate.set(false)
+		Eventually(opener.got).Should(Equal([]string{"open", "close"}))
+		gate.set(true)
+		Eventually(opener.got).Should(Equal([]string{"open", "close", "open"}))
+		// A new state starts a new run of failures, whose first is logged.
+		failed := "the guest listens on port 8080, but vm-launch could not open it in the container: boom\n"
+		Expect(logBuf.String()).To(Equal(failed + "the guest no longer listens on port 8080; it is closed in the container\n" + failed))
+	})
+
+	It("doubles its wait after each failure, up to the maximum", func() {
+		b := backoff{first: time.Second, max: 5 * time.Second}
+		var waits []time.Duration
+		for w := b.first; len(waits) < 5; w = b.next(w) {
+			waits = append(waits, w)
+		}
+		Expect(waits).To(Equal([]time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 5 * time.Second, 5 * time.Second}))
+	})
+
+	It("keeps trying to close the port at shutDown until it closes", func() {
+		opener.closeErr = errors.New("nope")
+		start()
+		gate.set(true)
+		Eventually(opener.got).Should(Equal([]string{"open"}))
+		gate.shutDown()
+		Eventually(opener.count).Should(BeNumerically(">=", 4))
+		opener.setCloseErr(nil)
+		Eventually(func() bool {
+			n := opener.count()
+			time.Sleep(50 * time.Millisecond)
+			return opener.count() == n
+		}).Should(BeTrue())
+		n := opener.count()
+		gate.set(true)
+		Consistently(opener.count, 100*time.Millisecond).Should(Equal(n))
+		Expect(opener.got()[1:]).To(HaveEach("close"))
+		Expect(logBuf.String()).To(Equal("the guest listens on port 8080; it is open in the container\n" +
+			"closing port 8080 in the container: nope\n"))
 	})
 
 	It("closes the port for good at shutDown", func() {
@@ -638,10 +718,42 @@ var _ = Describe("the QMP monitor", func() {
 			Expect(got).To(Equal(humanRequest(2, "hostfwd_remove n0 tcp:0.0.0.0:8080")))
 		})
 
-		It("fails when QEMU did not remove the rule", func() {
+		It("counts a rule that QEMU does not have as removed", func() {
 			_, err := ruleRun(false, `{"return": "host forwarding rule for tcp:0.0.0.0:8080 not found\r\n"}`)
-			Expect(err).To(MatchError("QEMU did not remove the forwarding rule: host forwarding rule for tcp:0.0.0.0:8080 not found"))
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("fails when QEMU did not remove the rule", func() {
+			_, err := ruleRun(false, `{"return": "invalid format\r\n"}`)
+			Expect(err).To(MatchError("QEMU did not remove the forwarding rule: invalid format"))
 			Expect(isPortConflict(err)).To(BeFalse())
+		})
+
+		It("counts every rule of a QEMU that closed its QMP socket as removed, and cannot add one", func() {
+			conn, theirs, err := newQMPSocket()
+			Expect(err).NotTo(HaveOccurred())
+			defer conn.Close()
+			Expect(theirs.Close()).To(Succeed())
+			p := qmpPort{monitor: newQMPMonitor(conn), port: 8080}
+			Expect(p.closePort()).To(Succeed())
+			Expect(p.openPort()).To(MatchError("QMP: reading the greeting: EOF"))
+			Expect(p.closePort()).To(Succeed())
+
+			// A QEMU that exits after the greeting, with a request unread.
+			conn, theirs, err = newQMPSocket()
+			Expect(err).NotTo(HaveOccurred())
+			defer conn.Close()
+			_, err = theirs.Write([]byte(fakeGreeting + "\r\n"))
+			Expect(err).NotTo(HaveOccurred())
+			p = qmpPort{monitor: newQMPMonitor(conn), port: 8080}
+			go func() {
+				defer GinkgoRecover()
+				buf := make([]byte, 1)
+				_, err := theirs.Read(buf)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(theirs.Close()).To(Succeed())
+			}()
+			Expect(p.closePort()).To(Succeed())
 		})
 	})
 

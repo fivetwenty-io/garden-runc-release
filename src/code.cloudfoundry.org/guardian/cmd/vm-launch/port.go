@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -50,11 +51,22 @@ func isPortConflict(err error) bool {
 // portGate keeps the container's PORT open while the guest listens on it,
 // and closed otherwise. It acts on the guest's latest state only, one change
 // at a time, in its own goroutine, so a slow change never holds up the guest
-// console. A port that cannot open stays closed, with a line that says why,
-// until the guest's next report that it listens.
+// console.
+//
+// A change that fails is tried again, after retry.first and then after
+// twice as long each time up to retry.max, until it succeeds or the guest's
+// state changes, and only the first failure in a row is logged. The gate
+// tries again rather than ending the run, because a change can fail for a
+// moment, as when QEMU's monitor is slow to reply, and the app in the guest
+// is still healthy; a port that stays closed shows up in the health check,
+// and the logged failure says why. The gate cannot tell whether a change
+// that failed took effect, so it closes the port of unknown state before it
+// opens it, which also clears a QEMU forwarding rule that an open which
+// timed out added late.
 type portGate struct {
 	opener portOpener
 	port   int
+	retry  backoff
 	logger *log.Logger
 
 	mu   sync.Mutex
@@ -67,11 +79,40 @@ type portGate struct {
 	done     chan struct{}
 }
 
-// startPortGate returns a running gate for port, which starts closed.
-func startPortGate(opener portOpener, port int, logger *log.Logger) *portGate {
+// backoff is how long the gate waits before it tries a failed change again:
+// first after the first failure, and twice as long after each further one,
+// up to max.
+type backoff struct {
+	first, max time.Duration
+}
+
+// next returns the wait after a failure that followed a wait of d.
+func (b backoff) next(d time.Duration) time.Duration {
+	return min(2*d, b.max)
+}
+
+// gateRetry is the backoff of the gate in run. Its first wait matches the
+// guest watcher's period.
+var gateRetry = backoff{first: time.Second, max: 16 * time.Second}
+
+// portState is what the gate knows of the port.
+type portState int
+
+const (
+	portClosed portState = iota
+	portOpen
+	// portUnknown follows a change that failed, which may or may not have
+	// taken effect.
+	portUnknown
+)
+
+// startPortGate returns a running gate for port, which starts closed and
+// tries failed changes again after the waits of retry.
+func startPortGate(opener portOpener, port int, retry backoff, logger *log.Logger) *portGate {
 	g := &portGate{
 		opener: opener,
 		port:   port,
+		retry:  retry,
 		logger: logger,
 		want:   make(chan bool, 1),
 		shut:   make(chan struct{}),
@@ -112,12 +153,22 @@ func (g *portGate) end() {
 
 func (g *portGate) loop() {
 	defer close(g.done)
-	open, shut := false, false
-	closePort := func() {
-		if err := g.opener.closePort(); err != nil {
-			g.logf("closing port %d in the container: %v", g.port, err)
+	var (
+		up, shut, goal bool
+		state          = portClosed
+		// retry fires when a failed change is due to be tried again.
+		retry   <-chan time.Time
+		timer   *time.Timer
+		wait    = g.retry.first
+		failing bool
+	)
+	// newGoal forgets the failures of the last goal.
+	newGoal := func() {
+		if timer != nil {
+			timer.Stop()
 		}
-		open = false
+		timer, retry = nil, nil
+		wait, failing = g.retry.first, false
 	}
 	for {
 		select {
@@ -129,11 +180,31 @@ func (g *portGate) loop() {
 			select {
 			case <-g.shut:
 				shut = true
-				if open {
-					closePort()
-				}
-				continue
 			default:
+			}
+		}
+		if next := up && !shut; next != goal {
+			goal = next
+			newGoal()
+		}
+		if retry == nil && state != stateFor(goal) {
+			if err := g.change(&state, goal); err != nil {
+				if !failing {
+					failing = true
+					g.logFailure(goal, err)
+				}
+				timer = time.NewTimer(wait)
+				retry = timer.C
+				wait = g.retry.next(wait)
+			} else {
+				wait, failing = g.retry.first, false
+				switch {
+				case shut:
+				case goal:
+					g.logf("the guest listens on port %d; it is open in the container", g.port)
+				default:
+					g.logf("the guest no longer listens on port %d; it is closed in the container", g.port)
+				}
 			}
 		}
 		var shutCh <-chan struct{}
@@ -145,24 +216,53 @@ func (g *portGate) loop() {
 			return
 		case <-shutCh:
 			// Handled at the top of the loop.
-		case up := <-g.want:
-			switch {
-			case shut, up == open:
-			case up:
-				if err := g.opener.openPort(); err != nil {
-					g.logf("the guest listens on port %d, but vm-launch could not open it in the container: %v", g.port, err)
-					if isPortConflict(err) {
-						g.logf("%s", portConflictMessage(g.port))
-					}
-					continue
-				}
-				open = true
-				g.logf("the guest listens on port %d; it is open in the container", g.port)
-			default:
-				closePort()
-				g.logf("the guest no longer listens on port %d; it is closed in the container", g.port)
-			}
+		case up = <-g.want:
+		case <-retry:
+			timer, retry = nil, nil
 		}
+	}
+}
+
+func stateFor(open bool) portState {
+	if open {
+		return portOpen
+	}
+	return portClosed
+}
+
+// change opens or closes the port, closing first a port that is not known
+// to be closed, and records the outcome in state.
+func (g *portGate) change(state *portState, open bool) error {
+	if *state != portClosed {
+		if err := g.opener.closePort(); err != nil {
+			*state = portUnknown
+			if open {
+				return fmt.Errorf("closing it after a change that failed: %w", err)
+			}
+			return err
+		}
+		*state = portClosed
+	}
+	if !open {
+		return nil
+	}
+	if err := g.opener.openPort(); err != nil {
+		*state = portUnknown
+		return err
+	}
+	*state = portOpen
+	return nil
+}
+
+// logFailure logs err, the failure of a change to open or close the port.
+func (g *portGate) logFailure(open bool, err error) {
+	if !open {
+		g.logf("closing port %d in the container: %v", g.port, err)
+		return
+	}
+	g.logf("the guest listens on port %d, but vm-launch could not open it in the container: %v", g.port, err)
+	if isPortConflict(err) {
+		g.logf("%s", portConflictMessage(g.port))
 	}
 }
 
@@ -213,17 +313,25 @@ func (q qmpPort) openPort() error {
 	return nil
 }
 
+// closePort removes the rule. A rule that QEMU does not have is closed
+// already, and so is every rule of a QEMU whose end of the QMP socket has
+// closed, which it does as it exits.
 func (q qmpPort) closePort() error {
 	out, err := q.monitor.humanCommand("hostfwd_remove " + qemuNetdevID + " " + q.hostRule())
+	if errors.Is(err, io.EOF) || errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
 	// hostfwd_remove reports "host forwarding rule for RULE removed" when
-	// it succeeds, and something else when it does not.
-	if out = strings.TrimSpace(out); !strings.HasSuffix(out, " removed") {
-		return fmt.Errorf("QEMU did not remove the forwarding rule: %s", out)
+	// it removed the rule, "host forwarding rule for RULE not found" when
+	// QEMU has no such rule, and something else when it failed.
+	out = strings.TrimSpace(out)
+	if strings.HasSuffix(out, " removed") || strings.HasSuffix(out, " not found") {
+		return nil
 	}
-	return nil
+	return fmt.Errorf("QEMU did not remove the forwarding rule: %s", out)
 }
 
 // qmpTimeout bounds one QMP command, from the request to the reply.
