@@ -5,8 +5,10 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -970,6 +972,31 @@ var _ = Describe("the guest listen watcher", func() {
 		return bin
 	}
 
+	// watcherTimeout bounds a watcher that a spec runs to its end. A round
+	// takes milliseconds, so a watcher that runs this long hangs.
+	const watcherTimeout = 10 * time.Second
+
+	// runBounded runs name with args and env, in a process group of its
+	// own, and returns its combined output and error. A command that is
+	// still running after watcherTimeout fails the spec with what it
+	// printed so far, and its whole process group is killed, because the
+	// watcher is a subshell that can outlive its parent and hold the output
+	// pipe open.
+	runBounded := func(name string, args, env []string) ([]byte, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), watcherTimeout)
+		defer cancel()
+		c := exec.CommandContext(ctx, name, args...)
+		c.Env = env
+		c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		c.Cancel = func() error { return syscall.Kill(-c.Process.Pid, syscall.SIGKILL) }
+		c.WaitDelay = time.Second
+		out, err := c.CombinedOutput()
+		if ctx.Err() != nil {
+			Fail(fmt.Sprintf("%s was still running after %v; it printed so far:\n%s", filepath.Base(name), watcherTimeout, out))
+		}
+		return out, err
+	}
+
 	// newTick returns a FIFO for the watcher to wait on, in a directory
 	// that any user can reach.
 	newTick := func() string {
@@ -1028,9 +1055,8 @@ var _ = Describe("the guest listen watcher", func() {
 			"\n\t\t\trvm_pause\n", "\n\t\t\trvm_round_end\n",
 		).Replace(watch)
 		script := "rvm_round_end() { exit 0; }\n" + prelude + watch + `wait "$rvm_watch"` + "\n"
-		c := exec.Command(shell.argv[0], append(shell.argv[1:], "-c", script)...)
-		c.Env = []string{"PATH=" + watcherPath(shell), "RVM_PORT=" + strconv.Itoa(port)}
-		out, err := c.CombinedOutput()
+		out, err := runBounded(shell.argv[0], append(shell.argv[1:], "-c", script),
+			[]string{"PATH=" + watcherPath(shell), "RVM_PORT=" + strconv.Itoa(port)})
 		Expect(err).NotTo(HaveOccurred(), "%s: %s", shell.name, out)
 		return string(out)
 	}
@@ -1129,9 +1155,8 @@ echo() { if [ -z "${rvm_failed_once:-}" ]; then rvm_failed_once=1; return 1; fi;
 	)
 
 	It("does nothing in a guest without a port", func() {
-		c := exec.Command("/bin/sh", "-c", guestListenWatch(testNonce)+guestListenStop+`echo "watch=[$rvm_watch]"`)
-		c.Env = []string{"PATH=/usr/bin:/bin"}
-		out, err := c.CombinedOutput()
+		out, err := runBounded("/bin/sh", []string{"-c", guestListenWatch(testNonce) + guestListenStop + `echo "watch=[$rvm_watch]"`},
+			[]string{"PATH=/usr/bin:/bin"})
 		Expect(err).NotTo(HaveOccurred(), string(out))
 		Expect(string(out)).To(Equal("watch=[]\n"))
 	})
