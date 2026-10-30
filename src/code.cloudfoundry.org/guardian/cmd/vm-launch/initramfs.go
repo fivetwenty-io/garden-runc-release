@@ -224,16 +224,37 @@ const guestSetLimits = `ulimit -n "$RVM_NOFILE_HARD" && ulimit -S -n "$RVM_NOFIL
 // address in /proc/net/tcp as eight hex digits in host byte order, so a
 // loopback address, 127.0.0.0/8, ends in 7F; ::1 and ::ffff:127.0.0.0/104
 // are the IPv6 loopback forms.
+//
+// Each grep exits 0 when it finds a line and 1 when it finds none, and only
+// those two answers change the watcher's state. Any other status, such as a
+// grep that could not run in a guest short of memory, keeps the last
+// answer, so a look that fails never closes the port of an app that still
+// listens. The watcher reads only the tables the guest kernel has, because
+// grep fails for a file that is missing, as /proc/net/tcp6 is in a kernel
+// without IPv6.
 func guestListenWatch(nonce string) string {
 	return `rvm_watch=
 if [ -n "${RVM_PORT:-}" ]; then
 	rvm_port_hex=$(printf '%04X' "$RVM_PORT")
+	rvm_tables=
+	for rvm_table in /proc/net/tcp /proc/net/tcp6; do
+		[ -e "$rvm_table" ] && rvm_tables="$rvm_tables $rvm_table"
+	done
 	(
 		rvm_up=0
 		while :; do
-			rvm_now=0
-			grep -hE "^ *[0-9]+: [0-9A-F]+:$rvm_port_hex [0-9A-F]+:0000 0A " /proc/net/tcp /proc/net/tcp6 2>/dev/null |
-				grep -qvE '^ *[0-9]+: ([0-9A-F]{6}7F|0{24}01000000|0{16}FFFF0000[0-9A-F]{6}7F):' && rvm_now=1
+			rvm_now=$rvm_up
+			rvm_lines=$(grep -hE "^ *[0-9]+: [0-9A-F]+:$rvm_port_hex [0-9A-F]+:0000 0A " $rvm_tables 2>/dev/null)
+			case $? in
+			0)
+				printf '%s\n' "$rvm_lines" | grep -qvE '^ *[0-9]+: ([0-9A-F]{6}7F|0{24}01000000|0{16}FFFF0000[0-9A-F]{6}7F):'
+				case $? in
+				0) rvm_now=1 ;;
+				1) rvm_now=0 ;;
+				esac
+				;;
+			1) rvm_now=0 ;;
+			esac
 			if [ "$rvm_now" != "$rvm_up" ]; then
 				echo "` + listenTag(nonce) + `$rvm_now"
 				rvm_up=$rvm_now

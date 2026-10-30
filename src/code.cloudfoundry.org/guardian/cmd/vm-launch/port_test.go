@@ -627,25 +627,41 @@ var _ = Describe("the guest listen watcher", func() {
 		return bin
 	}
 
-	// checkOnce runs one round of the watcher for port against fake
-	// /proc/net/tcp and tcp6 contents and returns what it printed.
-	checkOnce := func(shell guestShell, port int, tcp, tcp6 string) string {
+	// noTable stands for a /proc/net table the guest kernel lacks.
+	const noTable = "\x00"
+
+	// watchRound runs one round of the watcher for port, after the shell
+	// code prelude, against fake /proc/net/tcp and tcp6 contents, either of
+	// which may be noTable. The watcher starts in the state wasUp, "0" or
+	// "1", and watchRound returns what it printed.
+	watchRound := func(shell guestShell, port int, tcp, tcp6, prelude, wasUp string) string {
 		dir := GinkgoT().TempDir()
 		tcpPath, tcp6Path := filepath.Join(dir, "tcp"), filepath.Join(dir, "tcp6")
-		Expect(os.WriteFile(tcpPath, []byte(procNetHeader+tcp), 0o644)).To(Succeed())
-		Expect(os.WriteFile(tcp6Path, []byte(procNetHeader+tcp6), 0o644)).To(Succeed())
+		for path, table := range map[string]string{tcpPath: tcp, tcp6Path: tcp6} {
+			if table != noTable {
+				Expect(os.WriteFile(path, []byte(procNetHeader+table), 0o644)).To(Succeed())
+			}
+		}
 		watch := guestListenWatch(testNonce)
-		Expect(watch).To(ContainSubstring(" /proc/net/tcp /proc/net/tcp6 "))
-		Expect(watch).To(ContainSubstring("\n\t\t\tsleep 1\n"))
+		for _, s := range []string{" /proc/net/tcp /proc/net/tcp6;", "\n\t\trvm_up=0\n", "\n\t\t\tsleep 1\n"} {
+			Expect(watch).To(ContainSubstring(s))
+		}
 		watch = strings.NewReplacer(
-			" /proc/net/tcp /proc/net/tcp6 ", " "+tcpPath+" "+tcp6Path+" ",
+			" /proc/net/tcp /proc/net/tcp6;", " "+tcpPath+" "+tcp6Path+";",
+			"\n\t\trvm_up=0\n", "\n\t\trvm_up="+wasUp+"\n",
 			"\n\t\t\tsleep 1\n", "\n\t\t\texit 0\n",
 		).Replace(watch)
-		c := exec.Command(shell.argv[0], append(shell.argv[1:], "-c", watch+`wait "$rvm_watch"`+"\n")...)
+		c := exec.Command(shell.argv[0], append(shell.argv[1:], "-c", prelude+watch+`wait "$rvm_watch"`+"\n")...)
 		c.Env = []string{"PATH=" + watcherPath(shell), "RVM_PORT=" + strconv.Itoa(port)}
 		out, err := c.CombinedOutput()
 		Expect(err).NotTo(HaveOccurred(), "%s: %s", shell.name, out)
 		return string(out)
+	}
+
+	// checkOnce runs one round of the watcher, from the state not
+	// listening, with both tables present.
+	checkOnce := func(shell guestShell, port int, tcp, tcp6 string) string {
+		return watchRound(shell, port, tcp, tcp6, "", "0")
 	}
 
 	listening := "RVM_LISTEN_" + testNonce + "=1\n"
@@ -683,6 +699,32 @@ var _ = Describe("the guest listen watcher", func() {
 					Expect(out).To(BeEmpty(), "%s: %s", shell.name, name)
 				}
 			}
+		},
+		shellEntries(""),
+	)
+
+	DescribeTable("reads only the tables the guest kernel has",
+		func(shellOf func() guestShell) {
+			shell := shellOf()
+			Expect(watchRound(shell, 8080, procNetLine("00000000:1F90", "0A"), noTable, "", "0")).To(Equal(listening), shell.name)
+			Expect(watchRound(shell, 8080, noTable, procNetLine(wildcard6+":1F90", "0A"), "", "0")).To(Equal(listening), shell.name)
+			Expect(watchRound(shell, 8080, noTable, noTable, "", "1")).To(Equal("RVM_LISTEN_"+testNonce+"=0\n"), shell.name)
+		},
+		shellEntries(""),
+	)
+
+	DescribeTable("keeps its state when a grep fails instead of answering",
+		func(shellOf func() guestShell) {
+			shell := shellOf()
+			up := procNetLine("00000000:1F90", "0A")
+			// A shell function runs in place of the grep applet, and
+			// "command grep" runs the applet. Status 2 is grep's error.
+			for _, flags := range []string{"-hE", "-qvE"} {
+				prelude := `grep() { case "$1" in ` + flags + `) return 2 ;; esac; command grep "$@"; }` + "\n"
+				Expect(watchRound(shell, 8080, up, "", prelude, "1")).To(BeEmpty(), "%s: %s", shell.name, flags)
+				Expect(watchRound(shell, 8080, up, "", prelude, "0")).To(BeEmpty(), "%s: %s", shell.name, flags)
+			}
+			Expect(watchRound(shell, 8080, "", "", "", "1")).To(Equal("RVM_LISTEN_"+testNonce+"=0\n"), shell.name)
 		},
 		shellEntries(""),
 	)
