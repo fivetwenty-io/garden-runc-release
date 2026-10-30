@@ -265,6 +265,25 @@ func providerForFSType(fstype string) (volumeProvider, bool) {
 	return volumeProvider{}, false
 }
 
+// providerNames names the providers in volumeProviders, for an error line:
+// "JuiceFS", "JuiceFS and NFS", or "JuiceFS, NFS, and SMB".
+func providerNames() string {
+	names := make([]string, 0, len(volumeProviders))
+	for _, p := range volumeProviders {
+		names = append(names, p.Name)
+	}
+	switch len(names) {
+	case 0:
+		return "no"
+	case 1:
+		return names[0]
+	case 2:
+		return names[0] + " and " + names[1]
+	default:
+		return strings.Join(names[:len(names)-1], ", ") + ", and " + names[len(names)-1]
+	}
+}
+
 // checkVolumeProvider refuses a volume that no provider supports, before
 // anything boots. It finds the mount at exactly dir in the mount table at
 // mountinfo and looks its filesystem type up in volumeProviders. A path with
@@ -272,7 +291,7 @@ func providerForFSType(fstype string) (volumeProvider, bool) {
 // last entry in the table is the one the process sees. Errors never repeat
 // VCAP_SERVICES.
 func checkVolumeProvider(mountinfo, dir string) error {
-	const only = "VM backends support only JuiceFS volumes today"
+	only := "VM backends support only " + providerNames() + " volumes today"
 	f, err := os.Open(mountinfo)
 	if err != nil {
 		var pathErr *os.PathError
