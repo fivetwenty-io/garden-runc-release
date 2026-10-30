@@ -1005,7 +1005,8 @@ var _ = Describe("the guest listen watcher", func() {
 	// still running after watcherTimeout fails the spec with what it
 	// printed so far, and its whole process group is killed, because the
 	// watcher is a subshell that can outlive its parent and hold the output
-	// pipe open.
+	// pipe open. The group is killed when the command returns too, so a
+	// child the shell leaves behind does not outlive it.
 	runBounded := func(name string, args, env []string) ([]byte, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), watcherTimeout)
 		defer cancel()
@@ -1015,6 +1016,9 @@ var _ = Describe("the guest listen watcher", func() {
 		c.Cancel = func() error { return syscall.Kill(-c.Process.Pid, syscall.SIGKILL) }
 		c.WaitDelay = time.Second
 		out, err := c.CombinedOutput()
+		// Nothing is left to wait for, so ESRCH, from a group with no
+		// process in it, is the usual answer and not an error.
+		_ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
 		if ctx.Err() != nil {
 			Fail(fmt.Sprintf("%s was still running after %v; it printed so far:\n%s", filepath.Base(name), watcherTimeout, out))
 		}
@@ -1184,6 +1188,37 @@ echo() { if [ -z "${rvm_failed_once:-}" ]; then rvm_failed_once=1; return 1; fi;
 		Expect(err).NotTo(HaveOccurred(), string(out))
 		Expect(string(out)).To(Equal("watch=[]\n"))
 	})
+
+	// A shell that exits normally can leave a background child behind. The
+	// group kill covers that child as well as the one a timeout abandons, so
+	// no spec leaks a process even when its script is wrong.
+	DescribeTable("kills a background child that outlives the shell, whether or not it holds the output pipe",
+		func(redirect string) {
+			out, err := runBounded("/bin/sh", []string{"-c", "sleep 60 " + redirect + " & echo $!"},
+				[]string{"PATH=/usr/bin:/bin"})
+			if redirect != "" {
+				Expect(err).NotTo(HaveOccurred(), string(out))
+			}
+			pid, convErr := strconv.Atoi(strings.TrimSpace(string(out)))
+			Expect(convErr).NotTo(HaveOccurred(), string(out))
+			Expect(pid).To(BeNumerically(">", 1))
+
+			// A killed child that nothing has reaped yet is a zombie, which
+			// still has a /proc entry but is no longer running.
+			running := func() bool {
+				stat, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+				if err != nil {
+					return false
+				}
+				state := stat[bytes.LastIndexByte(stat, ')')+2]
+				return state != 'Z' && state != 'X'
+			}
+			DeferCleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+			Eventually(running, 5*time.Second, 20*time.Millisecond).Should(BeFalse(), "the sleep the shell left behind is still running")
+		},
+		Entry("with the child holding the output pipe", ""),
+		Entry("with the child's output redirected", ">/dev/null 2>&1"),
+	)
 
 	// The other specs of the watcher replace its pause, so none of them
 	// shows that the watcher waits between its looks. A watcher that did not
