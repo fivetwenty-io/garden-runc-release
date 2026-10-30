@@ -1166,12 +1166,24 @@ echo() { if [ -z "${rvm_failed_once:-}" ]; then rvm_failed_once=1; return 1; fi;
 	}
 
 	// loopbackPort returns a port with a listener on 127.0.0.1, which the
-	// watcher does not count.
+	// watcher does not count, and on which followListener can listen at
+	// [::]. A port that is free on 127.0.0.1 can still be taken for IPv6,
+	// as by a socket in TIME_WAIT on [::1], so it tries other ports.
 	loopbackPort := func() int {
-		loopback, err := net.Listen("tcp4", "127.0.0.1:0")
-		Expect(err).NotTo(HaveOccurred())
-		DeferCleanup(loopback.Close)
-		return loopback.Addr().(*net.TCPAddr).Port
+		for try := 0; try < 20; try++ {
+			loopback, err := net.Listen("tcp4", "127.0.0.1:0")
+			Expect(err).NotTo(HaveOccurred())
+			port := loopback.Addr().(*net.TCPAddr).Port
+			wild, err := net.Listen("tcp6", "[::]:"+strconv.Itoa(port))
+			if err == nil {
+				Expect(wild.Close()).To(Succeed())
+				DeferCleanup(loopback.Close)
+				return port
+			}
+			Expect(loopback.Close()).To(Succeed())
+		}
+		Fail("found no port free on both 127.0.0.1 and [::] in 20 tries")
+		return 0
 	}
 
 	// followListener opens and closes a listener on [::]:port and expects
