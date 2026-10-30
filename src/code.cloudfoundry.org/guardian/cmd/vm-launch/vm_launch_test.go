@@ -7,6 +7,7 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -36,7 +37,21 @@ const testNonce = "0123456789abcdef"
 // for a spec that needs vm-launch's own stdout or signals.
 const helperArtifacts = "VM_LAUNCH_TEST_ARTIFACTS"
 
+// helperStopCheck marks a helper process that calls run, which fails at
+// once on its arguments, and then writes to its stdout. It exits with
+// status 0 and a message on stderr if the write returned, and the runtime
+// kills a process whose write to a broken stdout returns while nothing
+// catches SIGPIPE, so a helper that dies by SIGPIPE shows that run stopped
+// catching it.
+const helperStopCheck = "VM_LAUNCH_TEST_SIGPIPE_AFTER_RUN"
+
 func init() {
+	if os.Getenv(helperStopCheck) != "" {
+		code := run([]string{"--backend", "nope", "--", "true"}, log.New(io.Discard, "", 0))
+		_, err := os.Stdout.WriteString("written after run\n")
+		fmt.Fprintf(os.Stderr, "run returned %d, and a write to a broken stdout after it returned: %v\n", code, err)
+		os.Exit(0)
+	}
 	if art := os.Getenv(helperArtifacts); art != "" {
 		os.Exit(run([]string{"--backend", "vm-qemu", "--artifacts", art, "--", "true"}, log.New(os.Stderr, "vm-launch: ", 0)))
 	}
@@ -848,6 +863,26 @@ var _ = Describe("run", func() {
 })
 
 var _ = Describe("run with a stdout that nobody reads", func() {
+	It("stops catching SIGPIPE once it has returned, so the runtime's default applies again", func() {
+		r, w, err := os.Pipe()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(r.Close()).To(Succeed())
+		defer w.Close()
+
+		var stderr bytes.Buffer
+		cmd := exec.Command(os.Args[0])
+		cmd.Env = []string{helperStopCheck + "=1", "PATH=" + os.Getenv("PATH")}
+		cmd.Stdout = w
+		cmd.Stderr = &stderr
+		_ = cmd.Run()
+
+		state := cmd.ProcessState
+		Expect(state).NotTo(BeNil())
+		status := state.Sys().(syscall.WaitStatus)
+		Expect(status.Signaled()).To(BeTrue(), "the helper was not killed by SIGPIPE; stderr: %s", stderr.String())
+		Expect(status.Signal()).To(Equal(syscall.SIGPIPE), stderr.String())
+	})
+
 	It("reports the write error and still exits with the guest's status instead of dying from SIGPIPE", func() {
 		art := makeArtifacts()
 		script := `#!/bin/bash
