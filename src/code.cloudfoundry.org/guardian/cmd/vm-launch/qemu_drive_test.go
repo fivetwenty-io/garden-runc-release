@@ -291,7 +291,7 @@ var _ = Describe("the initramfs memfd against a real QEMU", func() {
 		bb := guestBusybox()
 		files, _, initrdPath, _ := hypervisorFiles(nil, memfdInitramfs(bb, `echo "hello from the $RVM_SOURCE"; exit 7`, "export RVM_SOURCE='memfd initramfs'\n"), nil)
 		argv := tcgArgv(qemu, qemuArgv(art, initrdPath, 128, taskNetwork(), "", 0))
-		code, stdout, stderr := runRealQEMU(argv, files, "", 5*time.Minute)
+		code, stdout, stderr := bootRealQEMU(argv, files)
 		Expect(code).To(Equal(0), "QEMU failed: %s\n%s", stderr, stdout)
 		Expect(stdout).To(ContainSubstring(startTag(testNonce)))
 		Expect(stdout).To(ContainSubstring("hello from the memfd initramfs"))
