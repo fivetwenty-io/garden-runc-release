@@ -712,6 +712,12 @@ var _ = Describe("the QMP monitor", func() {
 			Expect(isPortConflict(err)).To(BeTrue())
 		})
 
+		It("reports other output of hostfwd_add as a failure that is not a conflict", func() {
+			_, err := ruleRun(true, `{"return": "Invalid host forwarding rule 'tcp:0.0.0.0:8080-10.0.2.15:8080' (Bad host port)\r\n"}`)
+			Expect(err).To(MatchError("QEMU did not add the forwarding rule: Invalid host forwarding rule 'tcp:0.0.0.0:8080-10.0.2.15:8080' (Bad host port)"))
+			Expect(isPortConflict(err)).To(BeFalse())
+		})
+
 		It("removes the rule", func() {
 			got, err := ruleRun(false, `{"return": "host forwarding rule for tcp:0.0.0.0:8080 removed\r\n"}`)
 			Expect(err).NotTo(HaveOccurred())

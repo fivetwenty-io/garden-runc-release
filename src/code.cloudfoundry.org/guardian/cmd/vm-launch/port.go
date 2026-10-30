@@ -38,6 +38,10 @@ type portOpener interface {
 	closePort() error
 }
 
+// hostfwdFailedPrefix starts the output of hostfwd_add when QEMU could not
+// bind the rule's port.
+const hostfwdFailedPrefix = "Could not set up host forwarding rule"
+
 // errHostfwdFailed reports a forwarding rule QEMU could not set up, which is
 // how QEMU reports a port that something else listens on.
 var errHostfwdFailed = errors.New("QEMU could not set up the forwarding rule")
@@ -306,11 +310,16 @@ func (q qmpPort) openPort() error {
 	if err != nil {
 		return err
 	}
-	// hostfwd_add prints nothing when it succeeds.
-	if out = strings.TrimSpace(out); out != "" {
+	// hostfwd_add prints nothing when it succeeds. Any other output, such
+	// as a rule QEMU cannot parse, is not a conflict on the port.
+	switch out = strings.TrimSpace(out); {
+	case out == "":
+		return nil
+	case strings.HasPrefix(out, hostfwdFailedPrefix):
 		return fmt.Errorf("%w: %s", errHostfwdFailed, out)
+	default:
+		return fmt.Errorf("QEMU did not add the forwarding rule: %s", out)
 	}
-	return nil
 }
 
 // closePort removes the rule. A rule that QEMU does not have is closed
