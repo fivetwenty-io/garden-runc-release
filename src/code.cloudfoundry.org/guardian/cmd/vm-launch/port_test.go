@@ -163,6 +163,8 @@ var _ = Describe("listen lines on the serial console", func() {
 		Entry("port zero", "0:1\n", 0, false, 0, false, false),
 		Entry("a port above 65535", "65536:1\n", 0, false, 0, false, false),
 		Entry("six digits", "100000:1\n", 0, false, 0, false, false),
+		Entry("six digits with a leading zero", "008080:1\n", 0, false, 0, false, false),
+		Entry("five digits with a leading zero", "08080:1\n", 8080, true, 8, true, false),
 		Entry("no port", ":1\n", 0, false, 0, false, false),
 		Entry("a port and no colon", "8080 1\n", 0, false, 0, false, false),
 		Entry("the old form without a port", "1\n", 0, false, 0, false, false),

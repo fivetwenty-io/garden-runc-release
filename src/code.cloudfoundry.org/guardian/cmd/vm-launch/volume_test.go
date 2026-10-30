@@ -362,6 +362,17 @@ var _ = Describe("checkVolumeProvider", func() {
 		Expect(err.Error()).To(ContainSubstring("reading"))
 	})
 
+	It("refuses when reading the mount table fails part way", func() {
+		err := checkVolumeProvider(GinkgoT().TempDir(), "/data")
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("reading"))
+
+		long := mountinfoLine(40, "/data", "fuse.juicefs") + strings.Repeat("x", 2<<20) + "\n"
+		err = checkVolumeProvider(infoFile(long), "/data")
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("reading"))
+	})
+
 	It("matches the mount point exactly, not by prefix", func() {
 		info := infoFile(mountinfoLine(40, "/data", "fuse.juicefs"), mountinfoLine(41, "/data/vol", "nfs4"), mountinfoLine(42, "/data-old", "ext4"))
 		Expect(checkVolumeProvider(info, "/data")).To(Succeed())
@@ -392,6 +403,13 @@ var _ = Describe("checkVolumeProvider", func() {
 		info := infoFile(mountinfoLine(40, `/a\04`, "fuse.juicefs"), mountinfoLine(41, `/b\9zz`, "fuse.juicefs"))
 		Expect(checkVolumeProvider(info, `/a\04`)).To(Succeed())
 		Expect(checkVolumeProvider(info, `/b\9zz`)).To(Succeed())
+	})
+
+	It("leaves an escape above \\377 as written, since it is not a byte", func() {
+		info := infoFile(mountinfoLine(40, `/a\400b`, "fuse.juicefs"), mountinfoLine(41, `/c\777`, "fuse.juicefs"))
+		Expect(checkVolumeProvider(info, `/a\400b`)).To(Succeed())
+		Expect(checkVolumeProvider(info, `/c\777`)).To(Succeed())
+		Expect(checkVolumeProvider(info, "/a\x00b")).To(MatchError(ContainSubstring("no mount")))
 	})
 
 	It("uses the last entry when a later mount shadows the same path", func() {
