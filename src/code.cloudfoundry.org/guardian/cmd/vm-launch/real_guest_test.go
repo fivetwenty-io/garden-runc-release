@@ -589,3 +589,217 @@ echo served`)
 			"the guest no longer listens on port " + p + "; it is closed in the container\n"))
 	})
 })
+
+// bodyProbe records the bodies that HTTP requests to ports got.
+type bodyProbe struct {
+	mu     sync.Mutex
+	bodies map[string]map[string]bool
+}
+
+func (p *bodyProbe) observe(addr string) {
+	c, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		return
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := c.Write([]byte("GET /index.html HTTP/1.0\r\n\r\n")); err != nil {
+		return
+	}
+	reply, _ := io.ReadAll(c)
+	if _, body, ok := strings.Cut(string(reply), "\r\n\r\n"); ok {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if p.bodies == nil {
+			p.bodies = map[string]map[string]bool{}
+		}
+		if p.bodies[addr] == nil {
+			p.bodies[addr] = map[string]bool{}
+		}
+		p.bodies[addr][strings.TrimSpace(body)] = true
+	}
+}
+
+func (p *bodyProbe) got(addr string) []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var out []string
+	for b := range p.bodies[addr] {
+		out = append(out, b)
+	}
+	return out
+}
+
+var _ = Describe("several ports against a real QEMU", func() {
+	It("forwards each port the guest listens on, once it does, and keeps a port that nothing listens on closed", func() {
+		art := realArtifacts()
+		qemu := realQEMU()
+		requireMicrovm(qemu)
+		var ports []int
+		for range 3 {
+			l, err := net.Listen("tcp", "127.0.0.1:0")
+			Expect(err).NotTo(HaveOccurred())
+			ports = append(ports, l.Addr().(*net.TCPAddr).Port)
+			Expect(l.Close()).To(Succeed())
+		}
+		first, second, unused := ports[0], ports[1], ports[2]
+		for _, port := range ports {
+			reservation, err := reservePort(port)
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(reservation.Close)
+		}
+		f1, f2 := strconv.Itoa(first), strconv.Itoa(second)
+
+		nw := taskNetwork()
+		nw.ports = ports
+		// The guest serves the first port, serves the second one a few
+		// seconds later, and stops both before it exits. Nothing ever
+		// listens on the third port.
+		g := taskGuest(`mkdir -p /tmp/one /tmp/two && echo one-` + f1 + ` >/tmp/one/index.html && echo two-` + f2 + ` >/tmp/two/index.html
+sleep 3
+httpd -f -p ` + f1 + ` -h /tmp/one &
+h1=$!
+sleep 5
+httpd -f -p ` + f2 + ` -h /tmp/two &
+h2=$!
+sleep 10
+kill $h1 $h2
+wait $h1 $h2
+echo served`)
+		g.nw = nw
+		f, err := newInitramfs(guestBusybox(), g)
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(f.Close)
+
+		type result struct {
+			res runResult
+			err error
+		}
+		var (
+			r      result
+			out    *safeBuffer
+			stderr *safeBuffer
+			logBuf *safeBuffer
+			states = map[int][]string{}
+			bodies = &bodyProbe{}
+		)
+		bootWithRetry(func() bool {
+			monitor, qemuEnd, err := newQMPSocket()
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(monitor.Close)
+			DeferCleanup(func() { _ = qemuEnd.Close() })
+			files, _, initrdPath, monitorFD := hypervisorFiles(nil, withUserspaceMark(f), qemuEnd)
+			consoleLog := filepath.Join(GinkgoT().TempDir(), "console.log")
+			argv := consoleLogArgv(markedArgv(tcgArgv(qemu, qemuArgv(art, initrdPath, minGuestMemoryMiB, nw, "", monitorFD))), consoleLog)
+			cmd := newHypervisorCmd(argv, files)
+			stderr = &safeBuffer{}
+			cmd.Stderr = stderr
+
+			logBuf = &safeBuffer{}
+			qmp := newQMPMonitor(monitor)
+			gates := startPortGates(ports, func(port int) portOpener { return qmpPort{monitor: qmp, port: port} }, gateRetry, log.New(logBuf, "", 0))
+			out = &safeBuffer{}
+			console := newBootWriter(realBootMark)
+			stopTail := make(chan struct{})
+			tailed := tailFile(consoleLog, console, stopTail)
+			var qemuProc *os.Process
+			running := make(chan struct{})
+			sup := supervisor{
+				stdout:   out,
+				logger:   log.New(logBuf, "", 0),
+				signals:  make(chan os.Signal),
+				grace:    killGrace,
+				deadline: stopDeadline,
+				started: func() {
+					_ = qemuEnd.Close()
+					qemuProc = cmd.Process
+					close(running)
+				},
+				listen: gates.set,
+			}
+			kill := func() {
+				select {
+				case <-running:
+					_ = qemuProc.Kill()
+				default:
+				}
+			}
+
+			probes := map[int]*portProbe{}
+			stopProbe := make(chan struct{})
+			var probed sync.WaitGroup
+			for _, port := range ports {
+				probes[port] = &portProbe{}
+			}
+			for _, port := range ports {
+				probed.Add(1)
+				go func() {
+					defer GinkgoRecover()
+					defer probed.Done()
+					addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+					for {
+						probes[port].observe(addr)
+						bodies.observe(addr)
+						select {
+						case <-stopProbe:
+							return
+						case <-time.After(100 * time.Millisecond):
+						}
+					}
+				}()
+			}
+			var stopOnce sync.Once
+			stop := func() {
+				stopOnce.Do(func() {
+					gates.end()
+					close(stopProbe)
+					probed.Wait()
+					close(stopTail)
+					<-tailed
+				})
+			}
+			DeferCleanup(stop)
+
+			exited := make(chan struct{})
+			go func() {
+				defer close(exited)
+				res, err := sup.run(cmd, testNonce)
+				r = result{res, err}
+			}()
+			details := func() string {
+				return "stderr: " + stderr.String() + "\nconsole: " + console.String() + "\nlog: " + logBuf.String() + fmt.Sprintf("\nports went %q", probes[first].got())
+			}
+			booted := awaitRealGuest(kill, console, exited, details)
+			stop()
+			if booted {
+				Expect(console.String()).To(ContainSubstring(realBootMark), "QEMU exited before the guest started userspace\n%s", details())
+			}
+			for _, port := range ports {
+				states[port] = probes[port].got()
+			}
+			return booted
+		})
+
+		Expect(r.err).NotTo(HaveOccurred())
+		code, reason := exitCode(r.res)
+		Expect(code).To(Equal(0), "%s\n%s\n%s", reason, stderr.String(), out.String())
+		Expect(out.String()).To(ContainSubstring("served"))
+		Expect(out.String()).NotTo(ContainSubstring("RVM_LISTEN_"))
+
+		GinkgoWriter.Printf("ports went %v\n", states)
+		for _, port := range []int{first, second} {
+			Expect(states[port][0]).To(Equal("closed"), "%q", states[port])
+			Expect(states[port]).To(ContainElement("serves"), "port %d: %q\n%s", port, states[port], logBuf.String())
+			Expect(states[port][:slices.Index(states[port], "serves")]).NotTo(ContainElement("accepts"), "%q", states[port])
+		}
+		Expect(bodies.got(net.JoinHostPort("127.0.0.1", f1))).To(ConsistOf("one-" + f1))
+		Expect(bodies.got(net.JoinHostPort("127.0.0.1", f2))).To(ConsistOf("two-" + f2))
+		Expect(states[unused]).To(Equal([]string{"closed"}))
+		// The second port opened later than the first, so the first served
+		// while the second was still closed.
+		Expect(logBuf.String()).To(ContainSubstring("the guest listens on port " + f1 + "; it is open in the container\n"))
+		Expect(logBuf.String()).To(ContainSubstring("the guest listens on port " + f2 + "; it is open in the container\n"))
+		Expect(strings.Index(logBuf.String(), "port "+f1+"; it is open")).To(BeNumerically("<", strings.Index(logBuf.String(), "port "+f2+"; it is open")))
+		Expect(logBuf.String()).NotTo(ContainSubstring(strconv.Itoa(unused)))
+	})
+})
