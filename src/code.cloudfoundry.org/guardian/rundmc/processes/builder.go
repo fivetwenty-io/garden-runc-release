@@ -196,12 +196,15 @@ func (p *ProcBuilder) BuildProcess(bndl goci.Bndl, spec garden.ProcessSpec, user
 
 	apparmorProfile := bndl.Process().ApparmorProfile
 	if wrapped && kind == backend.VMQemu && apparmorProfile != "" {
-		// QEMU kicks its vCPU threads with SIGUSR1, which the default AppArmor
-		// profile denies. An empty profile would leave the container's profile
-		// in place, so the process names the unconfined label instead. QEMU
-		// inherits it, and the container's other processes keep the bundle's
-		// profile. A bundle without a profile has nothing to lift, and naming
-		// a label on a host without AppArmor would fail the exec.
+		// QEMU runs unconfined. The lift dates from before the default AppArmor
+		// profile allowed signals between processes in the same container,
+		// which covers the SIGUSR1 QEMU uses to kick its vCPU threads. We keep
+		// it until a confined QEMU has been checked on a cell. An empty profile
+		// would leave the container's profile in place, so the process names
+		// the unconfined label instead. QEMU inherits it, and the container's
+		// other processes keep the bundle's profile. A bundle without a
+		// profile has nothing to lift, and naming a label on a host without
+		// AppArmor would fail the exec.
 		apparmorProfile = unconfinedApparmorProfile
 	}
 

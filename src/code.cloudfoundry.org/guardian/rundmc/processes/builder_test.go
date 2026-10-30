@@ -238,7 +238,7 @@ var _ = Describe("ProcBuilder", func() {
 			// runc applies the container's profile to an exec'd process unless
 			// the process names a non-empty profile, so an empty profile here
 			// would leave QEMU confined.
-			It("is set to unconfined in a vm-qemu bundle, so QEMU can signal its vCPU threads", func() {
+			It("is set to unconfined in a vm-qemu bundle, until a confined QEMU has been checked on a cell", func() {
 				Expect(preparedProc.ApparmorProfile).To(Equal("unconfined"))
 			})
 
