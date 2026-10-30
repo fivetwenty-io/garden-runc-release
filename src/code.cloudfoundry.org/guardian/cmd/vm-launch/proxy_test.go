@@ -13,14 +13,16 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"golang.org/x/sys/unix"
 )
 
 // testDialPolicy retries fast so the specs stay quick.
 var testDialPolicy = dialPolicy{
-	attemptTimeout: 200 * time.Millisecond,
-	firstBackoff:   10 * time.Millisecond,
-	maxBackoff:     50 * time.Millisecond,
-	giveUp:         5 * time.Second,
+	attemptTimeout:   200 * time.Millisecond,
+	firstBackoff:     10 * time.Millisecond,
+	maxBackoff:       50 * time.Millisecond,
+	giveUp:           5 * time.Second,
+	unansweredGiveUp: 5 * time.Second,
 }
 
 // startProxy returns a proxy for upstream that listens on listenAddr.
@@ -79,6 +81,27 @@ func unusedAddr() string {
 	Expect(err).NotTo(HaveOccurred())
 	addr := l.Addr().String()
 	Expect(l.Close()).To(Succeed())
+	return addr
+}
+
+// unansweredAddr returns the address of a loopback listener whose accept
+// queue is full, so the kernel drops each new SYN and a dial to it gets no
+// answer.
+func unansweredAddr() string {
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	Expect(err).NotTo(HaveOccurred())
+	DeferCleanup(unix.Close, fd)
+	Expect(unix.Bind(fd, &unix.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}})).To(Succeed())
+	// A backlog of 0 holds one connection that nobody accepts.
+	Expect(unix.Listen(fd, 0)).To(Succeed())
+	sa, err := unix.Getsockname(fd)
+	Expect(err).NotTo(HaveOccurred())
+	addr := fmt.Sprintf("127.0.0.1:%d", sa.(*unix.SockaddrInet4).Port)
+	queued, err := net.Dial("tcp", addr)
+	Expect(err).NotTo(HaveOccurred())
+	DeferCleanup(queued.Close)
+	_, err = net.DialTimeout("tcp", addr, 200*time.Millisecond)
+	Expect(isUnanswered(err)).To(BeTrue(), "a dial to the full listener: %v", err)
 	return addr
 }
 
@@ -202,6 +225,17 @@ var _ = Describe("tcpProxy", func() {
 		Expect(time.Since(began)).To(BeNumerically(">=", time.Second))
 		Expect(time.Since(began)).To(BeNumerically("<", 4*time.Second))
 		Eventually(logBuf.String).Should(ContainSubstring("giving up on the guest at"))
+	})
+
+	It("waits longer for a guest that does not answer than for one that refuses, and then closes the client", func() {
+		c := dialProxy(startTestProxy(unansweredAddr(), upstreamDialPolicy))
+
+		began := time.Now()
+		_, err := io.ReadAll(c)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(time.Since(began)).To(BeNumerically(">=", 4*time.Second))
+		Expect(time.Since(began)).To(BeNumerically("<", 8*time.Second))
+		Eventually(logBuf.String).Should(ContainSubstring("i/o timeout"))
 	})
 
 	It("serves concurrent connections independently", func() {

@@ -18,27 +18,39 @@ import (
 // lags by up to a second, so a connection that arrives as the guest app
 // restarts its listener waits for it instead of failing: the proxy retries
 // the upstream dial with exponential backoff until giveUp has passed since
-// the client connected.
+// the client connected, or unansweredGiveUp when the last dial got no answer
+// within attemptTimeout.
 type dialPolicy struct {
-	attemptTimeout time.Duration
-	firstBackoff   time.Duration
-	maxBackoff     time.Duration
-	giveUp         time.Duration
+	attemptTimeout   time.Duration
+	firstBackoff     time.Duration
+	maxBackoff       time.Duration
+	giveUp           time.Duration
+	unansweredGiveUp time.Duration
 }
 
-// upstreamDialPolicy gives up 2 seconds after the client connected. The
-// proxy listens only once the guest app does, so it never sees a guest boot,
-// and a dial that the guest refuses means the guest app has closed its
-// listener. That is an app that restarts its listener, which 2 seconds
-// covers, or an app that stopped listening, whose port the gate closes at the
-// guest's next look, within a second. Either way, a client of an app that
-// stopped listening learns it within 2 seconds, so the gorouter can try
-// another instance. attemptTimeout bounds a dial that gets no answer.
+// upstreamDialPolicy gives up on a guest that refuses the dial 2 seconds
+// after the client connected, and on a guest that does not answer it after
+// 5 seconds. The proxy listens only once the guest app does, so it never
+// sees a guest boot, and a dial that the guest refuses means the guest app
+// has closed its listener. That is an app that restarts its listener, which
+// 2 seconds covers, or an app that stopped listening, whose port the gate
+// closes at the guest's next look, within a second. Either way, a client of
+// an app that stopped listening learns it within 2 seconds, so the gorouter
+// can try another instance.
+//
+// A dial that gets no answer within attemptTimeout means a guest app whose
+// accept queue is full, or a guest too busy to answer, and the app may
+// still serve. A runc app in that state would hold the gorouter's dial
+// through SYN retransmits for the gorouter's endpoint dial timeout, 5
+// seconds by default. The proxy has already accepted the gorouter's
+// connection, so that timeout no longer applies, and the proxy waits as
+// long in its place.
 var upstreamDialPolicy = dialPolicy{
-	attemptTimeout: time.Second,
-	firstBackoff:   25 * time.Millisecond,
-	maxBackoff:     500 * time.Millisecond,
-	giveUp:         2 * time.Second,
+	attemptTimeout:   time.Second,
+	firstBackoff:     25 * time.Millisecond,
+	maxBackoff:       500 * time.Millisecond,
+	giveUp:           2 * time.Second,
+	unansweredGiveUp: 5 * time.Second,
 }
 
 // tcpProxy carries TCP connections from a listener in the container to the
@@ -238,7 +250,7 @@ func (p *tcpProxy) handle(client net.Conn) {
 // fails with the last dial error once the policy gives up, or with the
 // context error after Close.
 func (p *tcpProxy) dialUpstream() (net.Conn, error) {
-	deadline := time.Now().Add(p.policy.giveUp)
+	began := time.Now()
 	backoff := p.policy.firstBackoff
 	for {
 		attempt, cancel := context.WithTimeout(p.ctx, p.policy.attemptTimeout)
@@ -250,7 +262,11 @@ func (p *tcpProxy) dialUpstream() (net.Conn, error) {
 		if p.ctx.Err() != nil {
 			return nil, p.ctx.Err()
 		}
-		if time.Until(deadline) < backoff {
+		budget := p.policy.giveUp
+		if isUnanswered(err) {
+			budget = p.policy.unansweredGiveUp
+		}
+		if time.Since(began)+backoff > budget {
 			return nil, err
 		}
 		if !p.sleep(backoff) {
@@ -260,6 +276,13 @@ func (p *tcpProxy) dialUpstream() (net.Conn, error) {
 			backoff = p.policy.maxBackoff
 		}
 	}
+}
+
+// isUnanswered reports whether err, from a dial, means that the dial got
+// no answer before its timeout.
+func isUnanswered(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 // sleep waits for d and reports false if Close came first.
