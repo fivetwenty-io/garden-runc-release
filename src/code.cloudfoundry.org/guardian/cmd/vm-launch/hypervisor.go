@@ -655,8 +655,10 @@ type supervisor struct {
 	logger  *log.Logger
 	signals <-chan os.Signal
 	grace   time.Duration
-	// stopping, when set, runs once at the first signal, before it is
-	// forwarded. vm-launch uses it to stop accepting guest connections.
+	// stopping, when set, runs once at the first signal, after the signal
+	// is logged and before it is forwarded, so what stopping logs comes
+	// after the signal's line. vm-launch uses it to stop accepting guest
+	// connections.
 	stopping func()
 	// started, when set, runs once the hypervisor has started and before
 	// anything else. vm-launch uses it to close its copies of the files the
@@ -701,11 +703,11 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 			if ss, ok := sig.(syscall.Signal); ok && res.received == 0 {
 				res.received = ss
 			}
+			s.logger.Printf("received %v, forwarding it to the hypervisor", sig)
 			if s.stopping != nil {
 				s.stopping()
 				s.stopping = nil
 			}
-			s.logger.Printf("received %v, forwarding it to the hypervisor", sig)
 			if err := cmd.Process.Signal(sig); err != nil && !errors.Is(err, os.ErrProcessDone) {
 				s.logger.Printf("forwarding %v to the hypervisor: %v", sig, err)
 			}

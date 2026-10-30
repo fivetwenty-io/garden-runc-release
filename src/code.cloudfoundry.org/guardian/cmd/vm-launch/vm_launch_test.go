@@ -764,9 +764,12 @@ var _ = Describe("supervisor", func() {
 		Expect(logBuf.String()).To(ContainSubstring("forwarding it to the hypervisor"))
 	})
 
-	It("runs the stopping hook once, at the first signal", func() {
+	It("runs the stopping hook once, at the first signal, after the signal's line", func() {
 		calls := 0
-		sup.stopping = func() { calls++ }
+		sup.stopping = func() {
+			calls++
+			sup.logger.Print("stopping")
+		}
 		sent := false
 		// Two signals once the traps are installed, which the first guest
 		// output proves.
@@ -783,6 +786,7 @@ var _ = Describe("supervisor", func() {
 		Expect(calls).To(Equal(1))
 		Expect(res.received).To(Equal(syscall.SIGINT))
 		Expect(codeOf(res)).To(Equal(130))
+		Expect(logBuf.String()).To(HavePrefix("received interrupt, forwarding it to the hypervisor\nstopping\nreceived terminated, forwarding it to the hypervisor\n"))
 	})
 
 	It("kills a hypervisor that ignores the forwarded signal", func() {

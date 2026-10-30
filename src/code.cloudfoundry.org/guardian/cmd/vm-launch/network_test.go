@@ -633,7 +633,23 @@ await open
 		p := strconv.Itoa(port)
 		Expect(strings.Count(logBuf.String(), "the guest listens on port "+p+"; it is open in the container\n")).To(Equal(2), logBuf.String())
 		Expect(strings.Count(logBuf.String(), "the guest no longer listens on port "+p+"; it is closed in the container\n")).To(Equal(1), logBuf.String())
+		Expect(logBuf.String()).To(HaveSuffix("the guest has stopped, so port " + p + " closes in the container\n"))
 		Expect(os.ReadDir(tmp)).To(BeEmpty())
+	})
+
+	It("logs that an open port closes before its exit line when the hypervisor stops", func() {
+		port := freePort()
+		p := strconv.Itoa(port)
+		portHypervisor(filepath.Join(art, "firecracker/firecracker"), port, `listen 1
+await open
+exit 3
+`)
+		GinkgoT().Setenv("PORT", p)
+
+		Expect(runVM(backend.VMFirecracker)).To(Equal(exitHypervisorFailed), logBuf.String())
+		Expect(logBuf.String()).To(HaveSuffix("the guest listens on port " + p + "; it is open in the container\n" +
+			"the guest has stopped, so port " + p + " closes in the container\n" +
+			"hypervisor failed with exit status 3 before the guest reported a status; exiting " + strconv.Itoa(exitHypervisorFailed) + "\n"))
 	})
 
 	It("adds QEMU's forwarding rule when the guest listens and removes it when it stops", func() {
@@ -658,6 +674,7 @@ sleep 0.3
 		p := strconv.Itoa(port)
 		Expect(logBuf.String()).To(ContainSubstring("the guest listens on port " + p + "; it is open in the container\n"))
 		Expect(logBuf.String()).To(ContainSubstring("the guest no longer listens on port " + p + "; it is closed in the container\n"))
+		Expect(logBuf.String()).NotTo(ContainSubstring("closes in the container"))
 		Expect(logBuf.String()).NotTo(ContainSubstring("QMP"))
 	})
 
@@ -691,9 +708,21 @@ exit 0
 		Expect(cmd.ProcessState.Sys().(syscall.WaitStatus).Signaled()).To(BeFalse(), stderr.String())
 		Expect(cmd.ProcessState.ExitCode()).To(Equal(143), stderr.String())
 		Expect(os.ReadFile(qmpLog)).To(Equal([]byte(qmpCapabilities + "\n" + hostfwdAdd(2, port) + "\n" + hostfwdRemove(3, port) + "\n")))
-		Expect(stderr.String()).To(HaveSuffix("vm-launch: the guest listens on port " + p + "; it is open in the container\n" +
-			"vm-launch: received terminated, forwarding it to the hypervisor\n" +
-			"vm-launch: stopped by terminated before the guest reported a status; exiting 143\n"))
+		// The gate logs the open while the signal comes, so either line may
+		// come first. The close follows both, and is logged at shutDown, or
+		// at the gate's end when QEMU exits before the gate reads the reply.
+		lines := strings.SplitAfter(stderr.String(), "\n")
+		opened := slices.Index(lines, "vm-launch: the guest listens on port "+p+"; it is open in the container\n")
+		received := slices.Index(lines, "vm-launch: received terminated, forwarding it to the hypervisor\n")
+		closed := slices.IndexFunc(lines, func(l string) bool {
+			return l == "vm-launch: vm-launch is stopping; port "+p+" is closed in the container\n" ||
+				l == "vm-launch: the guest has stopped, so port "+p+" closes in the container\n"
+		})
+		Expect([]int{opened, received, closed}).NotTo(ContainElement(-1), stderr.String())
+		Expect(closed).To(BeNumerically(">", max(opened, received)), stderr.String())
+		Expect(strings.Count(stderr.String(), "it is open in the container")).To(Equal(1), stderr.String())
+		Expect(strings.Count(stderr.String(), "closed in the container")+strings.Count(stderr.String(), "closes in the container")).To(Equal(1), stderr.String())
+		Expect(stderr.String()).To(HaveSuffix("\nvm-launch: stopped by terminated before the guest reported a status; exiting 143\n"))
 	})
 
 	It("names the port conflict when QEMU cannot add the forwarding rule, and keeps the guest running", func() {

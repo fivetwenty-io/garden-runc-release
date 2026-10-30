@@ -67,6 +67,10 @@ func isPortConflict(err error) bool {
 // that failed took effect, so it closes the port of unknown state before it
 // opens it, which also clears a QEMU forwarding rule that an open which
 // timed out added late.
+//
+// Each change that succeeds is logged, so the gate's last line says whether
+// the port is open. A close at shutDown is logged as vm-launch stopping, and
+// end logs that the port closes when the last line said it was open.
 type portGate struct {
 	opener portOpener
 	port   int
@@ -81,6 +85,11 @@ type portGate struct {
 	ended    chan struct{}
 	endOnce  sync.Once
 	done     chan struct{}
+
+	// shownOpen is set while the gate's last line about the port said it
+	// is open. Only the loop writes it, and end reads it once the loop
+	// has returned.
+	shownOpen bool
 }
 
 // backoff is how long the gate waits before it tries a failed change again:
@@ -148,10 +157,17 @@ func (g *portGate) shutDown() {
 }
 
 // end stops the gate once the hypervisor has exited and waits for it. It
-// leaves the port as it is: the end of QEMU removed its forwarding rule, and
-// closing the proxy closes its listener.
+// leaves the port as it is, because the end of QEMU removed its forwarding
+// rule and closing the proxy closes its listener. When the gate's last line
+// said that the port is open, end logs that it closes.
 func (g *portGate) end() {
-	g.endOnce.Do(func() { close(g.ended) })
+	g.endOnce.Do(func() {
+		close(g.ended)
+		<-g.done
+		if g.shownOpen {
+			g.logger.Printf("the guest has stopped, so port %d closes in the container", g.port)
+		}
+	})
 	<-g.done
 }
 
@@ -203,11 +219,18 @@ func (g *portGate) loop() {
 			} else {
 				wait, failing = g.retry.first, false
 				switch {
-				case shut:
 				case goal:
-					g.logf("the guest listens on port %d; it is open in the container", g.port)
+					if g.logf("the guest listens on port %d; it is open in the container", g.port) {
+						g.shownOpen = true
+					}
+				case shut:
+					if g.logf("vm-launch is stopping; port %d is closed in the container", g.port) {
+						g.shownOpen = false
+					}
 				default:
-					g.logf("the guest no longer listens on port %d; it is closed in the container", g.port)
+					if g.logf("the guest no longer listens on port %d; it is closed in the container", g.port) {
+						g.shownOpen = false
+					}
 				}
 			}
 		}
@@ -271,12 +294,15 @@ func (g *portGate) logFailure(open bool, err error) {
 }
 
 // logf logs a line unless the gate has ended, when a change can fail only
-// because the hypervisor is gone.
-func (g *portGate) logf(format string, args ...any) {
+// because the hypervisor is gone and end has the last word on the port. It
+// reports whether it logged the line.
+func (g *portGate) logf(format string, args ...any) bool {
 	select {
 	case <-g.ended:
+		return false
 	default:
 		g.logger.Printf(format, args...)
+		return true
 	}
 }
 

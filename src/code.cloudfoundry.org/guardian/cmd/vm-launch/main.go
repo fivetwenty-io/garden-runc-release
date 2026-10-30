@@ -457,6 +457,7 @@ func run(argv []string, logger *log.Logger) int {
 
 	cmd := newHypervisorCmd(hvArgv, files)
 	sup := supervisor{stdout: os.Stdout, logger: logger, signals: sigs, grace: killGrace, started: closeInherited}
+	var gate *portGate
 	if nw.port > 0 {
 		var opener portOpener
 		if cfg.backend == backend.VMFirecracker {
@@ -468,12 +469,16 @@ func run(argv []string, logger *log.Logger) int {
 		}
 		// The gate ends before the proxy closes and before the monitor
 		// closes, because deferred calls run last first.
-		gate := startPortGate(opener, nw.port, gateRetry, logger)
+		gate = startPortGate(opener, nw.port, gateRetry, logger)
 		defer gate.end()
 		sup.stopping = gate.shutDown
 		sup.listen = gate.set
 	}
 	res, err := sup.run(cmd, nonce)
+	if gate != nil {
+		// The gate's last line about the port comes before the exit line.
+		gate.end()
+	}
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError

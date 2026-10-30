@@ -364,7 +364,8 @@ var _ = Describe("the port gate", func() {
 		Consistently(opener.count, 100*time.Millisecond).Should(Equal(n))
 		Expect(opener.got()[1:]).To(HaveEach("close"))
 		Expect(logBuf.String()).To(Equal("the guest listens on port 8080; it is open in the container\n" +
-			"closing port 8080 in the container: nope\n"))
+			"closing port 8080 in the container: nope\n" +
+			"vm-launch is stopping; port 8080 is closed in the container\n"))
 	})
 
 	It("closes the port for good at shutDown", func() {
@@ -377,7 +378,8 @@ var _ = Describe("the port gate", func() {
 		gate.set(false)
 		gate.set(true)
 		Consistently(opener.got, 100*time.Millisecond).Should(Equal([]string{"open", "close"}))
-		Expect(logBuf.String()).To(Equal("the guest listens on port 8080; it is open in the container\n"))
+		Expect(logBuf.String()).To(Equal("the guest listens on port 8080; it is open in the container\n" +
+			"vm-launch is stopping; port 8080 is closed in the container\n"))
 	})
 
 	It("never opens a port that was closed when shutDown came", func() {
@@ -387,7 +389,7 @@ var _ = Describe("the port gate", func() {
 		Consistently(opener.got, 100*time.Millisecond).Should(BeEmpty())
 	})
 
-	It("leaves the port as it is at end, and is silent after it", func() {
+	It("leaves the port as it is at end, says that an open port closes, and is silent after it", func() {
 		start()
 		gate.set(true)
 		Eventually(opener.got).Should(Equal([]string{"open"}))
@@ -398,7 +400,19 @@ var _ = Describe("the port gate", func() {
 		gate.set(false)
 		gate.shutDown()
 		Consistently(opener.got, 100*time.Millisecond).Should(Equal([]string{"open"}))
-		Expect(logBuf.String()).To(Equal("the guest listens on port 8080; it is open in the container\n"))
+		Expect(logBuf.String()).To(Equal("the guest listens on port 8080; it is open in the container\n" +
+			"the guest has stopped, so port 8080 closes in the container\n"))
+	})
+
+	It("says nothing at end when its last line said that the port is closed", func() {
+		start()
+		gate.set(true)
+		Eventually(opener.got).Should(Equal([]string{"open"}))
+		gate.set(false)
+		Eventually(logBuf.String).Should(HaveSuffix("it is closed in the container\n"))
+		gate.end()
+		Expect(logBuf.String()).To(Equal("the guest listens on port 8080; it is open in the container\n" +
+			"the guest no longer listens on port 8080; it is closed in the container\n"))
 	})
 
 	It("ends while an open is in progress without logging its outcome", func() {
