@@ -1161,6 +1161,47 @@ echo() { if [ -z "${rvm_failed_once:-}" ]; then rvm_failed_once=1; return 1; fi;
 		Expect(string(out)).To(Equal("watch=[]\n"))
 	})
 
+	// The other specs of the watcher replace its pause, so none of them
+	// shows that the watcher waits between its looks. A watcher that did not
+	// would look at both tables in a tight loop for the life of the VM and
+	// still report every change correctly.
+	DescribeTable("waits about a second in each pause, with the FIFO and without it",
+		func(withFIFO bool) {
+			shell := guestBusyboxShell()
+			tick := filepath.Join(GinkgoT().TempDir(), "no-tick")
+			if withFIFO {
+				tick = newTick()
+			}
+			// The watcher's own text from the choice of the pause up to
+			// the start of its loop, run as the watcher runs it, in a
+			// subshell with its stdin on /dev/null.
+			watch := watchOnStdout(tick)
+			from, to := strings.Index(watch, "\t\tif [ -p "), strings.Index(watch, "\n\t\trvm_up=0\n")
+			Expect(from).To(BeNumerically(">=", 0), watch)
+			Expect(to).To(BeNumerically(">", from), watch)
+			script := "(\n" + watch[from:to] + `
+		if [ -p /proc/self/fd/3 ]; then echo fifo=open; else echo fifo=none; fi
+		rvm_pause
+		rvm_pause
+		echo paused
+) </dev/null
+`
+			began := time.Now()
+			out, err := runBounded(shell.argv[0], append(shell.argv[1:], "-c", script),
+				[]string{"PATH=" + watcherPath(shell)})
+			elapsed := time.Since(began)
+			Expect(err).NotTo(HaveOccurred(), string(out))
+			want := "fifo=none\npaused\n"
+			if withFIFO {
+				want = "fifo=open\npaused\n"
+			}
+			Expect(string(out)).To(Equal(want))
+			Expect(elapsed).To(BeNumerically(">=", 1800*time.Millisecond), "two pauses took %v", elapsed)
+		},
+		Entry("waits on the FIFO", true),
+		Entry("waits with sleep when the guest has no FIFO", false),
+	)
+
 	// startWatcher starts script in shell, with the watcher's port and its
 	// own process group, and returns the command, a pipe to its stdin, and
 	// its stdout lines. A cleanup kills the whole process group, because
