@@ -312,6 +312,20 @@ echo "init=$(sed -n 's/^Max open files *\([0-9]*\) *\([0-9]*\).*/\1 \2/p' /proc/
 		Expect(out).To(ContainSubstring(exitTag(testNonce) + "0"))
 	})
 
+	It("turns off console echo and starts the stop reader, which runs beside the command with the oom killer kept off it", func() {
+		out := bootRealGuest(taskGuest(`echo "echo_off=$(stty -a </dev/console | tr ' ;' '\n\n' | grep -cx -- -echo)"
+echo "oom_protected=$(grep -lx -- -1000 /proc/[0-9]*/oom_score_adj 2>/dev/null | wc -l)"
+echo "app=$(cat /rvm/app-pid) self=$$"`))
+		Expect(out).NotTo(ContainSubstring("turning off console echo failed"))
+		Expect(out).To(MatchRegexp(`(?m)^echo_off=1\r?$`))
+		// The stop reader is the one process that the oom killer never picks.
+		Expect(out).To(MatchRegexp(`(?m)^oom_protected=1\r?$`))
+		m := regexp.MustCompile(`(?m)^app=(\d+) self=(\d+)\r?$`).FindStringSubmatch(out)
+		Expect(m).NotTo(BeNil(), out)
+		Expect(m[1]).To(Equal(m[2]), "the recorded pid is the command's shell")
+		Expect(out).To(ContainSubstring(exitTag(testNonce) + "0"))
+	})
+
 	It("gives the command a /dev/shm tmpfs of half the guest's memory, mounted as Garden mounts it", func() {
 		out := bootRealGuest(taskGuest(`grep ' /dev/shm ' /proc/mounts
 ls -ld /dev/shm

@@ -990,7 +990,7 @@ var _ = Describe("the guest listen watcher", func() {
 			return "/usr/bin:/bin"
 		}
 		bin := guestBin(shell)
-		for _, applet := range []string{"printf", "sleep", "kill"} {
+		for _, applet := range []string{"printf", "kill"} {
 			Expect(os.Symlink(shell.argv[0], filepath.Join(bin, applet))).To(Succeed())
 		}
 		return bin

@@ -87,22 +87,25 @@ func sourceAndDumpEnv(shell []string, file string) map[string]string {
 	return parseEnvDump(out)
 }
 
-// guestBin returns a directory holding sh for shell, and the cat that the
-// command line of /init reads /rvm/cmd with, to be the whole PATH of a guest
-// run, as /bin is in the guest. The guest's busybox runs cat as an applet of
-// the same binary; /bin/sh gets the host's cat.
+// guestBin returns a directory holding sh for shell, the cat that the
+// command line of /init reads /rvm/cmd with, and the sleep that the stop
+// reader polls with, to be the whole PATH of a guest run, as /bin is in the
+// guest. The guest's busybox runs cat and sleep as applets of the same
+// binary; /bin/sh gets the host's.
 func guestBin(shell guestShell) string {
 	bin := filepath.Join(GinkgoT().TempDir(), "bin")
 	Expect(os.Mkdir(bin, 0o755)).To(Succeed())
 	// busybox runs as the applet its link names, as it does in the guest.
 	Expect(os.Symlink(shell.argv[0], filepath.Join(bin, "sh"))).To(Succeed())
-	cat := shell.argv[0]
-	if shell.argv[0] == hostShell().argv[0] {
-		var err error
-		cat, err = exec.LookPath("cat")
-		Expect(err).NotTo(HaveOccurred())
+	for _, tool := range []string{"cat", "sleep"} {
+		path := shell.argv[0]
+		if shell.argv[0] == hostShell().argv[0] {
+			var err error
+			path, err = exec.LookPath(tool)
+			Expect(err).NotTo(HaveOccurred())
+		}
+		Expect(os.Symlink(path, filepath.Join(bin, tool))).To(Succeed())
 	}
-	Expect(os.Symlink(cat, filepath.Join(bin, "cat"))).To(Succeed())
 	return bin
 }
 
@@ -575,9 +578,13 @@ var _ = Describe("the guest command line of /init", func() {
 	// initTail is /init from the environment checks on, with the guest paths
 	// replaced and reboot turned into a line the spec can see. The limits
 	// /rvm/limits would set are the shell's own, which any user may set.
+	// The stop reader reads /dev/null, so it ends at once without a request
+	// (see "the stop reader" for its runs).
 	initTail := func(paths *strings.Replacer, volume bool) string {
 		script := initScript(testNonce, volume)
 		tail := script[strings.Index(script, guestEnvChecks):]
+		Expect(strings.Count(tail, guestStopReader(testNonce))).To(Equal(1))
+		tail = strings.Replace(tail, guestStopReader(testNonce), stopReaderAt("/dev/null", filepath.Join(GinkgoT().TempDir(), "oom_score_adj")), 1)
 		if volume {
 			tail = strings.Replace(tail, guestVolumeSetup, "", 1)
 			tail = strings.Replace(tail, guestVolumeTeardown, "", 1)

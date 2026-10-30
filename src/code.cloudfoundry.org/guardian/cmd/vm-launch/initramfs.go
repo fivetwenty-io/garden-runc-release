@@ -116,37 +116,48 @@ func startTag(nonce string) string  { return "RVM_START_" + nonce }
 func exitTag(nonce string) string   { return "RVM_EXIT_" + nonce + "=" }
 func listenTag(nonce string) string { return "RVM_LISTEN_" + nonce + "=" }
 
+// stopTag is the stop request, the one line vm-launch writes to the guest's
+// serial console, which the guest's stop reader acts on (see
+// guestStopReader). The nonce frames the request, so no other console input
+// matches it by accident. It is no secret from the guest command, which can
+// read it from /init, and a forged request only stops that command, which
+// it can do anyway.
+func stopTag(nonce string) string { return "RVM_STOP_" + nonce }
+
 // initScript is the guest /init. It runs the command with stdin from
 // /dev/null (the serial console never delivers EOF), reports its status on
 // the console, and reboots: with -no-reboot (QEMU) or reboot=k (Firecracker)
 // that ends the hypervisor. poweroff -f hangs Firecracker, so it is not used.
 //
 // Right after the mounts, /init defines rvm_fail, which every setup step
-// uses. It then mounts /dev/shm, brings up lo and eth0 from /rvm/net (in
-// every guest, a task's included), prepares the open-files limit from
-// /rvm/limits, and checks that /rvm/env sources. A guest with a volume
-// then formats the volume image when it is blank and mounts it. When a
-// setup step fails, /init reboots before the start tag, so vm-launch
-// reports a guest that never started its command and shows the console
-// output, which ends with the failed step.
+// uses, and turns off console echo. It then mounts /dev/shm, brings up lo
+// and eth0 from /rvm/net (in every guest, a task's included), prepares the
+// open-files limit from /rvm/limits, and checks that /rvm/env sources. A
+// guest with a volume then formats the volume image when it is blank and
+// mounts it. When a setup step fails, /init reboots before the start tag, so
+// vm-launch reports a guest that never started its command and shows the
+// console output, which ends with the failed step. Last before the start
+// tag, /init starts the stop reader (see guestStopReader), which /init stops
+// again once the command has ended.
 //
 // The command runs in a subshell that records its pid, sets its open-files
 // limit, sources /rvm/env, and then becomes the shell that runs /rvm/cmd
-// with sh -c, so its status is the command's (see guestRunCommand). /init writes the exit line through its own open of
-// /dev/console, because the command may have left the console that it
-// shares with /init non-blocking, and through the shared console only when
-// that open fails. The guest environment applies only inside that subshell,
-// never to /init's own steps, such as the unquoted status in the exit line
-// or the volume teardown. A guest with a port watches, while the command
-// runs, whether anything listens on it (see guestListenWatch). With a
-// volume, /init syncs and unmounts it after the command and before it
-// reports the status.
+// with sh -c, so its status is the command's (see guestRunCommand). /init
+// writes the exit line through its own open of /dev/console, because the
+// command may have left the console that it shares with /init non-blocking,
+// and through the shared console only when that open fails. The guest
+// environment applies only inside that subshell, never to /init's own steps,
+// such as the unquoted status in the exit line or the volume teardown. A
+// guest with a port watches, while the command runs, whether anything
+// listens on it (see guestListenWatch). With a volume, /init syncs and
+// unmounts it after the command and before it reports the status.
 func initScript(nonce string, volume bool) string {
-	setup := guestFailFunc + guestShmSetup + guestNetworkSetup + guestLimitsSetup + guestEnvChecks
+	setup := guestFailFunc + guestConsoleSetup + guestShmSetup + guestNetworkSetup + guestLimitsSetup + guestEnvChecks
 	if volume {
 		setup += guestVolumeSetup
 	}
-	run := guestListenWatch(nonce) + guestRunCommand + "rvm_status=$?\n" + guestListenStop
+	setup += guestStopReader(nonce)
+	run := guestListenWatch(nonce) + guestRunCommand + guestRunStatus + guestStopReaderStop + guestListenStop
 	if volume {
 		run += guestVolumeTeardown
 	}
@@ -161,6 +172,62 @@ mount -t devtmpfs dev /dev 2>/dev/null
 ` + setup + `echo ` + startTag(nonce) + "\n" + run + `reboot -f
 `
 }
+
+// guestConsoleSetup turns off echo on the guest's console, so that the
+// stop request vm-launch writes to it never shows in the command's output.
+// A console that keeps echo on still delivers the request, so a failure only
+// warns.
+const guestConsoleSetup = `stty -echo </dev/console || echo "vm-launch guest setup: turning off console echo failed; a stop request will appear in the output"
+`
+
+// guestStopReader starts, in every guest, the background stop reader, which
+// sends SIGTERM to the command's top process when vm-launch writes the stop
+// request (see stopTag) to the console, as runC sends SIGTERM to a
+// container's first process. It starts before the start tag, so it is in
+// place before vm-launch may write the request, and a request that comes
+// before the reader opens the console waits in the console's input buffer.
+// The reader compares each console line, blanks and backslashes kept, with
+// the request exactly and never evaluates one. It acts on the first request, and then it exits.
+//
+// The command's subshell records its pid in guestAppPid as it starts (see
+// guestRunCommand), so the reader polls for that file every 50 ms when the
+// request comes before it. That poll runs sleep; everything else in the
+// reader is the shell's builtins, so, like the listen watcher, it keeps
+// working when the command has used up the processes the guest can start.
+// The reader also sets its own oom_score_adj to -1000, so the guest kernel
+// never picks it when the guest runs out of memory.
+//
+// /init stops the reader as soon as the command ends (see
+// guestStopReaderStop), so a late request can never signal another process
+// or /init's own steps after the command, such as the volume teardown. Its
+// standard input is /dev/null; it opens the console for itself.
+func guestStopReader(nonce string) string {
+	return `(
+	echo -1000 >/proc/self/oom_score_adj
+	rvm_stop=
+	while IFS= read -r rvm_line; do
+		if [ "$rvm_line" = "` + stopTag(nonce) + `" ]; then
+			rvm_stop=1
+			break
+		fi
+	done </dev/console
+	[ -n "$rvm_stop" ] || exit 0
+	until read -r rvm_app 2>/dev/null <` + guestAppPid + ` && [ -n "$rvm_app" ]; do
+		sleep 0.05
+	done
+	kill -TERM "$rvm_app"
+) </dev/null &
+rvm_reader=$!
+`
+}
+
+// guestStopReaderStop stops the stop reader once the command has ended and
+// its status is kept in rvm_status. A reader that has already acted on a
+// request has exited, and kill then fails quietly. The shell's report of
+// the reader that the kill ended goes to /dev/null.
+const guestStopReaderStop = `kill "$rvm_reader" 2>/dev/null
+wait "$rvm_reader" 2>/dev/null
+`
 
 // guestFailFunc defines rvm_fail, which a setup step calls when it fails: it
 // names the step on the console and reboots before the start tag.
@@ -356,8 +423,20 @@ const guestEnvChecks = `( . /rvm/env ) || rvm_fail "reading /rvm/env failed"
 // substitution drops the trailing newlines of /rvm/cmd, which the shell
 // ignores anyway. A pid that cannot be recorded is reported, and the
 // command still runs.
-const guestRunCommand = "( { read -r rvm_self rvm_rest </proc/self/stat && echo \"$rvm_self\" >" + guestAppPid + "; } || echo \"vm-launch guest: recording the command's pid in " + guestAppPid + " failed; a stop request cannot reach the command\"; " +
+//
+// /init waits for the subshell with its own standard error on /dev/null,
+// and the subshell takes /init's standard error back from fd 3, which it
+// then closes, so the command never sees fd 3. A shell that is not
+// interactive reports a foreground job that a signal ended, such as
+// "Terminated" after a stop request, on its standard error, and that line is
+// the shell's, not the command's. command keeps a failed redirection from
+// ending /init or the subshell; the command then still runs.
+const guestRunCommand = "command exec 3>&2 2>/dev/null\n( command exec 2>&3 3>&-; { read -r rvm_self rvm_rest </proc/self/stat && echo \"$rvm_self\" >" + guestAppPid + "; } || echo \"vm-launch guest: recording the command's pid in " + guestAppPid + " failed; a stop request cannot reach the command\"; " +
 	guestSetLimits + " && . /rvm/env && exec sh -c \"$(cat /rvm/cmd)\" ) </dev/null\n"
+
+// guestRunStatus keeps the command's status in rvm_status and gives /init
+// its standard error back (see guestRunCommand).
+const guestRunStatus = "rvm_status=$?\ncommand exec 2>&3 3>&-\n"
 
 // guestAppPid is the file in which the command's subshell records its pid,
 // which is the pid of the command's top process.
