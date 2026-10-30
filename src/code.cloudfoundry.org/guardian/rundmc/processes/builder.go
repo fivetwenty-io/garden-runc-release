@@ -41,6 +41,14 @@ const (
 	// gid with setgroups. No process of a vm-* container keeps it.
 	CapSetGID = "CAP_SETGID"
 
+	// CapSetUID lets a process change its user ids. No helper process (pea) of
+	// a vm-* container keeps it.
+	CapSetUID = "CAP_SETUID"
+
+	// CapSysChroot lets a process call chroot. No helper process (pea) of a
+	// vm-* container keeps it.
+	CapSysChroot = "CAP_SYS_CHROOT"
+
 	// unconfinedApparmorProfile is the AppArmor label every policy namespace
 	// provides without a loaded profile. runc applies the container's profile
 	// to an exec'd process unless the process names a non-empty profile of its

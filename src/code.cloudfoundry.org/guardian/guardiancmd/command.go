@@ -773,6 +773,7 @@ func (cmd *CommonCommand) wireContainerizer(
 		BundleSaver:      bundleSaver,
 		ExecRunner:       peasExecRunner,
 		PeaCleaner:       peaCleaner,
+		BundleLoader:     peasBundleLoader,
 		GroupedRunsc:     runtimePolicy.IsAlternative(),
 	}
 

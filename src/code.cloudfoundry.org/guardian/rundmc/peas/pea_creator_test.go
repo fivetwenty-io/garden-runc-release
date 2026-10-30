@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"code.cloudfoundry.org/garden"
+	"code.cloudfoundry.org/guardian/backend"
 	"code.cloudfoundry.org/guardian/gardener/gardenerfakes"
 	"code.cloudfoundry.org/guardian/rundmc/depot/depotfakes"
 	"code.cloudfoundry.org/guardian/rundmc/goci"
@@ -436,6 +437,145 @@ var _ = Describe("PeaCreator", func() {
 					CPU:    processSpec.OverrideContainerLimits.CPU,
 					Memory: processSpec.OverrideContainerLimits.Memory,
 				}))
+			})
+		})
+	})
+
+	Describe("pea capabilities by sandbox backend", func() {
+		var (
+			bundleLoader *peasfakes.FakeBundleLoader
+			allCaps      []string
+		)
+
+		sandboxBundle := func(annotations map[string]string) goci.Bndl {
+			return goci.Bndl{Spec: specs.Spec{Annotations: annotations}}
+		}
+
+		runningBundleProcess := func() specs.Process {
+			_, _, bndl, _, _, _, _, _ := execRunner.RunPeaArgsForCall(0)
+			return bndl.Process()
+		}
+
+		BeforeEach(func() {
+			allCaps = []string{"CAP_CHOWN", "CAP_SETUID", "CAP_SETGID", "CAP_SYS_CHROOT", "CAP_KILL"}
+			builtProcess.Capabilities = &specs.LinuxCapabilities{
+				Bounding:    append([]string{}, allCaps...),
+				Effective:   append([]string{}, allCaps...),
+				Permitted:   append([]string{}, allCaps...),
+				Inheritable: append([]string{}, allCaps...),
+				Ambient:     append([]string{}, allCaps...),
+			}
+			bundleLoader = new(peasfakes.FakeBundleLoader)
+			peaCreator.BundleLoader = bundleLoader
+		})
+
+		for _, kind := range []backend.Kind{backend.VMQemu, backend.VMFirecracker} {
+			kind := kind
+
+			Context("when the sandbox runs on "+string(kind), func() {
+				BeforeEach(func() {
+					bundleLoader.LoadReturns(sandboxBundle(map[string]string{backend.AnnotationKey: string(kind)}), nil)
+					_, err := peaCreator.CreatePea(log, processSpec, pio, ctrHandle)
+					Expect(err).NotTo(HaveOccurred())
+				})
+
+				It("loads the sandbox's bundle", func() {
+					Expect(bundleLoader.LoadCallCount()).To(Equal(1))
+					_, handle := bundleLoader.LoadArgsForCall(0)
+					Expect(handle).To(Equal(ctrHandle))
+				})
+
+				It("drops CAP_SETUID, CAP_SETGID and CAP_SYS_CHROOT from every capability set", func() {
+					caps := runningBundleProcess().Capabilities
+					Expect(caps).NotTo(BeNil())
+					for name, set := range map[string][]string{
+						"bounding":    caps.Bounding,
+						"effective":   caps.Effective,
+						"permitted":   caps.Permitted,
+						"inheritable": caps.Inheritable,
+						"ambient":     caps.Ambient,
+					} {
+						Expect(set).To(Equal([]string{"CAP_CHOWN", "CAP_KILL"}), name)
+					}
+				})
+
+				It("sets NoNewPrivileges", func() {
+					Expect(runningBundleProcess().NoNewPrivileges).To(BeTrue())
+				})
+
+				It("does not change the process the builder returned", func() {
+					Expect(builtProcess.NoNewPrivileges).To(BeFalse())
+					Expect(builtProcess.Capabilities.Bounding).To(Equal(allCaps))
+				})
+			})
+		}
+
+		Context("when the process builder returns no capabilities", func() {
+			BeforeEach(func() {
+				builtProcess.Capabilities = nil
+				bundleLoader.LoadReturns(sandboxBundle(map[string]string{backend.AnnotationKey: string(backend.VMQemu)}), nil)
+				_, err := peaCreator.CreatePea(log, processSpec, pio, ctrHandle)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			It("still sets NoNewPrivileges and leaves capabilities unset", func() {
+				process := runningBundleProcess()
+				Expect(process.Capabilities).To(BeNil())
+				Expect(process.NoNewPrivileges).To(BeTrue())
+			})
+		})
+
+		Context("when the process builder already sets NoNewPrivileges on a VM sandbox", func() {
+			BeforeEach(func() {
+				builtProcess.NoNewPrivileges = true
+				bundleLoader.LoadReturns(sandboxBundle(map[string]string{backend.AnnotationKey: string(backend.VMQemu)}), nil)
+				_, err := peaCreator.CreatePea(log, processSpec, pio, ctrHandle)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			It("keeps NoNewPrivileges set", func() {
+				Expect(runningBundleProcess().NoNewPrivileges).To(BeTrue())
+			})
+		})
+
+		for name, annotations := range map[string]map[string]string{
+			"oci-runc":         {backend.AnnotationKey: string(backend.OCIRunc)},
+			"oci-gvisor":       {backend.AnnotationKey: string(backend.OCIGvisor)},
+			"no annotation":    {},
+			"nil annotations":  nil,
+			"empty annotation": {backend.AnnotationKey: ""},
+		} {
+			annotations := annotations
+
+			Context("when the sandbox backend is "+name, func() {
+				BeforeEach(func() {
+					bundleLoader.LoadReturns(sandboxBundle(annotations), nil)
+					_, err := peaCreator.CreatePea(log, processSpec, pio, ctrHandle)
+					Expect(err).NotTo(HaveOccurred())
+				})
+
+				It("leaves the process exactly as the builder returned it", func() {
+					process := runningBundleProcess()
+					Expect(process).To(Equal(*builtProcess))
+					Expect(process.Capabilities.Bounding).To(Equal(allCaps))
+					Expect(process.Capabilities.Ambient).To(Equal(allCaps))
+					Expect(process.NoNewPrivileges).To(BeFalse())
+				})
+			})
+		}
+
+		Context("when the sandbox's bundle cannot be loaded", func() {
+			var createErr error
+
+			BeforeEach(func() {
+				bundleLoader.LoadReturns(goci.Bndl{}, errors.New("no-bundle"))
+				_, createErr = peaCreator.CreatePea(log, processSpec, pio, ctrHandle)
+			})
+
+			It("returns a wrapped error and runs nothing", func() {
+				Expect(createErr).To(MatchError(ContainSubstring("determining-backend")))
+				Expect(createErr).To(MatchError(ContainSubstring("no-bundle")))
+				Expect(execRunner.RunPeaCallCount()).To(Equal(0))
 			})
 		})
 	})

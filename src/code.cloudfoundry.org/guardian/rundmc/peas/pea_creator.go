@@ -10,10 +10,12 @@ import (
 	"strings"
 
 	"code.cloudfoundry.org/garden"
+	"code.cloudfoundry.org/guardian/backend"
 	"code.cloudfoundry.org/guardian/gardener"
 	spec "code.cloudfoundry.org/guardian/gardener/container-spec"
 	"code.cloudfoundry.org/guardian/rundmc/depot"
 	"code.cloudfoundry.org/guardian/rundmc/goci"
+	"code.cloudfoundry.org/guardian/rundmc/processes"
 	"code.cloudfoundry.org/guardian/rundmc/runrunc"
 	"code.cloudfoundry.org/guardian/rundmc/users"
 	"code.cloudfoundry.org/lager/v3"
@@ -69,6 +71,9 @@ type PeaCreator struct {
 	ProcessBuilder   runrunc.ProcessBuilder
 	ExecRunner       ExecRunner
 	PeaCleaner       gardener.PeaCleaner
+	// BundleLoader reads the sandbox's bundle to find its execution backend.
+	// When nil, every pea is treated as running on an OCI backend.
+	BundleLoader BundleLoader
 	// GroupedRunsc creates image-backed runsc subcontainers: they use virtual
 	// parent namespaces rather than the Sentry's host PID, share the sandbox's
 	// limits and resolve named users from the new image. Stock peas retain
@@ -99,6 +104,15 @@ func (p *PeaCreator) CreatePea(log lager.Logger, processSpec garden.ProcessSpec,
 	privileged, err := p.PrivilegedGetter.Privileged(sandboxHandle)
 	if err != nil {
 		return errs("determining-privileged", err)
+	}
+
+	kind := backend.OCIRunc
+	if p.BundleLoader != nil {
+		sandboxBundle, err := p.BundleLoader.Load(log, sandboxHandle)
+		if err != nil {
+			return errs("determining-backend", err)
+		}
+		kind = backend.FromBundle(sandboxBundle)
 	}
 
 	if p.GroupedRunsc && processSpec.OverrideContainerLimits != nil && *processSpec.OverrideContainerLimits != (garden.ProcessLimits{}) {
@@ -200,6 +214,9 @@ func (p *PeaCreator) CreatePea(log lager.Logger, processSpec garden.ProcessSpec,
 	}
 
 	preparedProcess := p.ProcessBuilder.BuildProcess(bndl, processSpec, resolvedUser)
+	if backend.IsVM(kind) {
+		preparedProcess = confineVMPea(preparedProcess)
+	}
 	bndl = bndl.WithProcess(*preparedProcess)
 
 	extraCleanup := func() error {
@@ -214,6 +231,18 @@ func (p *PeaCreator) CreatePea(log lager.Logger, processSpec garden.ProcessSpec,
 	}
 
 	return proc, nil
+}
+
+// confineVMPea returns a copy of a pea's process for a VM sandbox. The pea
+// shares the sandbox's PID namespace with vm-launch, so it loses the
+// capabilities that change identity or root and may not gain privileges.
+func confineVMPea(process *specs.Process) *specs.Process {
+	confined := *process
+	for _, capability := range []string{processes.CapSetUID, processes.CapSetGID, processes.CapSysChroot} {
+		confined.Capabilities = processes.WithoutCapability(confined.Capabilities, capability)
+	}
+	confined.NoNewPrivileges = true
+	return &confined
 }
 
 func (p *PeaCreator) linuxNamespaces(log lager.Logger, sandboxHandle string, privileged bool) (map[string]string, error) {
