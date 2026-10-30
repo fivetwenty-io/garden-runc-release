@@ -307,7 +307,7 @@ var _ = Describe("guest network", func() {
 				Expect(idx).To(BeNumerically(">", 0), step)
 				Expect(idx).To(BeNumerically("<", start), step)
 			}
-			Expect(script).To(HaveSuffix("\n( ulimit -n \"$RVM_NOFILE_HARD\" && ulimit -S -n \"$RVM_NOFILE_SOFT\" && . /rvm/env && exec sh /rvm/cmd ) </dev/null\nrvm_status=$?\n" + guestListenStop + "echo RVM_EXIT_" + testNonce + "=$rvm_status\nreboot -f\n"))
+			Expect(script).To(HaveSuffix("\n( ulimit -n \"$RVM_NOFILE_HARD\" && ulimit -S -n \"$RVM_NOFILE_SOFT\" && . /rvm/env && exec sh /rvm/cmd ) </dev/null\nrvm_status=$?\n" + guestListenStop + "echo RVM_EXIT_" + testNonce + "=$rvm_status >/dev/console || echo RVM_EXIT_" + testNonce + "=$rvm_status\nreboot -f\n"))
 		})
 
 		It("sets the mtu of eth0 only when /rvm/net names one, and before it brings eth0 up", func() {

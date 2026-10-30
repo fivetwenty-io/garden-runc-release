@@ -132,7 +132,10 @@ func listenTag(nonce string) string { return "RVM_LISTEN_" + nonce + "=" }
 //
 // The command runs in a subshell that sets its open-files limit, sources
 // /rvm/env, and then becomes the shell that runs /rvm/cmd, so its status is
-// the command's. The guest environment applies only inside that subshell,
+// the command's. /init writes the exit line through its own open of
+// /dev/console, because the command may have left the console that it
+// shares with /init non-blocking, and through the shared console only when
+// that open fails. The guest environment applies only inside that subshell,
 // never to /init's own steps, such as the unquoted status in the exit line
 // or the volume teardown. A guest with a port watches, while the command
 // runs, whether anything listens on it (see guestListenWatch). With a
@@ -147,7 +150,8 @@ func initScript(nonce string, volume bool) string {
 	if volume {
 		run += guestVolumeTeardown
 	}
-	run += "echo " + exitTag(nonce) + "$rvm_status\n"
+	exit := "echo " + exitTag(nonce) + "$rvm_status"
+	run += exit + " >/dev/console || " + exit + "\n"
 	return `#!/bin/busybox sh
 /bin/busybox --install -s /bin
 export PATH=/bin

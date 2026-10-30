@@ -98,7 +98,9 @@ func guestBin(shell guestShell) string {
 }
 
 // guestFiles writes envFile and the command cmd where a guest run reads
-// them, and returns a replacer from the guest paths to them.
+// them, and returns a replacer from the guest paths to them. The guest's
+// console becomes the spec's stdout, which /init then opens on its own, as
+// it opens the console in the guest.
 func guestFiles(envFile, cmd string) *strings.Replacer {
 	dir := GinkgoT().TempDir()
 	Expect(os.WriteFile(filepath.Join(dir, "env"), []byte(envFile), 0o600)).To(Succeed())
@@ -107,6 +109,7 @@ func guestFiles(envFile, cmd string) *strings.Replacer {
 		"/rvm/env", filepath.Join(dir, "env"),
 		"/rvm/cmd", filepath.Join(dir, "cmd"),
 		"reboot -f", "echo REBOOT",
+		"/dev/console", "/dev/stdout",
 	)
 }
 

@@ -234,7 +234,7 @@ var _ = Describe("initramfs", func() {
 		script := initScript(testNonce, false)
 		Expect(script).To(HavePrefix("#!/bin/busybox sh\n"))
 		Expect(script).To(ContainSubstring("\necho RVM_START_" + testNonce + "\n"))
-		Expect(script).To(ContainSubstring("\n( ulimit -n \"$RVM_NOFILE_HARD\" && ulimit -S -n \"$RVM_NOFILE_SOFT\" && . /rvm/env && exec sh /rvm/cmd ) </dev/null\nrvm_status=$?\n" + guestListenStop + "echo RVM_EXIT_" + testNonce + "=$rvm_status\nreboot -f\n"))
+		Expect(script).To(ContainSubstring("\n( ulimit -n \"$RVM_NOFILE_HARD\" && ulimit -S -n \"$RVM_NOFILE_SOFT\" && . /rvm/env && exec sh /rvm/cmd ) </dev/null\nrvm_status=$?\n" + guestListenStop + "echo RVM_EXIT_" + testNonce + "=$rvm_status >/dev/console || echo RVM_EXIT_" + testNonce + "=$rvm_status\nreboot -f\n"))
 		Expect(script).NotTo(ContainSubstring("poweroff"))
 	})
 
