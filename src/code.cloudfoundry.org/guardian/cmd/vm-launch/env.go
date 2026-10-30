@@ -277,6 +277,42 @@ func rewriteVCAPApplication(raw string, lookup func(string) (string, bool), gues
 	return string(out), true
 }
 
+// diskLimitMiB returns VCAP_APPLICATION limits.disk, the app's disk quota in
+// MiB. Diego's value is a whole number of MiB. The error says why there is no
+// usable quota: VCAP_APPLICATION is unset or has no limits.disk, which is
+// what a task run by hand or a spec looks like, or it is not JSON, its
+// limits is not an object, or its limits.disk is not a positive whole
+// number. No error repeats a value.
+func diskLimitMiB(lookup func(string) (string, bool)) (int64, error) {
+	raw, ok := lookup(vcapApplicationEnv)
+	if !ok {
+		return 0, fmt.Errorf("%s is not set", vcapApplicationEnv)
+	}
+	var app struct {
+		Limits json.RawMessage `json:"limits"`
+	}
+	if err := json.Unmarshal([]byte(raw), &app); err != nil {
+		return 0, fmt.Errorf("%s is not a JSON object", vcapApplicationEnv)
+	}
+	if app.Limits == nil {
+		return 0, fmt.Errorf("%s has no limits.disk", vcapApplicationEnv)
+	}
+	var limits struct {
+		Disk json.RawMessage `json:"disk"`
+	}
+	if err := json.Unmarshal(app.Limits, &limits); err != nil {
+		return 0, fmt.Errorf("%s limits is not a JSON object", vcapApplicationEnv)
+	}
+	if limits.Disk == nil || string(limits.Disk) == "null" {
+		return 0, fmt.Errorf("%s has no limits.disk", vcapApplicationEnv)
+	}
+	limit, err := strconv.ParseInt(string(limits.Disk), 10, 64)
+	if err != nil || limit <= 0 {
+		return 0, fmt.Errorf("%s limits.disk is not a positive whole number of MiB", vcapApplicationEnv)
+	}
+	return limit, nil
+}
+
 // databaseURL returns DATABASE_URL for VCAP_SERVICES services as the
 // launcher derives it (buildpackapplifecycle databaseuri): the first
 // credentials uri that parses and whose scheme is in databaseSchemes, with

@@ -462,6 +462,88 @@ var _ = Describe("guest environment", func() {
 		})
 	})
 
+	Describe("limits.disk", func() {
+		diskOf := func(vcap string) (int64, error) {
+			return diskLimitMiB(envMap(map[string]string{"VCAP_APPLICATION": vcap}))
+		}
+		ccLimits := `{"application_id":"` + testAppID + `","application_name":"app","name":"app","space_name":"s",` +
+			`"limits":{"disk":1024,"fds":16384,"mem":512},"process_type":"web","host":"10.0.0.1","port":61000,"instance_index":9}`
+
+		DescribeTable("is the app's disk quota in MiB",
+			func(vcap string, want int64) {
+				got, err := diskOf(vcap)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(got).To(Equal(want))
+			},
+			Entry("next to the other limits", `{"limits":{"disk":1024,"fds":16384,"mem":512},"name":"app"}`, int64(1024)),
+			Entry("first among them", `{"limits":{"disk":2048,"mem":512}}`, int64(2048)),
+			Entry("the only limit", `{"limits":{"disk":1}}`, int64(1)),
+			Entry("a quota of many TiB", `{"limits":{"disk":9007199254740993}}`, int64(9007199254740993)),
+			Entry("after an unrelated disk key", `{"disk":7,"limits":{"disk":300}}`, int64(300)),
+			Entry("with white space", " {\n \"limits\" : { \"disk\" : 640 } }\n", int64(640)),
+			Entry("the cloud controller's own shape", ccLimits, int64(1024)),
+		)
+
+		DescribeTable("is reported as missing, apart from a real quota",
+			func(set bool, vcap string) {
+				env := map[string]string{}
+				if set {
+					env["VCAP_APPLICATION"] = vcap
+				}
+				got, err := diskLimitMiB(envMap(env))
+				Expect(got).To(BeZero())
+				Expect(err).To(HaveOccurred())
+			},
+			Entry("VCAP_APPLICATION unset", false, ""),
+			Entry("VCAP_APPLICATION empty", true, ""),
+			Entry("no limits", true, `{"name":"app"}`),
+			Entry("a null limits", true, `{"limits":null}`),
+			Entry("an empty limits", true, `{"limits":{}}`),
+			Entry("limits without disk", true, `{"limits":{"mem":512}}`),
+			Entry("a null disk", true, `{"limits":{"disk":null}}`),
+			Entry("JSON null", true, `null`),
+			Entry("limits that is not an object", true, `{"limits":"1024"}`),
+			Entry("limits that is a list", true, `{"limits":[1024]}`),
+			Entry("VCAP_APPLICATION that is not an object", true, `[{"limits":{"disk":1024}}]`),
+			Entry("VCAP_APPLICATION that is not JSON", true, `disk=1024`),
+			Entry("a disk quota in a string", true, `{"limits":{"disk":"1024"}}`),
+			Entry("a boolean", true, `{"limits":{"disk":true}}`),
+			Entry("zero", true, `{"limits":{"disk":0}}`),
+			Entry("a negative quota", true, `{"limits":{"disk":-1024}}`),
+			Entry("a fraction", true, `{"limits":{"disk":1024.5}}`),
+			Entry("a whole number written as a float", true, `{"limits":{"disk":1024.0}}`),
+			Entry("an exponent", true, `{"limits":{"disk":1e3}}`),
+			Entry("a list", true, `{"limits":{"disk":[1024]}}`),
+			Entry("an object", true, `{"limits":{"disk":{"mb":1024}}}`),
+			Entry("a number too large to hold", true, `{"limits":{"disk":99999999999999999999}}`),
+		)
+
+		It("says why, in a message that never holds a value", func() {
+			for vcap, want := range map[string]string{
+				`{"limits":{"disk":"sekret-value"}}`:    "VCAP_APPLICATION limits.disk is not a positive whole number of MiB",
+				`{"limits":"sekret-value"}`:             "VCAP_APPLICATION limits is not a JSON object",
+				`sekret-value`:                          "VCAP_APPLICATION is not a JSON object",
+				`{"limits":{"mem":1},"x":"sekret"}`:     "VCAP_APPLICATION has no limits.disk",
+				`{"limits":{"disk":null},"x":"sekret"}`: "VCAP_APPLICATION has no limits.disk",
+				`{"x":"sekret"}`:                        "VCAP_APPLICATION has no limits.disk",
+			} {
+				_, err := diskOf(vcap)
+				Expect(err).To(MatchError(want), vcap)
+			}
+			_, err := diskLimitMiB(envMap(nil))
+			Expect(err).To(MatchError("VCAP_APPLICATION is not set"))
+		})
+
+		It("survives the launcher's rewrite, which changes limits.mem alone", func() {
+			env := map[string]string{"VCAP_APPLICATION": `{"limits":{"disk":4096,"mem":512}}`}
+			rewritten, ok := rewriteVCAPApplication(env["VCAP_APPLICATION"], envMap(env), 320)
+			Expect(ok).To(BeTrue())
+			got, err := diskOf(rewritten)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(got).To(Equal(int64(4096)))
+		})
+	})
+
 	Describe("MEMORY_LIMIT", func() {
 		It("becomes the guest size when it is set", func() {
 			Expect(build(map[string]string{"MEMORY_LIMIT": "512m"})).To(Equal("export MEMORY_LIMIT='320m'\n"))
