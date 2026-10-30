@@ -367,6 +367,7 @@ var _ = Describe("ExternalNetworker", func() {
 					},
 					Entry("a dotted-quad address", "10.255.0.7", "10.255.0.7"),
 					Entry("an IPv4-mapped IPv6 address, in dotted-quad form", "::ffff:10.255.0.7", "10.255.0.7"),
+					Entry("a private overlay address", "10.255.34.2", "10.255.34.2"),
 				)
 
 				DescribeTable("when the plugin reports no usable IPv4 container IP",
@@ -385,6 +386,10 @@ var _ = Describe("ExternalNetworker", func() {
 					Entry("an IPv6 address", "fd00::5", `"fd00::5", which is not an IPv4 address`),
 					Entry("a loopback address", "127.0.0.2", `"127.0.0.2", which is not an IPv4 address`),
 					Entry("the unspecified address", "0.0.0.0", `"0.0.0.0", which is not an IPv4 address`),
+					Entry("the address of tap0", "169.254.100.1", `"169.254.100.1", which is not an IPv4 address`),
+					Entry("the address of the guest", "169.254.100.2", `"169.254.100.2", which is not an IPv4 address`),
+					Entry("a multicast address", "224.0.0.1", `"224.0.0.1", which is not an IPv4 address`),
+					Entry("the limited broadcast address", "255.255.255.255", `"255.255.255.255", which is not an IPv4 address`),
 				)
 
 				It("sets no per-device reverse path filter, which the inherited all setting would override", func() {

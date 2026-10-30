@@ -368,12 +368,15 @@ func (p *externalBinaryNetworker) containerMTU(log lager.Logger, pid int) (int, 
 // guestEgressSource returns the address guest egress is translated to: the
 // container IP the network plugin reported, in dotted-quad form. The guest
 // network is IPv4 only, so a container without an IPv4 container IP has none.
+// Private ranges such as the 10.255.0.0/16 that silk uses are fine. Loopback,
+// unspecified, link-local (which includes tap0's own 169.254.100.1), multicast,
+// and broadcast addresses are not addresses a packet can leave with.
 func guestEgressSource(containerIP string) (string, error) {
 	if containerIP == "" {
 		return "", fmt.Errorf("the network plugin reported no %s", gardener.ContainerIPKey)
 	}
 	ip := net.ParseIP(containerIP).To4()
-	if ip == nil || ip.IsUnspecified() || ip.IsLoopback() {
+	if ip == nil || !ip.IsGlobalUnicast() {
 		return "", fmt.Errorf("the network plugin reported %s %q, which is not an IPv4 address guest egress can leave with", gardener.ContainerIPKey, containerIP)
 	}
 	return ip.String(), nil
