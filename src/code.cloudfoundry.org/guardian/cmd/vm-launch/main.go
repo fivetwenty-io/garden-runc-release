@@ -467,8 +467,11 @@ func run(argv []string, logger *log.Logger) int {
 		} else {
 			opener = qmpPort{monitor: newQMPMonitor(monitor), port: nw.port}
 		}
-		// The gate ends before the proxy closes and before the monitor
-		// closes, because deferred calls run last first.
+		// The explicit gate.end after sup.run is the one that ends the gate,
+		// as it must come before the exit line. A panic out of sup.run skips
+		// it, and this deferred call covers that one path: deferred calls
+		// run last first, so the gate still ends before the proxy closes
+		// and before the monitor closes. A second end is a no-op.
 		gate = startPortGate(opener, nw.port, gateRetry, logger)
 		defer gate.end()
 		sup.stopping = gate.shutDown
