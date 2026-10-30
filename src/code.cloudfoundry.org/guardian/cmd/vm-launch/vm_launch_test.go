@@ -832,6 +832,15 @@ var _ = Describe("run", func() {
 		Expect(code).To(Equal(exitLaunchError))
 		Expect(logBuf.String()).To(ContainSubstring(art + "/kernel/vmlinux"))
 	})
+
+	It("leaves SIGPIPE at its default for the processes started after it", func() {
+		Expect(run([]string{"--backend", "nope", "--", "true"}, log.New(io.Discard, "", 0))).To(Equal(exitLaunchError))
+		out, err := exec.Command("/bin/sh", "-c", "grep '^SigIgn:' /proc/self/status").Output()
+		Expect(err).NotTo(HaveOccurred())
+		mask, err := strconv.ParseUint(strings.TrimSpace(strings.TrimPrefix(string(out), "SigIgn:")), 16, 64)
+		Expect(err).NotTo(HaveOccurred(), string(out))
+		Expect(mask&(1<<(syscall.SIGPIPE-1))).To(BeZero(), "a child of vm-launch's process ignores SIGPIPE: %s", out)
+	})
 })
 
 var _ = Describe("run with a stdout that nobody reads", func() {

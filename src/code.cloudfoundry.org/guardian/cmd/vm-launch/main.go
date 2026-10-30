@@ -284,13 +284,16 @@ func run(argv []string, logger *log.Logger) int {
 	}
 
 	// The guest's output goes to stdout, which a dying reader can break. Go
-	// kills a process whose write to fd 1 or 2 hits a broken pipe, unless SIGPIPE
-	// is caught or ignored. Ignoring it turns that into an EPIPE error that the
-	// serial filter keeps, so the guest keeps draining and the exit status
-	// stays the guest's. The hypervisor inherits the setting; QEMU and
-	// Firecracker both ignore SIGPIPE themselves.
-	signal.Ignore(syscall.SIGPIPE)
-	defer signal.Reset(syscall.SIGPIPE)
+	// kills a process whose write to fd 1 or 2 hits a broken pipe, unless
+	// SIGPIPE is caught or ignored. Catching it turns that into an EPIPE
+	// error that the serial filter keeps, so the guest keeps draining and the
+	// exit status stays the guest's. vm-launch catches SIGPIPE rather than
+	// ignoring it, because an ignored signal stays ignored across exec, and
+	// the processes vm-launch starts should get SIGPIPE at its default. QEMU
+	// and Firecracker both ignore SIGPIPE themselves.
+	pipes := make(chan os.Signal, 1)
+	signal.Notify(pipes, syscall.SIGPIPE)
+	defer signal.Stop(pipes)
 
 	sigs := make(chan os.Signal, 4)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
