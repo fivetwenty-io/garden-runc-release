@@ -23,6 +23,26 @@ var testDialPolicy = dialPolicy{
 	giveUp:         5 * time.Second,
 }
 
+// startProxy returns a proxy for upstream that listens on listenAddr.
+func startProxy(listenAddr, upstream string, policy dialPolicy, logger *log.Logger) (*tcpProxy, error) {
+	p := newProxy(upstream, policy, logger)
+	if err := p.Listen(listenAddr); err != nil {
+		p.Close()
+		return nil, err
+	}
+	return p, nil
+}
+
+// Addr is the address of the open listener, or nil when there is none.
+func (p *tcpProxy) Addr() net.Addr {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.listener == nil {
+		return nil
+	}
+	return p.listener.Addr()
+}
+
 // serve accepts connections on l and runs handle for each until l closes.
 func serve(l net.Listener, handle func(*net.TCPConn)) {
 	go func() {

@@ -82,16 +82,6 @@ func newProxy(upstream string, policy dialPolicy, logger *log.Logger) *tcpProxy 
 	}
 }
 
-// startProxy returns a proxy for upstream that listens on listenAddr.
-func startProxy(listenAddr, upstream string, policy dialPolicy, logger *log.Logger) (*tcpProxy, error) {
-	p := newProxy(upstream, policy, logger)
-	if err := p.Listen(listenAddr); err != nil {
-		p.Close()
-		return nil, err
-	}
-	return p, nil
-}
-
 // Listen listens on listenAddr and accepts connections there until
 // StopListening, StopAccepting, or Close. It fails while the proxy already
 // listens, and with errProxyStopped after StopAccepting or Close. The
@@ -124,16 +114,6 @@ func (p *tcpProxy) Listen(listenAddr string) error {
 	p.wg.Add(1)
 	go p.acceptLoop(ln)
 	return nil
-}
-
-// Addr is the address of the open listener, or nil when there is none.
-func (p *tcpProxy) Addr() net.Addr {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.listener == nil {
-		return nil
-	}
-	return p.listener.Addr()
 }
 
 // StopListening closes the listener, if there is one, so new connections
