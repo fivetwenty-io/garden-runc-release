@@ -23,6 +23,7 @@ import (
 	"code.cloudfoundry.org/guardian/backend"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"golang.org/x/sys/unix"
 )
 
 // fixtureCert is a self-signed CA certificate, as DER and as PEM.
@@ -151,6 +152,41 @@ var _ = Describe("the guest CA bundle", func() {
 		Expect(bundleCerts(bundle)).To(Equal([][]byte{b.der}))
 		Expect(string(bundle)).NotTo(ContainSubstring("PRIVATE KEY"))
 		Expect(logBuf.String()).To(Equal("leaving 1 files out of the guest's trusted certificates: 0 unreadable, 0 not regular files, 1 with no PEM certificate\n"))
+	})
+
+	It("leaves out a certificate block with PEM headers, as Go does", func() {
+		withHeaders := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Headers: map[string]string{"Proc-Type": "4,ENCRYPTED"}, Bytes: c.der}))
+		write(filepath.Join(certDir, "headers.pem"), withHeaders+b.pem)
+		bundle, err := guestCABundle(nil, envLookup(map[string]string{systemCertPathEnv: certDir}), logger)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(bundleCerts(bundle)).To(Equal([][]byte{b.der}))
+		Expect(logBuf.String()).To(BeEmpty())
+	})
+
+	It("never opens a FIFO under the directory", func() {
+		fifo := filepath.Join(certDir, "fifo.crt")
+		Expect(syscall.Mkfifo(fifo, 0o644)).To(Succeed())
+		write(filepath.Join(certDir, "good.crt"), b.pem)
+		watch, err := unix.InotifyInit1(unix.IN_NONBLOCK | unix.IN_CLOEXEC)
+		Expect(err).NotTo(HaveOccurred())
+		defer unix.Close(watch)
+		_, err = unix.InotifyAddWatch(watch, fifo, unix.IN_OPEN)
+		Expect(err).NotTo(HaveOccurred())
+		events := make([]byte, 4096)
+
+		bundle, err := guestCABundle(nil, envLookup(map[string]string{systemCertPathEnv: certDir}), logger)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(bundleCerts(bundle)).To(Equal([][]byte{b.der}))
+		_, err = unix.Read(watch, events)
+		Expect(err).To(MatchError(unix.EAGAIN), "the FIFO was opened")
+
+		// An open of the FIFO shows up on the watch.
+		f, err := os.OpenFile(fifo, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(f.Close()).To(Succeed())
+		n, err := unix.Read(watch, events)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(n).To(BeNumerically(">=", unix.SizeofInotifyEvent))
 	})
 
 	It("leaves out unreadable, irregular, and non-PEM files with one line that only counts them", func() {
