@@ -542,6 +542,10 @@ describe 'garden' do
     let(:rendered_template) { template.render(properties) }
     let(:rules) { rendered_template.lines.map(&:strip).reject { |line| line.empty? || line.start_with?('#') } }
 
+    def qualified_rule(keyword)
+      /\A(?:(?:audit|allow|deny|quiet)\s+)*#{keyword}\b/
+    end
+
     it 'lets processes signal peers under the plain profile label' do
       expect(rules).to include('signal (send, receive) peer=garden-default,')
     end
@@ -550,15 +554,25 @@ describe 'garden' do
       expect(rules).to include('signal (send, receive) peer=garden-default//&unconfined,')
     end
 
-    it 'grants no signal rule to other peers' do
-      expect(rules.grep(/\Asignal\b/)).to contain_exactly(
+    it 'grants no signal rule to other peers, whatever qualifier the rule carries' do
+      expect(rules.grep(qualified_rule('signal'))).to contain_exactly(
         'signal (send, receive) peer=garden-default,',
         'signal (send, receive) peer=garden-default//&unconfined,'
       )
     end
 
-    it 'keeps the ptrace rule limited to the profile itself' do
-      expect(rules).to include('ptrace (trace,read) peer=garden-default,')
+    it 'keeps the ptrace rules limited to the profile itself and its stacked label, whatever qualifier a rule carries' do
+      expect(rules.grep(qualified_rule('ptrace'))).to contain_exactly(
+        'ptrace (trace,read) peer=garden-default,',
+        'ptrace (read) peer=garden-default//&unconfined,'
+      )
+    end
+
+    it 'includes only the tunables and the base abstraction, which could carry signal or ptrace rules of their own' do
+      expect(rendered_template.lines.map(&:strip).grep(/\A#\s*include\b/)).to contain_exactly(
+        '#include <tunables/global>',
+        '#include <abstractions/base>'
+      )
     end
 
     it 'lets processes read their peers under the label stacked on unconfined, without tracing them' do
