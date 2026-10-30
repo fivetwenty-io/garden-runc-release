@@ -626,21 +626,23 @@ var _ = Describe("the QMP monitor", func() {
 		Eventually(done).Should(BeClosed())
 	})
 
-	It("sends capabilities again after QEMU refused them", func() {
+	It("fails for good when QEMU refuses capabilities, and sends nothing more", func() {
 		m, qemu := newFakeQMP()
 		done := qemu.serve(func() {
 			qemu.send(fakeGreeting)
 			Expect(qemu.recv()).To(Equal(capsRequest(1)))
-			qemu.reply(`{"error": {"class": "CommandNotFound", "desc": "not yet"}}`)
-			Expect(qemu.recv()).To(Equal(capsRequest(2)))
-			qemu.reply(`{"return": {}}`)
-			Expect(qemu.recv()).To(Equal(humanRequest(3, "info network")))
-			qemu.reply(`{"return": "ok"}`)
+			qemu.reply(`{"error": {"class": "CommandNotFound", "desc": "Capabilities negotiation is already complete, command ignored"}}`)
 		})
 		_, err := m.humanCommand("info network")
-		Expect(err).To(MatchError("QMP qmp_capabilities: CommandNotFound: not yet"))
-		Expect(m.humanCommand("info network")).To(Equal("ok"))
+		Expect(err).To(MatchError("QMP qmp_capabilities: CommandNotFound: Capabilities negotiation is already complete, command ignored"))
 		Eventually(done).Should(BeClosed())
+		_, again := m.humanCommand("info network")
+		Expect(again).To(BeIdenticalTo(err))
+		// The second command returned without a write, so whatever it
+		// had sent would already be waiting.
+		Expect(qemu.conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))).To(Succeed())
+		_, rerr := qemu.r.ReadByte()
+		Expect(rerr).To(MatchError(os.ErrDeadlineExceeded))
 	})
 
 	It("fails for good when the first message is not a greeting", func() {

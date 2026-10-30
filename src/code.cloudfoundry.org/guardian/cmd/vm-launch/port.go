@@ -392,9 +392,12 @@ const qmpTimeout = 10 * time.Second
 // it comes, is skipped, and a line cut off by the timeout is completed by
 // the next read. A capabilities request that timed out is not sent again,
 // and the next command waits for its reply first. Only a failure of the
-// socket itself, an end of file or a failed write, or a line that is not a
-// QMP message, leaves the monitor broken, so every later command fails with
-// the same error.
+// socket itself, an end of file or a failed write, a line that is not a QMP
+// message, or an error in reply to capabilities, leaves the monitor broken,
+// so every later command fails with the same error. QEMU refuses
+// capabilities only when their negotiation is already complete, which
+// cannot happen on a socket that only vm-launch uses, so a refusal means a
+// monitor that vm-launch cannot use, and sending them again would not help.
 type qmpMonitor struct {
 	conn    net.Conn
 	r       *bufio.Reader
@@ -456,13 +459,11 @@ func (m *qmpMonitor) humanCommand(line string) (string, error) {
 			m.capsID = id
 		}
 		_, err := m.await("qmp_capabilities", m.capsID)
-		if err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
-			// QEMU answered, with an error, or the monitor is broken:
-			// either way no reply to this request is still to come.
-			m.capsID = 0
-		}
 		if err != nil {
-			return "", err
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				return "", err
+			}
+			return "", m.fail(err)
 		}
 		m.ready = true
 	}
