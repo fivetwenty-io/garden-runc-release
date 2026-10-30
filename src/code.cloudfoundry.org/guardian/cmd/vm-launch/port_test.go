@@ -333,11 +333,20 @@ var _ = Describe("the port gate", func() {
 type fakeQMP struct {
 	conn net.Conn
 	r    *bufio.Reader
+	// id is the id of the last request recv read.
+	id json.RawMessage
 }
 
+// newFakeQMP returns a monitor on a QMP socket and the fake QEMU on its
+// other end. The socket buffers, as QEMU's does, so either side can write
+// while the other is writing too.
 func newFakeQMP() (*qmpMonitor, *fakeQMP) {
-	ours, theirs := net.Pipe()
+	ours, theirsFile, err := newQMPSocket()
+	Expect(err).NotTo(HaveOccurred())
 	DeferCleanup(ours.Close)
+	theirs, err := net.FileConn(theirsFile)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(theirsFile.Close()).To(Succeed())
 	DeferCleanup(theirs.Close)
 	return newQMPMonitor(ours), &fakeQMP{conn: theirs, r: bufio.NewReader(theirs)}
 }
@@ -347,12 +356,29 @@ func (q *fakeQMP) send(msg string) {
 	Expect(err).NotTo(HaveOccurred())
 }
 
-// recv reads one request and returns it re-encoded with sorted keys.
+// reply sends msg, a JSON object, as the reply to the last request.
+func (q *fakeQMP) reply(msg string) {
+	q.replyTo(q.id, msg)
+}
+
+// replyTo sends msg, a JSON object, with id.
+func (q *fakeQMP) replyTo(id json.RawMessage, msg string) {
+	var v map[string]json.RawMessage
+	Expect(json.Unmarshal([]byte(msg), &v)).To(Succeed())
+	v["id"] = id
+	b, err := json.Marshal(v)
+	Expect(err).NotTo(HaveOccurred())
+	q.send(string(b))
+}
+
+// recv reads one request, keeps its id for reply, and returns it
+// re-encoded with sorted keys.
 func (q *fakeQMP) recv() string {
 	line, err := q.r.ReadBytes('\n')
 	Expect(err).NotTo(HaveOccurred())
-	var v any
+	var v map[string]json.RawMessage
 	Expect(json.Unmarshal(line, &v)).To(Succeed())
+	q.id = v["id"]
 	b, err := json.Marshal(v)
 	Expect(err).NotTo(HaveOccurred())
 	return string(b)
@@ -372,8 +398,14 @@ func (q *fakeQMP) serve(script func()) <-chan struct{} {
 
 const fakeGreeting = `{"QMP": {"version": {"qemu": {"micro": 0, "minor": 2, "major": 9}, "package": ""}, "capabilities": ["oob"]}}`
 
-func humanRequest(line string) string {
-	b, err := json.Marshal(map[string]any{"execute": "human-monitor-command", "arguments": map[string]string{"command-line": line}})
+// capsRequest is the capabilities request with id.
+func capsRequest(id int) string {
+	return `{"execute":"qmp_capabilities","id":` + strconv.Itoa(id) + `}`
+}
+
+// humanRequest is the human monitor command line with id.
+func humanRequest(id int, line string) string {
+	b, err := json.Marshal(map[string]any{"execute": "human-monitor-command", "arguments": map[string]string{"command-line": line}, "id": id})
 	Expect(err).NotTo(HaveOccurred())
 	return string(b)
 }
@@ -383,14 +415,14 @@ var _ = Describe("the QMP monitor", func() {
 		m, qemu := newFakeQMP()
 		done := qemu.serve(func() {
 			qemu.send(fakeGreeting)
-			Expect(qemu.recv()).To(Equal(`{"execute":"qmp_capabilities"}`))
+			Expect(qemu.recv()).To(Equal(capsRequest(1)))
 			qemu.send(`{"event": "RESUME", "data": {}, "timestamp": {"seconds": 1, "microseconds": 0}}`)
-			qemu.send(`{"return": {}}`)
-			Expect(qemu.recv()).To(Equal(humanRequest("info network")))
+			qemu.reply(`{"return": {}}`)
+			Expect(qemu.recv()).To(Equal(humanRequest(2, "info network")))
 			qemu.send(`{"event": "NIC_RX_FILTER_CHANGED", "data": {}, "timestamp": {"seconds": 1, "microseconds": 0}}`)
-			qemu.send(`{"return": "n0: user\r\n"}`)
-			Expect(qemu.recv()).To(Equal(humanRequest("hostfwd_add n0 tcp:0.0.0.0:8080-10.0.2.15:8080")))
-			qemu.send(`{"return": ""}`)
+			qemu.reply(`{"return": "n0: user\r\n"}`)
+			Expect(qemu.recv()).To(Equal(humanRequest(3, "hostfwd_add n0 tcp:0.0.0.0:8080-10.0.2.15:8080")))
+			qemu.reply(`{"return": ""}`)
 		})
 		Expect(m.humanCommand("info network")).To(Equal("n0: user\r\n"))
 		Expect(m.humanCommand("hostfwd_add n0 tcp:0.0.0.0:8080-10.0.2.15:8080")).To(Equal(""))
@@ -402,14 +434,31 @@ var _ = Describe("the QMP monitor", func() {
 		done := qemu.serve(func() {
 			qemu.send(fakeGreeting)
 			qemu.recv()
-			qemu.send(`{"return": {}}`)
+			qemu.reply(`{"return": {}}`)
 			qemu.recv()
-			qemu.send(`{"error": {"class": "GenericError", "desc": "Invalid netdev"}}`)
+			qemu.reply(`{"error": {"class": "GenericError", "desc": "Invalid netdev"}}`)
 			qemu.recv()
-			qemu.send(`{"return": "ok"}`)
+			qemu.reply(`{"return": "ok"}`)
 		})
 		_, err := m.humanCommand("hostfwd_add x tcp:0.0.0.0:1-10.0.2.15:1")
 		Expect(err).To(MatchError("QMP human-monitor-command: GenericError: Invalid netdev"))
+		Expect(m.humanCommand("info network")).To(Equal("ok"))
+		Eventually(done).Should(BeClosed())
+	})
+
+	It("sends capabilities again after QEMU refused them", func() {
+		m, qemu := newFakeQMP()
+		done := qemu.serve(func() {
+			qemu.send(fakeGreeting)
+			Expect(qemu.recv()).To(Equal(capsRequest(1)))
+			qemu.reply(`{"error": {"class": "CommandNotFound", "desc": "not yet"}}`)
+			Expect(qemu.recv()).To(Equal(capsRequest(2)))
+			qemu.reply(`{"return": {}}`)
+			Expect(qemu.recv()).To(Equal(humanRequest(3, "info network")))
+			qemu.reply(`{"return": "ok"}`)
+		})
+		_, err := m.humanCommand("info network")
+		Expect(err).To(MatchError("QMP qmp_capabilities: CommandNotFound: not yet"))
 		Expect(m.humanCommand("info network")).To(Equal("ok"))
 		Eventually(done).Should(BeClosed())
 	})
@@ -423,30 +472,104 @@ var _ = Describe("the QMP monitor", func() {
 		Expect(again).To(BeIdenticalTo(err))
 	})
 
-	It("fails for good when QEMU does not reply in time, so a late reply is never taken for the next one", func() {
+	It("skips the late reply to a command that timed out, so the next command gets its own", func() {
 		m, qemu := newFakeQMP()
 		m.timeout = 100 * time.Millisecond
+		late := make(chan struct{})
 		done := qemu.serve(func() {
 			qemu.send(fakeGreeting)
 			qemu.recv()
-			qemu.send(`{"return": {}}`)
-			qemu.recv()
+			qemu.reply(`{"return": {}}`)
+			Expect(qemu.recv()).To(Equal(humanRequest(2, "hostfwd_add n0 tcp:0.0.0.0:8080-10.0.2.15:8080")))
+			<-late
+			qemu.reply(`{"error": {"class": "GenericError", "desc": "late"}}`)
+			qemu.reply(`{"return": "late too"}`)
+			Expect(qemu.recv()).To(Equal(humanRequest(3, "hostfwd_remove n0 tcp:0.0.0.0:8080")))
+			qemu.reply(`{"return": "removed"}`)
 		})
-		_, err := m.humanCommand("info network")
+		_, err := m.humanCommand("hostfwd_add n0 tcp:0.0.0.0:8080-10.0.2.15:8080")
 		Expect(err).To(MatchError(ContainSubstring("QMP human-monitor-command: reading the reply: ")))
 		Expect(errors.Is(err, os.ErrDeadlineExceeded)).To(BeTrue(), err.Error())
+		close(late)
+		Expect(m.humanCommand("hostfwd_remove n0 tcp:0.0.0.0:8080")).To(Equal("removed"))
 		Eventually(done).Should(BeClosed())
-		_, again := m.humanCommand("info network")
-		Expect(again).To(BeIdenticalTo(err))
 	})
 
-	It("fails when QEMU closes its end of the QMP socket", func() {
+	It("waits for the reply to a capabilities request that timed out instead of sending it again", func() {
+		m, qemu := newFakeQMP()
+		m.timeout = 100 * time.Millisecond
+		late := make(chan struct{})
+		done := qemu.serve(func() {
+			qemu.send(fakeGreeting)
+			Expect(qemu.recv()).To(Equal(capsRequest(1)))
+			<-late
+			qemu.reply(`{"return": {}}`)
+			Expect(qemu.recv()).To(Equal(humanRequest(2, "info network")))
+			qemu.reply(`{"return": "ok"}`)
+		})
+		_, err := m.humanCommand("info network")
+		Expect(err).To(MatchError(ContainSubstring("QMP qmp_capabilities: reading the reply: ")))
+		Expect(errors.Is(err, os.ErrDeadlineExceeded)).To(BeTrue(), err.Error())
+		close(late)
+		Expect(m.humanCommand("info network")).To(Equal("ok"))
+		Eventually(done).Should(BeClosed())
+	})
+
+	It("reads a line that a timeout cut off, and a greeting that came late, in the next command", func() {
+		m, qemu := newFakeQMP()
+		m.timeout = 100 * time.Millisecond
+		next := make(chan struct{})
+		done := qemu.serve(func() {
+			_, err := qemu.conn.Write([]byte(fakeGreeting[:20]))
+			Expect(err).NotTo(HaveOccurred())
+			<-next
+			qemu.send(fakeGreeting[20:])
+			qemu.recv()
+			qemu.reply(`{"return": {}}`)
+			Expect(qemu.recv()).To(Equal(humanRequest(2, "info network")))
+			_, err = qemu.conn.Write([]byte(`{"id": 2, "return": `))
+			Expect(err).NotTo(HaveOccurred())
+			<-next
+			qemu.send(`"ok"}`)
+			Expect(qemu.recv()).To(Equal(humanRequest(3, "info network")))
+			qemu.reply(`{"return": "again"}`)
+		})
+		_, err := m.humanCommand("info network")
+		Expect(err).To(MatchError(ContainSubstring("QMP: reading the greeting: ")))
+		Expect(errors.Is(err, os.ErrDeadlineExceeded)).To(BeTrue(), err.Error())
+		next <- struct{}{}
+		_, err = m.humanCommand("info network")
+		Expect(err).To(MatchError(ContainSubstring("QMP human-monitor-command: reading the reply: ")))
+		Expect(errors.Is(err, os.ErrDeadlineExceeded)).To(BeTrue(), err.Error())
+		next <- struct{}{}
+		// The rest of the cut-off reply, to command 2, is skipped.
+		Expect(m.humanCommand("info network")).To(Equal("again"))
+		Eventually(done).Should(BeClosed())
+	})
+
+	It("fails for good when QEMU closes its end of the QMP socket", func() {
 		conn, theirs, err := newQMPSocket()
 		Expect(err).NotTo(HaveOccurred())
 		defer conn.Close()
 		Expect(theirs.Close()).To(Succeed())
-		_, err = newQMPMonitor(conn).humanCommand("info network")
+		m := newQMPMonitor(conn)
+		_, err = m.humanCommand("info network")
 		Expect(err).To(MatchError("QMP: reading the greeting: EOF"))
+		_, again := m.humanCommand("info network")
+		Expect(again).To(BeIdenticalTo(err))
+	})
+
+	It("fails for good on a line that is not a QMP message", func() {
+		m, qemu := newFakeQMP()
+		qemu.serve(func() {
+			qemu.send(fakeGreeting)
+			qemu.recv()
+			qemu.send(`{"return": {}, "id": 1`)
+		})
+		_, err := m.humanCommand("info network")
+		Expect(err).To(MatchError(HavePrefix("QMP qmp_capabilities: reading the reply: a line that is not a QMP message: ")))
+		_, again := m.humanCommand("info network")
+		Expect(again).To(BeIdenticalTo(err))
 	})
 
 	It("fails for a reply that is neither a return nor an error, or a return that is not text", func() {
@@ -454,9 +577,9 @@ var _ = Describe("the QMP monitor", func() {
 		qemu.serve(func() {
 			qemu.send(fakeGreeting)
 			qemu.recv()
-			qemu.send(`{"return": {}}`)
+			qemu.reply(`{"return": {}}`)
 			qemu.recv()
-			qemu.send(`{"id": 1}`)
+			qemu.reply(`{}`)
 		})
 		_, err := m.humanCommand("info network")
 		Expect(err).To(MatchError("QMP human-monitor-command: a reply with neither a return nor an error"))
@@ -465,9 +588,9 @@ var _ = Describe("the QMP monitor", func() {
 		qemu.serve(func() {
 			qemu.send(fakeGreeting)
 			qemu.recv()
-			qemu.send(`{"return": {}}`)
+			qemu.reply(`{"return": {}}`)
 			qemu.recv()
-			qemu.send(`{"return": {}}`)
+			qemu.reply(`{"return": {}}`)
 		})
 		_, err = m.humanCommand("info network")
 		Expect(err).To(MatchError(ContainSubstring("QMP human-monitor-command: the return is not a string: ")))
@@ -482,9 +605,9 @@ var _ = Describe("the QMP monitor", func() {
 			done := qemu.serve(func() {
 				qemu.send(fakeGreeting)
 				qemu.recv()
-				qemu.send(`{"return": {}}`)
+				qemu.reply(`{"return": {}}`)
 				got = qemu.recv()
-				qemu.send(reply)
+				qemu.reply(reply)
 			})
 			p := qmpPort{monitor: m, port: 8080}
 			var err error
@@ -500,7 +623,7 @@ var _ = Describe("the QMP monitor", func() {
 		It("adds a rule from the container's port to the guest's", func() {
 			got, err := ruleRun(true, `{"return": ""}`)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(got).To(Equal(humanRequest("hostfwd_add n0 tcp:0.0.0.0:8080-10.0.2.15:8080")))
+			Expect(got).To(Equal(humanRequest(2, "hostfwd_add n0 tcp:0.0.0.0:8080-10.0.2.15:8080")))
 		})
 
 		It("reports a rule QEMU could not set up as a port conflict", func() {
@@ -512,7 +635,7 @@ var _ = Describe("the QMP monitor", func() {
 		It("removes the rule", func() {
 			got, err := ruleRun(false, `{"return": "host forwarding rule for tcp:0.0.0.0:8080 removed\r\n"}`)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(got).To(Equal(humanRequest("hostfwd_remove n0 tcp:0.0.0.0:8080")))
+			Expect(got).To(Equal(humanRequest(2, "hostfwd_remove n0 tcp:0.0.0.0:8080")))
 		})
 
 		It("fails when QEMU did not remove the rule", func() {

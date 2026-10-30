@@ -519,9 +519,10 @@ var _ = Describe("run with PORT", func() {
 	// start tag and the exit tag, with these shell functions: listen 1|0
 	// writes a listen line; await open|closed waits up to 10 seconds for
 	// port to accept or refuse connections; qmp_send writes a line to the
-	// QMP socket, and qmp_recv waits up to 10 seconds for one, reads it, and
-	// appends it to the returned QMP log. A wait that runs out fails the
-	// fake hypervisor, and so the spec.
+	// QMP socket; qmp_recv waits up to 10 seconds for one, reads it, and
+	// appends it to the returned QMP log; and qmp_reply writes a JSON object
+	// as the reply to the request qmp_recv read last, with its id. A wait
+	// that runs out fails the fake hypervisor, and so the spec.
 	portHypervisor := func(path string, port int, body string) (argvFile, qmpLog string) {
 		argvFile = path + ".argv"
 		qmpLog = path + ".qmp"
@@ -547,7 +548,8 @@ await() {
 	exit 1
 }
 qmp_send() { printf '%s\n' "$1" >&"$qmp"; }
-qmp_recv() { IFS= read -r -t 10 line <&"$qmp" || { echo "no QMP request came in 10 seconds, or the QMP socket closed" >&2; exit 1; }; printf '%s\n' "$line" >>` + shellQuote(qmpLog) + `; }
+qmp_recv() { IFS= read -r -t 10 line <&"$qmp" || { echo "no QMP request came in 10 seconds, or the QMP socket closed" >&2; exit 1; }; qid=${line##*'"id":'}; qid=${qid%\}}; printf '%s\n' "$line" >>` + shellQuote(qmpLog) + `; }
+qmp_reply() { qmp_send "{\"id\": $qid, ${1#\{}"; }
 echo "RVM_START_$nonce"
 ` + body + `
 echo "RVM_EXIT_$nonce=0"
@@ -558,12 +560,12 @@ echo "RVM_EXIT_$nonce=0"
 	}
 
 	qmpGreeting := `qmp_send '{"QMP": {"version": {}, "capabilities": []}}'` + "\n"
-	qmpCapabilities := `{"execute":"qmp_capabilities"}`
-	hostfwdAdd := func(port int) string {
-		return fmt.Sprintf(`{"arguments":{"command-line":"hostfwd_add n0 tcp:0.0.0.0:%d-10.0.2.15:%d"},"execute":"human-monitor-command"}`, port, port)
+	qmpCapabilities := `{"execute":"qmp_capabilities","id":1}`
+	hostfwdAdd := func(id, port int) string {
+		return fmt.Sprintf(`{"arguments":{"command-line":"hostfwd_add n0 tcp:0.0.0.0:%d-10.0.2.15:%d"},"execute":"human-monitor-command","id":%d}`, port, port, id)
 	}
-	hostfwdRemove := func(port int) string {
-		return fmt.Sprintf(`{"arguments":{"command-line":"hostfwd_remove n0 tcp:0.0.0.0:%d"},"execute":"human-monitor-command"}`, port)
+	hostfwdRemove := func(id, port int) string {
+		return fmt.Sprintf(`{"arguments":{"command-line":"hostfwd_remove n0 tcp:0.0.0.0:%d"},"execute":"human-monitor-command","id":%d}`, port, id)
 	}
 
 	It("gives QEMU a QMP monitor and no forwarding rule for PORT, and neither without PORT", func() {
@@ -634,19 +636,19 @@ await open
 		_, qmpLog := portHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), port, qmpGreeting+`await closed
 listen 1
 qmp_recv
-qmp_send '{"return": {}}'
+qmp_reply '{"return": {}}'
 qmp_recv
 qmp_send '{"timestamp": {"seconds": 1, "microseconds": 2}, "event": "NIC_RX_FILTER_CHANGED", "data": {}}'
-qmp_send '{"return": ""}'
+qmp_reply '{"return": ""}'
 listen 0
 qmp_recv
-qmp_send '{"return": "host forwarding rule for tcp:0.0.0.0:`+strconv.Itoa(port)+` removed\r\n"}'
+qmp_reply '{"return": "host forwarding rule for tcp:0.0.0.0:`+strconv.Itoa(port)+` removed\r\n"}'
 sleep 0.3
 `)
 		GinkgoT().Setenv("PORT", strconv.Itoa(port))
 
 		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
-		Expect(os.ReadFile(qmpLog)).To(Equal([]byte(qmpCapabilities + "\n" + hostfwdAdd(port) + "\n" + hostfwdRemove(port) + "\n")))
+		Expect(os.ReadFile(qmpLog)).To(Equal([]byte(qmpCapabilities + "\n" + hostfwdAdd(2, port) + "\n" + hostfwdRemove(3, port) + "\n")))
 		p := strconv.Itoa(port)
 		Expect(logBuf.String()).To(ContainSubstring("the guest listens on port " + p + "; it is open in the container\n"))
 		Expect(logBuf.String()).To(ContainSubstring("the guest no longer listens on port " + p + "; it is closed in the container\n"))
@@ -658,15 +660,15 @@ sleep 0.3
 		p := strconv.Itoa(port)
 		_, qmpLog := portHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), port, qmpGreeting+`listen 1
 qmp_recv
-qmp_send '{"return": {}}'
+qmp_reply '{"return": {}}'
 qmp_recv
-qmp_send '{"return": "Could not set up host forwarding rule '"'"'tcp:0.0.0.0:`+p+`-10.0.2.15:`+p+`'"'"'\r\n"}'
+qmp_reply '{"return": "Could not set up host forwarding rule '"'"'tcp:0.0.0.0:`+p+`-10.0.2.15:`+p+`'"'"'\r\n"}'
 sleep 0.3
 `)
 		GinkgoT().Setenv("PORT", p)
 
 		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
-		Expect(os.ReadFile(qmpLog)).To(Equal([]byte(qmpCapabilities + "\n" + hostfwdAdd(port) + "\n")))
+		Expect(os.ReadFile(qmpLog)).To(Equal([]byte(qmpCapabilities + "\n" + hostfwdAdd(2, port) + "\n")))
 		Expect(logBuf.String()).To(ContainSubstring("the guest listens on port " + p + ", but vm-launch could not open it in the container: QEMU could not set up the forwarding rule: Could not set up host forwarding rule 'tcp:0.0.0.0:" + p + "-10.0.2.15:" + p + "'\n"))
 		Expect(logBuf.String()).To(ContainSubstring("port " + p + " already in use in this container; VM backends run one app process per container\n"))
 		Expect(logBuf.String()).NotTo(ContainSubstring("it is open in the container"))
@@ -676,15 +678,15 @@ sleep 0.3
 		port := freePort()
 		_, qmpLog := portHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), port, qmpGreeting+`listen 1
 qmp_recv
-qmp_send '{"return": {}}'
+qmp_reply '{"return": {}}'
 qmp_recv
-qmp_send '{"error": {"class": "GenericError", "desc": "no such netdev"}}'
+qmp_reply '{"error": {"class": "GenericError", "desc": "no such netdev"}}'
 sleep 0.3
 `)
 		GinkgoT().Setenv("PORT", strconv.Itoa(port))
 
 		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
-		Expect(os.ReadFile(qmpLog)).To(Equal([]byte(qmpCapabilities + "\n" + hostfwdAdd(port) + "\n")))
+		Expect(os.ReadFile(qmpLog)).To(Equal([]byte(qmpCapabilities + "\n" + hostfwdAdd(2, port) + "\n")))
 		Expect(logBuf.String()).To(ContainSubstring("could not open it in the container: QMP human-monitor-command: GenericError: no such netdev\n"))
 		Expect(logBuf.String()).NotTo(ContainSubstring("already in use"))
 	})

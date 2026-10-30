@@ -3,6 +3,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -229,26 +231,39 @@ const qmpTimeout = 10 * time.Second
 
 // qmpMonitor is a client of QEMU's QMP monitor on a connected stream socket.
 // It negotiates capabilities before its first command, skips asynchronous
-// events, and is used by one goroutine at a time. A command that fails on
-// the socket itself, such as one that times out, leaves the monitor broken:
-// a reply may still be on its way, which the next command would read as its
-// own, so every later command fails with the same error.
+// events, and is used by one goroutine at a time. It sends each command with
+// an id of its own and takes as the reply only the message with that id, so
+// a command that timed out leaves the monitor usable: its late reply, when
+// it comes, is skipped, and a line cut off by the timeout is completed by
+// the next read. A capabilities request that timed out is not sent again,
+// and the next command waits for its reply first. Only a failure of the
+// socket itself, an end of file or a failed write, or a line that is not a
+// QMP message, leaves the monitor broken, so every later command fails with
+// the same error.
 type qmpMonitor struct {
 	conn    net.Conn
-	dec     *json.Decoder
+	r       *bufio.Reader
 	timeout time.Duration
-	ready   bool
-	broken  error
+
+	// partial is the start of a line that a timeout cut off.
+	partial []byte
+	lastID  uint64
+	greeted bool
+	// capsID is the id of the capabilities request, once it is sent.
+	capsID uint64
+	ready  bool
+	broken error
 }
 
 func newQMPMonitor(conn net.Conn) *qmpMonitor {
-	return &qmpMonitor{conn: conn, dec: json.NewDecoder(conn), timeout: qmpTimeout}
+	return &qmpMonitor{conn: conn, r: bufio.NewReader(conn), timeout: qmpTimeout}
 }
 
 // qmpMessage is any message QEMU sends on its QMP monitor: the greeting, a
 // command's return or error, or an event.
 type qmpMessage struct {
 	QMP    json.RawMessage `json:"QMP"`
+	ID     *uint64         `json:"id"`
 	Return json.RawMessage `json:"return"`
 	Error  *qmpError       `json:"error"`
 	Event  string          `json:"event"`
@@ -267,20 +282,40 @@ func (m *qmpMonitor) humanCommand(line string) (string, error) {
 	if err := m.conn.SetDeadline(time.Now().Add(m.timeout)); err != nil {
 		return "", m.fail(fmt.Errorf("QMP: setting a deadline: %w", err))
 	}
-	if !m.ready {
+	if !m.greeted {
 		msg, err := m.read()
 		if err != nil {
-			return "", m.fail(fmt.Errorf("QMP: reading the greeting: %w", err))
+			return "", m.readFailed(fmt.Errorf("QMP: reading the greeting: %w", err))
 		}
 		if msg.QMP == nil {
 			return "", m.fail(errors.New("QMP: the first message is not a greeting"))
 		}
-		if _, err := m.execute("qmp_capabilities", nil); err != nil {
+		m.greeted = true
+	}
+	if !m.ready {
+		if m.capsID == 0 {
+			id, err := m.send("qmp_capabilities", nil)
+			if err != nil {
+				return "", err
+			}
+			m.capsID = id
+		}
+		_, err := m.await("qmp_capabilities", m.capsID)
+		if err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
+			// QEMU answered, with an error, or the monitor is broken:
+			// either way no reply to this request is still to come.
+			m.capsID = 0
+		}
+		if err != nil {
 			return "", err
 		}
 		m.ready = true
 	}
-	ret, err := m.execute("human-monitor-command", map[string]string{"command-line": line})
+	id, err := m.send("human-monitor-command", map[string]string{"command-line": line})
+	if err != nil {
+		return "", err
+	}
+	ret, err := m.await("human-monitor-command", id)
 	if err != nil {
 		return "", err
 	}
@@ -291,26 +326,35 @@ func (m *qmpMonitor) humanCommand(line string) (string, error) {
 	return out, nil
 }
 
-// execute sends one command and returns its return value.
-func (m *qmpMonitor) execute(command string, args any) (json.RawMessage, error) {
-	req := map[string]any{"execute": command}
+// send writes one command with a new id and returns the id.
+func (m *qmpMonitor) send(command string, args any) (uint64, error) {
+	m.lastID++
+	req := map[string]any{"execute": command, "id": m.lastID}
 	if args != nil {
 		req["arguments"] = args
 	}
 	b, err := json.Marshal(req)
 	if err != nil {
-		return nil, fmt.Errorf("QMP %s: encoding the request: %w", command, err)
+		return 0, fmt.Errorf("QMP %s: encoding the request: %w", command, err)
 	}
 	if _, err := m.conn.Write(append(b, '\n')); err != nil {
-		return nil, m.fail(fmt.Errorf("QMP %s: %w", command, err))
+		// A write cut off part way would run into the next request.
+		return 0, m.fail(fmt.Errorf("QMP %s: %w", command, err))
 	}
+	return m.lastID, nil
+}
+
+// await reads messages until the reply to the command with id and returns
+// its return value. It skips events and the replies to other commands,
+// which are the late replies to commands that timed out.
+func (m *qmpMonitor) await(command string, id uint64) (json.RawMessage, error) {
 	for {
 		msg, err := m.read()
 		if err != nil {
-			return nil, m.fail(fmt.Errorf("QMP %s: reading the reply: %w", command, err))
+			return nil, m.readFailed(fmt.Errorf("QMP %s: reading the reply: %w", command, err))
 		}
 		switch {
-		case msg.Event != "":
+		case msg.Event != "", msg.ID == nil || *msg.ID != id:
 		case msg.Error != nil:
 			return nil, fmt.Errorf("QMP %s: %s: %s", command, msg.Error.Class, msg.Error.Desc)
 		case msg.Return != nil:
@@ -327,10 +371,36 @@ func (m *qmpMonitor) fail(err error) error {
 	return err
 }
 
+// readFailed returns err, a failure of read, and marks the monitor broken
+// with it unless it is a timeout.
+func (m *qmpMonitor) readFailed(err error) error {
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return err
+	}
+	return m.fail(err)
+}
+
+// read returns the next message. A timeout, which returns an error that
+// matches os.ErrDeadlineExceeded, keeps what it read of the line for the
+// next read.
 func (m *qmpMonitor) read() (qmpMessage, error) {
-	var msg qmpMessage
-	err := m.dec.Decode(&msg)
-	return msg, err
+	for {
+		b, err := m.r.ReadBytes('\n')
+		m.partial = append(m.partial, b...)
+		if err != nil {
+			return qmpMessage{}, err
+		}
+		line := bytes.TrimSpace(m.partial)
+		m.partial = nil
+		if len(line) == 0 {
+			continue
+		}
+		var msg qmpMessage
+		if err := json.Unmarshal(line, &msg); err != nil {
+			return qmpMessage{}, fmt.Errorf("a line that is not a QMP message: %w", err)
+		}
+		return msg, nil
+	}
 }
 
 // newQMPSocket returns a connected pair of stream sockets: vm-launch's end
