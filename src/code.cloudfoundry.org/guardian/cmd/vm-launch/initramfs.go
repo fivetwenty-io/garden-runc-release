@@ -111,10 +111,12 @@ func (c *cpioWriter) pad(n int64) error {
 // impossible to forge by accident from guest command output. The guest
 // command runs as root and can read the nonce from /init, so it can forge
 // them on purpose, which changes only what vm-launch reports for that
-// command: its exit status, and whether its own port is open.
+// command: its exit status, whether its own port is open, and whether vm-launch
+// reports that the guest ran out of memory.
 func startTag(nonce string) string  { return "RVM_START_" + nonce }
 func exitTag(nonce string) string   { return "RVM_EXIT_" + nonce + "=" }
 func listenTag(nonce string) string { return "RVM_LISTEN_" + nonce + "=" }
+func oomTag(nonce string) string    { return "RVM_OOM_" + nonce + "=" }
 
 // stopTag is the stop request, the one line vm-launch writes to the guest's
 // serial console, which the guest's stop reader acts on (see
@@ -157,7 +159,7 @@ func initScript(nonce string, volume bool) string {
 		setup += guestVolumeSetup
 	}
 	setup += guestStopReader(nonce)
-	run := guestListenWatch(nonce) + guestRunCommand + guestRunStatus + guestStopReaderStop + guestListenStop
+	run := guestListenWatch(nonce) + guestRunCommand + guestRunStatus + guestStopReaderStop + guestListenStop + guestOOMReport(nonce)
 	if volume {
 		run += guestVolumeTeardown
 	}
@@ -399,6 +401,31 @@ const guestListenStop = `if [ -n "$rvm_watch" ]; then
 	wait "$rvm_watch"
 fi
 `
+
+// guestOOMReport tells vm-launch, once the command has ended, how many
+// processes the guest kernel killed for lack of memory, so that vm-launch can
+// report a guest OOM as the container runtime reports a cgroup OOM. It reads
+// the oom_kill counter of /proc/vmstat, which counts every process in the
+// guest and does not depend on the kernel's log level or message text, and
+// it writes the count on the console as an oomTag line before the exit line
+// when the count is above zero. The report is the shell's builtins only,
+// because a guest that ran out of memory may have no room to start a process.
+// A kernel without the counter gives no report.
+func guestOOMReport(nonce string) string {
+	report := "echo " + oomTag(nonce) + "$rvm_oom"
+	return `rvm_oom=0
+while read -r rvm_key rvm_val; do
+	if [ "$rvm_key" = oom_kill ]; then
+		rvm_oom=$rvm_val
+		break
+	fi
+done 2>/dev/null </proc/vmstat
+case "$rvm_oom" in
+'' | *[!0-9]* | 0 | 0[0-9]*) ;;
+*) ` + report + ` >/dev/console || ` + report + `;;
+esac
+`
+}
 
 // guestEnvChecks makes a broken /rvm/env a failed setup step, with the
 // console shown, instead of a command that fails to start. It sources

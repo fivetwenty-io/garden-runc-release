@@ -201,6 +201,11 @@
 // A guest command can exit with any of these values itself; whenever vm-launch
 // picks the status, it also writes a "vm-launch:" line to stderr.
 //
+// When the guest kernel killed any process for lack of memory, whatever the
+// exit status, vm-launch writes the stderr line "vm-launch: the guest ran out
+// of memory: its kernel killed N processes; the guest has M MiB" before it
+// exits. Guardian reads that line to report an out-of-memory exit.
+//
 // A container runs one VM per port: a second vm-launch for the same PORT, such
 // as a CF sidecar that gets the app's PORT, cannot reserve it and exits 125,
 // as does a vm-launch whose PORT another process already listens on, with a
@@ -236,6 +241,11 @@ const (
 	exitHypervisorFailed = 124
 	exitLaunchError      = 125
 )
+
+// oomLinePrefix is the text, after the logger's "vm-launch: ", that begins
+// the line oomMessage writes. Guardian's rundmc package pins the same text
+// with the "vm-launch: " in front.
+const oomLinePrefix = "the guest ran out of memory"
 
 const defaultArtifactsDir = "/opt/garden-vm/artifacts"
 
@@ -510,6 +520,9 @@ func run(argv []string, logger *log.Logger) int {
 		logger.Print(err)
 		return exitLaunchError
 	}
+	if res.guestOOMKills > 0 {
+		logger.Print(oomMessage(res.guestOOMKills, memMiB))
+	}
 	code, reason := exitCode(res)
 	if reason != "" {
 		logger.Printf("%s; exiting %d", reason, code)
@@ -649,6 +662,20 @@ func signalNumber(sig os.Signal) int {
 		return int(s)
 	}
 	return int(syscall.SIGTERM)
+}
+
+// oomMessage is the line vm-launch writes when the guest kernel killed
+// processes for lack of memory. Guardian watches the stderr of the vm-launch
+// it starts for a line that begins with oomLinePrefix, after the logger's own
+// prefix, and records an out-of-memory event for the container, so that Diego
+// reports the exit as it does for a container killed by its cgroup. The
+// wording after the prefix is for people.
+func oomMessage(kills, memMiB int) string {
+	noun := "processes"
+	if kills == 1 {
+		noun = "process"
+	}
+	return fmt.Sprintf("%s: its kernel killed %d %s; the guest has %d MiB", oomLinePrefix, kills, noun, memMiB)
 }
 
 // exitCode maps a guest run to vm-launch's exit status. reason is empty when

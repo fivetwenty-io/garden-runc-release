@@ -362,6 +362,39 @@ cp /bin/busybox /dev/shm/bb && chmod 755 /dev/shm/bb
 	})
 })
 
+var _ = Describe("a real guest that runs out of memory", func() {
+	It("reports how many processes its kernel killed, and then the command's status", func() {
+		// tail keeps a whole line, and a stream of zeros has no newline, so
+		// it outgrows a guest of minGuestMemoryMiB and the kernel kills it.
+		out := bootRealGuest(taskGuest(`head -c 400m /dev/zero | tail`))
+
+		m := regexp.MustCompile(`(?m)^` + oomTag(testNonce) + `([0-9]+)\r?$`).FindStringSubmatch(out)
+		Expect(m).NotTo(BeNil(), out)
+		kills, err := strconv.Atoi(m[1])
+		Expect(err).NotTo(HaveOccurred())
+		Expect(kills).To(BeNumerically(">=", 1), out)
+		AddReportEntry("guest oom kills", kills)
+		Expect(strings.Count(out, oomTag(testNonce))).To(Equal(1), out)
+		Expect(strings.Index(out, oomTag(testNonce))).To(BeNumerically("<", strings.Index(out, exitTag(testNonce)+"137")), out)
+
+		// The same stream, through the filter, gives the count and the status
+		// and leaves the guest's own kernel message in the output.
+		var filtered bytes.Buffer
+		f := newSerialFilter(&filtered, testNonce)
+		_, _ = f.Write([]byte(out))
+		f.finish()
+		Expect(f.oomKills).To(Equal(kills))
+		Expect(f.status).To(Equal(137))
+		Expect(filtered.String()).NotTo(ContainSubstring(oomTag(testNonce)))
+	})
+
+	It("reports nothing for a command that does not run out of memory", func() {
+		out := bootRealGuest(taskGuest(`echo fine`))
+		Expect(out).NotTo(ContainSubstring(oomTag(testNonce)))
+		Expect(out).To(ContainSubstring(exitTag(testNonce) + "0"))
+	})
+})
+
 // portProbe records what a connection to a port finds, over time: "closed"
 // when the connection is refused, "serves" when an HTTP request through it
 // gets an HTTP reply, and "accepts" when the connection opens but no reply

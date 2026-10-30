@@ -366,15 +366,20 @@ const maxBootLog = 64 * 1024
 // maxStatusDigits is the longest decimal exit status a shell reports (255).
 const maxStatusDigits = 3
 
+// maxOOMDigits is the most digits an OOM count may have, which keeps the
+// count far inside an int.
+const maxOOMDigits = 9
+
 // serialFilter turns the guest serial console into the guest command's
 // output. It drops the console before the start tag and after the exit
 // marker, swallows the marker, converts the console's CRLF line endings to LF,
 // and records the exit status. With a listen callback, it also swallows each
 // listen line the guest writes while the command runs (see
 // guestListenWatch) and passes its state to the callback, which must not
-// block. A listen line can follow command output that has no newline yet,
-// so it is found anywhere in a line, and the output around it is kept as it
-// was. It never fails a Write, so the hypervisor's output keeps draining
+// block. It swallows the guest's OOM line too (see guestOOMReport) and keeps
+// its count in oomKills. A listen or OOM line can follow command output that
+// has no newline yet, so each is found anywhere in a line, and the output
+// around it is kept as it was. It never fails a Write, so the hypervisor's output keeps draining
 // when the destination breaks; the first destination error is kept in
 // writeErr.
 type serialFilter struct {
@@ -382,12 +387,14 @@ type serialFilter struct {
 	startTag  []byte
 	exitTag   []byte
 	listenTag []byte
+	oomTag    []byte
 	listen    func(up bool)
 
 	phase    int
 	pending  []byte
 	bootLog  []byte
 	status   int
+	oomKills int
 	writeErr error
 
 	// startSeen is closed when the start tag is parsed, before any of the
@@ -402,6 +409,7 @@ func newSerialFilter(out io.Writer, nonce string) *serialFilter {
 		out:       out,
 		startTag:  []byte(startTag(nonce)),
 		exitTag:   []byte(exitTag(nonce)),
+		oomTag:    []byte(oomTag(nonce)),
 		startSeen: make(chan struct{}),
 		exited:    make(chan struct{}),
 	}
@@ -481,7 +489,14 @@ func (f *serialFilter) keepBootLog(b []byte) {
 func (f *serialFilter) processRun(eof bool) {
 	for {
 		idx := bytes.Index(f.pending, f.exitTag)
-		if li := f.indexListen(); li >= 0 && (idx < 0 || li < idx) {
+		li := f.indexListen()
+		if oi := bytes.Index(f.pending, f.oomTag); oi >= 0 && (idx < 0 || oi < idx) && (li < 0 || oi < li) {
+			if !f.processOOM(oi, eof) {
+				return
+			}
+			continue
+		}
+		if li >= 0 && (idx < 0 || li < idx) {
 			if !f.processListen(li, eof) {
 				return
 			}
@@ -511,7 +526,7 @@ func (f *serialFilter) processRun(eof bool) {
 		f.emitPending(len(f.pending), true)
 		return
 	}
-	hold := tagPrefixSuffix(f.pending, f.exitTag)
+	hold := max(tagPrefixSuffix(f.pending, f.exitTag), tagPrefixSuffix(f.pending, f.oomTag))
 	if f.listenTag != nil {
 		hold = max(hold, tagPrefixSuffix(f.pending, f.listenTag))
 	}
@@ -546,6 +561,26 @@ func (f *serialFilter) processListen(idx int, eof bool) bool {
 	f.emitPending(idx, true)
 	f.pending = append([]byte(nil), f.pending[len(f.listenTag)+n:]...)
 	f.listen(up)
+	return true
+}
+
+// processOOM handles the OOM tag at pending[idx:] as processListen handles a
+// listen tag: a complete line leaves the output and sets oomKills, and
+// anything else after the tag is output.
+func (f *serialFilter) processOOM(idx int, eof bool) bool {
+	kills, n, ok, needMore := parseCount(f.pending[idx+len(f.oomTag):])
+	if needMore && !eof {
+		f.emitPending(idx, false)
+		return false
+	}
+	if !ok {
+		// The tag ends in its only '=', so no tag can start inside it.
+		f.emitPending(idx+len(f.oomTag), true)
+		return true
+	}
+	f.emitPending(idx, true)
+	f.pending = append([]byte(nil), f.pending[len(f.oomTag)+n:]...)
+	f.oomKills = kills
 	return true
 }
 
@@ -602,6 +637,40 @@ func parseStatus(b []byte) (status int, ok, needMore bool) {
 	}
 }
 
+// parseCount parses the bytes after an OOM tag: 1 to maxOOMDigits decimal
+// digits, then LF or CRLF. n is the length of what it parsed. needMore
+// reports that b ends before that can be decided.
+func parseCount(b []byte) (count, n int, ok, needMore bool) {
+	i := 0
+	for i < len(b) && i <= maxOOMDigits && b[i] >= '0' && b[i] <= '9' {
+		i++
+	}
+	switch {
+	case i > maxOOMDigits:
+		return 0, 0, false, false
+	case i == len(b):
+		return 0, 0, false, true
+	case i == 0:
+		return 0, 0, false, false
+	}
+	count, err := strconv.Atoi(string(b[:i]))
+	if err != nil {
+		return 0, 0, false, false
+	}
+	switch {
+	case b[i] == '\n':
+		return count, i + 1, true, false
+	case b[i] != '\r':
+		return 0, 0, false, false
+	case i+1 == len(b):
+		return 0, 0, false, true
+	case b[i+1] == '\n':
+		return count, i + 2, true, false
+	default:
+		return 0, 0, false, false
+	}
+}
+
 // parseListen parses the bytes after a listen tag: 1 or 0, then LF or CRLF.
 // n is the length of what it parsed. needMore reports that b ends before
 // that can be decided.
@@ -648,6 +717,9 @@ type runResult struct {
 	// received is the first signal vm-launch received, whether it was
 	// forwarded or became a stop request, or 0.
 	received syscall.Signal
+	// guestOOMKills is how many processes the guest kernel killed for lack of
+	// memory, as the guest reported, or 0.
+	guestOOMKills int
 	// state is the hypervisor's reaped state.
 	state *os.ProcessState
 }
@@ -834,6 +906,7 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 			}
 			res.markerFound = filter.markerFound()
 			res.guestStatus = filter.status
+			res.guestOOMKills = filter.oomKills
 			res.state = cmd.ProcessState
 			return res, nil
 		}
