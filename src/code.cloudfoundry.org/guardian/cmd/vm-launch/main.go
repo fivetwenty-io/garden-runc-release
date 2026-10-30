@@ -180,10 +180,28 @@
 // and the reserve need, the guest gets 128 MiB and vm-launch logs a line
 // that says so.
 //
+// Guest root disk: when VCAP_APPLICATION has limits.disk, vm-launch creates
+// a sparse image for the guest root in its work directory, with mode 0600,
+// and unlinks it at once, so that nothing is left to clean up and the
+// container's quota charges the blocks the guest writes until the hypervisor
+// and vm-launch have let go of the image. The image is as large as the
+// smaller of limits.disk and the space free in the work directory, less 32
+// MiB kept for other writers in the container, so that the guest's own
+// filesystem fills before the quota does; it is 1 MiB smaller when that would
+// equal the volume image's size. The hypervisor gets it as a second drive,
+// after the volume image's and with discard turned on, so that the blocks the
+// guest frees go back to the quota. When less than 16 MiB is left after the
+// 32 MiB, or the image cannot be created, vm-launch exits 125 with a line
+// that says why. A missing or malformed limits.disk leaves the guest root in
+// RAM, with a line that says the disk quota does not apply to it.
+//
 // The initramfs that holds the guest's /init, busybox, command, and
 // environment is built in a sealed memfd and never written to disk. The
 // hypervisor gets it as the file descriptor after the volume image's, 3
 // without a volume and 4 with one, and vm-launch closes its own copy once
+// the hypervisor has started. A QEMU monitor socket comes next, and the
+// guest root image last, so the image is file descriptor 4 without a volume
+// or a monitor and 6 with both; vm-launch closes its copy of it, too, once
 // the hypervisor has started.
 //
 // Core dumps: vm-launch sets its RLIMIT_CORE to zero, soft and hard, and its
@@ -211,7 +229,9 @@
 //	       disable, a dumpable flag it could not clear, an open files
 //	       limit it could not read, bad arguments, a guest command over
 //	       131071 bytes, a missing artifact, a work
-//	       file, initramfs, or QMP socket it could not create, a
+//	       file, initramfs, guest root image, or QMP socket it could not
+//	       create, a disk quota too small for the guest root image or
+//	       that it could not read, a
 //	       hypervisor it could not run, PORT already in use in the
 //	       container, or a volume it cannot use:
 //	       VCAP_SERVICES that is not valid JSON, more than one volume
@@ -545,7 +565,41 @@ func run(argv []string, logger *log.Logger) int {
 		defer img.Close()
 	}
 
-	initrd, err := newInitramfs(filepath.Join(cfg.artifacts, artBusybox), guestContents{
+	// The guest root image is sized from the quota the work directory has
+	// left. rootDiskSize keeps its size from equalling the volume image's,
+	// which is how the guest tells the two drives apart.
+	var volumeBytes int64
+	if vol != nil {
+		volumeBytes = defaultImageSize
+	}
+	rootSize, _, err := rootDiskSize(workDir, lookupEnv, unix.Statfs, volumeBytes, logger)
+	if err != nil {
+		logger.Print(err)
+		return exitLaunchError
+	}
+
+	// vm-launch's copies of the files only the hypervisor uses close as soon
+	// as the hypervisor has its own, or on the way out when the hypervisor
+	// never starts.
+	var initrd, qemuMonitor, rootImg *os.File
+	closeInherited := func() {
+		closeFile(initrd, "the initramfs", logger)
+		initrd = nil
+		closeFile(qemuMonitor, "QEMU's end of the QMP socket", logger)
+		qemuMonitor = nil
+		closeFile(rootImg, "the guest root image", logger)
+		rootImg = nil
+	}
+	defer closeInherited()
+	if rootSize > 0 {
+		rootImg, err = createRootImage(workDir, rootSize)
+		if err != nil {
+			logger.Print(err)
+			return exitLaunchError
+		}
+	}
+
+	initrd, err = newInitramfs(filepath.Join(cfg.artifacts, artBusybox), guestContents{
 		command:  cfg.command,
 		nonce:    nonce,
 		nw:       nw,
@@ -558,17 +612,6 @@ func run(argv []string, logger *log.Logger) int {
 		logger.Print(err)
 		return exitLaunchError
 	}
-	// vm-launch's copies of the files only the hypervisor uses close as soon
-	// as the hypervisor has its own, or on the way out when the hypervisor
-	// never starts.
-	var qemuMonitor *os.File
-	closeInherited := func() {
-		closeFile(initrd, "the initramfs", logger)
-		initrd = nil
-		closeFile(qemuMonitor, "QEMU's end of the QMP socket", logger)
-		qemuMonitor = nil
-	}
-	defer closeInherited()
 	// QEMU forwards the ports through rules that vm-launch adds and removes
 	// on its QMP monitor.
 	var monitor net.Conn
@@ -580,8 +623,8 @@ func run(argv []string, logger *log.Logger) int {
 		}
 		defer monitor.Close()
 	}
-	files, drivePath, initrdPath, monitorFD := hypervisorFiles(img, initrd, qemuMonitor)
-	hvArgv, err := hypervisorArgv(cfg.backend, cfg.artifacts, workDir, initrdPath, memMiB, nw, drivePath, monitorFD)
+	files, drivePath, initrdPath, monitorFD, rootPath := hypervisorFiles(img, initrd, qemuMonitor, rootImg)
+	hvArgv, err := hypervisorArgv(cfg.backend, cfg.artifacts, workDir, initrdPath, memMiB, nw, drivePath, rootPath, monitorFD)
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError

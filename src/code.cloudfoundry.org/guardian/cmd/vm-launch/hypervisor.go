@@ -205,16 +205,21 @@ func qemuArgv(root, initrd string, memMiB int, nw *network, drivePath string, mo
 const qemuNetdevID = "n0"
 
 // The hypervisor's inherited files. The hypervisor gets the volume image,
-// when there is one, and the initramfs as extra files, and opens each through
-// /proc/self/fd. For the image that reopens exactly the inode vm-launch
-// checked, so the container path of the volume never reaches a QEMU option
-// string or the Firecracker configuration. The image keeps file descriptor
-// volumeDriveFD, and the initramfs takes the next one: 3 without a volume
-// and 4 with one. A QEMU monitor socket, when there is one, comes last.
+// when there is one, the initramfs, a QEMU monitor socket, when there is one,
+// and the guest root image, when there is one, as extra files, and opens each
+// through /proc/self/fd. For the volume image that reopens exactly the inode
+// vm-launch checked, so the container path of the volume never reaches a QEMU
+// option string or the Firecracker configuration. The root image has no path
+// at all, because vm-launch unlinks it when it creates it. The volume image
+// keeps file descriptor volumeDriveFD, and the initramfs takes the next one:
+// 3 without a volume and 4 with one. The monitor takes the one after that,
+// and the root image comes last, so that adding it moves no other file: 4
+// without a volume or a monitor, and 6 with both.
 const (
 	firstExtraFD  = 3
 	volumeDriveFD = firstExtraFD
 	volumeDriveID = "vol0"
+	rootDriveID   = "root0"
 )
 
 // procSelfFD is the path a process opens its own file descriptor fd by.
@@ -232,8 +237,9 @@ func volumeDrivePath() string {
 // the volume image or nil, and drivePath is empty without one. initrd is the
 // initramfs from newInitramfs. monitor is QEMU's end of the QMP socket or
 // nil, and monitorFD is its file descriptor in the hypervisor, or 0 without
-// one.
-func hypervisorFiles(img, initrd, monitor *os.File) (files []*os.File, drivePath, initrdPath string, monitorFD int) {
+// one. root is the guest root image from createRootImage or nil, and
+// rootPath is empty without one.
+func hypervisorFiles(img, initrd, monitor, root *os.File) (files []*os.File, drivePath, initrdPath string, monitorFD int, rootPath string) {
 	if img != nil {
 		files = append(files, img)
 		drivePath = procSelfFD(firstExtraFD + len(files) - 1)
@@ -244,7 +250,25 @@ func hypervisorFiles(img, initrd, monitor *os.File) (files []*os.File, drivePath
 		files = append(files, monitor)
 		monitorFD = firstExtraFD + len(files) - 1
 	}
-	return files, drivePath, initrdPath, monitorFD
+	if root != nil {
+		files = append(files, root)
+		rootPath = procSelfFD(firstExtraFD + len(files) - 1)
+	}
+	return files, drivePath, initrdPath, monitorFD, rootPath
+}
+
+// qemuRootDrive returns the QEMU options that attach the guest root image,
+// which the hypervisor opens as rootPath. The drive is raw for the reasons
+// the volume's is (see qemuArgv). Unsafe caching drops the guest's flushes,
+// which costs nothing because the data never outlives the VM, and
+// discard=unmap turns the guest's discards into holes in the image, so that
+// the blocks the guest frees go back to the container's quota.
+func qemuRootDrive(rootPath string) []string {
+	return []string{
+		"-drive", "if=none,id=" + rootDriveID + ",file=" + rootPath +
+			",format=raw,cache=unsafe,aio=threads,file.locking=off,werror=report,rerror=report,discard=unmap",
+		"-device", "virtio-blk-device,drive=" + rootDriveID,
+	}
 }
 
 type firecrackerConfig struct {
@@ -274,15 +298,24 @@ type firecrackerDrive struct {
 	IsReadOnly   bool   `json:"is_read_only"`
 	CacheType    string `json:"cache_type"`
 	IOEngine     string `json:"io_engine"`
+	Discard      bool   `json:"discard,omitempty"`
 }
 
 // Firecracker drive settings. Writeback passes guest flushes on to the
 // image; the default, Unsafe, drops them. The Sync engine is the supported
-// one. The volume is not the root device, so Firecracker adds no root= to
-// the kernel command line; the guest boots from the initramfs.
+// one. Neither drive is the root device, so Firecracker adds no root= to the
+// kernel command line, which would also make the kernel unpack the initramfs
+// into a ramfs instead of a tmpfs; the guest boots from the initramfs.
+//
+// The guest root image drops flushes, because its data never outlives the VM,
+// and turns the guest's discards into holes in the image. Firecracker takes
+// discard only with the Sync engine and exits with "Discard is not supported
+// with the async IO engine" otherwise, so the engine is named even though
+// Sync is what the volume has.
 const (
-	fcDriveCacheType = "Writeback"
-	fcDriveIOEngine  = "Sync"
+	fcDriveCacheType     = "Writeback"
+	fcDriveIOEngine      = "Sync"
+	fcRootDriveCacheType = "Unsafe"
 )
 
 type firecrackerNetworkInterface struct {
@@ -298,6 +331,12 @@ type firecrackerNetworkInterface struct {
 // port does not change the configuration, because vm-launch itself, not
 // Firecracker, forwards PORT.
 func firecrackerConfigJSON(root, initrd string, memMiB int, nw *network, drivePath string) ([]byte, error) {
+	return json.Marshal(newFirecrackerConfig(root, initrd, memMiB, nw, drivePath))
+}
+
+// newFirecrackerConfig returns the configuration firecrackerConfigJSON
+// encodes.
+func newFirecrackerConfig(root, initrd string, memMiB int, nw *network, drivePath string) firecrackerConfig {
 	cfg := firecrackerConfig{
 		BootSource: firecrackerBootSource{
 			KernelImagePath: filepath.Join(root, artVmlinux),
@@ -318,7 +357,7 @@ func firecrackerConfigJSON(root, initrd string, memMiB int, nw *network, drivePa
 		}}
 	}
 	cfg.NetworkInterfaces = []firecrackerNetworkInterface{{IfaceID: "eth0", GuestMAC: fcGuestMAC, HostDevName: fcTapName}}
-	return json.Marshal(cfg)
+	return cfg
 }
 
 func firecrackerArgv(root, configPath string) []string {
@@ -330,17 +369,35 @@ func firecrackerArgv(root, configPath string) []string {
 // memMiB is the guest memory size from guestMemory, which keeps it between
 // the floor and the ceiling. nw is the guest network, which run always
 // builds, and drivePath is the volume image path the hypervisor opens, or
-// empty without a volume. monitorFD is QEMU's QMP socket (see qemuArgv), or 0;
+// empty without a volume. rootPath is the path of the guest root image, or
+// empty when the guest root stays in RAM; that drive comes after the volume's
+// on both backends. monitorFD is QEMU's QMP socket (see qemuArgv), or 0;
 // Firecracker has no monitor.
-func hypervisorArgv(kind backend.Kind, root, workDir, initrd string, memMiB int, nw *network, drivePath string, monitorFD int) ([]string, error) {
+func hypervisorArgv(kind backend.Kind, root, workDir, initrd string, memMiB int, nw *network, drivePath, rootPath string, monitorFD int) ([]string, error) {
 	switch kind {
 	case backend.VMQemu:
-		return qemuArgv(root, initrd, memMiB, nw, drivePath, monitorFD), nil
+		argv := qemuArgv(root, initrd, memMiB, nw, drivePath, monitorFD)
+		if rootPath != "" {
+			argv = append(argv, qemuRootDrive(rootPath)...)
+		}
+		return argv, nil
 	case backend.VMFirecracker:
 		if monitorFD != 0 {
 			return nil, errors.New("firecracker has no QMP monitor")
 		}
-		cfg, err := firecrackerConfigJSON(root, initrd, memMiB, nw, drivePath)
+		fc := newFirecrackerConfig(root, initrd, memMiB, nw, drivePath)
+		if rootPath != "" {
+			fc.Drives = append(fc.Drives, firecrackerDrive{
+				DriveID:      rootDriveID,
+				PathOnHost:   rootPath,
+				IsRootDevice: false,
+				IsReadOnly:   false,
+				CacheType:    fcRootDriveCacheType,
+				IOEngine:     fcDriveIOEngine,
+				Discard:      true,
+			})
+		}
+		cfg, err := json.Marshal(fc)
 		if err != nil {
 			return nil, fmt.Errorf("encoding firecracker config: %w", err)
 		}

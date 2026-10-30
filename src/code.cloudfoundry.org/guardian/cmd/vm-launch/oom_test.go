@@ -280,6 +280,8 @@ var _ = Describe("run with a guest OOM", func() {
 		art = makeArtifacts()
 		GinkgoT().Setenv("TMPDIR", GinkgoT().TempDir())
 		GinkgoT().Setenv("MEMORY_LIMIT", "512m")
+		// A disk quota keeps the log to the lines these specs are about.
+		GinkgoT().Setenv("VCAP_APPLICATION", `{"limits":{"disk":64}}`)
 		logBuf = &bytes.Buffer{}
 	})
 

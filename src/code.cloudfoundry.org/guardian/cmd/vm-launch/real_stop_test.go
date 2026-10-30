@@ -59,7 +59,7 @@ func superviseRealStop(command, ready string, later ...laterSignal) realStop {
 
 	var r realStop
 	bootWithRetry(func() bool {
-		files, _, initrdPath, _ := hypervisorFiles(nil, withUserspaceMark(f), nil)
+		files, _, initrdPath, _, _ := hypervisorFiles(nil, withUserspaceMark(f), nil, nil)
 		consoleLog := filepath.Join(GinkgoT().TempDir(), "console.log")
 		argv := consoleLogArgv(markedArgv(tcgArgv(qemu, qemuArgv(art, initrdPath, minGuestMemoryMiB, g.nw, "", 0))), consoleLog)
 		cmd := newHypervisorCmd(argv, files)

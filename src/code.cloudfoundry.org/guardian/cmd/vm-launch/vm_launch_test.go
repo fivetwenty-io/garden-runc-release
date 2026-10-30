@@ -724,7 +724,7 @@ var _ = Describe("hypervisor command lines", func() {
 	const art = "/opt/garden-vm/artifacts"
 
 	It("builds the QEMU microvm command line through the bundled loader", func() {
-		argv, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/proc/self/fd/3", 128, taskNetwork(), "", 0)
+		argv, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/proc/self/fd/3", 128, taskNetwork(), "", "", 0)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(argv).To(Equal([]string{
 			art + "/qemu/ld-linux-x86-64.so.2", "--library-path", art + "/qemu/lib",
@@ -739,7 +739,7 @@ var _ = Describe("hypervisor command lines", func() {
 
 	It("writes the Firecracker config and builds its command line", func() {
 		work := GinkgoT().TempDir()
-		argv, err := hypervisorArgv(backend.VMFirecracker, art, work, "/proc/self/fd/3", 128, taskNetwork(), "", 0)
+		argv, err := hypervisorArgv(backend.VMFirecracker, art, work, "/proc/self/fd/3", 128, taskNetwork(), "", "", 0)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(argv).To(Equal([]string{art + "/firecracker/firecracker", "--no-api", "--config-file", work + "/fc.json"}))
 
@@ -764,7 +764,7 @@ var _ = Describe("hypervisor command lines", func() {
 	})
 
 	It("rejects other backends", func() {
-		_, err := hypervisorArgv(backend.OCIRunc, art, "/w", "/w/i", 128, taskNetwork(), "", 0)
+		_, err := hypervisorArgv(backend.OCIRunc, art, "/w", "/w/i", 128, taskNetwork(), "", "", 0)
 		Expect(err).To(MatchError(ContainSubstring("unsupported backend")))
 	})
 
@@ -943,6 +943,169 @@ var _ = Describe("run", func() {
 		Expect(mask&(1<<(syscall.SIGPIPE-1))).To(BeZero(), "a child of vm-launch's process ignores SIGPIPE: %s", out)
 	})
 })
+
+// rootImageAt is fake hypervisor shell that fails unless its file descriptor
+// fd is the guest root image: a regular file of size bytes with mode 0600,
+// open for writing, whose name is gone. The write goes through a new open
+// without O_TRUNC, which the image allows because the hypervisor reopens it
+// by /proc/self/fd/N.
+func rootImageAt(fd string, size int64) string {
+	return `case "$(readlink /proc/self/fd/` + fd + `)" in */root.img\ \(deleted\)) ;; *) echo "fd ` + fd + ` is not the unlinked root image" >&2; exit 1 ;; esac
+[ "$(stat -L -c '%F %s %a' /proc/self/fd/` + fd + `)" = "regular file ` + strconv.FormatInt(size, 10) + ` 600" ] || { echo "fd ` + fd + ` is not a 0600 regular file of ` + strconv.FormatInt(size, 10) + ` bytes" >&2; exit 1; }
+exec 8<>/proc/self/fd/` + fd + ` && printf x >&8 || { echo "cannot write to the root image" >&2; exit 1; }
+exec 8>&-
+`
+}
+
+// rootImageReleased is fake hypervisor shell that waits up to five seconds
+// for its parent, vm-launch, to close its copy of the guest root image, and
+// fails when it never does. The hypervisor's own copy stays open.
+const rootImageReleased = `n=0
+ls /proc/$PPID/fd >/dev/null 2>&1 || { echo "cannot read the descriptors of vm-launch" >&2; exit 1; }
+while for l in /proc/$PPID/fd/*; do readlink "$l"; done 2>/dev/null | grep -q -F 'root.img (deleted)'; do
+	n=$((n + 1))
+	[ "$n" -gt 100 ] && { echo "vm-launch still holds the root image" >&2; exit 1; }
+	sleep 0.05
+done
+`
+
+// noRootImage is fake hypervisor shell that fails when it has a file
+// descriptor for a guest root image.
+const noRootImage = `for l in /proc/self/fd/*; do
+	case "$(readlink "$l" 2>/dev/null)" in *root.img*) echo "the hypervisor has a root image without a disk quota" >&2; exit 1 ;; esac
+done
+`
+
+var _ = Describe("run with a guest root image", func() {
+	const (
+		diskMiB = 64
+		// rootSize is what the image has for a disk quota of diskMiB when the
+		// work directory has room: the quota less the headroom.
+		rootSize = (diskMiB - rootDiskHeadroomMiB) * bytesPerMiB
+	)
+
+	var (
+		art    string
+		tmp    string
+		logBuf *bytes.Buffer
+	)
+
+	BeforeEach(func() {
+		art = makeArtifacts()
+		tmp = GinkgoT().TempDir()
+		GinkgoT().Setenv("TMPDIR", tmp)
+		GinkgoT().Setenv("VCAP_APPLICATION", fmt.Sprintf(`{"limits":{"disk":%d}}`, diskMiB))
+		logBuf = &bytes.Buffer{}
+	})
+
+	runVM := func(kind backend.Kind) int {
+		return run([]string{"--backend", string(kind), "--artifacts", art, "--", "/tmp/lifecycle/launcher", "app", "true", ""}, log.New(logBuf, "", 0))
+	}
+
+	It("gives QEMU the root image as the file descriptor after the initramfs, with discard, and keeps nothing on disk", func() {
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"),
+			initramfsAt("3")+rootImageAt("4", rootSize)+noFilesUnder(tmp)+initramfsReleased+rootImageReleased)
+		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
+
+		argv, err := os.ReadFile(argvFile)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(argv)).To(HaveSuffix("\n" + strings.Join(goldenQEMURootDrive("4"), "\n") + "\n"))
+		Expect(string(argv)).To(ContainSubstring("\n-initrd\n/proc/self/fd/3\n"))
+		Expect(logBuf.String()).NotTo(ContainSubstring("does not apply"))
+		Expect(os.ReadDir(tmp)).To(BeEmpty())
+	})
+
+	It("gives Firecracker the root image as a drive with discard on the Sync engine", func() {
+		letFirecrackerSeeVMLaunch()
+		// The copy goes outside TMPDIR, which must stay empty.
+		fcCopy := filepath.Join(art, "fc-copy.json")
+		writeFakeHypervisor(filepath.Join(art, "firecracker/firecracker"),
+			`p=; for a in "$@"; do [ "$p" = --config-file ] && cp "$a" `+shellQuote(fcCopy)+`; p=$a; done
+`+initramfsAt("3")+rootImageAt("4", rootSize)+noFilesUnder(tmp)+initramfsReleased+rootImageReleased)
+		Expect(runVM(backend.VMFirecracker)).To(Equal(0), logBuf.String())
+
+		cfg, err := os.ReadFile(fcCopy)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(cfg)).To(ContainSubstring(`"drives":[` + goldenFCRootDrive + `]`))
+		Expect(string(cfg)).To(ContainSubstring(`"initrd_path":"/proc/self/fd/3"`))
+		Expect(os.ReadDir(tmp)).To(BeEmpty())
+	})
+
+	It("closes its copy of the root image when the hypervisor cannot be started", func() {
+		Expect(os.Remove(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"))).To(Succeed())
+		Expect(os.WriteFile(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), []byte("not runnable"), 0o644)).To(Succeed())
+		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(ContainSubstring("starting hypervisor"))
+		Expect(heldRootImages()).To(BeZero())
+	})
+
+	It("exits 125 with the quota line before the hypervisor starts when too little quota is left", func() {
+		GinkgoT().Setenv("VCAP_APPLICATION", `{"limits":{"disk":40}}`)
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(ContainSubstring("the container has 40 MiB of disk quota left, and the guest root needs at least 48 MiB of it, which is 16 MiB plus 32 MiB kept for other writers; raise the app's disk quota"))
+		Expect(argvFile).NotTo(BeAnExistingFile())
+		Expect(os.ReadDir(tmp)).To(BeEmpty())
+		Expect(heldRootImages()).To(BeZero())
+	})
+
+	It("exits 125 with the image error before the hypervisor starts when the image cannot be sized", func() {
+		saved := truncateRootImage
+		DeferCleanup(func() { truncateRootImage = saved })
+		truncateRootImage = func(*os.File, int64) error { return syscall.EDQUOT }
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(ContainSubstring("creating the guest root image in "))
+		Expect(logBuf.String()).To(ContainSubstring("sizing it to"))
+		Expect(argvFile).NotTo(BeAnExistingFile())
+		Expect(os.ReadDir(tmp)).To(BeEmpty())
+		Expect(heldRootImages()).To(BeZero())
+	})
+
+	It("keeps the RAM root, with no drive and one line, for a missing or malformed disk limit", func() {
+		for name, app := range map[string]string{
+			"no limits":          `{"name":"app"}`,
+			"no limits.disk":     `{"limits":{"mem":512}}`,
+			"a disk of zero":     `{"limits":{"disk":0}}`,
+			"a negative disk":    `{"limits":{"disk":-1}}`,
+			"a disk that's text": `{"limits":{"disk":"lots"}}`,
+			"not JSON":           `nope`,
+		} {
+			logBuf.Reset()
+			GinkgoT().Setenv("VCAP_APPLICATION", app)
+			argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), initramfsAt("3")+noRootImage+noFilesUnder(tmp))
+			Expect(runVM(backend.VMQemu)).To(Equal(0), name+": "+logBuf.String())
+
+			argv, err := os.ReadFile(argvFile)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(argv)).NotTo(ContainSubstring("-drive"), name)
+			Expect(strings.Count(logBuf.String(), "the disk quota does not apply to the guest root")).To(Equal(1), name+": "+logBuf.String())
+		}
+	})
+
+	It("keeps the RAM root when VCAP_APPLICATION is unset", func() {
+		Expect(os.Unsetenv("VCAP_APPLICATION")).To(Succeed())
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), initramfsAt("3")+noRootImage)
+		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
+		argv, err := os.ReadFile(argvFile)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(argv)).NotTo(ContainSubstring("-drive"))
+	})
+})
+
+// heldRootImages counts this process's descriptors for an unlinked guest
+// root image.
+func heldRootImages() int {
+	entries, err := os.ReadDir("/proc/self/fd")
+	Expect(err).NotTo(HaveOccurred())
+	n := 0
+	for _, e := range entries {
+		if link, err := os.Readlink(filepath.Join("/proc/self/fd", e.Name())); err == nil && strings.HasSuffix(link, "/"+rootImageName+" (deleted)") {
+			n++
+		}
+	}
+	return n
+}
 
 var _ = Describe("run with a stdout that nobody reads", func() {
 	It("catches SIGPIPE while it runs and stops catching it once it has returned, so the runtime's default applies again", func() {

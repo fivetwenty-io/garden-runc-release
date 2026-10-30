@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"code.cloudfoundry.org/guardian/backend"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -55,6 +56,12 @@ func optionAfter(argv []string, flag, marker string) string {
 
 // driveOption returns the -drive argument of the generated QEMU command line.
 func driveOption(argv []string) string { return optionAfter(argv, "-drive", "") }
+
+// rootDriveOption and rootDeviceOption return the guest root image's -drive
+// and -device arguments of the generated QEMU command line.
+func rootDriveOption(argv []string) string { return optionAfter(argv, "-drive", "id=root0") }
+
+func rootDeviceOption(argv []string) string { return optionAfter(argv, "-device", "drive=root0") }
 
 // deviceOption returns the volume's -device argument of the generated QEMU
 // command line.
@@ -178,6 +185,41 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 		Expect(stderr).To(ContainSubstring("vol9"))
 	})
 
+	// rootArgv is the command line with a guest root image on file descriptor
+	// 4. parseDrive passes its one file as file descriptor 3, so the specs
+	// below point the drive at that.
+	rootArgv := func() []string {
+		argv, err := hypervisorArgv(backend.VMQemu, goldenArt, "/unused", goldenInitrd, goldenMemMiB, taskNetwork(), "", procSelfFD(4), 0)
+		Expect(err).NotTo(HaveOccurred())
+		return argv
+	}
+	onFDThree := func(option string) string { return strings.Replace(option, procSelfFD(4), procSelfFD(3), 1) }
+
+	It("accepts the root image's drive option string, with discard=unmap", func() {
+		qemu := realQEMU()
+		drive := onFDThree(rootDriveOption(rootArgv()))
+		Expect(strings.Split(drive, ",")).To(ContainElement("discard=unmap"))
+		code, stderr := parseDrive(qemu, noMachine, "-drive", drive)
+		Expect(code).To(Equal(0), "QEMU rejected -drive %s: %s", drive, stderr)
+	})
+
+	It("accepts the root image's -drive and -device pair on a microvm machine", func() {
+		qemu := realQEMU()
+		requireMicrovm(qemu)
+		argv := rootArgv()
+		drive, device := onFDThree(rootDriveOption(argv)), rootDeviceOption(argv)
+		code, stderr := parseDrive(qemu, microvm, "-drive", drive, "-device", device)
+		Expect(code).To(Equal(0), "QEMU rejected -drive %s -device %s: %s", drive, device, stderr)
+	})
+
+	It("rejects a discard value it does not know, so the root drive check above can fail", func() {
+		qemu := realQEMU()
+		drive := strings.Replace(onFDThree(rootDriveOption(rootArgv())), "discard=unmap", "discard=maybe", 1)
+		code, stderr := parseDrive(qemu, noMachine, "-drive", drive)
+		Expect(code).NotTo(Equal(0))
+		Expect(stderr).To(ContainSubstring("discard"))
+	})
+
 	It("rejects the unprefixed locking option, so the check above can fail", func() {
 		qemu := realQEMU()
 		drive := strings.Replace(driveOption(qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), volumeDrivePath(), 0)), "file.locking=off", "locking=off", 1)
@@ -268,7 +310,7 @@ var _ = Describe("the initramfs memfd against a real QEMU", func() {
 		art := realArtifacts()
 		qemu := realQEMU()
 		requireMicrovm(qemu)
-		files, _, initrdPath, _ := hypervisorFiles(nil, memfdInitramfs(fakeBusybox(), "true", noGuestEnv), nil)
+		files, _, initrdPath, _, _ := hypervisorFiles(nil, memfdInitramfs(fakeBusybox(), "true", noGuestEnv), nil, nil)
 		Expect(initrdPath).To(Equal(goldenInitrd))
 		code, stderr := stoppedQEMU(qemu, filepath.Join(art, artBzImage), initrdPath, files)
 		Expect(code).To(Equal(0), "QEMU could not load the memfd initramfs: %s", stderr)
@@ -278,7 +320,7 @@ var _ = Describe("the initramfs memfd against a real QEMU", func() {
 		art := realArtifacts()
 		qemu := realQEMU()
 		requireMicrovm(qemu)
-		files, _, _, _ := hypervisorFiles(nil, memfdInitramfs(fakeBusybox(), "true", noGuestEnv), nil)
+		files, _, _, _, _ := hypervisorFiles(nil, memfdInitramfs(fakeBusybox(), "true", noGuestEnv), nil, nil)
 		code, stderr := stoppedQEMU(qemu, filepath.Join(art, artBzImage), procSelfFD(9), files)
 		Expect(code).NotTo(Equal(0))
 		Expect(stderr).To(ContainSubstring(procSelfFD(9)))
@@ -289,7 +331,7 @@ var _ = Describe("the initramfs memfd against a real QEMU", func() {
 		qemu := realQEMU()
 		requireMicrovm(qemu)
 		bb := guestBusybox()
-		files, _, initrdPath, _ := hypervisorFiles(nil, withUserspaceMark(memfdInitramfs(bb, `echo "hello from the $RVM_SOURCE"; exit 7`, "export RVM_SOURCE='memfd initramfs'\n")), nil)
+		files, _, initrdPath, _, _ := hypervisorFiles(nil, withUserspaceMark(memfdInitramfs(bb, `echo "hello from the $RVM_SOURCE"; exit 7`, "export RVM_SOURCE='memfd initramfs'\n")), nil, nil)
 		argv := markedArgv(tcgArgv(qemu, qemuArgv(art, initrdPath, 128, taskNetwork(), "", 0)))
 		code, stdout, stderr := bootRealQEMU(argv, files)
 		Expect(code).To(Equal(0), "QEMU failed: %s\n%s", stderr, stdout)
