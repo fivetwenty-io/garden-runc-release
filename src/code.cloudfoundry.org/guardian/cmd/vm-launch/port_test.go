@@ -332,8 +332,9 @@ var _ = Describe("the port gate", func() {
 		gate.set(true)
 		Eventually(opener.got).Should(Equal([]string{"open", "close", "open"}))
 		// A new state starts a new run of failures, whose first is logged.
+		// The gate logs a failure after the call that failed returns.
 		failed := "the guest listens on port 8080, but vm-launch could not open it in the container: boom\n"
-		Expect(logBuf.String()).To(Equal(failed + "the guest no longer listens on port 8080; it is closed in the container\n" + failed))
+		Eventually(logBuf.String).Should(Equal(failed + "the guest no longer listens on port 8080; it is closed in the container\n" + failed))
 	})
 
 	It("doubles its wait after each failure, up to the maximum", func() {
