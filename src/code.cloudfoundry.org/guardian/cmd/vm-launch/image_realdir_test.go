@@ -215,7 +215,7 @@ var _ = Describe("an image on the directory named by "+imageDirEnv, func() {
 			go func() {
 				defer GinkgoRecover()
 				defer wg.Done()
-				fd, err := openImageFile(dirfd, name, img, o, nil)
+				fd, _, err := openImageFile(dirfd, name, img, o, nil)
 				if err == nil {
 					unix.Close(fd)
 				}
@@ -253,7 +253,7 @@ var _ = Describe("an image on the directory named by "+imageDirEnv, func() {
 		noSillyRenames()
 		st := statOf(img)
 		Expect(int(st.Nlink)).To(Equal(1))
-		Expect(st.Size).To(Equal(size))
+		Expect(st.Size).To(Equal(o.creationSize()), "openImageFile publishes at the creation step, and the grow comes after the lock")
 	})
 
 	It("removes a temp name that a killed launch left, an orphan or a second name of the image, and keeps the image", func() {

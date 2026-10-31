@@ -87,18 +87,23 @@
 // one service instance, and the process types of one app, get separate
 // images. A task has neither CF_INSTANCE_INDEX nor process_type, and a task
 // that has a volume fails to start. vm-launch creates a missing image under
-// a temporary name, as a sparse 1 GiB file with mode 0600, and publishes it
+// a temporary name, as a sparse 64 MiB file with mode 0600, and publishes it
 // with renameat2(RENAME_NOREPLACE) once it is sized, so the image name never
 // refers to an unsized file. A launch that is killed leaves at worst a
-// .rvm-disk-*.tmp file, which nothing reads but which holds up to 1 GiB of
+// .rvm-disk-*.tmp file, which nothing reads but which holds up to 64 MiB of
 // quota until an operator deletes it, because a quota that counts file
 // length, as JuiceFS does, charges a new image its whole size. On an NFS
 // volume, whose client refuses renameat2 with a flag, vm-launch allocates
 // the image, publishes it with a hard link instead, and removes the temporary
 // name, and the next launch removes a temporary name that a killed launch
-// left. It sizes only
-// an image it creates: an existing image that is not exactly 1 GiB fails the
-// launch. The volume path and the image are resolved without following
+// left. Once it holds the image's lock, vm-launch grows the image to the size
+// VM_VOLUMES asks for, 1 GiB by default, writing only zeros past its end: by
+// truncate on JuiceFS, and on NFS by fallocate or, where the volume has none,
+// by zero writes that log their progress every 10 seconds and that the next
+// start continues when this one is stopped. It never shrinks an image, and
+// it keeps a larger one with a line that says so. An image below 64 MiB was
+// not made by vm-launch and fails the launch. The volume path and the image
+// are resolved without following
 // symbolic links, the volume path must be a mount point, and the image must
 // be a regular file owned by the app's uid, with one link and mode 0600.
 // vm-launch never reads the image. It holds an exclusive flock on the image

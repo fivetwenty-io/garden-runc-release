@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -534,16 +535,36 @@ var _ = Describe("run with VM_VOLUMES", func() {
 			for _, e := range entries {
 				info, err := e.Info()
 				Expect(err).NotTo(HaveOccurred())
-				Expect(info.Size()).To(Equal(int64(defaultImageSize)), "the image keeps its default size until sizes are applied")
+				Expect(info.Size()).To(Equal(int64(defaultImageSize)), "an image with no size asked for is the 1 GiB default")
 			}
 		}
 	})
 
-	It("accepts a valid entry for the bound volume and still creates the default-size image", func() {
+	It("brings the image to the size a valid entry asks for, and keeps it there when a later start asks for less", func() {
+		imageSizes := func() []int64 {
+			GinkgoHelper()
+			entries, err := os.ReadDir(volDir)
+			Expect(err).NotTo(HaveOccurred())
+			var sizes []int64
+			for _, e := range entries {
+				info, err := e.Info()
+				Expect(err).NotTo(HaveOccurred())
+				sizes = append(sizes, info.Size())
+			}
+			return sizes
+		}
 		GinkgoT().Setenv("VM_VOLUMES", `{"`+volDir+`":{"size":"2G"}}`)
 		writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
 		Expect(runVM()).To(Equal(0), logBuf.String())
 		Expect(logBuf.String()).NotTo(ContainSubstring("VM_VOLUMES"))
+		Expect(imageSizes()).To(Equal([]int64{2 << 30}))
+
+		logBuf.Reset()
+		GinkgoT().Setenv("VM_VOLUMES", `{"`+volDir+`":{"size":"1G"}}`)
+		writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+		Expect(runVM()).To(Equal(0), logBuf.String())
+		Expect(imageSizes()).To(Equal([]int64{2 << 30}))
+		Expect(logBuf.String()).To(MatchRegexp(regexp.QuoteMeta("volume "+quoteForLog(volDir)+`: image "rvm-disk-0`) + `[^"]*` + regexp.QuoteMeta(`.img" is 2 GiB, larger than the 1 GiB asked for; vm-launch never shrinks an image, so it keeps 2 GiB`)))
 	})
 })
 

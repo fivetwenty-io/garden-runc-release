@@ -441,9 +441,11 @@ type preparedVolumes []preparedVolume
 // keep their fences, and the caller releases them too.
 func (pv *preparedVolumes) prepare(v selectedVolume, signals <-chan os.Signal, budget *lockBudget, logger *log.Logger) (*attachment, error) {
 	mode := privateMode(v.Provider.Capabilities(v.Mount))
+	// A volume with no size in VM_VOLUMES leaves Size zero, and the engine
+	// gives it its default, the same 1 GiB RequestedBytes reports.
 	att, err := v.Provider.Prepare(prepareRequest{
 		Mount: v.Mount, ImageName: v.Volume.ImageName, Index: v.Volume.Index, Mode: mode, Signals: signals,
-		LockBudget: budget,
+		Size: v.Volume.Settings.SizeBytes, Logger: logger, LockBudget: budget,
 		BeforeLock: func(img *os.File) error {
 			_, dev, ino, err := inodeOf(img, v.Volume.ContainerDir)
 			if err != nil {
