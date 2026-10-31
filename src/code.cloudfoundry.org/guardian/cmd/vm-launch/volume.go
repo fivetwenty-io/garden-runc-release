@@ -102,8 +102,9 @@ type vcapServices map[string][]struct {
 // volumesFromEnv returns the guest volumes named in VCAP_SERVICES, in
 // volume order, or none when the app has none. More than maxVolumes volume
 // mounts, two mounts on one path, a path on or under another volume's path,
-// a mode other than rw, a container path the guest cannot use, a missing or malformed application_id or process_type in
-// VCAP_APPLICATION, a bad CF_INSTANCE_INDEX, and a task are errors, so a
+// a mode other than rw, a container path the guest cannot use, a missing or
+// malformed application_id or process_type in VCAP_APPLICATION, a bad
+// CF_INSTANCE_INDEX, and a task that has a private volume are errors, so a
 // misconfigured app fails to start instead of losing data to the wrong
 // volume. Errors never repeat VCAP_SERVICES, which carries credentials.
 // lookup reads the environment the rest of vm-launch shares (see
@@ -126,6 +127,10 @@ type vcapServices map[string][]struct {
 //
 // No volume path may be on or under another, so the guest never has to order
 // its mounts, and a mount can never hide another volume.
+//
+// A share has no image, so when VM_VOLUMES sets every volume to share mode,
+// the application, process type, and instance index are not read, and the
+// volumes come back with no image name. A task can therefore have shares.
 func volumesFromEnv(lookup func(string) (string, bool)) ([]guestVolume, error) {
 	raw, ok := lookup(vcapServicesEnv)
 	if !ok {
@@ -190,6 +195,19 @@ func volumesFromEnv(lookup func(string) (string, bool)) ([]guestVolume, error) {
 		return nil, err
 	}
 
+	// A share has no image, so a volume that VM_VOLUMES makes a share needs
+	// no image name, and the app, process type, and instance index matter
+	// only when some volume stays private. That keeps a task from being
+	// refused for the instance image its shares never use. A VM_VOLUMES that
+	// does not parse names no share here, and applyVolumeSettings reports it.
+	if shares := shareDirs(lookup, dirs); len(shares) == len(dirs) {
+		vols := make([]guestVolume, len(dirs))
+		for i, d := range dirs {
+			vols[i] = guestVolume{ContainerDir: d}
+		}
+		return vols, nil
+	}
+
 	app, err := applicationFromEnv(lookup)
 	if err != nil {
 		return nil, err
@@ -210,6 +228,24 @@ func volumesFromEnv(lookup func(string) (string, bool)) ([]guestVolume, error) {
 		vols[i] = guestVolume{ContainerDir: m.dir, ImageName: name, Index: int(n)}
 	}
 	return vols, nil
+}
+
+// shareDirs returns the set of dirs that VM_VOLUMES sets to share mode. A
+// missing or unparsable VM_VOLUMES gives an empty set, so every volume counts
+// as private until applyVolumeSettings has reported the refusal.
+func shareDirs(lookup func(string) (string, bool), dirs []string) map[string]bool {
+	raw, _ := lookup(volumeSettingsEnv)
+	settings, err := parseVolumeSettings(raw, dirs)
+	if err != nil {
+		return nil
+	}
+	shares := map[string]bool{}
+	for dir, s := range settings {
+		if s.Mode == volumeShare {
+			shares[dir] = true
+		}
+	}
+	return shares
 }
 
 // vcapApplication is the part of VCAP_APPLICATION vm-launch reads. Both
@@ -248,14 +284,16 @@ func applicationFromEnv(lookup func(string) (string, bool)) (vcapApplication, er
 //
 // A task has no CF_INSTANCE_INDEX and no process_type. It would have to share
 // an image with an instance of the app, which the single writer lock turns
-// into a crash loop for one of them, so a task that has a volume is an error.
+// into a crash loop for one of them, so a task that has a private volume is
+// an error. A task can still have a volume in share mode, which has no image
+// (see volumesFromEnv).
 func imageNameFor(appID, processType, index string, present bool) (string, error) {
 	if !applicationIDPattern.MatchString(appID) {
 		return "", fmt.Errorf("application id %s is not a lowercase UUID", quoteForLog(appID))
 	}
 	if !present || processType == "" {
-		return "", fmt.Errorf("volumes are not supported for tasks on VM backends: this process has no %s or no process_type in %s, so it has no instance image of its own",
-			instanceIndexEnv, vcapApplicationEnv)
+		return "", fmt.Errorf("private volumes are not supported for tasks on VM backends: this process has no %s or no process_type in %s, so it has no instance image of its own; a task can have a volume only as a share, which %s sets with \"mode\": \"share\"",
+			instanceIndexEnv, vcapApplicationEnv, volumeSettingsEnv)
 	}
 	if !processTypePattern.MatchString(processType) {
 		return "", fmt.Errorf("%s process_type is not 1 to 63 lowercase letters, digits, underscores, or hyphens, starting with a letter or digit", vcapApplicationEnv)

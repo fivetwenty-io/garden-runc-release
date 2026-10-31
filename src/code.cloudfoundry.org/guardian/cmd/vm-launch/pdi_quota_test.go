@@ -221,6 +221,63 @@ var _ = Describe("the quota check of the image engine", func() {
 			Expect(lines).To(BeEmpty())
 		})
 
+		Describe("when the first open missed an image that exists, as a stale NFS negative dentry does", func() {
+			var dirfd int
+
+			BeforeEach(func() {
+				var err error
+				dirfd, err = unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+				Expect(err).NotTo(HaveOccurred())
+				DeferCleanup(func() { _ = unix.Close(dirfd) })
+				opts.Size = 20 * gib
+				volume(gib, 20*gib)
+			})
+
+			It("reports that the image appeared, instead of the creation check's line, when a fresh lookup finds the name", func() {
+				writeImage(img, 20*gib, nil)
+				fd, err := createImage(dirfd, "rvm-disk-0.img", img, opts, nil)
+				Expect(fd).To(Equal(-1))
+				Expect(errors.Is(err, errImageAppeared)).To(BeTrue(), "%v", err)
+				Expect(os.ReadDir(dir)).To(HaveLen(1), "nothing was created")
+			})
+
+			It("asks the lookup for the name, and keeps the check's line when the name is not there", func() {
+				var asked []string
+				opts.lookup = func(_ int, name string) bool {
+					asked = append(asked, name)
+					return false
+				}
+				_, err := createImage(dirfd, "rvm-disk-0.img", img, opts, nil)
+				Expect(errors.Is(err, errVolumeFull)).To(BeTrue(), "%v", err)
+				Expect(err).To(MatchError(ContainSubstring("creating image")))
+				Expect(asked).To(Equal([]string{"rvm-disk-0.img"}))
+			})
+
+			It("does not ask the lookup when the check passes", func() {
+				volume(20*gib, 20*gib)
+				opts.Size = 8 << 20
+				opts.lookup = func(int, string) bool {
+					Fail("the lookup ran")
+					return false
+				}
+				fd, err := createImage(dirfd, "rvm-disk-0.img", img, opts, nil)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(unix.Close(fd)).To(Succeed())
+			})
+		})
+
+		It("finds a name that exists, never one that does not, and never follows a link", func() {
+			dirfd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+			Expect(err).NotTo(HaveOccurred())
+			defer unix.Close(dirfd)
+			Expect(freshLookup(dirfd, "rvm-disk-0.img")).To(BeFalse())
+			writeImage(img, mib, nil)
+			Expect(freshLookup(dirfd, "rvm-disk-0.img")).To(BeTrue())
+			Expect(os.Symlink(filepath.Join(dir, "missing"), filepath.Join(dir, "link"))).To(Succeed())
+			Expect(freshLookup(dirfd, "link")).To(BeTrue(), "a dangling link is a name that exists")
+			Expect(freshLookup(dirfd, "bad/name")).To(BeFalse())
+		})
+
 		It("asks about the directory of the volume root, which is the descriptor the engine detected the mount with", func() {
 			opts.Size = 20 * gib
 			var modes []uint32
@@ -423,7 +480,9 @@ var _ = Describe("the quota check of the image engine", func() {
 						}
 						return pwriteFull(fd, b, off)
 					}
-				}, 4 * mib},
+					// The chunks before the refused one were never synced, so
+					// the grow cuts them off.
+				}, 2 * mib},
 			}
 		}
 

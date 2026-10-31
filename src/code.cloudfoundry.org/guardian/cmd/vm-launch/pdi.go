@@ -194,7 +194,15 @@ func (req prepareRequest) fileImageOptions(base imageOptions) imageOptions {
 type attachment struct {
 	// File is the disk, open read-write, which the hypervisor reopens
 	// through /proc/self/fd: an image file in file-image mode, or the
-	// block device node in block mode.
+	// block device node in block mode. The reopen is a new open file
+	// description. On NFS, the client keeps its lost-lock EIO on the
+	// description that took the flock, so I/O through the reopen does not
+	// meet that EIO once a lease expires and the lock is lost, and the flock
+	// is no fence against a writer the client can no longer exclude.
+	//
+	// There is no Usage method yet. Reporting an attachment's usage and
+	// quota is deferred; the file-image providers could answer it with fstat
+	// and fstatfs on File.
 	File *os.File
 	// Mode is how the disk reaches the guest. A provider may leave it unset,
 	// and vm-launch then records the mode it asked for; a provider that sets

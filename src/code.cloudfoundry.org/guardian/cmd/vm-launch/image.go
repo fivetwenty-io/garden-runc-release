@@ -111,10 +111,13 @@ type imageOptions struct {
 	IsMountRoot func(dirfd int) (bool, error)
 
 	// Preallocate makes a new image allocate its whole range before it is
-	// sized, for a volume whose quota counts allocated blocks, as an NFS
+	// sized, and makes the grow of a published image allocate the added
+	// range, by fallocate where the volume has it and by writing zeros where
+	// it does not, for a volume whose quota counts allocated blocks, as an NFS
 	// server's does. A sparse image there would pass its creation and meet
 	// the quota later, inside the guest, as an I/O error. A volume whose
-	// quota counts file length, as JuiceFS's does, leaves it off.
+	// quota counts file length, as JuiceFS's does, leaves it off, and its
+	// grow only sets the length.
 	Preallocate bool
 
 	// fallocate, when set, replaces fallocate(2) as the step that allocates a
@@ -194,6 +197,12 @@ type imageOptions struct {
 	// to answer with a length that has gone stale.
 	statSize func(fd int) (int64, error)
 
+	// lookup, when set, replaces freshLookup as the step that asks whether
+	// an image name exists, after the creation check has refused the volume.
+	// Tests use it to answer as an NFS client with a stale negative dentry
+	// does, which the first open misses and a revalidated lookup sees.
+	lookup func(dirfd int, name string) bool
+
 	// fstatfs, when set, replaces fstatfs(2) as the step that reads the
 	// volume's free space for the quota check (checkSpace). Tests use it to
 	// answer as a volume with a quota does.
@@ -244,9 +253,9 @@ const (
 	// fails with EEXIST when the name exists on every filesystem that has hard
 	// links, NFS included, and then removes the temp name. The file is closed
 	// before its name is unlinked, because an NFS client turns the unlink of a
-	// name that is still open into a silly rename to a hidden .nfs file. A launch killed
-	// between the link and the unlink leaves a second link to a published
-	// image, which sweepTempImages removes on the next launch.
+	// name that is still open into a silly rename to a hidden .nfs file. A
+	// launch killed between the link and the unlink leaves a second link to a
+	// published image, which sweepTempImages removes on the next launch.
 	publishLink
 )
 
@@ -537,6 +546,13 @@ func createImage(dirfd int, name, path string, o imageOptions, sigs <-chan os.Si
 	// before the volume has been asked whether it has the room.
 	op := createOp(newGrowTarget(dirfd, path), o.Size)
 	if err := o.checkSpace(op); err != nil {
+		// An NFS client can hold a negative dentry for an image another cell
+		// has created since, and an image that exists fills the plan, so the
+		// check for the whole size would fail on it. Look the name up fresh
+		// before reporting, and open the image if it is there.
+		if errors.Is(err, errVolumeFull) && o.nameVisible(dirfd, name) {
+			return -1, errImageAppeared
+		}
 		return -1, err
 	}
 	if o.Publish == publishLink {
@@ -576,6 +592,34 @@ func createImage(dirfd int, name, path string, o imageOptions, sigs <-chan os.Si
 	default:
 		return fail(fmt.Errorf("creating volume image %s: publishing it: %w%s", path, err, renameHint(err)))
 	}
+}
+
+// nameVisible reports whether the image name exists beneath dirfd, asked
+// fresh through lookup or freshLookup.
+func (o imageOptions) nameVisible(dirfd int, name string) bool {
+	if o.lookup != nil {
+		return o.lookup(dirfd, name)
+	}
+	return freshLookup(dirfd, name)
+}
+
+// freshLookup reports whether name exists in the directory dirfd, after
+// asking the filesystem for the directory's attributes. An NFS client keeps a
+// negative dentry until the directory's attributes time out, and refreshing
+// them is what makes the next lookup of the name go to the server. It follows
+// no link, and any failure other than the name existing counts as not there.
+func freshLookup(dirfd int, name string) bool {
+	statx := func(path string, flags int) error {
+		var st unix.Statx_t
+		for {
+			err := unix.Statx(dirfd, path, flags|unix.AT_STATX_FORCE_SYNC, unix.STATX_TYPE, &st)
+			if !errors.Is(err, unix.EINTR) {
+				return err
+			}
+		}
+	}
+	_ = statx("", unix.AT_EMPTY_PATH)
+	return statx(name, unix.AT_SYMLINK_NOFOLLOW) == nil
 }
 
 // renameNoReplace moves oldName to newName in dirfd, failing with EEXIST when
@@ -705,7 +749,7 @@ func createImageByLink(dirfd int, name, path string, op spaceOp, o imageOptions,
 		return -1, errCreateAgain
 	default:
 		removeTempByID(dirfd, tempName, id)
-		return -1, fmt.Errorf("creating volume image %s: publishing it: %w%s", path, err, linkHint(err))
+		return -1, o.creationFailure(op, fmt.Errorf("creating volume image %s: publishing it: %w%s", path, err, linkHint(err)))
 	}
 
 	if err := unlinkTempName(dirfd, tempName); err != nil {
@@ -1056,8 +1100,9 @@ func removeOwnTemp(dirfd, fd int, tempName string) {
 // that a quota that counts allocated blocks refuses the image now; the
 // truncate that follows then only sets the length. Without it the truncate
 // leaves the file sparse, which on a volume whose quota counts file length
-// still charges the whole size, so a quota error here is an ordinary failure
-// to create the image. The file checked is still the temp file, so a failed
+// still charges the whole size, so a quota error here can still happen, and
+// creationFailure reports it in the quota line, with no image created. The
+// file checked is still the temp file, so a failed
 // check is reported by newImageCheckError. A signal during preallocation
 // returns its *signalledError unwrapped.
 func sizeNewImage(fd int, path string, o imageOptions, sigs <-chan os.Signal) error {
@@ -1405,13 +1450,17 @@ func freshSize(fd int) (int64, error) {
 // For a new temp file (g nil), a signal returns at once, without a sync, and
 // a failed write returns its error, because the caller discards the file.
 // For the grow of a published image (g set), a signal first syncs what was
-// written, so the next launch continues from a length the volume has kept, and
-// a failed write syncs what came before it, so the image keeps the length it
-// reached. A sync that fails, there or at a periodic or final sync, cuts the
-// image back to the length that last synced (cutBack), and is reported with
-// the signal's line or the write's error, keeping its errno for errors.Is.
-// Either way the image is left shorter, fully allocated up to its end, and
-// only ever holds zeros past the length it had.
+// written, so the next launch continues from a length the volume has kept.
+// A failed write cuts the image back to the length that last synced and then
+// syncs the cut, because the zeros written since then cannot be trusted: an
+// NFS client reports a quota error from writeback at the write that follows
+// it and clears it, so a sync after that write succeeds and would keep a hole
+// where the server refused a range. A sync that fails, at a periodic or final
+// sync or after a signal, cuts the image back to the length that last synced
+// too (cutBack). The error is the signal's line or the write's error,
+// keeping its errno for errors.Is. Either way the image is left shorter,
+// fully allocated up to its end, and only ever holds zeros past the length it
+// had.
 func writeZeros(fd int, from, to int64, o imageOptions, sigs <-chan os.Signal, g *growth) error {
 	syncFile := o.syncFile
 	if syncFile == nil {
@@ -1434,25 +1483,36 @@ func writeZeros(fd int, from, to int64, o imageOptions, sigs <-chan os.Signal, g
 		synced = end
 		return nil
 	}
+	// cutTo cuts the image back to the length that last synced, for a grow.
+	// On NFS a write lands in the client's cache, and EDQUOT, ENOSPC, or EIO
+	// from the server arrives at a sync or at a later write. The client sends
+	// the writes concurrently and the server can apply them out of order, so a
+	// range past a refused one can land and move the server's length past a
+	// hole that the next launch would never fill. Every byte past synced is a
+	// zero this grow wrote under the lock, past the length allocateRange
+	// found, so the cut removes nothing else.
+	cutTo := func() error {
+		if err := setLength(fd, synced, o); err != nil {
+			return err
+		}
+		end = synced
+		g.end = synced
+		return nil
+	}
+	cutFailed := func(serr, cerr error) error {
+		return fmt.Errorf("%w; cutting the image back to the %d bytes that synced also failed: %w", serr, synced, cerr)
+	}
 	// cutBack runs after the sync that failed with serr, for a grow, and cuts
-	// the image back to the length that last synced. On NFS a write lands in
-	// the client's cache, and EDQUOT, ENOSPC, or EIO from the server arrives at
-	// the sync. The client sends the writes concurrently and the server can
-	// apply them out of order, so a range past a refused one can land and move
-	// the server's length past a hole that the next launch would never fill.
-	// Every byte past synced is a zero this grow wrote under the lock, past
-	// the length allocateRange found, so the cut removes nothing else. It
-	// returns serr, with the cut's own failure added when there is one, and
-	// leaves a new temp file (g nil) as it is, because the caller discards it.
+	// the image back. It returns serr, with the cut's own failure added when
+	// there is one, and leaves a new temp file (g nil) as it is, because the
+	// caller discards it.
 	cutBack := func(serr error) error {
 		if g == nil {
 			return serr
 		}
-		if err := setLength(fd, synced, o); err != nil {
-			return fmt.Errorf("%w; cutting the image back to the %d bytes that synced also failed: %w", serr, synced, err)
+		if cerr := cutTo(); cerr != nil {
+			return cutFailed(serr, cerr)
 		}
-		end = synced
-		g.end = synced
 		return serr
 	}
 	for end < to {
@@ -1472,8 +1532,12 @@ func writeZeros(fd int, from, to int64, o imageOptions, sigs <-chan os.Signal, g
 		if err := write(fd, zeros[:n], end); err != nil {
 			werr := fmt.Errorf("writing zeros at offset %d: %w", end, err)
 			if g != nil {
-				if serr := syncWritten(); serr != nil {
-					werr = fmt.Errorf("%w; syncing the zeros written before it also failed: %w", werr, cutBack(serr))
+				// The zeros since the last sync are suspect whatever a sync
+				// would now say, so cut them and sync the cut.
+				if cerr := cutTo(); cerr != nil {
+					werr = cutFailed(werr, cerr)
+				} else if serr := syncFile(fd); serr != nil {
+					werr = fmt.Errorf("%w; syncing the image after cutting it back also failed: %w", werr, serr)
 				}
 			}
 			return werr

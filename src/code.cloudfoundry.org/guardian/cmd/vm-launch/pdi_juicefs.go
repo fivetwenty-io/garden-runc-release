@@ -19,6 +19,20 @@ func init() { registerDiskProvider(juicefsProvider{}) }
 // truncate where the volume has no fallocate. A JuiceFS flock holds across
 // cells, and its quota counts file length, so an image is charged its whole
 // size as soon as it is sized or grown.
+//
+// Driver contract. The fence is JuiceFS's flock, and it reaches the metadata
+// engine, and so every cell, only when the JuiceFS client negotiates flock
+// forwarding with FUSE. The provider requires a mount made without
+// --no-bsd-lock, which would leave the kernel taking flock locally on each
+// cell, and without --writeback or -o writeback_cache, under which FUSE
+// ignores the length in an attribute reply for a regular file and the fresh
+// length reads of the grow return the cell's cached length. Nothing in the
+// mount table shows either setting, so there is no runtime check, and Match
+// and Capabilities claim the fence on the filesystem type alone. The lab
+// check confirms the mount options of our juicefs release. Unlike the NFS
+// provider, which reads local_lock=none from the superblock options and
+// refuses a mount without it, this asymmetry is a decision and not an
+// omission.
 type juicefsProvider struct{}
 
 func (juicefsProvider) Name() string { return "JuiceFS" }

@@ -141,12 +141,21 @@ func volumeMount(mountinfo, dir string, id uint64) (mountRecord, error) {
 //	ID PARENT MAJ:MIN ROOT MOUNTPOINT OPTIONS [OPTIONAL...] - FSTYPE SOURCE SUPEROPTIONS
 //
 // The optional fields end at the lone "-", and there may be none. The kernel
-// writes a space, tab, newline, and backslash inside the root, mount point,
-// and source as three-digit octal escapes, which are decoded here. The option
-// lists are split at commas and otherwise kept as written. The returned
-// record has no ContainerDir. A line without every field is an error.
+// separates the fields with one space and writes only a space, tab, newline,
+// and backslash inside the root, mount point, and source as three-digit octal
+// escapes, which are decoded here. Any other character, such as a no-break
+// space or a form feed, appears raw inside a field, so the line is split on
+// the single ASCII space and not on every character that Unicode calls white
+// space. A mount made with an empty source prints that field as nothing, which
+// leaves two spaces in a row and an empty field here, and it is the only field
+// that may be empty. The option lists are split at commas and otherwise kept
+// as written. The returned record has no ContainerDir. A line without every
+// field is an error.
 func parseMountInfoRecord(line string) (mountRecord, error) {
-	fields := strings.Fields(line)
+	var fields []string
+	if line != "" {
+		fields = strings.Split(line, " ")
+	}
 	if len(fields) < 10 {
 		return mountRecord{}, fmt.Errorf("want at least 10 fields, have %d", len(fields))
 	}
@@ -162,6 +171,11 @@ func parseMountInfoRecord(line string) (mountRecord, error) {
 		return mountRecord{}, errors.New("no - separator before the filesystem type")
 	case len(fields)-sep-1 != 3:
 		return mountRecord{}, fmt.Errorf("want a filesystem type, a source, and superblock options after the separator, have %d fields", len(fields)-sep-1)
+	}
+	for i, f := range fields {
+		if f == "" && i != sep+2 {
+			return mountRecord{}, fmt.Errorf("field %d is empty, and only the source may be", i+1)
+		}
 	}
 
 	var rec mountRecord

@@ -78,6 +78,60 @@ var _ = Describe("volumesFromEnv", func() {
 		}
 	})
 
+	Describe("a task and VM_VOLUMES", func() {
+		taskVars := func(volumes string) map[string]string {
+			vcap := vcapWith(map[string][]string{"nfs": {mountJSON("/a", "rw"), mountJSON("/b", "rw")}})
+			return map[string]string{"VCAP_SERVICES": vcap, "VCAP_APPLICATION": `{"application_id":"` + testAppID + `"}`, "VM_VOLUMES": volumes}
+		}
+
+		It("accepts a task whose volumes are all shares, and gives them no image name", func() {
+			vols, err := volumesFromEnv(lookup(taskVars(`{"/a":{"mode":"share"},"/b":{"mode":"share"}}`)))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(vols).To(Equal([]guestVolume{{ContainerDir: "/a"}, {ContainerDir: "/b"}}))
+		})
+
+		It("accepts shares for a task that has no VCAP_APPLICATION at all", func() {
+			vars := taskVars(`{"/a":{"mode":"share"},"/b":{"mode":"share"}}`)
+			delete(vars, "VCAP_APPLICATION")
+			vols, err := volumesFromEnv(lookup(vars))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(vols).To(HaveLen(2))
+		})
+
+		It("refuses a task that keeps one volume private, in the words for a private volume", func() {
+			for name, volumes := range map[string]string{
+				"one share and one with no entry":     `{"/a":{"mode":"share"}}`,
+				"one share and one private":           `{"/a":{"mode":"share"},"/b":{"mode":"private"}}`,
+				"one share and a size on the private": `{"/a":{"mode":"share"},"/b":{"size":"2G"}}`,
+				"no entry at all":                     ``,
+				"every volume private":                `{"/a":{"mode":"private"},"/b":{"mode":"private"}}`,
+				"VM_VOLUMES that does not parse":      `{"/a":{"mode":"share"},`,
+				"a share named for a path not bound":  `{"/a":{"mode":"share"},"/b":{"mode":"share"},"/c":{"mode":"share"}}`,
+			} {
+				vols, err := volumesFromEnv(lookup(taskVars(volumes)))
+				Expect(vols).To(BeNil(), name)
+				Expect(err).To(MatchError(ContainSubstring("private volumes are not supported for tasks on VM backends")), name)
+				Expect(err).To(MatchError(ContainSubstring(`a task can have a volume only as a share, which VM_VOLUMES sets with "mode": "share"`)), name)
+			}
+		})
+
+		It("names the image of an instance that mixes shares and private volumes, and leaves the mode to applyVolumeSettings", func() {
+			vars := taskVars(`{"/a":{"mode":"share"}}`)
+			vars["VCAP_APPLICATION"], vars["CF_INSTANCE_INDEX"] = vcapApp, "2"
+			vols, err := volumesFromEnv(lookup(vars))
+			Expect(err).NotTo(HaveOccurred())
+			name := "rvm-disk-" + testAppID + "-web-2.img"
+			Expect(vols).To(Equal([]guestVolume{{ContainerDir: "/a", ImageName: name, Index: 2}, {ContainerDir: "/b", ImageName: name, Index: 2}}))
+		})
+
+		It("still checks the application of an instance with a private volume", func() {
+			vars := taskVars(`{"/a":{"mode":"share"}}`)
+			vars["VCAP_APPLICATION"], vars["CF_INSTANCE_INDEX"] = `{"application_id":"x"}`, "0"
+			_, err := volumesFromEnv(lookup(vars))
+			Expect(err).To(MatchError(ContainSubstring("application_id is not a lowercase UUID")))
+		})
+	})
+
 	It("names the image after the application, the process type, and CF_INSTANCE_INDEX", func() {
 		vcap := vcapWith(map[string][]string{"juicefs": {mountJSON("/var/vcap/data/0d1e", "rw")}})
 		for index, name := range map[string]string{"0": "rvm-disk-" + testAppID + "-web-0.img", "3": "rvm-disk-" + testAppID + "-web-3.img", "65535": "rvm-disk-" + testAppID + "-web-65535.img"} {

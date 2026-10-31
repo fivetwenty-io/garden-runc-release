@@ -1621,6 +1621,22 @@ var _ = Describe("publishing a new image by link", func() {
 		Expect(os.ReadDir(dir)).To(BeEmpty())
 	})
 
+	It("reports a quota refusal of the link in the quota's words, and says that no image was created", func() {
+		for _, errno := range []unix.Errno{unix.EDQUOT, unix.ENOSPC} {
+			opts.link = func(int, string, string) error { return errno }
+			_, err := open()
+			Expect(errors.Is(err, errno)).To(BeTrue(), "%v", err)
+			Expect(errors.Is(err, errQuotaRefused)).To(BeTrue(), "%v", err)
+			Expect(err).To(MatchError(And(
+				HavePrefix("volume "+quoteForLog(dir)+`: creating image "rvm-disk-0.img"`),
+				ContainSubstring("the volume's quota refused it ("+errno.Error()+")"),
+				ContainSubstring(quotaAdvice),
+				HaveSuffix("; no image was created"))))
+			Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+			Expect(os.ReadDir(dir)).To(BeEmpty())
+		}
+	})
+
 	It("creates the image again when a sweep removes the temp file before the link", func() {
 		first := true
 		opts.afterTempCreate = func(dirfd int, name string) {
@@ -2831,7 +2847,7 @@ var _ = Describe("growing an image to the size asked for", func() {
 				Expect(statOf(img).Size).To(Equal(int64(2 << 20)))
 			})
 
-			It("keeps what it wrote when a zero write is refused part way, syncs it, exits 125 with the quota's words, and the next start continues", func() {
+			It("cuts the image back to what synced when a zero write is refused part way, syncs the cut, exits 125 with the quota's words, and the next start continues", func() {
 				writeImage(img, 2<<20, nil)
 				markImage()
 				opts.pwrite = func(fd int, b []byte, off int64) error {
@@ -2844,22 +2860,68 @@ var _ = Describe("growing an image to the size asked for", func() {
 				opts.fstatfs = fakeVolume(7<<30+1<<29, 10<<30)
 				_, err := open(nil)
 				Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
-				Expect(err).To(MatchError("volume " + vq + `: growing image "rvm-disk-0.img" from 2 MiB to 8 MiB needs 6 MiB, and the volume's quota refused it (disk quota exceeded); the volume has 7.5 GiB free of 10 GiB; ` + quotaAdvice + "; the image stays at 4 MiB"))
+				Expect(err).To(MatchError("volume " + vq + `: growing image "rvm-disk-0.img" from 2 MiB to 8 MiB needs 6 MiB, and the volume's quota refused it (disk quota exceeded); the volume has 7.5 GiB free of 10 GiB; ` + quotaAdvice + "; the image stays at 2 MiB"))
 				Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 				Expect(events).To(Equal([]growEvent{
-					{off: 2 << 20, len: 1 << 20}, {off: 3 << 20, len: 1 << 20}, {off: 4 << 20, len: 1 << 20}, {sync: true},
-				}), "the chunks before the refused one are synced")
-				Expect(statOf(img).Size).To(Equal(int64(4 << 20)))
+					{off: 2 << 20, len: 1 << 20}, {off: 3 << 20, len: 1 << 20}, {off: 4 << 20, len: 1 << 20}, {cut: true, off: 2 << 20}, {sync: true},
+				}), "the chunks before the refused one are not trusted, because they were never synced")
+				Expect(statOf(img).Size).To(Equal(int64(2 << 20)))
 				marksKept(2 << 20)
 
-				opts.pwrite = nil
+				events = nil
+				opts.pwrite = func(fd int, b []byte, off int64) error {
+					events = append(events, growEvent{off: off, len: int64(len(b))})
+					return pwriteFull(fd, b, off)
+				}
 				openOK()
+				Expect(writes()).To(Equal([][2]int64{{2 << 20, 1 << 20}, {3 << 20, 1 << 20}, {4 << 20, 1 << 20}, {5 << 20, 1 << 20}, {6 << 20, 1 << 20}, {7 << 20, 1 << 20}}),
+					"the next start writes again from the length that synced")
 				Expect(statOf(img).Size).To(Equal(int64(8 << 20)))
 				marksKept(2 << 20)
 				Expect(allZero(2 << 20)).To(BeTrue())
 			})
 
-			It("reports a sync that fails with EDQUOT after a refused write in the quota's words, keeps both errnos, and cuts back to what synced", func() {
+			It("cuts the image back when a write reports a quota error that the NFS client clears, so the sync after it succeeds, and no hole is left", func() {
+				writeImage(img, 2<<20, nil)
+				markImage()
+				// The client reports the writeback error at this write,
+				// consumes it, and has already sent the bytes of this write and
+				// of the chunks before it, so the file reaches past the refused
+				// range and the sync that follows returns 0.
+				opts.pwrite = func(fd int, b []byte, off int64) error {
+					events = append(events, growEvent{off: off, len: int64(len(b))})
+					if err := pwriteFull(fd, b, off); err != nil {
+						return err
+					}
+					if off == 4<<20 {
+						return unix.EDQUOT
+					}
+					return nil
+				}
+				opts.fstatfs = fakeVolume(7<<30+1<<29, 10<<30)
+				_, err := open(nil)
+				Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
+				Expect(err).To(MatchError("volume " + vq + `: growing image "rvm-disk-0.img" from 2 MiB to 8 MiB needs 6 MiB, and the volume's quota refused it (disk quota exceeded); the volume has 7.5 GiB free of 10 GiB; ` + quotaAdvice + "; the image stays at 2 MiB"))
+				Expect(events).To(Equal([]growEvent{
+					{off: 2 << 20, len: 1 << 20}, {off: 3 << 20, len: 1 << 20}, {off: 4 << 20, len: 1 << 20}, {cut: true, off: 2 << 20}, {sync: true},
+				}))
+				Expect(statOf(img).Size).To(Equal(int64(2<<20)), "the bytes the failing write copied are cut too")
+				marksKept(2 << 20)
+			})
+
+			It("cuts the image back at the first chunk too, and says so when the cut fails as well", func() {
+				writeImage(img, 2<<20, nil)
+				opts.pwrite = func(fd int, b []byte, off int64) error { return unix.EDQUOT }
+				opts.truncate = func(int, int64) error { return unix.EPERM }
+				opts.fstatfs = fakeVolume(7<<30+1<<29, 10<<30)
+				_, err := open(nil)
+				Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
+				Expect(errors.Is(err, unix.EPERM)).To(BeTrue(), "%v", err)
+				Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+				Expect(events).To(BeEmpty(), "a failed cut is not followed by a sync")
+			})
+
+			It("reports a sync of the cut that fails with EDQUOT after a refused write in the quota's words, and keeps both errnos", func() {
 				writeImage(img, 2<<20, nil)
 				markImage()
 				opts.pwrite = func(fd int, b []byte, off int64) error {
@@ -2881,7 +2943,7 @@ var _ = Describe("growing an image to the size asked for", func() {
 				Expect(err).To(MatchError("volume " + vq + `: growing image "rvm-disk-0.img" from 2 MiB to 8 MiB needs 6 MiB, and the volume's quota refused it (disk quota exceeded); the volume has 7.5 GiB free of 10 GiB; ` + quotaAdvice + "; the image stays at 2 MiB"))
 				Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 				Expect(events).To(Equal([]growEvent{
-					{off: 2 << 20, len: 1 << 20}, {off: 3 << 20, len: 1 << 20}, {sync: true}, {cut: true, off: 2 << 20},
+					{off: 2 << 20, len: 1 << 20}, {off: 3 << 20, len: 1 << 20}, {cut: true, off: 2 << 20}, {sync: true},
 				}))
 				Expect(statOf(img).Size).To(Equal(int64(2 << 20)))
 				marksKept(2 << 20)
