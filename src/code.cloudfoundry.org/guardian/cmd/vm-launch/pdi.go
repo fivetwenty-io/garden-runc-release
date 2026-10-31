@@ -205,6 +205,11 @@ type attachment struct {
 	// the drive on QEMU, or the identity it predicts Firecracker gives the
 	// drive. Providers leave it empty.
 	ID string
+	// Index is the volume index of the volume, which newGuestDrives records
+	// with ID. It names the drive on both backends, and a share among the
+	// volumes keeps it from being the attachment's position. Providers leave
+	// it unset.
+	Index int
 	// Release drops the fence and closes File. vm-launch calls it once the
 	// hypervisor has exited or never started. It never deletes the disk.
 	Release func() error

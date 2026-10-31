@@ -749,7 +749,7 @@ var _ = Describe("block drives in the hypervisor arguments", func() {
 	})
 
 	It("mixes block and image drives in volume order", func() {
-		drives := []volumeDrive{drivePathsFor(1)[0], {path: volumeDrivePath(1), id: qemuVolumeSerial(1), mode: attachBlock}}
+		drives := []volumeDrive{drivePathsFor(1)[0], {path: volumeDrivePath(1), id: qemuVolumeSerial(1), mode: attachBlock, index: 1}}
 		argv := qemuArgv(goldenArt, procSelfFD(5), goldenMemMiB, task, drives, 0)
 		Expect(optionAfter(argv, "-drive", "id=vol0")).To(ContainSubstring(",file=/proc/self/fd/3,format=raw,cache=writeback,"))
 		Expect(optionAfter(argv, "-drive", "id=vol1")).To(ContainSubstring(",file.driver=host_device,file.filename=/proc/self/fd/4,cache=none,"))

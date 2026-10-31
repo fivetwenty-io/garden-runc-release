@@ -5,6 +5,8 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -426,5 +428,190 @@ var _ = Describe("the initramfs memfd against a real QEMU", func() {
 		Expect(stdout).To(ContainSubstring(startTag(testNonce)))
 		Expect(stdout).To(ContainSubstring("hello from the memfd initramfs"))
 		Expect(stdout).To(ContainSubstring(exitTag(testNonce) + "7"))
+	})
+})
+
+var _ = Describe("QEMU arguments for a guest with shares", func() {
+	task := taskNetwork()
+
+	// shareAt is the socket of the share at volume index i, as shareServers
+	// reports it for a work directory of /work.
+	shareAt := func(i int) shareSocket {
+		return shareSocket{Index: i, Tag: shareTag(i), Path: fmt.Sprintf("/work/rvm-vol%d.sock", i)}
+	}
+	// sharedBase is goldenQEMUBase with the machine naming the memfd.
+	sharedBase := func(initrd string) []string {
+		base := withInitrd(goldenQEMUBase, initrd)
+		out := append([]string(nil), base...)
+		for i, a := range out {
+			if a == "-M" {
+				out[i+1] += ",memory-backend=mem0"
+			}
+		}
+		return out
+	}
+	memfd := func(mib int) []string {
+		return []string{"-object", fmt.Sprintf("memory-backend-memfd,id=mem0,size=%dM,share=on", mib)}
+	}
+	fsDevice := func(i int) []string {
+		return []string{
+			"-chardev", fmt.Sprintf("socket,id=fs%d,path=/work/rvm-vol%d.sock", i, i),
+			"-device", fmt.Sprintf("vhost-user-fs-device,chardev=fs%d,tag=rvm-vol%d", i, i),
+		}
+	}
+	// driveAt is the QEMU drive and device of the volume at volume index i
+	// whose image is on file descriptor fd.
+	driveAt := func(i, fd int) []string {
+		return []string{
+			"-drive", fmt.Sprintf("if=none,id=vol%d,file=/proc/self/fd/%d,format=raw,cache=writeback,aio=threads,file.locking=off,werror=report,rerror=report,discard=ignore", i, fd),
+			"-device", fmt.Sprintf("virtio-blk-device,drive=vol%d,serial=rvm-vol%d", i, i),
+		}
+	}
+
+	It("keeps every argument of a guest with no share, with and without a drive and a monitor", func() {
+		Expect(qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, task, nil, 0)).To(Equal(concat(goldenQEMUBase, goldenQEMUTaskNetdev)))
+		Expect(qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, task, nil, 0, []shareSocket{}...)).To(Equal(concat(goldenQEMUBase, goldenQEMUTaskNetdev)))
+		Expect(qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, task, drivePathsFor(1), 5)).To(Equal(
+			concat(withInitrd(goldenQEMUBase, goldenVolumeInitrd), goldenQEMUTaskNetdev, goldenQEMUDrive, goldenQEMUMonitor("5"))))
+		argv, err := hypervisorArgv(backend.VMQemu, goldenArt, "/unused", goldenVolumeInitrd, goldenMemMiB, task, drivePathsFor(1), "", 0)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(argv).To(Equal(concat(withInitrd(goldenQEMUBase, goldenVolumeInitrd), goldenQEMUTaskNetdev, goldenQEMUDrive)))
+	})
+
+	It("gives one share shared memory the size of the guest's, a socket, and a vhost-user-fs device", func() {
+		Expect(qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, task, nil, 0, shareAt(0))).To(Equal(
+			concat(sharedBase(goldenInitrd), goldenQEMUTaskNetdev, memfd(goldenMemMiB), fsDevice(0))))
+	})
+
+	It("sizes the shared memory by the guest's memory, which stays the -m value", func() {
+		argv := qemuArgv(goldenArt, goldenInitrd, 2048, task, nil, 0, shareAt(0))
+		Expect(optionAfter(argv, "-m", "")).To(Equal("2048"))
+		Expect(optionAfter(argv, "-object", "memory-backend-memfd")).To(Equal("memory-backend-memfd,id=mem0,size=2048M,share=on"))
+		plain := qemuArgv(goldenArt, goldenInitrd, 2048, task, nil, 0)
+		Expect(optionAfter(plain, "-m", "")).To(Equal("2048"))
+	})
+
+	It("gives two shares one memfd and a chardev and device each, numbered by volume index", func() {
+		Expect(qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, task, nil, 0, shareAt(1), shareAt(3))).To(Equal(
+			concat(sharedBase(goldenInitrd), goldenQEMUTaskNetdev, memfd(goldenMemMiB), fsDevice(1), fsDevice(3))))
+	})
+
+	It("keeps a private volume's drive, serial, and name at its volume index when a share comes first", func() {
+		drives := []volumeDrive{{path: volumeDrivePath(0), id: qemuVolumeSerial(1), mode: attachFileImage, index: 1}}
+		argv, err := hypervisorArgv(backend.VMQemu, goldenArt, "/unused", goldenVolumeInitrd, goldenMemMiB, task, drives, "", 0, shareAt(0))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(argv).To(Equal(concat(sharedBase(goldenVolumeInitrd), goldenQEMUTaskNetdev, driveAt(1, 3), memfd(goldenMemMiB), fsDevice(0))))
+		Expect(argv).NotTo(ContainElement(ContainSubstring("id=vol0,")))
+		Expect(argv).NotTo(ContainElement(ContainSubstring("drive=vol0,")))
+		Expect(argv).NotTo(ContainElement(ContainSubstring("serial=rvm-vol0")))
+	})
+
+	It("lets a share sit between two private volumes and names each drive by its volume index", func() {
+		drives := []volumeDrive{
+			{path: volumeDrivePath(0), id: qemuVolumeSerial(0), mode: attachFileImage, index: 0},
+			{path: volumeDrivePath(1), id: qemuVolumeSerial(2), mode: attachFileImage, index: 2},
+		}
+		argv, err := hypervisorArgv(backend.VMQemu, goldenArt, "/unused", procSelfFD(5), goldenMemMiB, task, drives, "", 6, shareAt(1))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(argv).To(Equal(concat(sharedBase(procSelfFD(5)), goldenQEMUTaskNetdev, driveAt(0, 3), driveAt(2, 4), memfd(goldenMemMiB), fsDevice(1), goldenQEMUMonitor("6"))))
+	})
+
+	It("takes the drive's volume index from the attachment, so hypervisorFiles names a drive after a share by its volume index", func() {
+		img := openSizedFile(1 << 20)
+		att := imageAttachments(img)[0]
+		att.Index = 2
+		_, drives, _, _, _ := hypervisorFiles([]*attachment{att}, openSizedFile(1<<20), nil, nil)
+		Expect(drives).To(HaveLen(1))
+		Expect(drives[0].index).To(Equal(2))
+		argv, err := hypervisorArgv(backend.VMQemu, goldenArt, "/unused", procSelfFD(4), goldenMemMiB, task, drives, "", 0, shareAt(0), shareAt(1))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(optionAfter(argv, "-drive", "")).To(ContainSubstring("id=vol2,"))
+	})
+
+	It("records the volume index on the attachment when it identifies the drives", func() {
+		first, second := openSizedFile(1<<20), openSizedFile(1<<20)
+		vols := preparedVolumes{
+			{Index: 1, Path: "/a", Attachment: &attachment{File: first, Mode: attachFileImage}},
+			{Index: 3, Path: "/b", Attachment: &attachment{File: second, Mode: attachFileImage}},
+		}
+		_, err := newGuestDrives(backend.VMQemu, vols, nil)
+		Expect(err).NotTo(HaveOccurred())
+		_, drives, _, _, _ := hypervisorFiles(vols.files(), openSizedFile(1<<20), nil, nil)
+		Expect([]int{drives[0].index, drives[1].index}).To(Equal([]int{1, 3}))
+		Expect([]string{drives[0].id, drives[1].id}).To(Equal([]string{"rvm-vol1", "rvm-vol3"}))
+	})
+
+	It("names a Firecracker drive by its volume index", func() {
+		drives := []volumeDrive{{path: volumeDrivePath(0), id: "12345", mode: attachFileImage, index: 2}}
+		raw := fcConfigJSON(goldenVolumeInitrd, goldenMemMiB, task, drives, "")
+		Expect(raw).To(ContainSubstring(`"drive_id":"vol2"`))
+		Expect(raw).NotTo(ContainSubstring(`"drive_id":"vol0"`))
+	})
+
+	It("refuses shares on Firecracker, which has no vhost-user-fs device", func() {
+		work := GinkgoT().TempDir()
+		_, err := hypervisorArgv(backend.VMFirecracker, goldenArt, work, goldenInitrd, goldenMemMiB, task, nil, "", 0, shareAt(0))
+		Expect(err).To(MatchError(ContainSubstring("cannot serve shares")))
+		Expect(filepath.Join(work, "fc.json")).NotTo(BeAnExistingFile())
+	})
+
+	DescribeTable("refuses a share list it cannot turn into devices",
+		func(shares []shareSocket, message string) {
+			_, err := hypervisorArgv(backend.VMQemu, goldenArt, "/unused", goldenInitrd, goldenMemMiB, task, nil, "", 0, shares...)
+			Expect(err).To(MatchError(ContainSubstring(message)))
+		},
+		Entry("two shares at one index", []shareSocket{shareAt(1), shareAt(1)}, "two shares have the volume index 1"),
+		Entry("a negative index", []shareSocket{{Index: -1, Tag: "rvm-vol-1", Path: "/work/s.sock"}}, "below 0"),
+		Entry("no socket path", []shareSocket{{Index: 0, Tag: "rvm-vol0"}}, "no socket path"),
+		Entry("no tag", []shareSocket{{Index: 0, Path: "/work/s.sock"}}, "empty or has a comma"),
+		Entry("a tag with a comma", []shareSocket{{Index: 0, Tag: "a,b", Path: "/work/s.sock"}}, "empty or has a comma"),
+	)
+
+	It("doubles a comma in the socket path, which QEMU reads as the next key", func() {
+		argv := qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, task, nil, 0, shareSocket{Index: 0, Tag: "rvm-vol0", Path: "/work,x/s.sock"})
+		Expect(optionAfter(argv, "-chardev", "id=fs0")).To(Equal("socket,id=fs0,path=/work,,x/s.sock"))
+	})
+
+	It("takes the sockets of a shareServers for the arguments, so the chardev path is the socket the share is served on", func() {
+		work := GinkgoT().TempDir()
+		srv, err := newShareServers("/unused", work, []shareGrant{{Index: 2, Path: "/p", Tag: shareTag(2)}}, log.New(io.Discard, "", 0))
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { srv.stop(0) })
+		argv, err := hypervisorArgv(backend.VMQemu, goldenArt, work, goldenInitrd, goldenMemMiB, task, nil, "", 0, srv.sockets()...)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(optionAfter(argv, "-chardev", "id=fs2")).To(Equal("socket,id=fs2,path=" + filepath.Join(work, "rvm-vol2.sock")))
+		Expect(optionAfter(argv, "-device", "vhost-user-fs-device")).To(Equal("vhost-user-fs-device,chardev=fs2,tag=rvm-vol2"))
+	})
+
+	Describe("against a real QEMU", func() {
+		// The machine with its memory named, and the memfd, as QEMU parses
+		// them; the guest never starts.
+		sharedMachine := func(qemu string) (string, []string) {
+			requireMicrovm(qemu)
+			argv := qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, task, nil, 0, shareAt(0))
+			machine := strings.Replace(optionAfter(argv, "-M", "microvm"), "accel=kvm", "accel=tcg", 1)
+			return machine, []string{"-object", optionAfter(argv, "-object", "memory-backend-memfd"), "-m", strconv.Itoa(goldenMemMiB)}
+		}
+		run := func(qemu, machine string, args ...string) (int, string) {
+			argv := append([]string{qemu, "-S", "-display", "none", "-M", machine, "-nodefaults", "-no-user-config", "-monitor", "stdio"}, args...)
+			code, _, stderr := runRealQEMU(argv, nil, "quit\n", 30*time.Second)
+			return code, stderr
+		}
+
+		It("accepts the machine and the memfd that vm-launch generates for a share", func() {
+			qemu := realQEMU()
+			machine, args := sharedMachine(qemu)
+			Expect(machine).To(ContainSubstring(",memory-backend=mem0"))
+			code, stderr := run(qemu, machine, args...)
+			Expect(code).To(Equal(0), "QEMU rejected -M %s %q: %s", machine, args, stderr)
+		})
+
+		It("rejects a machine that names a memory backend that does not exist, so the check above can fail", func() {
+			qemu := realQEMU()
+			machine, args := sharedMachine(qemu)
+			code, stderr := run(qemu, strings.Replace(machine, "memory-backend=mem0", "memory-backend=nope", 1), args...)
+			Expect(code).NotTo(Equal(0))
+			Expect(stderr).To(ContainSubstring("nope"))
+		})
 	})
 })

@@ -377,7 +377,7 @@ func drivePathsFor(n int) []volumeDrive {
 func imageDrives(paths ...string) []volumeDrive {
 	drives := make([]volumeDrive, len(paths))
 	for i, p := range paths {
-		drives[i] = volumeDrive{path: p, id: qemuVolumeSerial(i), mode: attachFileImage}
+		drives[i] = volumeDrive{path: p, id: qemuVolumeSerial(i), mode: attachFileImage, index: i}
 	}
 	return drives
 }
@@ -387,7 +387,7 @@ func imageDrives(paths ...string) []volumeDrive {
 func imageAttachments(files ...*os.File) []*attachment {
 	atts := make([]*attachment, len(files))
 	for i, f := range files {
-		atts[i] = &attachment{File: f, Mode: attachFileImage, ID: qemuVolumeSerial(i), Release: func() error { return nil }}
+		atts[i] = &attachment{File: f, Mode: attachFileImage, ID: qemuVolumeSerial(i), Index: i, Release: func() error { return nil }}
 	}
 	return atts
 }

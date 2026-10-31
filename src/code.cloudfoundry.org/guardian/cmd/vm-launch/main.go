@@ -792,7 +792,7 @@ func run(argv []string, logger *log.Logger) int {
 	}
 	defer shareSrv.stop(0)
 	files, drivePaths, initrdPath, monitorFD, rootPath := hypervisorFiles(prepared.files(), initrd, qemuMonitor, rootImg)
-	hvArgv, err := hypervisorArgv(cfg.backend, cfg.artifacts, workDir, initrdPath, memMiB, nw, drivePaths, rootPath, monitorFD)
+	hvArgv, err := hypervisorArgv(cfg.backend, cfg.artifacts, workDir, initrdPath, memMiB, nw, drivePaths, rootPath, monitorFD, shareSrv.sockets()...)
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError

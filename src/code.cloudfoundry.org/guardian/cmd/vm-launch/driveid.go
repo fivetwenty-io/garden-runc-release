@@ -132,7 +132,7 @@ func firecrackerDriveID(f *os.File) (string, error) {
 // index, as prepare adds them. On Firecracker they are predicted from the
 // open files, so they must be the files the hypervisor gets; for a block
 // device that is the device node's own inode. Each volume's identity is
-// recorded on its attachment (attachment.ID), where hypervisorFiles takes it
+// recorded on its attachment (attachment.ID, with the volume index in attachment.Index), where hypervisorFiles takes it
 // for the hypervisor's arguments, and each volume's kind comes from its
 // attachment's mode. A drive without a usable identity or kind, and two
 // drives that would share an identity, are an error, because the guest could
@@ -186,6 +186,7 @@ func newGuestDrives(kind backend.Kind, volumes preparedVolumes, root *os.File) (
 	}
 	for i, v := range volumes {
 		v.Attachment.ID = drives.volumes[i].id
+		v.Attachment.Index = v.Index
 	}
 	return drives, nil
 }

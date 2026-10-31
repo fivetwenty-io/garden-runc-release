@@ -155,26 +155,36 @@ func checkArtifacts(kind backend.Kind, root string) error {
 // stream socket that QEMU serves its QMP monitor on.
 //
 // drives are the volume drives in volume order, from hypervisorFiles, and
-// the guest gets each one as a virtio-blk drive, volumeDriveID(i) for the
-// drive at index i, after the NIC and in the same order. Each drive's device
-// carries the drive's identity as its serial, which is qemuVolumeSerial of
-// the volume's volume index (see newGuestDrives) and which the guest reads
-// back. A share has no drive, so i counts the drives alone and is QEMU's own
-// name for the drive, which the guest never sees. The format is pinned
+// the guest gets each one as a virtio-blk drive, volumeDriveID of the
+// drive's volume index, after the NIC and in the same order. Each drive's
+// device carries the drive's identity as its serial, which is qemuVolumeSerial
+// of the volume's volume index (see newGuestDrives) and which the guest reads
+// back. A share has no drive, so a drive's name counts the shares before it,
+// as its serial does, and is QEMU's own name for the drive. The format is pinned
 // to raw, so QEMU never probes the guest-written disk for a format header
 // such as a qcow2 backing file. I/O errors, ENOSPC and EDQUOT included, reach
 // the guest as errors instead of pausing the VM. QEMU's own locking is off,
 // because vm-launch holds the fence that decides who writes the disk: the
 // image's flock, or the device's exclusive open. Drives in neither mode are
 // for hypervisorArgv to refuse; qemuArgv attaches them as images.
-func qemuArgv(root, initrd string, memMiB int, nw *network, drives []volumeDrive, monitorFD int) []string {
+//
+// shares are the guest's shares, in volume order: the virtiofsd socket of
+// each, which QEMU connects to as a vhost-user client. A guest without a
+// share gets the arguments above and nothing more. A guest with one gets its
+// RAM as a shared memfd (see qemuShareArgs) and a vhost-user-fs device for
+// each share, after the volume drives and before the monitor.
+func qemuArgv(root, initrd string, memMiB int, nw *network, drives []volumeDrive, monitorFD int, shares ...shareSocket) []string {
 	art := func(rel string) string { return filepath.Join(root, rel) }
+	machine := qemuMachine
+	if len(shares) > 0 {
+		machine += ",memory-backend=" + qemuMemoryID
+	}
 	argv := []string{
 		art(artQEMULoader),
 		"--library-path", art(artQEMULibDir),
 		art(artQEMUBinary),
 		"-L", art(artQEMUShareDir),
-		"-M", qemuMachine,
+		"-M", machine,
 		"-cpu", "host",
 		"-smp", strconv.Itoa(guestVCPUs),
 		"-m", strconv.Itoa(memMiB),
@@ -191,9 +201,10 @@ func qemuArgv(root, initrd string, memMiB int, nw *network, drives []volumeDrive
 		"-netdev", "user,id="+qemuNetdevID+",net="+qemuNetwork,
 		"-device", "virtio-net-device,netdev="+qemuNetdevID,
 	)
-	for i, d := range drives {
-		argv = append(argv, qemuVolumeDrive(volumeDriveID(i), d)...)
+	for _, d := range drives {
+		argv = append(argv, qemuVolumeDrive(volumeDriveID(d.index), d)...)
 	}
+	argv = append(argv, qemuShareArgs(memMiB, shares)...)
 	if monitorFD > 0 {
 		argv = append(argv,
 			"-chardev", "socket,id=qmp0,fd="+strconv.Itoa(monitorFD)+",server=off",
@@ -206,6 +217,57 @@ func qemuArgv(root, initrd string, memMiB int, nw *network, drives []volumeDrive
 // qemuNetdevID names the guest's user-mode network, which forwarding rules
 // name too.
 const qemuNetdevID = "n0"
+
+// qemuMemoryID names the memfd that backs guest RAM when the guest has a
+// share. -M names it as the machine's memory.
+const qemuMemoryID = "mem0"
+
+// qemuShareArgs returns the QEMU options that give the guest its shares, or
+// nothing without one. virtiofsd reads and writes guest memory through the
+// vhost-user protocol, so guest RAM has to be a file it can map: a
+// memory-backend-memfd object with share=on, as large as -m, which -M
+// (see qemuArgv) names as the machine's memory. Each share then gets a
+// chardev on its virtiofsd socket, which QEMU connects to, and a
+// vhost-user-fs-device on that chardev with the share's tag. The chardev is
+// fs<N> for the share at volume index N, as the share's socket and tag
+// are. QEMU reads a comma in an option value as the next key, so the socket
+// path doubles any.
+func qemuShareArgs(memMiB int, shares []shareSocket) []string {
+	if len(shares) == 0 {
+		return nil
+	}
+	argv := []string{"-object", "memory-backend-memfd,id=" + qemuMemoryID + ",size=" + strconv.Itoa(memMiB) + "M,share=on"}
+	for _, s := range shares {
+		chardev := "fs" + strconv.Itoa(s.Index)
+		argv = append(argv,
+			"-chardev", "socket,id="+chardev+",path="+strings.ReplaceAll(s.Path, ",", ",,"),
+			"-device", "vhost-user-fs-device,chardev="+chardev+",tag="+s.Tag,
+		)
+	}
+	return argv
+}
+
+// checkShares refuses a share list qemuShareArgs could not turn into devices
+// the guest tells apart: a share with no socket path or no tag, a tag with a
+// comma, which would end the option, an index below zero, and two shares at
+// one volume index, which would give two chardevs one id.
+func checkShares(shares []shareSocket) error {
+	seen := make(map[int]bool, len(shares))
+	for _, s := range shares {
+		switch {
+		case s.Index < 0:
+			return fmt.Errorf("share %q has the volume index %d, which is below 0", s.Tag, s.Index)
+		case seen[s.Index]:
+			return fmt.Errorf("two shares have the volume index %d", s.Index)
+		case s.Path == "":
+			return fmt.Errorf("share %q has no socket path", s.Tag)
+		case s.Tag == "" || strings.ContainsRune(s.Tag, ','):
+			return fmt.Errorf("the share at volume index %d has the tag %q, which is empty or has a comma", s.Index, s.Tag)
+		}
+		seen[s.Index] = true
+	}
+	return nil
+}
 
 // qemuVolumeDrive returns the QEMU options that attach the volume drive d as
 // the drive id. An image goes through QEMU's file driver with writeback
@@ -226,12 +288,16 @@ func qemuVolumeDrive(id string, d volumeDrive) []string {
 }
 
 // volumeDrive is one volume drive as the hypervisor's arguments name it: the
-// path the hypervisor opens it by, the drive's identity, and how the disk
-// reaches the guest. hypervisorFiles takes all three from the attachment.
+// path the hypervisor opens it by, the drive's identity, how the disk
+// reaches the guest, and the volume index of its volume. hypervisorFiles takes
+// all four from the attachment. Both backends name the drive after the volume
+// index (see volumeDriveID), so a share among the volumes, which has no
+// drive, does not renumber the drives after it.
 type volumeDrive struct {
-	path string
-	id   string
-	mode attachMode
+	path  string
+	id    string
+	mode  attachMode
+	index int
 }
 
 // The hypervisor's inherited files. The hypervisor gets the volume images,
@@ -253,8 +319,9 @@ const (
 	rootDriveID   = "root0"
 )
 
-// volumeDriveID names the drive of the volume at index i in volume order,
-// on QEMU and on Firecracker alike: vol0 for the first.
+// volumeDriveID names the drive of the volume with volume index i, on QEMU
+// and on Firecracker alike: vol0 for the first volume. A share is a volume
+// that has no drive, so with a share at index 0 the first drive is vol1.
 func volumeDriveID(i int) string {
 	return "vol" + strconv.Itoa(i)
 }
@@ -288,7 +355,7 @@ func hypervisorFiles(vols []*attachment, initrd, monitor, root *os.File) (files 
 			continue
 		}
 		files = append(files, att.File)
-		drives = append(drives, volumeDrive{path: procSelfFD(firstExtraFD + len(files) - 1), id: att.ID, mode: att.Mode})
+		drives = append(drives, volumeDrive{path: procSelfFD(firstExtraFD + len(files) - 1), id: att.ID, mode: att.Mode, index: att.Index})
 	}
 	files = append(files, initrd)
 	initrdPath = procSelfFD(firstExtraFD + len(files) - 1)
@@ -397,9 +464,9 @@ func newFirecrackerConfig(root, initrd string, memMiB int, nw *network, drives [
 		Drives:        []firecrackerDrive{},
 		MachineConfig: firecrackerMachineConfig{VCPUCount: guestVCPUs, MemSizeMiB: memMiB},
 	}
-	for i, d := range drives {
+	for _, d := range drives {
 		cfg.Drives = append(cfg.Drives, firecrackerDrive{
-			DriveID:      volumeDriveID(i),
+			DriveID:      volumeDriveID(d.index),
 			PathOnHost:   d.path,
 			IsRootDevice: false,
 			IsReadOnly:   false,
@@ -437,8 +504,10 @@ func firecrackerArgv(root, configPath string) []string {
 // because QEMU passes it as the serial. rootPath is the path of the guest
 // root image, or empty when the guest root stays in RAM; that drive comes
 // after the volumes' on both backends. monitorFD is QEMU's QMP socket (see
-// qemuArgv), or 0; Firecracker has no monitor.
-func hypervisorArgv(kind backend.Kind, root, workDir, initrd string, memMiB int, nw *network, drives []volumeDrive, rootPath string, monitorFD int) ([]string, error) {
+// qemuArgv), or 0; Firecracker has no monitor. shares are the guest's
+// shares, which only QEMU serves, so Firecracker refuses them. QEMU refuses a
+// share list that checkShares rejects.
+func hypervisorArgv(kind backend.Kind, root, workDir, initrd string, memMiB int, nw *network, drives []volumeDrive, rootPath string, monitorFD int, shares ...shareSocket) ([]string, error) {
 	if len(drives) > maxVolumes {
 		return nil, fmt.Errorf("%d volume drives, over the %d a guest can have", len(drives), maxVolumes)
 	}
@@ -447,14 +516,20 @@ func hypervisorArgv(kind backend.Kind, root, workDir, initrd string, memMiB int,
 		case d.path == "":
 			return nil, fmt.Errorf("volume drive %s has no path", volumeDriveID(i))
 		case d.mode != attachFileImage && d.mode != attachBlock:
-			return nil, fmt.Errorf("volume drive %s is in %s, which VM backends do not attach as a drive", volumeDriveID(i), d.mode)
+			return nil, fmt.Errorf("volume drive %s is in %s, which VM backends do not attach as a drive", volumeDriveID(d.index), d.mode)
 		case kind == backend.VMQemu && !validDriveID(d.id):
-			return nil, fmt.Errorf("volume drive %s has the identity %q, which is not 1 to %d letters, digits, and hyphens, so QEMU cannot pass it as the drive's serial", volumeDriveID(i), d.id, virtioBlockIDBytes)
+			return nil, fmt.Errorf("volume drive %s has the identity %q, which is not 1 to %d letters, digits, and hyphens, so QEMU cannot pass it as the drive's serial", volumeDriveID(d.index), d.id, virtioBlockIDBytes)
 		}
+	}
+	if len(shares) > 0 && kind != backend.VMQemu {
+		return nil, fmt.Errorf("%s cannot serve shares, which need QEMU's vhost-user-fs device", kind)
+	}
+	if err := checkShares(shares); err != nil {
+		return nil, err
 	}
 	switch kind {
 	case backend.VMQemu:
-		argv := qemuArgv(root, initrd, memMiB, nw, drives, monitorFD)
+		argv := qemuArgv(root, initrd, memMiB, nw, drives, monitorFD, shares...)
 		if rootPath != "" {
 			argv = append(argv, qemuRootDrive(rootPath)...)
 		}
