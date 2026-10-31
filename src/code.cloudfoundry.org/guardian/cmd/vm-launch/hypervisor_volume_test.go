@@ -658,9 +658,10 @@ var _ = Describe("hypervisor drives for several volumes against a real QEMU", fu
 		img := sparseImage(size)
 
 		// A blank disk of the block kind fails the boot before the command,
-		// with the line that names the volume's disk, and stays blank.
+		// with the line that names the volume's disk, when tune2fs finds no
+		// filesystem on it, and stays blank.
 		stdout := bootKinds(img, driveBlock, "echo never-ran")
-		Expect(stdout).To(MatchRegexp(`vm-launch guest setup: mounting volume 0's disk /dev/vd[a-z]+ at /home/vcap/data failed; vm-launch never formats a block volume, so the guest will not boot with it`))
+		Expect(stdout).To(MatchRegexp(`vm-launch guest setup: reading the filesystem on volume 0's disk /dev/vd[a-z]+ for /home/vcap/data with tune2fs -l failed; vm-launch never formats a block volume, so the guest will not boot with it`))
 		Expect(stdout).NotTo(ContainSubstring(startTag(testNonce)), stdout)
 		Expect(stdout).NotTo(ContainSubstring("never-ran"), stdout)
 		head := make([]byte, 1<<20)

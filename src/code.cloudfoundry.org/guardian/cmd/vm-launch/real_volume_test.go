@@ -23,6 +23,8 @@ const (
 	extSuperblockOffset = 1024
 	extSuperblockBytes  = 1024
 
+	extBlocksCountLo   = 0x04
+	extFreeBlocksLo    = 0x0c
 	extLogBlockSize    = 0x18
 	extFirstDataBlock  = 0x14
 	extState           = 0x3a
@@ -32,6 +34,8 @@ const (
 	extFeatureROCompat = 0x64
 	extUUID            = 0x68
 	extDescSize        = 0xfe
+	extBlocksCountHi   = 0x150
+	extFreeBlocksHi    = 0x158
 	extChecksumSeed    = 0x270
 	extChecksum        = 0x3fc
 
@@ -94,6 +98,29 @@ func (e *extImage) hasJournal() bool { return e.u32(extFeatureCompat)&extCompatH
 // which every change from the host must then recompute.
 func (e *extImage) checksummed() bool {
 	return e.u32(extFeatureROCompat)&extROCompatMetadataCsum != 0
+}
+
+// blockSize returns the filesystem's block size in bytes.
+func (e *extImage) blockSize() int64 { return int64(1024) << e.u32(extLogBlockSize) }
+
+// blocks returns the filesystem's block count, with its high half when
+// the filesystem is 64-bit.
+func (e *extImage) blocks() int64 {
+	n := int64(e.u32(extBlocksCountLo))
+	if e.u32(extFeatureIncompat)&extIncompat64Bit != 0 {
+		n |= int64(e.u32(extBlocksCountHi)) << 32
+	}
+	return n
+}
+
+// freeBlocks returns the free block count the superblock records, which
+// e2fsck brings up to date.
+func (e *extImage) freeBlocks() int64 {
+	n := int64(e.u32(extFreeBlocksLo))
+	if e.u32(extFeatureIncompat)&extIncompat64Bit != 0 {
+		n |= int64(e.u32(extFreeBlocksHi)) << 32
+	}
+	return n
 }
 
 // uuid returns the filesystem's UUID, which a new format would change.
@@ -356,6 +383,169 @@ var _ = Describe("volume images against a real QEMU", func() {
 		Expect(out).To(ContainSubstring("Bad magic number in super-block"), out)
 		Expect(imageDigest(img)).To(Equal(before), "the guest wrote to the image")
 		Expect(extLabel(img)).To(BeEmpty())
+	})
+
+	// growTo makes the host file img size bytes long, as a larger disk_mb
+	// leaves a volume's image.
+	growTo := func(img *os.File, size int64) {
+		GinkgoHelper()
+		Expect(img.Truncate(size)).To(Succeed())
+	}
+	// grewLine matches the line ext4grow prints when it grows the volume.
+	const grewLine = `(?m)^ext4grow: grew ` + dataDir + ` to fill /dev/vd[a-z]+, from [0-9]+ to [0-9]+ usable blocks of [0-9]+ bytes\r?$`
+
+	It("grows a 1 GiB journalled image to 2 GiB online after its preen, with its files, and leaves it alone at the next boot", func() {
+		img := openSizedFile(defaultImageSize)
+		markData(img, "kept-through-the-grow")
+		fs := readExtImage(img)
+		uuid := fs.uuid()
+		Expect(fs.hasJournal()).To(BeTrue())
+		Expect(fs.blocks() * fs.blockSize()).To(Equal(int64(defaultImageSize)))
+
+		growTo(img, 2*defaultImageSize)
+		out := bootData(img, `echo "mark=$(cat `+dataDir+`/mark)"; df -k `+dataDir+` | sed -n 's/^[^ ]* *\([0-9]*\) .*/size=\1/p'`)
+		Expect(out).NotTo(ContainSubstring("vm-launch guest setup"), out)
+		Expect(out).To(MatchRegexp(`(?m)^rvm-volume: clean, `), out)
+		Expect(out).To(MatchRegexp(grewLine), out)
+		Expect(out).To(MatchRegexp(`(?m)^mark=kept-through-the-grow\r?$`), out)
+		Expect(out).To(ContainSubstring(exitTag(testNonce)+"0"), out)
+		// The command already sees the grown filesystem.
+		m := regexp.MustCompile(`(?m)^size=([0-9]+)\r?$`).FindStringSubmatch(out)
+		Expect(m).NotTo(BeNil(), out)
+		kib, err := strconv.ParseInt(m[1], 10, 64)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(kib).To(BeNumerically(">", int64(defaultImageSize)/1024), out)
+
+		fs = readExtImage(img)
+		Expect(fs.uuid()).To(Equal(uuid), "the image was formatted again")
+		Expect(fs.blocks() * fs.blockSize()).To(Equal(int64(2 * defaultImageSize)))
+		Expect(imageHolds(img, "kept-through-the-grow")).To(BeTrue())
+
+		// The image fills its device now, so the next boot preens it and
+		// runs no ext4grow.
+		out = bootData(img, `echo "mark=$(cat `+dataDir+`/mark)"`)
+		Expect(out).NotTo(ContainSubstring("vm-launch guest setup"), out)
+		Expect(out).NotTo(ContainSubstring("ext4grow"), out)
+		Expect(out).To(MatchRegexp(`(?m)^mark=kept-through-the-grow\r?$`), out)
+		Expect(out).To(ContainSubstring(exitTag(testNonce)+"0"), out)
+		Expect(readExtImage(img).blocks()).To(Equal(fs.blocks()))
+	})
+
+	It("gives a legacy ext2 image with files a 4 MiB journal before it grows it, and keeps its files", func() {
+		img := legacyImage(defaultImageSize)
+		markData(img, "kept-through-the-journal")
+		fs := readExtImage(img)
+		uuid, blocks := fs.uuid(), fs.blocks()
+		Expect(fs.hasJournal()).To(BeFalse())
+
+		growTo(img, 2*defaultImageSize)
+		out := bootData(img, `echo "mark=$(cat `+dataDir+`/mark)"`)
+		Expect(out).NotTo(ContainSubstring("vm-launch guest setup"), out)
+		Expect(out).NotTo(ContainSubstring("mounts at its old size"), out)
+		Expect(out).To(MatchRegexp(grewLine), out)
+		Expect(out).To(MatchRegexp(`(?m)^mark=kept-through-the-journal\r?$`), out)
+		Expect(out).To(ContainSubstring(exitTag(testNonce)+"0"), out)
+
+		fs = readExtImage(img)
+		Expect(fs.uuid()).To(Equal(uuid), "the image was formatted again")
+		Expect(fs.hasJournal()).To(BeTrue(), "the legacy image got no journal")
+		devBlocks := int64(2*defaultImageSize) / fs.blockSize()
+		GinkgoWriter.Printf("the legacy image grew from %d to %d blocks of %d bytes on a device of %d\n", blocks, fs.blocks(), fs.blockSize(), devBlocks)
+		Expect(fs.blocks()).To(BeNumerically(">", blocks))
+		Expect(fs.blocks()).To(BeNumerically("<=", devBlocks))
+		Expect(imageHolds(img, "kept-through-the-journal")).To(BeTrue())
+	})
+
+	It("mounts a full legacy image at its old size without a journal and asks for 4 MiB, and grows it once the app frees the space", func() {
+		const size = 16 << 20
+		img := legacyImage(size)
+		markData(img, "kept-while-full")
+		// The guest fills the image; dd stops when the filesystem is full.
+		out := bootData(img, "dd if=/dev/zero of="+dataDir+"/fill bs=64k 2>/dev/null; sync -f "+dataDir+"; echo filled")
+		Expect(out).NotTo(ContainSubstring("vm-launch guest setup"), out)
+		Expect(out).To(MatchRegexp(`(?m)^filled\r?$`), out)
+		fs := readExtImage(img)
+		uuid, blocks := fs.uuid(), fs.blocks()
+		Expect(fs.hasJournal()).To(BeFalse())
+
+		Expect(fs.freeBlocks()*fs.blockSize()).To(BeNumerically("<", 4<<20), "the fill left 4 MiB free")
+
+		growTo(img, 2*size)
+		out = bootData(img, `echo "mark=$(cat `+dataDir+`/mark)"; rm `+dataDir+`/fill`)
+		Expect(out).NotTo(ContainSubstring("vm-launch guest setup"), out)
+		Expect(out).To(MatchRegexp(`(?m)^vm-launch guest: the volume image volume\.img at `+dataDir+` has no journal and only [0-9]+ KiB free, and it needs 4 MiB free for the journal it must have before it grows, so it mounts at its old size of `+strconv.FormatInt(blocks, 10)+` blocks of [0-9]+ bytes; free 4 MiB in `+dataDir+` and restart the app to grow it\r?$`), out)
+		Expect(out).NotTo(ContainSubstring("ext4grow"), out)
+		Expect(out).To(MatchRegexp(`(?m)^mark=kept-while-full\r?$`), out)
+		Expect(out).To(ContainSubstring(exitTag(testNonce)+"0"), out)
+		fs = readExtImage(img)
+		Expect(fs.uuid()).To(Equal(uuid))
+		Expect(fs.hasJournal()).To(BeFalse())
+		Expect(fs.blocks()).To(Equal(blocks), "the full image grew")
+
+		// The app freed the space, so the next boot adds the journal and
+		// grows the image.
+		out = bootData(img, `echo "mark=$(cat `+dataDir+`/mark)"`)
+		Expect(out).NotTo(ContainSubstring("vm-launch guest setup"), out)
+		Expect(out).To(MatchRegexp(grewLine), out)
+		Expect(out).To(MatchRegexp(`(?m)^mark=kept-while-full\r?$`), out)
+		Expect(out).To(ContainSubstring(exitTag(testNonce)+"0"), out)
+		fs = readExtImage(img)
+		Expect(fs.hasJournal()).To(BeTrue())
+		Expect(fs.blocks()).To(BeNumerically(">", blocks))
+		Expect(fs.blocks()).To(BeNumerically("<=", int64(2*size)/fs.blockSize()))
+	})
+
+	It("grows a block volume online when its disk is bigger, without formatting or checking it", func() {
+		const size = 64 << 20
+		img := openSizedFile(size)
+		markData(img, "kept-on-the-block-volume")
+		fs := readExtImage(img)
+		uuid, blocks := fs.uuid(), fs.blocks()
+
+		growTo(img, 2*size)
+		g := imageGuest(`echo "mark=$(cat `+dataDir+`/mark)"`, []string{dataDir}, 2*size)
+		g.drives.volumes[0].kind = driveBlock
+		out := bootRealGuestEdited(g, []*os.File{img}, realRootImage(), nil)
+		Expect(out).NotTo(ContainSubstring("vm-launch guest setup"), out)
+		Expect(out).NotTo(ContainSubstring("rvm-volume: clean"), out)
+		Expect(out).To(MatchRegexp(grewLine), out)
+		Expect(out).To(MatchRegexp(`(?m)^mark=kept-on-the-block-volume\r?$`), out)
+		Expect(out).To(ContainSubstring(exitTag(testNonce)+"0"), out)
+		fs = readExtImage(img)
+		Expect(fs.uuid()).To(Equal(uuid), "the block volume was formatted")
+		Expect(fs.blocks()).To(BeNumerically(">", blocks))
+		Expect(fs.blocks() * fs.blockSize()).To(Equal(int64(2 * size)))
+	})
+
+	It("fails the boot on an image whose filesystem is larger than its device, before the preen, and never mounts it", func() {
+		img := openSizedFile(defaultImageSize)
+		markData(img, "kept-on-a-shrunk-device")
+		fs := readExtImage(img)
+		growTo(img, defaultImageSize/2)
+		before := imageDigest(img)
+		out := bootData(img, "echo command-ran")
+		Expect(out).To(MatchRegexp(`(?m)^vm-launch guest setup: the filesystem on the volume image volume\.img at `+dataDir+` has `+strconv.FormatInt(fs.blocks(), 10)+` blocks of 4096 bytes, more than the `+strconv.FormatInt(fs.blocks()/2, 10)+` its device holds, so the device was shrunk or holds another filesystem's data; vm-launch never mounts a filesystem larger than its device; inspect it on the volume\r?$`), out)
+		Expect(out).NotTo(ContainSubstring("rvm-volume: clean"), out)
+		Expect(out).NotTo(ContainSubstring(startTag(testNonce)), out)
+		Expect(out).NotTo(ContainSubstring("command-ran"), out)
+		Expect(imageDigest(img)).To(Equal(before), "the guest wrote to the image")
+	})
+
+	It("fails the boot on an image whose first 64 KiB are zero but which keeps a backup superblock, and never formats it", func() {
+		img := openSizedFile(defaultImageSize)
+		markData(img, "kept-behind-a-zeroed-head")
+		fs := readExtImage(img)
+		Expect(fs.blockSize()).To(Equal(int64(4096)))
+		_, err := img.WriteAt(make([]byte, 64<<10), 0)
+		Expect(err).NotTo(HaveOccurred())
+		before := imageDigest(img)
+
+		out := bootData(img, "echo command-ran")
+		Expect(out).To(MatchRegexp(`(?m)^vm-launch guest setup: the volume image volume\.img for `+dataDir+` reads as zero in its first 64 KiB but holds the magic of an ext2, ext3, or ext4 superblock at byte 134217728, where a backup superblock is kept, so it looks like a damaged filesystem, and vm-launch never formats it; repair it by hand on the volume with e2fsck -b from a backup superblock \(e2fsck -b 32768 -B 4096 for 4096-byte blocks\)\r?$`), out)
+		Expect(out).NotTo(ContainSubstring(startTag(testNonce)), out)
+		Expect(out).NotTo(ContainSubstring("command-ran"), out)
+		Expect(imageDigest(img)).To(Equal(before), "the guest wrote to the image")
+		Expect(imageHolds(img, "kept-behind-a-zeroed-head")).To(BeTrue())
 	})
 
 	It("drops sync and dirsync only from the images with a journal when the operator turns sync mounts off", func() {

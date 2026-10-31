@@ -315,7 +315,8 @@ var _ = Describe("guest volume initramfs", func() {
 		Expect(guestVolumeSetup).To(ContainSubstring("\n\t\t\t/rvm/tools/e2fsck -p \"$rvm_vdev\" || rvm_vrc=$?\n"))
 		Expect(guestVolumeSetup).To(ContainSubstring(`mount -t ext4 -o "$rvm_vopts" "$rvm_vdev" "$rvm_vpath"`))
 		Expect(guestVolumeSetup).To(ContainSubstring("rvm_vopts=sync,dirsync,noatime,noinit_itable,errors=remount-ro\n"))
-		Expect(guestVolumeSetup).To(ContainSubstring(`*" has_journal "*) rvm_vopts=noatime,noinit_itable,errors=remount-ro ;;`))
+		Expect(guestVolumeSetup).To(ContainSubstring(`*" has_journal "*) rvm_vjournal=yes ;;`))
+		Expect(guestVolumeSetup).To(ContainSubstring("\tyes) rvm_vopts=noatime,noinit_itable,errors=remount-ro ;;\n"))
 		// Every e2fsprogs tool runs by its full path, never as a busybox
 		// applet, and nothing runs e2fsck in a mode that answers yes. The
 		// lines stage 2 prints are in double quotes and may name a tool.
@@ -324,8 +325,31 @@ var _ = Describe("guest volume initramfs", func() {
 			Expect(strings.Count(commands, tool)).To(Equal(strings.Count(commands, guestToolsDir+"/"+tool)), "%s runs without its path", tool)
 		}
 		Expect(strings.Count(commands, guestMke2fs+" -")).To(Equal(1))
-		Expect(strings.Count(commands, guestE2fsck+" -")).To(Equal(1))
-		Expect(strings.Count(commands, guestTune2fs+" -")).To(Equal(1))
+		// e2fsck runs only as e2fsck -p and e2fsck -f -p, tune2fs only to
+		// read the superblock and to add the legacy image's journal, and
+		// ext4grow only on the mounted volume.
+		for tool, forms := range map[string][]string{
+			guestE2fsck:   {` -p "$rvm_vdev" || rvm_vrc=$?`, ` -f -p "$rvm_vdev" || rvm_vrc=$?`},
+			guestTune2fs:  {` -l "$rvm_vdev" >` + guestVolumeSuper + ` 2>/dev/null`, ` -O has_journal -J size=4 "$rvm_vdev"; then`},
+			guestExt4grow: {` "$rvm_vdev" "$rvm_vpath" || echo`},
+		} {
+			n := 0
+			for _, form := range forms {
+				c := strings.Count(guestVolumeSetup, tool+form)
+				Expect(c).To(BeNumerically(">", 0), "%s%s", tool, form)
+				n += c
+			}
+			// The lists of the tools that an arm checks for name them too.
+			listed := strings.Count(strings.Join(regexp.MustCompile(`for rvm_vtool in [^;]*;`).FindAllString(commands, -1), ""), tool)
+			Expect(strings.Count(commands, tool)-listed).To(Equal(n), "%s runs in another form", tool)
+		}
+		Expect(strings.Count(guestVolumeSetup, guestTune2fs+" -l")).To(Equal(1), "the superblock is read in one place")
+		Expect(strings.Count(guestVolumeSetup, guestTune2fs+" -O")).To(Equal(1))
+		Expect(strings.Count(guestVolumeSetup, guestExt4grow+" ")).To(Equal(1))
+		Expect(guestLegacyJournalMiB).To(Equal("4"))
+		Expect(guestLegacyJournalBytesText).To(Equal(strconv.Itoa(4 << 20)))
+		Expect(guestLegacyJournalSlack).To(Equal("32"))
+		Expect(sectorBytesText).To(Equal(strconv.Itoa(sectorBytes)))
 		Expect(guestVolumeSetup).NotTo(ContainSubstring("-y"))
 		Expect(guestVolumeSetup).NotTo(ContainSubstring("resize2fs"))
 		Expect(guestMke2fs).To(Equal("/rvm/tools/mke2fs"))
@@ -347,12 +371,23 @@ var _ = Describe("guest volume initramfs", func() {
 		image := volumeArm(string(driveImage))
 		block := volumeArm(string(driveBlock))
 		share := volumeArm(volumeKindShare)
-		for _, risky := range []string{"mke2fs", "e2fsck", "tune2fs", guestToolsDir, "MKE2FS_CONFIG", "dd ", "rvm_blank", guestVolumeHead, "rvm_vopts", "$RVM_SYNC_MOUNTS"} {
+		for _, risky := range []string{"mke2fs", "e2fsck", "-O has_journal", "MKE2FS_CONFIG", "dd ", "rvm_blank", guestVolumeHead, guestVolumeBackup, "rvm_vopts", "$RVM_SYNC_MOUNTS"} {
 			Expect(image).To(ContainSubstring(risky))
 			Expect(strings.Count(guestVolumeSetup, risky)).To(Equal(strings.Count(image, risky)), "%s outside the image arm", risky)
 			Expect(block).NotTo(ContainSubstring(risky))
 			Expect(share).NotTo(ContainSubstring(risky))
 		}
+		// A block volume's superblock is only read, and its filesystem only
+		// grown online once it is mounted, by the helpers the image arm
+		// shares, which only read the device.
+		Expect(block).To(ContainSubstring("\n\t\trvm_vsuper || rvm_fail"))
+		Expect(block).To(ContainSubstring("\n\t\trvm_vfits\n"))
+		Expect(block).To(HaveSuffix("\n\t\trvm_vgrow_now"))
+		Expect(image).To(HaveSuffix("\n\t\trvm_vgrow_now"))
+		for _, risky := range []string{"mke2fs", "e2fsck", "-O", "dd ", "mount -t"} {
+			Expect(guestVolumeFuncs).NotTo(ContainSubstring(risky))
+		}
+		Expect(share).NotTo(ContainSubstring("rvm_vgrow"))
 		Expect(block).To(ContainSubstring(`mount -t ext4 -o noatime,errors=remount-ro "$rvm_vdev" "$rvm_vpath" || rvm_fail`))
 		Expect(block).NotTo(ContainSubstring("sync"))
 		Expect(block).NotTo(ContainSubstring("image"))
@@ -367,8 +402,10 @@ var _ = Describe("guest volume initramfs", func() {
 	It("keeps its scratch files under /rvm, where no volume path can reach them", func() {
 		Expect(guestVolumeHead).To(Equal("/rvm/volume-head"))
 		Expect(guestVolumeUsed).To(Equal("/rvm/volume-used"))
+		Expect(guestVolumeBackup).To(Equal("/rvm/volume-backup"))
+		Expect(guestVolumeSuper).To(Equal("/rvm/volume-super"))
 		Expect(guestVolumeSetup).NotTo(ContainSubstring("/tmp/"))
-		for _, p := range []string{guestVolumeHead, guestVolumeUsed} {
+		for _, p := range []string{guestVolumeHead, guestVolumeUsed, guestVolumeBackup, guestVolumeSuper} {
 			Expect(checkVolumeDir(p)).To(MatchError(ContainSubstring("on or under /rvm")))
 		}
 	})
@@ -392,10 +429,20 @@ var _ = Describe("guest volume initramfs", func() {
 			dir     string
 			bin     string
 			tools   string
+			sys     string
 			callLog string
 			device  string
 			mnt     string
 		)
+
+		// setSectors gives the device dev its size in 512-byte sectors in
+		// the test /sys/block, as the text sysfs gives, which stage 2 reads.
+		setSectors := func(dev, sectors string) {
+			GinkgoHelper()
+			at := filepath.Join(sys, filepath.Base(dev))
+			Expect(os.MkdirAll(at, 0o755)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(at, "size"), []byte(sectors), 0o444)).To(Succeed())
+		}
 
 		// writeKindsSync writes the test /rvm/mounts, as mountsFile writes
 		// it, for mounts, the paths of the volumes in volume order, each of
@@ -430,24 +477,40 @@ var _ = Describe("guest volume initramfs", func() {
 			writeKinds(kinds, mounts...)
 		}
 
+		// backupPlaces are where stage 2 looks for a backup superblock, in
+		// the order it looks.
+		backupPlaces := []int64{8193 * 1024, 8193*1024 + 1024, 16384 * 2048, 16384*2048 + 1024, 32768 * 4096, 32768*4096 + 1024}
+
 		BeforeEach(func() {
 			dir = GinkgoT().TempDir()
 			bin = filepath.Join(dir, "bin")
 			Expect(os.Mkdir(bin, 0o755)).To(Succeed())
 			tools = filepath.Join(dir, "tools")
 			Expect(os.Mkdir(tools, 0o755)).To(Succeed())
+			sys = filepath.Join(dir, "sys")
+			Expect(os.Mkdir(sys, 0o755)).To(Succeed())
 			callLog = filepath.Join(dir, "calls")
 			device = filepath.Join(dir, "vda")
 			mnt = filepath.Join(dir, "mnt", "da'ta")
 
-			// Each stub records its argv. dd writes what DD_MODE says to its
-			// of= file, or, for the device named in DD_DATA_IF, data; the
-			// others exit with their *_RC, and mount fails for the mount
-			// point MOUNT_FAIL_AT names. The guest filesystem tools are in
-			// their own directory, which stands in for /rvm/tools: mke2fs
-			// also records the configuration it was given, and tune2fs
-			// prints TUNE2FS_FEATURES as the filesystem's features, or no
-			// feature line with TUNE2FS_NO_FEATURES.
+			// Each stub records its argv. e2fsck exits with E2FSCK_RC, and
+			// e2fsck -f with E2FSCK_F_RC the first time and E2FSCK_F2_RC
+			// after that. dd writes what DD_MODE says to its
+			// of= file, or, for the device named in DD_DATA_IF, data, and a
+			// dd with skip=, which reads a backup superblock's place, reads
+			// the test device itself with the real dd, unless DD_SKIP_FAIL
+			// is set; the others exit with their *_RC, and mount fails for
+			// the mount point MOUNT_FAIL_AT names. The guest filesystem
+			// tools are in their own directory, which stands in for
+			// /rvm/tools: mke2fs also records the configuration it was
+			// given. tune2fs -l prints a superblock of TUNE2FS_BLOCKS blocks
+			// of TUNE2FS_BSIZE bytes, TUNE2FS_FREE of them free, which is a
+			// 1 GiB filesystem with 4096-byte blocks by default, and
+			// TUNE2FS_FEATURES as the filesystem's features, or no feature
+			// line with TUNE2FS_NO_FEATURES. With TUNE2FS_FAIL_FIRST, its
+			// first -l fails. tune2fs -O exits with TUNE2FS_O_RC and, when
+			// that is 0 and TUNE2FS_O_NOJOURNAL is unset, adds has_journal
+			// to the features of every later -l.
 			stubIn := func(at, name, body string) {
 				script := "#!/bin/sh\necho \"" + name + " $*\" >> " + shellQuote(callLog) + "\n" + body + "\n"
 				Expect(os.WriteFile(filepath.Join(at, name), []byte(script), 0o755)).To(Succeed())
@@ -456,15 +519,47 @@ var _ = Describe("guest volume initramfs", func() {
 			stubIn(tools, "mke2fs", `echo "MKE2FS_CONFIG=${MKE2FS_CONFIG-unset}" >> `+shellQuote(callLog)+`
 exit "${MKE2FS_RC:-0}"`)
 			stubIn(tools, "e2fsck", `echo "rvm-volume: clean, 11/65536 files, 4127/262144 blocks"
-exit "${E2FSCK_RC:-0}"`)
+rc=${E2FSCK_RC:-0}
+if [ "$1" = -f ]; then
+	full=`+shellQuote(filepath.Join(dir, "e2fsck-full-ran"))+`
+	rc=${E2FSCK_F_RC:-0}
+	[ ! -e "$full" ] || rc=${E2FSCK_F2_RC:-0}
+	: >"$full"
+fi
+exit "$rc"`)
 			stubIn(tools, "tune2fs", `echo "tune2fs 1.47.4 (6-Mar-2025)" >&2
+journal=`+shellQuote(filepath.Join(dir, "journalled"))+`
+if [ "$1" = -O ]; then
+	[ "${TUNE2FS_O_RC:-0}" = 0 ] || exit "$TUNE2FS_O_RC"
+	echo "Creating journal inode: done"
+	[ -n "${TUNE2FS_O_NOJOURNAL:-}" ] || : >"$journal"
+	exit 0
+fi
+first=`+shellQuote(filepath.Join(dir, "tune2fs-ran"))+`
+if [ -n "${TUNE2FS_FAIL_FIRST:-}" ] && [ ! -e "$first" ]; then
+	: >"$first"
+	exit 1
+fi
 [ "${TUNE2FS_RC:-0}" = 0 ] || exit "$TUNE2FS_RC"
+features=${TUNE2FS_FEATURES-has_journal ext_attr resize_inode dir_index filetype extent 64bit}
+[ -e "$journal" ] && features="has_journal $features"
 echo "Filesystem volume name:   rvm-volume"
-[ -n "${TUNE2FS_NO_FEATURES:-}" ] || echo "Filesystem features:      ${TUNE2FS_FEATURES-has_journal ext_attr resize_inode dir_index filetype extent 64bit}"
-echo "Filesystem flags:         signed_directory_hash "`)
-			stubIn(tools, "ext4grow", `exit 0`)
+[ -n "${TUNE2FS_NO_FEATURES:-}" ] || echo "Filesystem features:      $features"
+echo "Filesystem flags:         signed_directory_hash "
+echo "Block count:              ${TUNE2FS_BLOCKS-262144}"
+echo "Reserved block count:     0"
+echo "Free blocks:              ${TUNE2FS_FREE-200000}"
+echo "Free inodes:              65525"
+echo "Block size:               ${TUNE2FS_BSIZE-4096}"`)
+			stubIn(tools, "ext4grow", `echo "ext4grow: grew $2 to fill $1"
+exit "${EXT4GROW_RC:-0}"`)
 			Expect(os.WriteFile(filepath.Join(tools, "mke2fs.conf"), []byte(guestMke2fsConfText), 0o644)).To(Succeed())
-			stub("dd", `for a; do case $a in of=*) of=${a#of=} ;; if=*) in=${a#if=} ;; esac; done
+			stub("dd", `skip=
+for a; do case $a in of=*) of=${a#of=} ;; if=*) in=${a#if=} ;; skip=*) skip=1 ;; esac; done
+if [ -n "$skip" ]; then
+	[ -z "${DD_SKIP_FAIL:-}" ] || { echo "dd: can't read device" >&2; exit 1; }
+	exec /bin/dd "$@" 2>/dev/null
+fi
 mode=$DD_MODE
 [ -n "${DD_DATA_IF:-}" ] && [ "$in" = "$DD_DATA_IF" ] && mode=data
 case "$mode" in
@@ -481,8 +576,12 @@ exit "${MOUNT_RC:-0}"`)
 			stub("umount", `exit "${UMOUNT_RC:-0}"`)
 
 			// This /rvm/mounts points the path at a test mount point. The
-			// device is the argument stage 1 passes, here a test file.
+			// device is the argument stage 1 passes, here a test file, and
+			// each of the devices the specs use is 1 GiB in /sys/block.
 			writeMounts(mnt)
+			for _, name := range []string{"vda", "vdb", "vdc", "vdd"} {
+				setSectors(name, "2097152\n")
+			}
 		})
 
 		// runIn executes rvm_fail and the volume setup in shell, with args
@@ -496,6 +595,7 @@ exit "${MOUNT_RC:-0}"`)
 				"/rvm/mounts", filepath.Join(dir, "mounts"),
 				"/rvm/volume-", filepath.Join(dir, "volume-"),
 				guestToolsDir+"/", tools+"/",
+				"/sys/block/", sys+"/",
 				`[ -b "$rvm_vdev" ]`, `[ -f "$rvm_vdev" ]`,
 				"dd if=", filepath.Join(bin, "dd")+" if=",
 				"mount -t", filepath.Join(bin, "mount")+" -t",
@@ -504,6 +604,7 @@ exit "${MOUNT_RC:-0}"`)
 			Expect(script).NotTo(ContainSubstring(guestVolumeHead))
 			Expect(script).NotTo(ContainSubstring(guestVolumeUsed))
 			Expect(script).NotTo(ContainSubstring(guestToolsDir))
+			Expect(script).NotTo(ContainSubstring("/sys/block/"))
 			Expect(script).NotTo(ContainSubstring("-b \""))
 			Expect(strings.Count(script, filepath.Join(bin, "mount")+" -t")).To(Equal(strings.Count(guestVolumeSetup, "mount -t")))
 
@@ -536,6 +637,28 @@ exit "${MOUNT_RC:-0}"`)
 		ddCall := func(device string) string {
 			return "dd if=" + device + " of=" + filepath.Join(dir, "volume-head") + " bs=4096 count=16\n"
 		}
+		// backupCall is the dd that reads the two bytes of the magic of a
+		// superblock that starts at the byte at of device.
+		backupCall := func(device string, at int64) string {
+			return "dd if=" + device + " of=" + filepath.Join(dir, "volume-backup") + " bs=2 skip=" + strconv.FormatInt((at+56)/2, 10) + " count=1\n"
+		}
+		// blankCalls are the reads of an image whose first 64 KiB are zero:
+		// the start, and the magic of a backup superblock at the start of
+		// block group 1 and 1024 bytes in, for 1024-, 2048-, and 4096-byte
+		// blocks, all of which a 1 GiB device holds.
+		blankCalls := func(device string) string {
+			calls := ddCall(device)
+			for _, at := range backupPlaces {
+				calls += backupCall(device, at)
+			}
+			return calls
+		}
+		// preenCalls are the calls for an image with data up to its mount:
+		// the start, the superblock, the preen, and the superblock again.
+		preenCalls := func(device string) string {
+			return ddCall(device) + tune2fsCall(device) + fsckCall(device) + tune2fsCall(device)
+		}
+		growCall := func(device, mnt string) string { return "ext4grow " + device + " " + mnt + "\n" }
 
 		BeforeEach(func() {
 			Expect(os.WriteFile(device, nil, 0o600)).To(Succeed())
@@ -545,7 +668,7 @@ exit "${MOUNT_RC:-0}"`)
 			r := run("DD_MODE=zeros")
 			Expect(r.out).To(ContainSubstring("REACHED_START"))
 			Expect(r.out).NotTo(ContainSubstring("REBOOT"))
-			Expect(r.calls).To(Equal(ddCall(device) + mkfsCall(device) + mountCall(device, mnt)))
+			Expect(r.calls).To(Equal(blankCalls(device) + mkfsCall(device) + mountCall(device, mnt)))
 			Expect(mnt).To(BeADirectory())
 			Expect(filepath.Join(dir, "volume-head")).NotTo(BeAnExistingFile())
 			Expect(filepath.Join(dir, "volume-used")).NotTo(BeAnExistingFile())
@@ -554,7 +677,7 @@ exit "${MOUNT_RC:-0}"`)
 		It("preens an image with data with e2fsck -p and mounts it without formatting it", func() {
 			r := run("DD_MODE=data")
 			Expect(r.out).To(Equal("rvm-volume: clean, 11/65536 files, 4127/262144 blocks\nREACHED_START\n"))
-			Expect(r.calls).To(Equal(ddCall(device) + fsckCall(device) + mountCall(device, mnt)))
+			Expect(r.calls).To(Equal(preenCalls(device) + mountCall(device, mnt)))
 		})
 
 		It("mounts every volume on the device stage 1 passed in its place, in volume order, and formats only the blank ones", func() {
@@ -567,9 +690,9 @@ exit "${MOUNT_RC:-0}"`)
 			r := runWith(devices, "DD_MODE=zeros", "DD_DATA_IF="+devices[1])
 			Expect(r.out).To(Equal("rvm-volume: clean, 11/65536 files, 4127/262144 blocks\nREACHED_START\n"))
 			Expect(r.calls).To(Equal(
-				ddCall(devices[0]) + mkfsCall(devices[0]) + mountCall(devices[0], mounts[0]) +
-					ddCall(devices[1]) + fsckCall(devices[1]) + mountCall(devices[1], mounts[1]) +
-					ddCall(devices[2]) + mkfsCall(devices[2]) + mountCall(devices[2], mounts[2])))
+				blankCalls(devices[0]) + mkfsCall(devices[0]) + mountCall(devices[0], mounts[0]) +
+					preenCalls(devices[1]) + mountCall(devices[1], mounts[1]) +
+					blankCalls(devices[2]) + mkfsCall(devices[2]) + mountCall(devices[2], mounts[2])))
 			for _, m := range mounts {
 				Expect(m).To(BeADirectory())
 			}
@@ -585,7 +708,7 @@ exit "${MOUNT_RC:-0}"`)
 			r := runWith(devices, "DD_MODE=data", "MOUNT_FAIL_AT="+mounts[1])
 			clean := "rvm-volume: clean, 11/65536 files, 4127/262144 blocks\n"
 			Expect(r.out).To(Equal(clean + clean + "vm-launch guest setup: mounting the volume image rvm-disk-1.img at " + mounts[1] + " failed; it is not blank, so vm-launch will not format it; inspect or delete rvm-disk-1.img on the volume\nREBOOT\n"))
-			Expect(r.calls).To(Equal(ddCall(devices[0]) + fsckCall(devices[0]) + mountCall(devices[0], mounts[0]) + ddCall(devices[1]) + fsckCall(devices[1]) + mountCall(devices[1], mounts[1])))
+			Expect(r.calls).To(Equal(preenCalls(devices[0]) + mountCall(devices[0], mounts[0]) + preenCalls(devices[1]) + mountCall(devices[1], mounts[1])))
 			Expect(mounts[2]).NotTo(BeAnExistingFile())
 		})
 
@@ -624,7 +747,7 @@ exit "${MOUNT_RC:-0}"`)
 		It("never formats an image with data that does not mount", func() {
 			r := run("DD_MODE=data", "MOUNT_RC=32")
 			Expect(r.out).To(ContainSubstring("vm-launch guest setup: mounting the volume image rvm-disk-0.img at " + mnt + " failed; it is not blank, so vm-launch will not format it; inspect or delete rvm-disk-0.img on the volume"))
-			Expect(r.calls).To(Equal(ddCall(device) + fsckCall(device) + mountCall(device, mnt)))
+			Expect(r.calls).To(Equal(preenCalls(device) + mountCall(device, mnt)))
 			Expect(r.out).To(ContainSubstring("REBOOT"))
 			Expect(r.out).NotTo(ContainSubstring("REACHED_START"))
 			Expect(r.calls).NotTo(ContainSubstring("mke2fs"))
@@ -647,7 +770,7 @@ exit "${MOUNT_RC:-0}"`)
 			r := run("DD_MODE=zeros", "MKE2FS_RC=1")
 			Expect(r.out).To(ContainSubstring("vm-launch guest setup: formatting the blank volume image rvm-disk-0.img for " + mnt + " failed"))
 			Expect(r.out).NotTo(ContainSubstring("REACHED_START"))
-			Expect(r.calls).To(Equal(ddCall(device) + mkfsCall(device)))
+			Expect(r.calls).To(Equal(blankCalls(device) + mkfsCall(device)))
 		})
 
 		It("fails when a newly formatted image does not mount", func() {
@@ -687,7 +810,7 @@ exit "${MOUNT_RC:-0}"`)
 						want += "vm-launch guest: e2fsck -p repaired the volume image rvm-disk-0.img and asked for a reboot, which only a mounted filesystem needs; the image is not mounted yet, so the guest goes on\n"
 					}
 					Expect(r.out).To(Equal(want+"REACHED_START\n"), "%s, e2fsck status %d", shell.name, rc)
-					Expect(r.calls).To(Equal(ddCall(device)+fsckCall(device)+mountCall(device, mnt)), "%s, e2fsck status %d", shell.name, rc)
+					Expect(r.calls).To(Equal(preenCalls(device)+mountCall(device, mnt)), "%s, e2fsck status %d", shell.name, rc)
 				}
 			},
 			shellEntries(""),
@@ -703,7 +826,7 @@ exit "${MOUNT_RC:-0}"`)
 					Expect(os.RemoveAll(callLog)).To(Succeed())
 					r := runIn(shell, []string{device}, "DD_MODE=data", "E2FSCK_RC="+strconv.Itoa(rc))
 					Expect(r.out).To(Equal(cleanLine+"vm-launch guest setup: the volume image rvm-disk-0.img has errors that e2fsck -p can't repair; inspect it on the volume (e2fsck -p exited "+strconv.Itoa(rc)+" for "+mnt+", and vm-launch never formats an image that is not blank)\nREBOOT\n"), "%s, e2fsck status %d", shell.name, rc)
-					Expect(r.calls).To(Equal(ddCall(device)+fsckCall(device)), "%s, e2fsck status %d", shell.name, rc)
+					Expect(r.calls).To(Equal(ddCall(device)+tune2fsCall(device)+fsckCall(device)), "%s, e2fsck status %d", shell.name, rc)
 				}
 			},
 			shellEntries(""),
@@ -712,7 +835,7 @@ exit "${MOUNT_RC:-0}"`)
 		DescribeTable("fails the boot before it reads the image when a guest filesystem tool is missing, and never falls back to another mke2fs",
 			func(shellOf func() guestShell) {
 				shell := shellOf()
-				for _, name := range []string{"mke2fs", "e2fsck", "tune2fs"} {
+				for _, name := range []string{"mke2fs", "e2fsck", "tune2fs", "ext4grow"} {
 					for _, how := range []string{"missing", "not executable", "a directory"} {
 						Expect(os.RemoveAll(callLog)).To(Succeed())
 						Expect(os.RemoveAll(mnt)).To(Succeed())
@@ -754,10 +877,13 @@ exit "${MOUNT_RC:-0}"`)
 				shell := shellOf()
 				writeKindsSync([]driveKind{driveImage}, true, mnt)
 				r := runIn(shell, []string{device}, append([]string{"DD_MODE=" + mode}, env...)...)
-				prepare := ddCall(device) + fsckCall(device)
+				// An image with data has its superblock read before and after
+				// its preen whatever the setting, and a blank image only when
+				// sync mounts are off, after its format.
+				prepare, offRead := preenCalls(device), ""
 				out := cleanLine
 				if mode == "zeros" {
-					prepare, out = ddCall(device)+mkfsCall(device), ""
+					prepare, offRead, out = blankCalls(device)+mkfsCall(device), tune2fsCall(device), ""
 				}
 				if line != "" {
 					out += "vm-launch guest: reading the filesystem features of the volume image rvm-disk-0.img failed, so it mounts with sync and dirsync\n"
@@ -767,10 +893,11 @@ exit "${MOUNT_RC:-0}"`)
 				if wantSync {
 					mount = mountCall(device, mnt)
 				}
-				Expect(r.calls).To(Equal(prepare+tune2fsCall(device)+mount), "%s", shell.name)
+				Expect(r.calls).To(Equal(prepare+offRead+mount), "%s", shell.name)
 
-				// With sync mounts on, which is the default, tune2fs never runs
-				// and the mount keeps sync and dirsync whatever the features.
+				// With sync mounts on, which is the default, the mount keeps
+				// sync and dirsync whatever the features, and a blank image's
+				// superblock is not read.
 				Expect(os.Remove(callLog)).To(Succeed())
 				writeKinds([]driveKind{driveImage}, mnt)
 				r = runIn(shell, []string{device}, append([]string{"DD_MODE=" + mode}, env...)...)
@@ -783,7 +910,7 @@ exit "${MOUNT_RC:-0}"`)
 			shellEntries("a new image too small for a journal", "zeros", []string{"TUNE2FS_FEATURES=ext_attr resize_inode dir_index filetype extent 64bit flex_bg"}, true, ""),
 			shellEntries("an image with an external journal device feature only", "data", []string{"TUNE2FS_FEATURES=journal_dev filetype"}, true, ""),
 			shellEntries("an image with no features", "data", []string{"TUNE2FS_FEATURES="}, true, "unread"),
-			shellEntries("an image whose features tune2fs cannot read", "data", []string{"TUNE2FS_RC=1"}, true, "unread"),
+			shellEntries("a newly formatted image whose features tune2fs cannot read", "zeros", []string{"TUNE2FS_RC=1"}, true, "unread"),
 			shellEntries("an image for which tune2fs prints no feature line", "data", []string{"TUNE2FS_NO_FEATURES=1"}, true, "unread"),
 		)
 
@@ -795,7 +922,7 @@ exit "${MOUNT_RC:-0}"`)
 				Expect(os.WriteFile(device, zeroDevice, 0o600)).To(Succeed())
 				r := runIn(shell, []string{device}, "DD_MODE=data")
 				Expect(r.out).To(Equal("REACHED_START\n"), "%s", shell.name)
-				Expect(r.calls).To(Equal("mount -t ext4 -o noatime,errors=remount-ro "+device+" "+mnt+"\n"), "%s", shell.name)
+				Expect(r.calls).To(Equal(tune2fsCall(device)+"mount -t ext4 -o noatime,errors=remount-ro "+device+" "+mnt+"\n"), "%s", shell.name)
 			},
 			shellEntries(""),
 		)
@@ -812,18 +939,26 @@ exit "${MOUNT_RC:-0}"`)
 			return blank
 		}
 
-		DescribeTable("never reads or formats a blank block volume, and fails the boot with a line that names the volume's disk",
+		DescribeTable("never formats a blank block volume, and fails the boot with a line that names the volume's disk",
 			func(shellOf func() guestShell) {
 				shell := shellOf()
 				writeKinds([]driveKind{driveBlock}, mnt)
 				blank := zeroDevice(device)
-				// The dd stub reads every device as blank, and the mount of a
-				// blank disk fails, as it does in a guest.
-				r := runIn(shell, []string{device}, "DD_MODE=zeros", "MOUNT_RC=32")
-				Expect(r.out).To(Equal("vm-launch guest setup: mounting volume 0's disk " + device + " at " + mnt + " failed; vm-launch never formats a block volume, so the guest will not boot with it\nREBOOT\n"))
-				Expect(r.calls).To(Equal(blockMountCall(device, mnt)), "%s", shell.name)
+				// tune2fs finds no superblock on a blank disk, as it does in
+				// a guest, and the boot fails before the mount.
+				r := runIn(shell, []string{device}, "DD_MODE=zeros", "TUNE2FS_RC=1")
+				Expect(r.out).To(Equal("vm-launch guest setup: reading the filesystem on volume 0's disk " + device + " for " + mnt + " with tune2fs -l failed; vm-launch never formats a block volume, so the guest will not boot with it\nREBOOT\n"))
+				Expect(r.calls).To(Equal(tune2fsCall(device)), "%s", shell.name)
 				Expect(os.ReadFile(device)).To(Equal(blank))
 				Expect(filepath.Join(dir, "volume-head")).NotTo(BeAnExistingFile())
+
+				// A disk whose superblock reads but that does not mount fails
+				// the boot with the same words.
+				Expect(os.Remove(callLog)).To(Succeed())
+				r = runIn(shell, []string{device}, "DD_MODE=zeros", "MOUNT_RC=32")
+				Expect(r.out).To(Equal("vm-launch guest setup: mounting volume 0's disk " + device + " at " + mnt + " failed; vm-launch never formats a block volume, so the guest will not boot with it\nREBOOT\n"))
+				Expect(r.calls).To(Equal(tune2fsCall(device)+blockMountCall(device, mnt)), "%s", shell.name)
+				Expect(os.ReadFile(device)).To(Equal(blank))
 			},
 			shellEntries(""),
 		)
@@ -835,7 +970,7 @@ exit "${MOUNT_RC:-0}"`)
 				zeroDevice(device)
 				r := runIn(shell, []string{device}, "DD_MODE=zeros")
 				Expect(r.out).To(Equal("REACHED_START\n"), "%s", shell.name)
-				Expect(r.calls).To(Equal(blockMountCall(device, mnt)), "%s", shell.name)
+				Expect(r.calls).To(Equal(tune2fsCall(device)+blockMountCall(device, mnt)), "%s", shell.name)
 				Expect(r.calls).NotTo(ContainSubstring("sync"))
 				Expect(mnt).To(BeADirectory())
 			},
@@ -868,9 +1003,379 @@ exit "${MOUNT_RC:-0}"`)
 				r := runIn(shell, devices, "DD_MODE=zeros")
 				Expect(r.out).To(Equal("REACHED_START\n"), "%s", shell.name)
 				Expect(r.calls).To(Equal(
-					ddCall(devices[0])+mkfsCall(devices[0])+mountCall(devices[0], mounts[0])+
-						blockMountCall(devices[1], mounts[1])+
-						ddCall(devices[2])+mkfsCall(devices[2])+mountCall(devices[2], mounts[2])), "%s", shell.name)
+					blankCalls(devices[0])+mkfsCall(devices[0])+mountCall(devices[0], mounts[0])+
+						tune2fsCall(devices[1])+blockMountCall(devices[1], mounts[1])+
+						blankCalls(devices[2])+mkfsCall(devices[2])+mountCall(devices[2], mounts[2])), "%s", shell.name)
+			},
+			shellEntries(""),
+		)
+
+		// twoGiB is a 2 GiB device in sectors, twice the size of the
+		// filesystem the tune2fs stub gives by default.
+		const twoGiB = "4194304\n"
+		// legacyFeatures are the features of an rvm.6 image, which busybox
+		// mke2fs made without a journal.
+		const legacyFeatures = "TUNE2FS_FEATURES=dir_index filetype sparse_super"
+		// legacyCalls are the calls for a legacy image that grows, from
+		// its full check to the read of its superblock with the journal.
+		legacyCalls := func(device string) string {
+			return "e2fsck -f -p " + device + "\n" + tune2fsCall(device) + "tune2fs -O has_journal -J size=4 " + device + "\n" + tune2fsCall(device)
+		}
+		// tune2fsBanner is the version line tune2fs prints on stderr,
+		// which reaches the console when it adds a journal.
+		const tune2fsBanner = "tune2fs 1.47.4 (6-Mar-2025)\n"
+		growLine := func(device, mnt string) string { return "ext4grow: grew " + mnt + " to fill " + device + "\n" }
+
+		DescribeTable("grows a journalled image online after its mount when its device holds more blocks than its filesystem, and leaves one that its filesystem fills",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				setSectors(device, twoGiB)
+				r := runIn(shell, []string{device}, "DD_MODE=data")
+				Expect(r.out).To(Equal(cleanLine+growLine(device, mnt)+"REACHED_START\n"), "%s", shell.name)
+				Expect(r.calls).To(Equal(preenCalls(device)+mountCall(device, mnt)+growCall(device, mnt)), "%s", shell.name)
+
+				// With sync mounts off, a journalled image grows as well,
+				// without sync and dirsync.
+				Expect(os.Remove(callLog)).To(Succeed())
+				writeKindsSync([]driveKind{driveImage}, true, mnt)
+				r = runIn(shell, []string{device}, "DD_MODE=data")
+				Expect(r.calls).To(Equal(preenCalls(device)+asyncMountCall(device, mnt)+growCall(device, mnt)), "%s", shell.name)
+
+				// A device a few sectors bigger holds no whole block more,
+				// and a device the filesystem fills has nothing to grow into.
+				writeKinds([]driveKind{driveImage}, mnt)
+				for _, sectors := range []string{"2097159\n", "2097152\n", "2097152"} {
+					Expect(os.Remove(callLog)).To(Succeed())
+					setSectors(device, sectors)
+					r = runIn(shell, []string{device}, "DD_MODE=data")
+					Expect(r.out).To(Equal(cleanLine+"REACHED_START\n"), "%s, %q sectors", shell.name, sectors)
+					Expect(r.calls).To(Equal(preenCalls(device)+mountCall(device, mnt)), "%s, %q sectors", shell.name, sectors)
+				}
+			},
+			shellEntries(""),
+		)
+
+		DescribeTable("grows a block volume online after its mount when its disk holds more blocks than its filesystem, and never formats, checks, or gives it a journal",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				writeKinds([]driveKind{driveBlock}, mnt)
+				setSectors(device, twoGiB)
+				r := runIn(shell, []string{device}, "DD_MODE=zeros")
+				Expect(r.out).To(Equal(growLine(device, mnt)+"REACHED_START\n"), "%s", shell.name)
+				Expect(r.calls).To(Equal(tune2fsCall(device)+blockMountCall(device, mnt)+growCall(device, mnt)), "%s", shell.name)
+
+				// A disk without a journal, which the volume driver never
+				// hands over, or whose features do not read, mounts at its
+				// old size.
+				for env, line := range map[string]string{
+					"TUNE2FS_FEATURES=dir_index filetype": "",
+					"TUNE2FS_NO_FEATURES=1":               "",
+					"TUNE2FS_FEATURES=":                   "",
+				} {
+					Expect(line).To(BeEmpty())
+					Expect(os.Remove(callLog)).To(Succeed())
+					r = runIn(shell, []string{device}, "DD_MODE=zeros", env)
+					Expect(r.out).To(Equal("vm-launch guest: volume 0's disk "+device+" has no journal that tune2fs -l shows, so it mounts at its old size of 262144 blocks of 4096 bytes and does not grow\nREACHED_START\n"), "%s, %s", shell.name, env)
+					Expect(r.calls).To(Equal(tune2fsCall(device)+blockMountCall(device, mnt)), "%s, %s", shell.name, env)
+				}
+			},
+			shellEntries(""),
+		)
+
+		DescribeTable("keeps an image or a block volume mounted at its old size and goes on when ext4grow fails, with a line that names the volume",
+			func(shellOf func() guestShell, kind driveKind) {
+				shell := shellOf()
+				writeKinds([]driveKind{kind}, mnt)
+				setSectors(device, twoGiB)
+				r := runIn(shell, []string{device}, "DD_MODE=data", "EXT4GROW_RC=1")
+				name, prepare, mount := "the volume image rvm-disk-0.img", preenCalls(device), mountCall(device, mnt)
+				out := cleanLine
+				if kind == driveBlock {
+					name, prepare, mount, out = "volume 0's disk "+device, tune2fsCall(device), blockMountCall(device, mnt), ""
+				}
+				Expect(r.out).To(Equal(out+growLine(device, mnt)+"vm-launch guest: growing "+name+" at "+mnt+" from 262144 to 524288 blocks of 4096 bytes failed, so it stays at its old size; its data is intact\nREACHED_START\n"), "%s", shell.name)
+				Expect(r.calls).To(Equal(prepare+mount+growCall(device, mnt)), "%s", shell.name)
+			},
+			shellEntries("an image", driveImage),
+			shellEntries("a block volume", driveBlock),
+		)
+
+		DescribeTable("fails the boot on a filesystem larger than its device before anything writes to it or mounts it",
+			func(shellOf func() guestShell, kind driveKind) {
+				shell := shellOf()
+				writeKinds([]driveKind{kind}, mnt)
+				name, calls := "the volume image rvm-disk-0.img", ddCall(device)+tune2fsCall(device)
+				if kind == driveBlock {
+					name, calls = "volume 0's disk "+device, tune2fsCall(device)
+				}
+				line := "vm-launch guest setup: the filesystem on " + name + " at " + mnt + " has 262145 blocks of 4096 bytes, more than the 262144 its device holds, so the device was shrunk or holds another filesystem's data; vm-launch never mounts a filesystem larger than its device; inspect it on the volume\nREBOOT\n"
+				r := runIn(shell, []string{device}, "DD_MODE=data", "TUNE2FS_BLOCKS=262145")
+				Expect(r.out).To(Equal(line), "%s", shell.name)
+				Expect(r.calls).To(Equal(calls), "%s", shell.name)
+
+				// A 1024-byte block on a device that ends half a block early
+				// is past the device too.
+				Expect(os.Remove(callLog)).To(Succeed())
+				setSectors(device, "2097151\n")
+				r = runIn(shell, []string{device}, "DD_MODE=data", "TUNE2FS_BLOCKS=1048576", "TUNE2FS_BSIZE=1024")
+				Expect(r.out).To(Equal(strings.NewReplacer("262145 blocks of 4096", "1048576 blocks of 1024", "the 262144", "the 1048575").Replace(line)), "%s", shell.name)
+				Expect(r.calls).To(Equal(calls), "%s", shell.name)
+			},
+			shellEntries("an image", driveImage),
+			shellEntries("a block volume", driveBlock),
+		)
+
+		DescribeTable("leaves an image's superblock that does not read before the preen to the preen, and fails the boot when it does not read after it",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				r := runIn(shell, []string{device}, "DD_MODE=data", "TUNE2FS_FAIL_FIRST=1")
+				Expect(r.out).To(Equal(cleanLine+"REACHED_START\n"), "%s", shell.name)
+				Expect(r.calls).To(Equal(preenCalls(device)+mountCall(device, mnt)), "%s", shell.name)
+
+				// The check after the preen still finds a filesystem larger
+				// than its device.
+				Expect(os.Remove(callLog)).To(Succeed())
+				Expect(os.Remove(filepath.Join(dir, "tune2fs-ran"))).To(Succeed())
+				r = runIn(shell, []string{device}, "DD_MODE=data", "TUNE2FS_FAIL_FIRST=1", "TUNE2FS_BLOCKS=300000")
+				Expect(r.out).To(HavePrefix(cleanLine+"vm-launch guest setup: the filesystem on the volume image rvm-disk-0.img at "+mnt+" has 300000 blocks of 4096 bytes, more than the 262144 its device holds"), "%s", shell.name)
+				Expect(r.calls).To(Equal(preenCalls(device)), "%s", shell.name)
+
+				for _, env := range [][]string{
+					{"TUNE2FS_RC=1"},
+					{"TUNE2FS_BLOCKS="},
+					{"TUNE2FS_BLOCKS=0"},
+					{"TUNE2FS_BLOCKS=0262144"},
+					{"TUNE2FS_BLOCKS=26214x"},
+					{"TUNE2FS_BLOCKS=-1"},
+					{"TUNE2FS_BSIZE="},
+					{"TUNE2FS_BSIZE=1000"},
+					{"TUNE2FS_BSIZE=0"},
+				} {
+					Expect(os.Remove(callLog)).To(Succeed())
+					r = runIn(shell, []string{device}, append([]string{"DD_MODE=data"}, env...)...)
+					Expect(r.out).To(Equal(cleanLine+"vm-launch guest setup: reading the superblock of the volume image rvm-disk-0.img for "+mnt+" with tune2fs -l failed after its preen, so the guest cannot tell whether it fits its device; inspect it on the volume\nREBOOT\n"), "%s, %q", shell.name, env)
+					Expect(r.calls).To(Equal(preenCalls(device)), "%s, %q", shell.name, env)
+				}
+			},
+			shellEntries(""),
+		)
+
+		DescribeTable("fails the boot at once, touching nothing, when the device's size in /sys/block does not read as a number",
+			func(shellOf func() guestShell, kind driveKind) {
+				shell := shellOf()
+				writeKinds([]driveKind{kind}, mnt)
+				name := "the volume image rvm-disk-0.img"
+				if kind == driveBlock {
+					name = "volume 0's disk " + device
+				}
+				size := filepath.Join(sys, "vda", "size")
+				for _, content := range []string{"missing", "", "\n", "0\n", "-1\n", "12a\n", "02097152\n"} {
+					Expect(os.RemoveAll(size)).To(Succeed())
+					if content != "missing" {
+						Expect(os.WriteFile(size, []byte(content), 0o444)).To(Succeed())
+					}
+					r := runIn(shell, []string{device}, "DD_MODE=data")
+					Expect(r.out).To(Equal("vm-launch guest setup: reading the size of "+device+" for "+name+" at "+mnt+" from /sys/block failed\nREBOOT\n"), "%s, %q", shell.name, content)
+					Expect(r.calls).To(BeEmpty(), "%s, %q", shell.name, content)
+				}
+			},
+			shellEntries("an image", driveImage),
+			shellEntries("a block volume", driveBlock),
+		)
+
+		DescribeTable("gives a legacy image without a journal a 4 MiB journal after a full check, and only then grows it",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				setSectors(device, twoGiB)
+				r := runIn(shell, []string{device}, "DD_MODE=data", legacyFeatures)
+				Expect(r.out).To(Equal(cleanLine+cleanLine+tune2fsBanner+"Creating journal inode: done\n"+growLine(device, mnt)+"REACHED_START\n"), "%s", shell.name)
+				Expect(r.calls).To(Equal(preenCalls(device)+legacyCalls(device)+mountCall(device, mnt)+growCall(device, mnt)), "%s", shell.name)
+
+				// The image has a journal now, so with sync mounts off it
+				// mounts without sync and dirsync.
+				for _, name := range []string{"journalled", "e2fsck-full-ran"} {
+					Expect(os.Remove(filepath.Join(dir, name))).To(Succeed())
+				}
+				Expect(os.Remove(callLog)).To(Succeed())
+				writeKindsSync([]driveKind{driveImage}, true, mnt)
+				r = runIn(shell, []string{device}, "DD_MODE=data", legacyFeatures)
+				Expect(r.calls).To(Equal(preenCalls(device)+legacyCalls(device)+asyncMountCall(device, mnt)+growCall(device, mnt)), "%s", shell.name)
+			},
+			shellEntries(""),
+		)
+
+		DescribeTable("leaves a legacy image that does not need to grow as it is apart from the preen",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				for _, sectors := range []string{"2097152\n", "2097159\n"} {
+					Expect(os.RemoveAll(callLog)).To(Succeed())
+					setSectors(device, sectors)
+					r := runIn(shell, []string{device}, "DD_MODE=data", legacyFeatures)
+					Expect(r.out).To(Equal(cleanLine+"REACHED_START\n"), "%s, %q", shell.name, sectors)
+					Expect(r.calls).To(Equal(preenCalls(device)+mountCall(device, mnt)), "%s, %q", shell.name, sectors)
+				}
+			},
+			shellEntries(""),
+		)
+
+		DescribeTable("mounts a legacy image at its old size without a journal and asks the app to free 4 MiB when it has less free, and does not fail the boot",
+			func(shellOf func() guestShell, blockSize, blocks, enough int) {
+				shell := shellOf()
+				setSectors(device, twoGiB)
+				size := []string{"TUNE2FS_BSIZE=" + strconv.Itoa(blockSize), "TUNE2FS_BLOCKS=" + strconv.Itoa(blocks)}
+				short := enough - 1
+				r := runIn(shell, []string{device}, append([]string{"DD_MODE=data", legacyFeatures, "TUNE2FS_FREE=" + strconv.Itoa(short)}, size...)...)
+				Expect(r.out).To(Equal(cleanLine+cleanLine+"vm-launch guest: the volume image rvm-disk-0.img at "+mnt+" has no journal and only "+strconv.Itoa(short*blockSize/1024)+" KiB free, and it needs 4 MiB free for the journal it must have before it grows, so it mounts at its old size of "+strconv.Itoa(blocks)+" blocks of "+strconv.Itoa(blockSize)+" bytes; free 4 MiB in "+mnt+" and restart the app to grow it\nREACHED_START\n"), "%s", shell.name)
+				Expect(r.calls).To(Equal(preenCalls(device)+"e2fsck -f -p "+device+"\n"+tune2fsCall(device)+mountCall(device, mnt)), "%s", shell.name)
+
+				// One more free block is enough.
+				Expect(os.Remove(callLog)).To(Succeed())
+				Expect(os.Remove(filepath.Join(dir, "e2fsck-full-ran"))).To(Succeed())
+				r = runIn(shell, []string{device}, append([]string{"DD_MODE=data", legacyFeatures, "TUNE2FS_FREE=" + strconv.Itoa(enough)}, size...)...)
+				Expect(r.calls).To(Equal(preenCalls(device)+legacyCalls(device)+mountCall(device, mnt)+growCall(device, mnt)), "%s", shell.name)
+			},
+			// 4 MiB of journal and 32 blocks more.
+			shellEntries("4096-byte blocks", 4096, 262144, 1024+32),
+			shellEntries("2048-byte blocks", 2048, 524288, 2048+32),
+			shellEntries("1024-byte blocks", 1024, 1048576, 4096+32),
+		)
+
+		DescribeTable("fails the boot when the full check of a legacy image that would grow exits 4 or more, before it gets a journal",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				setSectors(device, twoGiB)
+				for _, rc := range []int{4, 8, 12} {
+					Expect(os.RemoveAll(callLog)).To(Succeed())
+					Expect(os.RemoveAll(filepath.Join(dir, "e2fsck-full-ran"))).To(Succeed())
+					r := runIn(shell, []string{device}, "DD_MODE=data", legacyFeatures, "E2FSCK_F_RC="+strconv.Itoa(rc))
+					Expect(r.out).To(Equal(cleanLine+cleanLine+"vm-launch guest setup: the volume image rvm-disk-0.img has errors that e2fsck -f -p can't repair; inspect it on the volume (e2fsck -f -p exited "+strconv.Itoa(rc)+" for "+mnt+" before the image got the journal it needs to grow, and vm-launch never formats an image that is not blank)\nREBOOT\n"), "%s, %d", shell.name, rc)
+					Expect(r.calls).To(Equal(preenCalls(device)+"e2fsck -f -p "+device+"\n"), "%s, %d", shell.name, rc)
+				}
+			},
+			shellEntries(""),
+		)
+
+		DescribeTable("checks a legacy image again and mounts it at its old size when tune2fs cannot add its journal, and fails the boot when that check exits 4 or more",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				setSectors(device, twoGiB)
+				failed := preenCalls(device) + "e2fsck -f -p " + device + "\n" + tune2fsCall(device) + "tune2fs -O has_journal -J size=4 " + device + "\n" + "e2fsck -f -p " + device + "\n"
+				r := runIn(shell, []string{device}, "DD_MODE=data", legacyFeatures, "TUNE2FS_O_RC=1")
+				Expect(r.out).To(Equal(cleanLine+cleanLine+tune2fsBanner+cleanLine+"vm-launch guest: adding a 4 MiB journal to the volume image rvm-disk-0.img failed, so it mounts at its old size of 262144 blocks of 4096 bytes; its data is intact\nREACHED_START\n"), "%s", shell.name)
+				Expect(r.calls).To(Equal(failed+tune2fsCall(device)+mountCall(device, mnt)), "%s", shell.name)
+
+				Expect(os.Remove(callLog)).To(Succeed())
+				Expect(os.Remove(filepath.Join(dir, "e2fsck-full-ran"))).To(Succeed())
+				r = runIn(shell, []string{device}, "DD_MODE=data", legacyFeatures, "TUNE2FS_O_RC=1", "E2FSCK_F2_RC=4")
+				Expect(r.out).To(Equal(cleanLine+cleanLine+tune2fsBanner+cleanLine+"vm-launch guest setup: the volume image rvm-disk-0.img has errors that e2fsck -f -p can't repair after adding a journal to it failed; inspect it on the volume (e2fsck -f -p exited 4 for "+mnt+", and vm-launch never formats an image that is not blank)\nREBOOT\n"), "%s", shell.name)
+				Expect(r.calls).To(Equal(failed), "%s", shell.name)
+			},
+			shellEntries(""),
+		)
+
+		DescribeTable("mounts a legacy image at its old size when tune2fs reports success but the image still has no journal, or when its features do not read",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				setSectors(device, twoGiB)
+				r := runIn(shell, []string{device}, "DD_MODE=data", legacyFeatures, "TUNE2FS_O_NOJOURNAL=1")
+				Expect(r.out).To(Equal(cleanLine+cleanLine+tune2fsBanner+"Creating journal inode: done\nvm-launch guest: tune2fs gave the volume image rvm-disk-0.img no journal, so it mounts at its old size of 262144 blocks of 4096 bytes\nREACHED_START\n"), "%s", shell.name)
+				Expect(r.calls).To(Equal(preenCalls(device)+legacyCalls(device)+mountCall(device, mnt)), "%s", shell.name)
+
+				for _, env := range []string{"TUNE2FS_NO_FEATURES=1", "TUNE2FS_FEATURES="} {
+					Expect(os.Remove(callLog)).To(Succeed())
+					r = runIn(shell, []string{device}, "DD_MODE=data", env)
+					Expect(r.out).To(Equal(cleanLine+"vm-launch guest: tune2fs -l gives no filesystem features for the volume image rvm-disk-0.img, so the guest cannot tell whether it has the journal it needs to grow, and it mounts at its old size of 262144 blocks of 4096 bytes\nREACHED_START\n"), "%s, %s", shell.name, env)
+					Expect(r.calls).To(Equal(preenCalls(device)+mountCall(device, mnt)), "%s, %s", shell.name, env)
+				}
+			},
+			shellEntries(""),
+		)
+
+		// sparseDevice makes device a sparse 1 GiB file of zeros, with the
+		// bytes b at the byte at when b is not empty.
+		sparseDevice := func(at int64, b []byte) {
+			GinkgoHelper()
+			f, err := os.OpenFile(device, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+			Expect(err).NotTo(HaveOccurred())
+			defer f.Close()
+			Expect(f.Truncate(1 << 30)).To(Succeed())
+			if len(b) > 0 {
+				_, err = f.WriteAt(b, at)
+				Expect(err).NotTo(HaveOccurred())
+			}
+		}
+
+		DescribeTable("never formats an image whose first 64 KiB are zero but which holds a backup superblock's magic, and fails the boot as a damaged filesystem",
+			func(shellOf func() guestShell, place int, groupBlock, blockSize int) {
+				shell := shellOf()
+				at := backupPlaces[place]
+				sparseDevice(at+56, []byte{0x53, 0xef})
+				r := runIn(shell, []string{device}, "DD_MODE=zeros")
+				Expect(r.out).To(Equal(fmt.Sprintf("vm-launch guest setup: the volume image rvm-disk-0.img for %s reads as zero in its first 64 KiB but holds the magic of an ext2, ext3, or ext4 superblock at byte %d, where a backup superblock is kept, so it looks like a damaged filesystem, and vm-launch never formats it; repair it by hand on the volume with e2fsck -b from a backup superblock (e2fsck -b %d -B %d for %d-byte blocks)\nREBOOT\n", mnt, at, groupBlock, blockSize, blockSize)), "%s", shell.name)
+				calls := ddCall(device)
+				for _, p := range backupPlaces[:place+1] {
+					calls += backupCall(device, p)
+				}
+				Expect(r.calls).To(Equal(calls), "%s", shell.name)
+				Expect(r.calls).NotTo(ContainSubstring("mke2fs"))
+				Expect(r.calls).NotTo(ContainSubstring("mount"))
+			},
+			shellEntries("at block 8193 of 1024 bytes", 0, 8193, 1024),
+			shellEntries("1024 bytes into block 8193 of 1024 bytes", 1, 8193, 1024),
+			shellEntries("at block 16384 of 2048 bytes", 2, 16384, 2048),
+			shellEntries("1024 bytes into block 16384 of 2048 bytes", 3, 16384, 2048),
+			shellEntries("at block 32768 of 4096 bytes", 4, 32768, 4096),
+			shellEntries("1024 bytes into block 32768 of 4096 bytes", 5, 32768, 4096),
+		)
+
+		DescribeTable("formats an image whose first 64 KiB are zero when no backup superblock's magic is where one would be",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				// The magic in the other byte order, the magic one byte off,
+				// and other data at the magic's place are no superblock.
+				for _, c := range []struct {
+					at int64
+					b  []byte
+				}{{0, nil}, {backupPlaces[4] + 56, []byte{0xef, 0x53}}, {backupPlaces[4] + 57, []byte{0x53, 0xef}}, {backupPlaces[0] + 56, []byte{0x53, 0x00}}, {backupPlaces[2] + 100, []byte{0x53, 0xef}}} {
+					Expect(os.RemoveAll(callLog)).To(Succeed())
+					sparseDevice(c.at, c.b)
+					r := runIn(shell, []string{device}, "DD_MODE=zeros")
+					Expect(r.out).To(Equal("REACHED_START\n"), "%s, %d", shell.name, c.at)
+					Expect(r.calls).To(Equal(blankCalls(device)+mkfsCall(device)+mountCall(device, mnt)), "%s, %d", shell.name, c.at)
+				}
+			},
+			shellEntries(""),
+		)
+
+		DescribeTable("looks for a backup superblock only where the image holds all of one",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				// A 1024-byte superblock at byte at needs a device of at
+				// least at+1024 bytes, which is (at+1024)/512 sectors.
+				for _, c := range []struct {
+					sectors int64
+					places  int
+				}{{128, 0}, {(backupPlaces[0] + 1024) / 512, 1}, {(backupPlaces[0]+1024)/512 - 1, 0}, {(backupPlaces[1] + 1024) / 512, 2}, {32 << 11, 2}, {(backupPlaces[3] + 1024) / 512, 4}, {(backupPlaces[5]+1024)/512 - 1, 5}, {(backupPlaces[5] + 1024) / 512, 6}} {
+					Expect(os.RemoveAll(callLog)).To(Succeed())
+					setSectors(device, strconv.FormatInt(c.sectors, 10)+"\n")
+					r := runIn(shell, []string{device}, "DD_MODE=zeros")
+					Expect(r.out).To(Equal("REACHED_START\n"), "%s, %d sectors", shell.name, c.sectors)
+					calls := ddCall(device)
+					for _, p := range backupPlaces[:c.places] {
+						calls += backupCall(device, p)
+					}
+					Expect(r.calls).To(Equal(calls+mkfsCall(device)+mountCall(device, mnt)), "%s, %d sectors", shell.name, c.sectors)
+				}
+			},
+			shellEntries(""),
+		)
+
+		DescribeTable("treats a failed read of a backup superblock's place as a failure, never as a blank image",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				r := runIn(shell, []string{device}, "DD_MODE=zeros", "DD_SKIP_FAIL=1")
+				Expect(r.out).To(Equal("vm-launch guest setup: reading "+device+" at byte 8389632, where a backup superblock would be, failed\nREBOOT\n"), "%s", shell.name)
+				Expect(r.calls).To(Equal(ddCall(device)+backupCall(device, backupPlaces[0])), "%s", shell.name)
 			},
 			shellEntries(""),
 		)
@@ -888,7 +1393,7 @@ exit "${MOUNT_RC:-0}"`)
 					"RVM_VOL2_KIND=block\nRVM_VOL2_PATH="+shellQuote(mounts[2])+"\n"), 0o644)).To(Succeed())
 				r := runIn(shell, devices, "DD_MODE=data")
 				Expect(r.out).To(Equal("rvm-volume: clean, 11/65536 files, 4127/262144 blocks\nREACHED_START\n"), "%s", shell.name)
-				Expect(r.calls).To(Equal(ddCall(devices[0])+fsckCall(devices[0])+mountCall(devices[0], mounts[0])+blockMountCall(devices[2], mounts[2])), "%s", shell.name)
+				Expect(r.calls).To(Equal(preenCalls(devices[0])+mountCall(devices[0], mounts[0])+tune2fsCall(devices[2])+blockMountCall(devices[2], mounts[2])), "%s", shell.name)
 				Expect(mounts[1]).NotTo(BeAnExistingFile())
 
 				Expect(os.Remove(callLog)).To(Succeed())

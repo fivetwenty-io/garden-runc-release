@@ -394,8 +394,9 @@ fi
 // /rvm/net (in every guest, a task's included), prepares the open-files
 // limit from /rvm/limits, and checks that /rvm/env sources. A guest with
 // volumes then mounts each one by its kind, formatting only a blank volume
-// image, preening every other image with e2fsck -p, and never formatting or
-// checking a block volume (see guestVolumeSetup). When a setup step
+// image, preening every other image with e2fsck -p, never formatting or
+// checking a block volume, and growing an image or a block volume online
+// when its device is bigger (see guestVolumeSetup). When a setup step
 // fails, stage 2 reboots before the start tag, so vm-launch reports a guest
 // that never started its command and shows the console output, which ends
 // with the failed step. Last before the start tag, stage 2 starts the stop
@@ -767,13 +768,137 @@ const guestRunStatus = "rvm_status=$?\ncommand exec 2>&3 3>&-\n"
 // which is the pid of the command's top process.
 const guestAppPid = "/rvm/app-pid"
 
-// Guest scratch files of the blank check. They live under /rvm, which no
-// volume path may use, so that an app's container_dir can never collide with
-// them.
+// Guest scratch files of the blank check and of the superblock reads. They
+// live under /rvm, which no volume path may use, so that an app's
+// container_dir can never collide with them.
 const (
-	guestVolumeHead = "/rvm/volume-head"
-	guestVolumeUsed = "/rvm/volume-used"
+	guestVolumeHead   = "/rvm/volume-head"
+	guestVolumeUsed   = "/rvm/volume-used"
+	guestVolumeBackup = "/rvm/volume-backup"
+	guestVolumeSuper  = "/rvm/volume-super"
 )
+
+// guestLegacyJournalMiB is the size in MiB of the journal stage 2 gives an
+// image without one before it grows it, as tune2fs -J size takes it, and
+// guestLegacyJournalBytesText the same size in bytes. guestLegacyJournalSlack
+// is the blocks beyond the journal's own that the image must have free for
+// it: the indirect blocks that map a journal inode without extents, at most
+// 17 with 1024-byte blocks, with room to spare. They are decimal text, as
+// the guest's shell takes them, and a spec keeps them in step.
+const (
+	guestLegacyJournalMiB       = "4"
+	guestLegacyJournalBytesText = "4194304"
+	guestLegacyJournalSlack     = "32"
+)
+
+// sectorBytesText is sectorBytes in decimal, as the guest's shell takes it.
+// A spec keeps the two equal.
+const sectorBytesText = "512"
+
+// guestVolumeFuncs defines the helpers of the image and block arms of the
+// volume setup (see guestVolumeSetup), which work on the volume in
+// rvm_vdev, named in the guest's lines as rvm_vname, at rvm_vpath.
+//
+// rvm_vsize reads the device's size in 512-byte sectors from /sys/block, where
+// stage 1 read and checked it, into rvm_vsectors, and fails the boot when
+// it cannot.
+//
+// rvm_vsuper reads the filesystem's superblock with tune2fs -l, which only
+// reads, into rvm_vblocks, its size in blocks, rvm_vbsize, the bytes in a
+// block, rvm_vfree, its free blocks, or 0 when tune2fs gives none, and
+// rvm_vjournal, which is yes when the features name has_journal, no when
+// they name others, and unknown when tune2fs gives none. It succeeds when
+// tune2fs ran and gave a size and a block size the guest can use. The loop
+// is the shell's own read, so the parse starts no process.
+//
+// rvm_vfits compares the filesystem's size with the device's, in the
+// filesystem's blocks. A filesystem larger than its device fails the boot
+// before the mount, because it means a device that was shrunk or that holds
+// another filesystem's data, and a read-write mount of it could lose data.
+// rvm_vgrow is set when the device holds more blocks than the filesystem.
+//
+// rvm_vgrow_now runs ext4grow on the mounted filesystem when rvm_vgrow is
+// set. ext4grow asks the kernel to resize the filesystem online to fill its
+// device (see guestExt4grow). A grow that fails leaves the filesystem as it
+// was, mounted at its old size with its data intact, so stage 2 says so
+// with a line that names the volume and goes on.
+const guestVolumeFuncs = `rvm_vsize() {
+	rvm_vsectors=
+	read -r rvm_vsectors 2>/dev/null <"/sys/block/${rvm_vdev##*/}/size"
+	case "$rvm_vsectors" in
+	'' | 0* | *[!0-9]*) rvm_fail "reading the size of $rvm_vdev for $rvm_vname at $rvm_vpath from /sys/block failed" ;;
+	esac
+}
+rvm_vsuper() {
+	rvm_vsbok= rvm_vblocks= rvm_vbsize= rvm_vfree= rvm_vfeat= rvm_vjournal=unknown
+	if ! ` + guestTune2fs + ` -l "$rvm_vdev" >` + guestVolumeSuper + ` 2>/dev/null; then
+		rm -f ` + guestVolumeSuper + `
+		return 1
+	fi
+	while IFS= read -r rvm_vl; do
+		case "$rvm_vl" in
+		"Block count:"*) rvm_vblocks=${rvm_vl##* } ;;
+		"Block size:"*) rvm_vbsize=${rvm_vl##* } ;;
+		"Free blocks:"*) rvm_vfree=${rvm_vl##* } ;;
+		"Filesystem features:"*) rvm_vfeat=${rvm_vl#Filesystem features:} ;;
+		esac
+	done <` + guestVolumeSuper + `
+	rm -f ` + guestVolumeSuper + `
+	case " $rvm_vfeat " in
+	*" has_journal "*) rvm_vjournal=yes ;;
+	*[a-z0-9]*) rvm_vjournal=no ;;
+	esac
+	case "$rvm_vfree" in
+	'' | 0?* | *[!0-9]*) rvm_vfree=0 ;;
+	esac
+	case "$rvm_vblocks" in
+	'' | 0* | *[!0-9]*) return 1 ;;
+	esac
+	case "$rvm_vbsize" in
+	1024 | 2048 | 4096 | 8192 | 16384 | 32768 | 65536) rvm_vsbok=1 ;;
+	*) return 1 ;;
+	esac
+}
+rvm_vfits() {
+	rvm_vdevblocks=$((rvm_vsectors * ` + sectorBytesText + ` / rvm_vbsize))
+	[ "$((rvm_vblocks > rvm_vdevblocks))" = 0 ] || rvm_fail "the filesystem on $rvm_vname at $rvm_vpath has $rvm_vblocks blocks of $rvm_vbsize bytes, more than the $rvm_vdevblocks its device holds, so the device was shrunk or holds another filesystem's data; vm-launch never mounts a filesystem larger than its device; inspect it on the volume"
+	rvm_vgrow=
+	[ "$((rvm_vdevblocks > rvm_vblocks))" = 0 ] || rvm_vgrow=1
+}
+rvm_vgrow_now() {
+	[ -n "$rvm_vgrow" ] || return 0
+	` + guestExt4grow + ` "$rvm_vdev" "$rvm_vpath" || echo "vm-launch guest: growing $rvm_vname at $rvm_vpath from $rvm_vblocks to $rvm_vdevblocks blocks of $rvm_vbsize bytes failed, so it stays at its old size; its data is intact"
+}
+`
+
+// guestVolumeBackupCheck runs on an image whose first 64 KiB read as zero,
+// before stage 2 takes it as blank. An ext2, ext3, or ext4 filesystem keeps
+// a copy of its superblock at the start of block group 1, which is block
+// 8193 with 1024-byte blocks, 16384 with 2048-byte blocks, and 32768 with
+// 4096-byte blocks, and a superblock holds the magic 0xEF53, little endian,
+// 56 bytes in. For each block size, stage 2 reads the two bytes where the
+// magic would be, in a superblock at the start of that block and in one
+// 1024 bytes further in, wherever the image holds the whole superblock. An
+// image with the magic there lost its start but not its filesystem, so it
+// is never formatted, and the boot fails with a line that asks for a repair
+// by hand from the backup superblock with e2fsck -b. A read error fails the
+// boot too, and never counts as blank. dd reads the two bytes on its own,
+// so od never has to skip past the end of what it reads.
+const guestVolumeBackupCheck = `			for rvm_vsb in 1024:8193 2048:16384 4096:32768; do
+				rvm_vbs=${rvm_vsb%:*}
+				rvm_vgb=${rvm_vsb#*:}
+				for rvm_vat in 0 1024; do
+					rvm_voff=$((rvm_vgb * rvm_vbs + rvm_vat))
+					[ "$((rvm_voff + 1024 <= rvm_vsectors * ` + sectorBytesText + `))" = 1 ] || continue
+					dd if="$rvm_vdev" of=` + guestVolumeBackup + ` bs=2 skip=$(((rvm_voff + 56) / 2)) count=1 2>/dev/null || rvm_fail "reading $rvm_vdev at byte $rvm_voff, where a backup superblock would be, failed"
+					rvm_vmagic=$(od -An -tx1 ` + guestVolumeBackup + `) || rvm_fail "checking $rvm_vdev for a backup superblock at byte $rvm_voff failed"
+					case "$rvm_vmagic" in
+					*"53 ef"*) rvm_fail "the volume image $rvm_vimage for $rvm_vpath reads as zero in its first 64 KiB but holds the magic of an ext2, ext3, or ext4 superblock at byte $rvm_voff, where a backup superblock is kept, so it looks like a damaged filesystem, and vm-launch never formats it; repair it by hand on the volume with e2fsck -b from a backup superblock (e2fsck -b $rvm_vgb -B $rvm_vbs for $rvm_vbs-byte blocks)" ;;
+					esac
+				done
+			done
+			rm -f ` + guestVolumeBackup + `
+`
 
 // guestVolumeSetup mounts every volume, in volume order, each on the device
 // that stage 1 found by the drive's identity and passed as stage 2's argument
@@ -782,16 +907,20 @@ const (
 // volume count in /rvm/mounts, a sync mount setting other than true or false,
 // a volume without a path, and a kind stage 2 does not know are setup
 // failures. The kind decides everything else, and only the image arm can
-// format or check a filesystem.
+// format or check a filesystem. The image and block arms grow a filesystem
+// online when its device is bigger (see guestVolumeFuncs).
 //
 // An image volume must have a block device, and the guest must have the
 // guest filesystem tools that vm-launch puts below guestToolsDir. Stage 2
 // runs them by their full paths and never falls back to busybox's mke2fs,
 // so a missing tool fails the boot before stage 2 reads the device. Stage 2
-// formats only an image whose first 64 KiB it reads itself as all zero,
-// which is a new image or one whose creator died before the first boot; the
-// host never tells it an image is new. A read error is a setup failure,
-// never a blank image. A blank image gets a journalled ext4 from the shipped
+// formats only an image whose first 64 KiB it reads itself as all zero and
+// that holds no backup superblock where an ext2, ext3, or ext4 filesystem
+// keeps one (see guestVolumeBackupCheck), which is a new image or one whose
+// creator died before the first boot; the host never tells it an image is
+// new. A read error is a setup failure, never a blank image, and an image
+// whose start is zero but which holds a backup superblock fails the boot as
+// a damaged filesystem. A blank image gets a journalled ext4 from the shipped
 // mke2fs with the pinned mke2fs.conf (see guestVolumeMke2fsArgs). The format
 // skips zeroing the inode tables and the journal, so it never writes the
 // image's whole size, which is safe because vm-launch makes every image with
@@ -807,7 +936,26 @@ const (
 // on. A status of 4 or more fails the boot with a line that names the image
 // and asks an operator to inspect it, and the image is never formatted.
 // Stage 2 never runs e2fsck -y. An image that is not blank and does not
-// mount after its preen is never formatted either.
+// mount after its preen is never formatted either. Before the preen, stage 2
+// reads the superblock with tune2fs -l, and an image whose filesystem is
+// larger than its device fails the boot there, before e2fsck writes to it;
+// a superblock that tune2fs cannot read then is left to the preen to
+// report. After the preen the superblock must read, or the boot fails,
+// because the guest could not tell whether the filesystem fits its device.
+//
+// An image whose device holds more blocks than its filesystem, because the
+// host grew the image file, grows online after the mount (see
+// guestVolumeFuncs). The kernel journals the resize, so a crash in the
+// middle replays at the next mount, and an image without a journal, such as
+// an rvm.6 ext2 image, first gets one: stage 2 checks it in full with
+// e2fsck -f -p and adds a 4 MiB journal with tune2fs -O has_journal before
+// the mount. Without 4 MiB free for the journal, the image mounts at its
+// old size with a line that asks the app to free 4 MiB, and the boot goes
+// on. A journal that tune2fs cannot add leaves the image at its old size
+// after a second full check, with a line that says so. An image whose
+// features tune2fs does not give is not grown either. An image that does
+// not need to grow is left as it is apart from the preen, and a blank image
+// fills its device from the format.
 //
 // An image mounts with sync and dirsync, which put every completed write on
 // the image before the syscall returns, because the hypervisors stop at once
@@ -820,16 +968,23 @@ const (
 // the filesystem consistent through a sudden stop. An image without a
 // journal, such as an rvm.6 ext2 image or a new image too small for one,
 // keeps sync and dirsync, and so does an image whose features tune2fs cannot
-// read, with a line that says so.
+// read, with a line that says so. An rvm.6 image that got a journal so that
+// it could grow has one from then on.
 //
 // A block volume is a whole disk that holds the app's data, and stage 2
-// never reads its start, formats it, or checks it, because the volume driver
-// checks it before it hands it over. It must have a block device, which stage
-// 2 mounts as ext4 with noatime and errors=remount-ro and without sync or
-// dirsync, so the disk keeps the speed of a local disk; the teardown's sync
-// -f flushes it after the command. A disk that does not mount, a blank one
-// included, fails the boot with a line that names the volume's disk, never
-// an image file, and says vm-launch never formats a block volume.
+// never formats it or checks it, because the volume driver checks it before
+// it hands it over. It must have a block device and the guest tune2fs and
+// ext4grow. Stage 2 reads its superblock with tune2fs -l, which only reads,
+// and a disk whose superblock does not read, a blank one included, fails
+// the boot with a line that names the volume's disk, never an image file,
+// and says vm-launch never formats a block volume, as does a filesystem
+// larger than its disk. Stage 2 mounts the disk as ext4 with noatime and
+// errors=remount-ro and without sync or dirsync, so the disk keeps the
+// speed of a local disk; the teardown's sync -f flushes it after the
+// command. A disk that does not mount fails the boot with the same line. A
+// disk bigger than its filesystem grows online after the mount, as an image
+// does, when it has a journal, which the volume driver requires; a disk
+// without one stays at its old size, with a line that says so.
 //
 // A share has no drive, so stage 1 passes it an empty argument, and any
 // other argument is a setup failure. Stage 2 does not mount shares; the code
@@ -848,51 +1003,102 @@ case "${RVM_SYNC_MOUNTS:-}" in
 true | false) ;;
 *) rvm_fail "the sync mount setting in /rvm/mounts is not true or false" ;;
 esac
-rvm_vi=0
+` + guestVolumeFuncs + `rvm_vi=0
 for rvm_vdev in "$@"; do
 	eval "rvm_vkind=\${RVM_VOL${rvm_vi}_KIND:-} rvm_vpath=\${RVM_VOL${rvm_vi}_PATH:-} rvm_vimage=\${RVM_VOL${rvm_vi}_IMAGE:-}"
 	[ -n "$rvm_vpath" ] || rvm_fail "/rvm/mounts gives volume $rvm_vi no path"
 	case "$rvm_vkind" in
 	` + string(driveImage) + `)
 		[ -b "$rvm_vdev" ] || rvm_fail "no block device for the volume image $rvm_vimage at $rvm_vpath"
-		for rvm_vtool in ` + guestMke2fs + ` ` + guestE2fsck + ` ` + guestTune2fs + `; do
+		for rvm_vtool in ` + guestMke2fs + ` ` + guestE2fsck + ` ` + guestTune2fs + ` ` + guestExt4grow + `; do
 			[ -f "$rvm_vtool" ] && [ -x "$rvm_vtool" ] || rvm_fail "the guest has no $rvm_vtool for the volume image $rvm_vimage at $rvm_vpath, and it never formats or checks a volume image with another tool"
 		done
 		[ -f ` + guestMke2fsConfig + ` ] && [ -r ` + guestMke2fsConfig + ` ] || rvm_fail "the guest has no ` + guestMke2fsConfig + ` for the volume image $rvm_vimage at $rvm_vpath"
 		mkdir -p "$rvm_vpath" || rvm_fail "creating $rvm_vpath failed"
+		rvm_vname="the volume image $rvm_vimage"
+		rvm_vsize
 		dd if="$rvm_vdev" of=` + guestVolumeHead + ` bs=4096 count=16 || rvm_fail "reading the start of $rvm_vdev failed"
 		tr -d '\000' <` + guestVolumeHead + ` >` + guestVolumeUsed + ` || rvm_fail "checking whether $rvm_vdev is blank failed"
 		rvm_blank=
 		[ -s ` + guestVolumeHead + ` ] && [ ! -s ` + guestVolumeUsed + ` ] && rvm_blank=1
 		rm -f ` + guestVolumeHead + ` ` + guestVolumeUsed + `
 		if [ -n "$rvm_blank" ]; then
+` + guestVolumeBackupCheck + `		fi
+		rvm_vgrow=
+		if [ -n "$rvm_blank" ]; then
 			MKE2FS_CONFIG=` + guestMke2fsConfig + ` ` + guestMke2fs + ` ` + guestVolumeMke2fsArgs + ` "$rvm_vdev" || rvm_fail "formatting the blank volume image $rvm_vimage for $rvm_vpath failed"
+			rvm_vjournal=unknown
+			[ "$RVM_SYNC_MOUNTS" = true ] || rvm_vsuper
 		else
+			! rvm_vsuper || rvm_vfits
 			rvm_vrc=0
 			` + guestE2fsck + ` -p "$rvm_vdev" || rvm_vrc=$?
 			[ "$rvm_vrc" -lt 4 ] || rvm_fail "the volume image $rvm_vimage has errors that e2fsck -p can't repair; inspect it on the volume (e2fsck -p exited $rvm_vrc for $rvm_vpath, and vm-launch never formats an image that is not blank)"
 			[ $((rvm_vrc & 2)) -eq 0 ] || echo "vm-launch guest: e2fsck -p repaired the volume image $rvm_vimage and asked for a reboot, which only a mounted filesystem needs; the image is not mounted yet, so the guest goes on"
+			rvm_vsuper || rvm_fail "reading the superblock of the volume image $rvm_vimage for $rvm_vpath with tune2fs -l failed after its preen, so the guest cannot tell whether it fits its device; inspect it on the volume"
+			rvm_vfits
+			if [ -n "$rvm_vgrow" ] && [ "$rvm_vjournal" = unknown ]; then
+				echo "vm-launch guest: tune2fs -l gives no filesystem features for the volume image $rvm_vimage, so the guest cannot tell whether it has the journal it needs to grow, and it mounts at its old size of $rvm_vblocks blocks of $rvm_vbsize bytes"
+				rvm_vgrow=
+			fi
+			if [ -n "$rvm_vgrow" ] && [ "$rvm_vjournal" = no ]; then
+				rvm_vrc=0
+				` + guestE2fsck + ` -f -p "$rvm_vdev" || rvm_vrc=$?
+				[ "$rvm_vrc" -lt 4 ] || rvm_fail "the volume image $rvm_vimage has errors that e2fsck -f -p can't repair; inspect it on the volume (e2fsck -f -p exited $rvm_vrc for $rvm_vpath before the image got the journal it needs to grow, and vm-launch never formats an image that is not blank)"
+				rvm_vsuper || rvm_fail "reading the superblock of the volume image $rvm_vimage for $rvm_vpath with tune2fs -l failed after its check, so the guest cannot tell whether it has room for a journal; inspect it on the volume"
+				if [ "$((rvm_vfree >= ` + guestLegacyJournalBytesText + ` / rvm_vbsize + ` + guestLegacyJournalSlack + `))" = 1 ]; then
+					if ` + guestTune2fs + ` -O has_journal -J size=` + guestLegacyJournalMiB + ` "$rvm_vdev"; then
+						rvm_vsuper || rvm_fail "reading the superblock of the volume image $rvm_vimage for $rvm_vpath with tune2fs -l failed after it got a journal; inspect it on the volume"
+						rvm_vfits
+						if [ "$rvm_vjournal" != yes ]; then
+							echo "vm-launch guest: tune2fs gave the volume image $rvm_vimage no journal, so it mounts at its old size of $rvm_vblocks blocks of $rvm_vbsize bytes"
+							rvm_vgrow=
+						fi
+					else
+						rvm_vrc=0
+						` + guestE2fsck + ` -f -p "$rvm_vdev" || rvm_vrc=$?
+						[ "$rvm_vrc" -lt 4 ] || rvm_fail "the volume image $rvm_vimage has errors that e2fsck -f -p can't repair after adding a journal to it failed; inspect it on the volume (e2fsck -f -p exited $rvm_vrc for $rvm_vpath, and vm-launch never formats an image that is not blank)"
+						rvm_vsuper || rvm_fail "reading the superblock of the volume image $rvm_vimage for $rvm_vpath with tune2fs -l failed after adding a journal to it failed; inspect it on the volume"
+						rvm_vfits
+						echo "vm-launch guest: adding a ` + guestLegacyJournalMiB + ` MiB journal to the volume image $rvm_vimage failed, so it mounts at its old size of $rvm_vblocks blocks of $rvm_vbsize bytes; its data is intact"
+						rvm_vgrow=
+					fi
+				else
+					echo "vm-launch guest: the volume image $rvm_vimage at $rvm_vpath has no journal and only $((rvm_vfree * rvm_vbsize / 1024)) KiB free, and it needs ` + guestLegacyJournalMiB + ` MiB free for the journal it must have before it grows, so it mounts at its old size of $rvm_vblocks blocks of $rvm_vbsize bytes; free ` + guestLegacyJournalMiB + ` MiB in $rvm_vpath and restart the app to grow it"
+					rvm_vgrow=
+				fi
+			fi
 		fi
 		rvm_vopts=` + guestImageSyncOptions + `,` + guestImageMountOptions + `
 		if [ "$RVM_SYNC_MOUNTS" = false ]; then
-			if rvm_vfeat=$(` + guestTune2fs + ` -l "$rvm_vdev" 2>/dev/null) && rvm_vfeat=$(printf '%s\n' "$rvm_vfeat" | sed -n 's/^Filesystem features:[[:space:]]*//p') && [ -n "$rvm_vfeat" ]; then
-				case " $rvm_vfeat " in
-				*" has_journal "*) rvm_vopts=` + guestImageMountOptions + ` ;;
-				esac
-			else
-				echo "vm-launch guest: reading the filesystem features of the volume image $rvm_vimage failed, so it mounts with sync and dirsync"
-			fi
+			case "$rvm_vjournal" in
+			yes) rvm_vopts=` + guestImageMountOptions + ` ;;
+			unknown) echo "vm-launch guest: reading the filesystem features of the volume image $rvm_vimage failed, so it mounts with sync and dirsync" ;;
+			esac
 		fi
 		if [ -n "$rvm_blank" ]; then
 			mount -t ext4 -o "$rvm_vopts" "$rvm_vdev" "$rvm_vpath" || rvm_fail "mounting the newly formatted volume image $rvm_vimage at $rvm_vpath failed"
 		else
 			mount -t ext4 -o "$rvm_vopts" "$rvm_vdev" "$rvm_vpath" || rvm_fail "mounting the volume image $rvm_vimage at $rvm_vpath failed; it is not blank, so vm-launch will not format it; inspect or delete $rvm_vimage on the volume"
 		fi
+		rvm_vgrow_now
 		;;
 	` + string(driveBlock) + `)
 		[ -b "$rvm_vdev" ] || rvm_fail "no block device for volume $rvm_vi's disk at $rvm_vpath"
+		for rvm_vtool in ` + guestTune2fs + ` ` + guestExt4grow + `; do
+			[ -f "$rvm_vtool" ] && [ -x "$rvm_vtool" ] || rvm_fail "the guest has no $rvm_vtool for volume $rvm_vi's disk at $rvm_vpath, and it never grows a block volume with another tool"
+		done
 		mkdir -p "$rvm_vpath" || rvm_fail "creating $rvm_vpath failed"
+		rvm_vname="volume $rvm_vi's disk $rvm_vdev"
+		rvm_vsize
+		rvm_vsuper || rvm_fail "reading the filesystem on volume $rvm_vi's disk $rvm_vdev for $rvm_vpath with tune2fs -l failed; vm-launch never formats a block volume, so the guest will not boot with it"
+		rvm_vfits
+		if [ -n "$rvm_vgrow" ] && [ "$rvm_vjournal" != yes ]; then
+			echo "vm-launch guest: volume $rvm_vi's disk $rvm_vdev has no journal that tune2fs -l shows, so it mounts at its old size of $rvm_vblocks blocks of $rvm_vbsize bytes and does not grow"
+			rvm_vgrow=
+		fi
 		mount -t ext4 -o noatime,errors=remount-ro "$rvm_vdev" "$rvm_vpath" || rvm_fail "mounting volume $rvm_vi's disk $rvm_vdev at $rvm_vpath failed; vm-launch never formats a block volume, so the guest will not boot with it"
+		rvm_vgrow_now
 		;;
 	` + volumeKindShare + `)
 		[ -z "$rvm_vdev" ] || rvm_fail "stage 1 passed the device $rvm_vdev for the share at $rvm_vpath, which has no drive"
