@@ -734,7 +734,7 @@ var _ = Describe("run with several volumes", func() {
 					lines = "received terminated while waiting for the fake disk\n"
 				}
 				for _, d := range want {
-					lines += "releasing the volume image: the fence of " + filepath.Base(d) + " would not let go\n"
+					lines += "releasing the volume disk: the fence of " + filepath.Base(d) + " would not let go\n"
 				}
 				Expect(logBuf.String()).To(HaveSuffix(lines), "%s at volume %d", name, failAt)
 				Expect(argvFile).NotTo(BeAnExistingFile())
@@ -771,7 +771,7 @@ var _ = Describe("run with several volumes", func() {
 
 	// sameImageLine is the refusal of two volumes that reach one image.
 	sameImageLine := func() string {
-		return "volume paths " + quoteForLog(dirs[0]) + " and " + quoteForLog(dirs[1]) + " reach the same disk image; bind each volume to a directory of its own\n"
+		return "volume paths " + quoteForLog(dirs[0]) + " and " + quoteForLog(dirs[1]) + " reach the same disk; bind each volume to a directory of its own\n"
 	}
 
 	It("refuses at once, without a lock wait, two volumes whose images are one file when the provider takes the lock", func() {
@@ -932,7 +932,7 @@ var _ = Describe("run with several volumes", func() {
 		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
 		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
 		Expect(logBuf.String()).To(HaveSuffix("volume paths " + quoteForLog(dirs[0]) + " and " + quoteForLog(dirs[1]) +
-			` are the same directory of one filesystem (device 0:52, root "/share"), so they would share one disk image; bind each volume to a directory of its own` + "\n"))
+			` are the same directory of one filesystem (device 0:52, root "/share"), so they would share one disk; bind each volume to a directory of its own` + "\n"))
 		for _, d := range dirs {
 			Expect(os.ReadDir(d)).To(BeEmpty())
 		}

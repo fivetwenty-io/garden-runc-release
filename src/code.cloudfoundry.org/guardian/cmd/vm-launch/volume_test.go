@@ -605,7 +605,7 @@ var _ = Describe("findVolumeProviders", func() {
 		_, err := findAll([]string{"/a", "/b"},
 			"40 29 0:52 /share /a rw shared:40 - fuse.juicefs JuiceFS:vol rw\n",
 			"41 29 0:52 /share /b rw shared:41 - fuse.juicefs JuiceFS:vol rw\n")
-		Expect(err).To(MatchError(`volume paths "/a" and "/b" are the same directory of one filesystem (device 0:52, root "/share"), so they would share one disk image; bind each volume to a directory of its own`))
+		Expect(err).To(MatchError(`volume paths "/a" and "/b" are the same directory of one filesystem (device 0:52, root "/share"), so they would share one disk; bind each volume to a directory of its own`))
 	})
 
 	It("accepts two directories of one filesystem and one directory of two filesystems", func() {

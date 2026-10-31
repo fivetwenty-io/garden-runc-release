@@ -395,7 +395,7 @@ func findVolumeProviders(mountinfo string, vols []guestVolume) ([]selectedVolume
 		}
 		for _, prev := range selected {
 			if prev.Mount.Major == m.Major && prev.Mount.Minor == m.Minor && prev.Mount.Root == m.Root {
-				return nil, fmt.Errorf("volume paths %s and %s are the same directory of one filesystem (device %d:%d, root %s), so they would share one disk image; bind each volume to a directory of its own",
+				return nil, fmt.Errorf("volume paths %s and %s are the same directory of one filesystem (device %d:%d, root %s), so they would share one disk; bind each volume to a directory of its own",
 					quoteForLog(prev.Volume.ContainerDir), quoteForLog(v.ContainerDir), m.Major, m.Minor, quoteForLog(m.Root))
 			}
 		}
@@ -421,7 +421,9 @@ type preparedVolume struct {
 type preparedVolumes []preparedVolume
 
 // prepare asks v's provider for its disk, in the mode privateMode picks from
-// the provider's capabilities, and adds it. The attachment must be in that
+// the provider's capabilities, and adds it. An instance index at or above the
+// provider's MaxInstances is refused first, without calling Prepare
+// (checkInstanceLimit). The attachment must be in that
 // mode, and its file must be what the mode says: a regular file in
 // file-image mode and a block device in block mode, whose size comes from
 // the device itself.
@@ -440,7 +442,11 @@ type preparedVolumes []preparedVolume
 // hand back what it built along with the error. The volumes added before
 // keep their fences, and the caller releases them too.
 func (pv *preparedVolumes) prepare(v selectedVolume, signals <-chan os.Signal, budget *lockBudget, logger *log.Logger) (*attachment, error) {
-	mode := privateMode(v.Provider.Capabilities(v.Mount))
+	caps := v.Provider.Capabilities(v.Mount)
+	mode := privateMode(caps)
+	if err := checkInstanceLimit(v.Provider, caps, v.Volume.ContainerDir, mode, v.Volume.Index); err != nil {
+		return nil, err
+	}
 	att, err := v.Provider.Prepare(prepareRequest{
 		Mount: v.Mount, ImageName: v.Volume.ImageName, Index: v.Volume.Index, Mode: mode, Signals: signals,
 		LockBudget: budget,
@@ -498,22 +504,22 @@ func (pv *preparedVolumes) prepare(v selectedVolume, signals <-chan os.Signal, b
 func inodeOf(f *os.File, dir string) (os.FileInfo, uint64, uint64, error) {
 	info, err := f.Stat()
 	if err != nil {
-		return nil, 0, 0, fmt.Errorf("reading the size of the volume image at %s: %w", quoteForLog(dir), err)
+		return nil, 0, 0, fmt.Errorf("reading the disk of the volume at %s: %w", quoteForLog(dir), err)
 	}
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
-		return nil, 0, 0, fmt.Errorf("reading the inode of the volume image at %s: the file system gave no inode", quoteForLog(dir))
+		return nil, 0, 0, fmt.Errorf("reading the inode of the disk of the volume at %s: the file system gave no inode", quoteForLog(dir))
 	}
 	return info, uint64(st.Dev), uint64(st.Ino), nil
 }
 
 // checkNotHeld refuses the disk with device dev and inode ino for the volume
 // at dir when an earlier volume already holds it. Two volumes on one disk
-// would give the guest one image twice.
+// would give the guest one disk twice, whether an image or a block device.
 func (pv preparedVolumes) checkNotHeld(dir string, dev, ino uint64) error {
 	for _, prev := range pv {
 		if prev.dev == dev && prev.ino == ino {
-			return fmt.Errorf("volume paths %s and %s reach the same disk image; bind each volume to a directory of its own",
+			return fmt.Errorf("volume paths %s and %s reach the same disk; bind each volume to a directory of its own",
 				quoteForLog(prev.Path), quoteForLog(dir))
 		}
 	}
@@ -534,7 +540,7 @@ func (pv preparedVolumes) files() []*attachment {
 func (pv preparedVolumes) release(logger *log.Logger) {
 	for i := len(pv) - 1; i >= 0; i-- {
 		if err := pv[i].Attachment.Release(); err != nil {
-			logger.Printf("releasing the volume image: %v", err)
+			logger.Printf("releasing the volume disk: %v", err)
 		}
 	}
 }

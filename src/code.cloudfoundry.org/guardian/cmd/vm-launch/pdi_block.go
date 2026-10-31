@@ -11,6 +11,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 	"unicode/utf8"
 	"unsafe"
 
@@ -31,11 +33,15 @@ import (
 // inspected, opens the node with O_RDWR|O_EXCL, and checks the device before
 // the hypervisor gets it: its device number, its size from BLKGETSIZE64, and
 // the ext4 superblock at byte 1024, which must have the ext4 magic, the
-// descriptor's UUID, and an internal journal. The UUID check means that a
-// device number another disk reuses cannot send the guest to the wrong data.
+// descriptor's UUID, an internal journal, and no more blocks than the device
+// holds. The UUID check means that a device number another disk reuses cannot
+// send the guest to the wrong data. It cannot tell apart two disks cloned
+// from one snapshot, which share a UUID.
 // On Linux an exclusive open of a block device fails with EBUSY while the
 // device is mounted or another process holds it exclusively, and while
-// vm-launch holds it, a host mount of the device fails with EBUSY. The
+// vm-launch holds it, a host mount of the device fails with EBUSY. vm-launch
+// retries a busy device within the launch's shared lock wait, so a restart
+// that overlaps the previous instance's VM on the same cell waits for it. The
 // hypervisor inherits the open file, so the claim lasts until both have let
 // go of it. Firecracker's identity for the drive comes from the node's own
 // st_dev, st_rdev, and st_ino (see firecrackerDriveID), because the node is
@@ -73,11 +79,14 @@ const (
 	ext4SuperblockOffset = 1024
 	ext4SuperblockSize   = 1024
 
-	ext4MagicOffset        = 0x38
-	ext4FeatureCompatOff   = 0x5c
-	ext4FeatureIncompatOff = 0x60
-	ext4UUIDOffset         = 0x68
-	ext4JournalInumOffset  = 0xe0
+	ext4BlocksCountLoOffset = 0x04
+	ext4LogBlockSizeOffset  = 0x18
+	ext4MagicOffset         = 0x38
+	ext4FeatureCompatOff    = 0x5c
+	ext4FeatureIncompatOff  = 0x60
+	ext4UUIDOffset          = 0x68
+	ext4JournalInumOffset   = 0xe0
+	ext4BlocksCountHiOffset = 0x150
 
 	ext4Magic = 0xef53
 	// ext4CompatHasJournal is COMPAT_HAS_JOURNAL.
@@ -85,7 +94,18 @@ const (
 	// ext4IncompatJournalDev is INCOMPAT_JOURNAL_DEV, which marks a device
 	// that holds another filesystem's external journal and no filesystem.
 	ext4IncompatJournalDev = 0x8
+	// ext4Incompat64Bit is INCOMPAT_64BIT, without which the high word of
+	// the block count is not used.
+	ext4Incompat64Bit = 0x80
+	// ext4MaxLogBlockSize is the largest s_log_block_size the kernel mounts:
+	// a block size of 1024 << 6, or 64 KiB.
+	ext4MaxLogBlockSize = 6
 )
+
+// blockBusyPoll is the first wait before vm-launch tries the exclusive open
+// of a busy device again. Each wait after it doubles, up to lockPoll, so a
+// device whose previous holder is about to exit is reached quickly.
+const blockBusyPoll = 50 * time.Millisecond
 
 // errBlockDeviceBusy is the kind of the refusal of a block device that is
 // mounted or held open exclusively.
@@ -240,17 +260,18 @@ func (p *blockProvider) Capabilities(mountRecord) capabilities {
 
 // Prepare refuses any mode but block mode, any instance index above 0, and a
 // mount it does not own, and then opens and checks the device through
-// openBlockVolume. The attachment's Release closes vm-launch's copy of the
-// device, and the exclusive claim ends once the hypervisor, which shares the
-// open file, has exited too.
+// openBlockVolume. The launch's prepare refuses an index above 0 from
+// MaxInstances before it calls Prepare, and the check here backs that up.
+// The attachment's Release closes vm-launch's copy of the device, and the
+// exclusive claim ends once the hypervisor, which shares the open file, has
+// exited too.
 func (p *blockProvider) Prepare(req prepareRequest) (*attachment, error) {
-	if req.Mode != attachBlock {
-		return nil, fmt.Errorf("the %s volume provider attaches only in %s, not in %s", p.name, attachBlock, req.Mode)
-	}
 	dir := quoteForLog(req.Mount.ContainerDir)
+	if req.Mode != attachBlock {
+		return nil, fmt.Errorf("volume path %s: the %s volume provider attaches only in %s, not in %s", dir, p.name, attachBlock, req.Mode)
+	}
 	if req.Index != 0 {
-		return nil, fmt.Errorf("volume path %s is a %s in block mode, which the volume service attaches to one VM at a time, so only instance 0 can use it, and this is instance %d; scale the app to one instance or give each instance a service of its own",
-			dir, p.name, req.Index)
+		return nil, instanceLimitError(p, req.Mount.ContainerDir, attachBlock, 1, req.Index)
 	}
 	if p.Match(req.Mount) != strongMatch {
 		return nil, fmt.Errorf("the %s volume provider does not own the %s mount at volume path %s", p.name, quoteForLog(req.Mount.FSType), dir)
@@ -273,10 +294,12 @@ func (p *blockProvider) Prepare(req prepareRequest) (*attachment, error) {
 // descriptor's number. BeforeLock, when there is one, gets that O_PATH file,
 // so a device an earlier volume of the launch holds is refused in the
 // launch's own words before the exclusive open would fail as busy. The node
-// is then opened with O_RDWR|O_EXCL|O_CLOEXEC|O_NOFOLLOW, and the open file
-// must be the inode checked before, with the descriptor's number, the
-// descriptor's size, and an ext4 superblock with the descriptor's UUID and a
-// journal (checkExt4Superblock). Every failure closes what it opened.
+// is then opened with O_RDWR|O_EXCL|O_CLOEXEC|O_NOFOLLOW, waiting while it is
+// busy (openExclusive), and the open file must be the inode checked before,
+// with the descriptor's number, the descriptor's size, and an ext4
+// superblock with the descriptor's UUID, a journal, and no more blocks than
+// the device holds (checkExt4Superblock). Every failure closes what it
+// opened.
 func (p *blockProvider) openBlockVolume(req prepareRequest) (*os.File, error) {
 	dir := req.Mount.ContainerDir
 	qdir := quoteForLog(dir)
@@ -328,9 +351,9 @@ func (p *blockProvider) openBlockVolume(req prepareRequest) (*os.File, error) {
 		}
 	}
 
-	fd, err := p.host.open(node, unix.O_RDWR|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW)
+	fd, err := p.openExclusive(node, what, req)
 	if err != nil {
-		return nil, p.nodeOpenError(what, err)
+		return nil, err
 	}
 	dev := os.NewFile(uintptr(fd), node)
 	ok := false
@@ -365,6 +388,50 @@ func (p *blockProvider) openBlockVolume(req prepareRequest) (*os.File, error) {
 	}
 	ok = true
 	return dev, nil
+}
+
+// openExclusive opens node with O_RDWR|O_EXCL|O_CLOEXEC|O_NOFOLLOW. While the
+// open fails with EBUSY, because the cell has the device mounted or another
+// process, such as the hypervisor of an instance that is still stopping,
+// holds it open exclusively, it tries again after blockBusyPoll, doubling
+// each wait up to lockPoll. It waits up to lockWait, or for what is left of
+// req.LockBudget when that is less, and the time it spends goes against the
+// budget, as an image's lock wait does. A signal on req.Signals ends the wait
+// with a *signalledError. Once the wait runs out, the device is refused as
+// still in use, with kind errBlockDeviceBusy. Every other failure is refused
+// at once, through nodeOpenError.
+func (p *blockProvider) openExclusive(node, what string, req prepareRequest) (int, error) {
+	began := time.Now()
+	wait := lockWait
+	if b := req.LockBudget; b != nil {
+		wait = min(wait, b.remaining)
+		defer func() { b.remaining = max(b.remaining-time.Since(began), 0) }()
+	}
+	deadline := began.Add(wait)
+	poll := blockBusyPoll
+	for {
+		fd, err := p.host.open(node, unix.O_RDWR|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW)
+		if err == nil {
+			return fd, nil
+		}
+		if !errors.Is(err, unix.EBUSY) {
+			return -1, p.nodeOpenError(what, err)
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return -1, &volumeError{kind: errBlockDeviceBusy, cause: err,
+				msg: fmt.Sprintf("%s is still in use after vm-launch waited %s for it: the cell has it mounted, or another process, such as an earlier instance's hypervisor, holds it open exclusively; a block device takes one writer",
+					what, wait.Round(100*time.Millisecond))}
+		}
+		timer := time.NewTimer(min(poll, remaining))
+		select {
+		case sig := <-req.Signals:
+			timer.Stop()
+			return -1, &signalledError{Sig: syscall.Signal(signalNumber(sig)), during: "waiting for the block device to be released"}
+		case <-timer.C:
+		}
+		poll = min(2*poll, lockPoll)
+	}
 }
 
 // checkBlockNode refuses a node that is not a block device with the number
@@ -402,12 +469,9 @@ func fileTypeName(mode uint32) string {
 }
 
 // nodeOpenError says why vm-launch could not open the device node, in terms
-// an operator can act on.
+// an operator can act on. openExclusive handles EBUSY, which it waits out.
 func (p *blockProvider) nodeOpenError(what string, err error) error {
 	switch {
-	case errors.Is(err, unix.EBUSY):
-		return &volumeError{kind: errBlockDeviceBusy, cause: err,
-			msg: fmt.Sprintf("%s is busy: the cell has it mounted, or another process holds it open exclusively, so vm-launch will not attach it; a block device takes one writer", what)}
 	case errors.Is(err, unix.ENOENT):
 		return fmt.Errorf("opening %s: the container has no such node; Garden makes it only when the cell runs Garden with --vm-block-volumes", what)
 	case errors.Is(err, unix.EACCES):
@@ -484,11 +548,15 @@ var euid = os.Geteuid
 
 // checkExt4Superblock reads the ext4 superblock at byte 1024 of the device fd
 // and refuses one without the ext4 magic, an external journal device, one
-// whose UUID is not desc's, and one without an internal journal. The guest
-// mounts the disk as ext4 and never formats it, and the volume driver formats
-// it with a journal, so a disk without one is not the driver's. The guest's
-// own mounts change the mount count, the last mount path, and the state, and
-// never these fields, so the check holds across attaches.
+// whose UUID is all zeros or is not desc's, one without an internal journal,
+// and one whose block size the kernel does not mount or whose blocks run past
+// the end of the device, which is desc.Size bytes. The guest mounts the disk
+// as ext4 and never formats it, and the volume driver formats it with a
+// journal, so a disk without one is not the driver's. A UUID that differs is
+// never printed, because the device may now be another app's disk, and
+// vm-launch's lines reach the app's log. The guest's own mounts change the
+// mount count, the last mount path, and the state, and never these fields, so
+// the check holds across attaches.
 func checkExt4Superblock(fd int, desc blockDescriptor, what string) error {
 	sb := make([]byte, ext4SuperblockSize)
 	n := 0
@@ -511,11 +579,16 @@ func checkExt4Superblock(fd int, desc blockDescriptor, what string) error {
 	if magic := le.Uint16(sb[ext4MagicOffset:]); magic != ext4Magic {
 		return fmt.Errorf("%s holds no ext4 filesystem (superblock magic %#04x, not %#04x); the volume driver formats the disk before it hands it over, and the guest never formats a block device", what, magic, ext4Magic)
 	}
-	if le.Uint32(sb[ext4FeatureIncompatOff:])&ext4IncompatJournalDev != 0 {
+	incompat := le.Uint32(sb[ext4FeatureIncompatOff:])
+	if incompat&ext4IncompatJournalDev != 0 {
 		return fmt.Errorf("%s is an external ext4 journal device, not a filesystem", what)
 	}
-	if uuid := formatUUID(sb[ext4UUIDOffset : ext4UUIDOffset+16]); uuid != desc.UUID {
-		return fmt.Errorf("%s holds the ext4 filesystem %s, and its descriptor names %s; the device number may now belong to another disk, so vm-launch refuses it", what, uuid, desc.UUID)
+	uuid := formatUUID(sb[ext4UUIDOffset : ext4UUIDOffset+16])
+	if uuid == zeroUUID {
+		return fmt.Errorf("%s holds an ext4 filesystem whose UUID is all zeros, which cannot identify the disk, so vm-launch refuses it", what)
+	}
+	if uuid != desc.UUID {
+		return fmt.Errorf("%s holds an ext4 filesystem whose UUID does not match the one the volume broker recorded for the disk; the device number may now belong to another disk, so vm-launch refuses it", what)
 	}
 	if le.Uint32(sb[ext4FeatureCompatOff:])&ext4CompatHasJournal == 0 {
 		return fmt.Errorf("%s holds an ext4 filesystem without a journal; the volume driver formats a block-mode disk with one", what)
@@ -523,8 +596,23 @@ func checkExt4Superblock(fd int, desc blockDescriptor, what string) error {
 	if le.Uint32(sb[ext4JournalInumOffset:]) == 0 {
 		return fmt.Errorf("%s keeps its ext4 journal on another device, which the guest does not have", what)
 	}
+	logBlockSize := le.Uint32(sb[ext4LogBlockSizeOffset:])
+	if logBlockSize > ext4MaxLogBlockSize {
+		return fmt.Errorf("%s holds an ext4 superblock with s_log_block_size %d, a block size the kernel does not mount", what, logBlockSize)
+	}
+	blockSize := uint64(1024) << logBlockSize
+	blocks := uint64(le.Uint32(sb[ext4BlocksCountLoOffset:]))
+	if incompat&ext4Incompat64Bit != 0 {
+		blocks |= uint64(le.Uint32(sb[ext4BlocksCountHiOffset:])) << 32
+	}
+	if deviceBlocks := uint64(desc.Size) / blockSize; blocks > deviceBlocks {
+		return fmt.Errorf("%s holds an ext4 filesystem of %d blocks of %d bytes, and the device holds only %d such blocks; the guest cannot mount a filesystem that ends past its disk", what, blocks, blockSize, deviceBlocks)
+	}
 	return nil
 }
+
+// zeroUUID is the all-zero UUID, which identifies no filesystem.
+const zeroUUID = "00000000-0000-0000-0000-000000000000"
 
 // formatUUID renders 16 bytes in the lower-case 8-4-4-4-12 form.
 func formatUUID(b []byte) string {
@@ -605,7 +693,7 @@ var blockDescriptorKeys = []string{blockDescKeyVersion, blockDescKeyMajor, block
 //
 // major and minor fit in 32 bits, and major is not 0, which numbers the
 // kernel's anonymous devices. size is from 1 to 2^63-1. uuid is the ext4
-// UUID in lower-case 8-4-4-4-12 form. disk_name is not empty, uses only ASCII
+// UUID in lower-case 8-4-4-4-12 form, and not all zeros. disk_name is not empty, uses only ASCII
 // letters, digits, ".", "_", and "-", does not start with "-", and is not "."
 // or "..".
 func parseBlockDescriptor(data []byte) (blockDescriptor, error) {
@@ -664,6 +752,8 @@ func parseBlockDescriptor(data []byte) (blockDescriptor, error) {
 		return blockDescriptor{}, fmt.Errorf("descriptor size %d is not a positive byte count", d.Size)
 	case !validDescriptorUUID(d.UUID):
 		return blockDescriptor{}, fmt.Errorf("descriptor uuid %q is not a lower-case 8-4-4-4-12 UUID", d.UUID)
+	case d.UUID == zeroUUID:
+		return blockDescriptor{}, errors.New("descriptor uuid is all zeros, which cannot identify a filesystem")
 	}
 	if err := validDescriptorDiskName(d.DiskName); err != nil {
 		return blockDescriptor{}, err

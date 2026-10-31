@@ -241,11 +241,11 @@ func discardAttachment(att *attachment, logger *log.Logger) {
 	switch {
 	case att.Release != nil:
 		if err := att.Release(); err != nil {
-			logger.Printf("releasing the volume image: %v", err)
+			logger.Printf("releasing the volume disk: %v", err)
 		}
 	case att.File != nil:
 		if err := att.File.Close(); err != nil {
-			logger.Printf("closing the volume image: %v", err)
+			logger.Printf("closing the volume disk: %v", err)
 		}
 	}
 }
@@ -368,8 +368,12 @@ func (r *providerRegistry) selectProvider(m mountRecord) (diskProvider, error) {
 // lock must hold across cells, and a block provider must fence with an
 // exclusive open and allow one instance, because otherwise two instances
 // could write one disk. A provider that offers neither mode is refused,
-// because those are the modes the hypervisor code attaches.
+// because those are the modes the hypervisor code attaches, and so is a
+// negative instance limit, which would read as no limit.
 func checkCapabilities(p diskProvider, c capabilities) error {
+	if c.MaxInstances < 0 {
+		return fmt.Errorf("the %s volume provider declares an instance limit of %d; a limit is 0 for none or a positive number of instances", p.Name(), c.MaxInstances)
+	}
 	switch {
 	case slices.Contains(c.Modes, attachFileImage):
 		if c.Fence != fenceDistributedFlock {
@@ -386,4 +390,28 @@ func checkCapabilities(p diskProvider, c capabilities) error {
 		return fmt.Errorf("the %s volume provider offers neither %s nor %s, the modes VM backends attach", p.Name(), attachFileImage, attachBlock)
 	}
 	return nil
+}
+
+// checkInstanceLimit refuses the instance index of a volume whose provider
+// declares capabilities c, when c limits how many instances can use one of
+// its disks and index is not below the limit. vm-launch makes the check
+// itself, before Prepare, so that the limit holds whether or not a provider
+// checks the index too. dir is the volume path and mode the mode vm-launch
+// asks for, for the refusal.
+func checkInstanceLimit(p diskProvider, c capabilities, dir string, mode attachMode, index int) error {
+	if c.MaxInstances > 0 && index >= c.MaxInstances {
+		return instanceLimitError(p, dir, mode, c.MaxInstances, index)
+	}
+	return nil
+}
+
+// instanceLimitError is the refusal of instance index of the volume at dir,
+// whose provider p lets only limit instances use one disk in mode.
+func instanceLimitError(p diskProvider, dir string, mode attachMode, limit, index int) error {
+	if limit == 1 {
+		return fmt.Errorf("volume path %s is a %s in %s, which the volume service attaches to one VM at a time, so only instance 0 can use it, and this is instance %d; scale the app to one instance or give each instance a service of its own",
+			quoteForLog(dir), p.Name(), mode, index)
+	}
+	return fmt.Errorf("volume path %s is a %s in %s, which the volume service attaches to %d VMs at a time, so only instances 0 to %d can use it, and this is instance %d; scale the app to %d instances or give each instance a service of its own",
+		quoteForLog(dir), p.Name(), mode, limit, limit-1, index, limit)
 }

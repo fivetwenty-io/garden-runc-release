@@ -534,7 +534,7 @@ stat -L -c %d%r%i /proc/self/fd/3 /proc/self/fd/5 >`+shellQuote(filepath.Join(ou
 			argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
 			Expect(runVM(backend.VMQemu)).To(Equal(c.code), name)
 			Expect(released).To(Equal(1), name)
-			Expect(logBuf.String()).To(HaveSuffix(c.err.Error()+"\nreleasing the volume image: the fake fence would not let go\n"), name)
+			Expect(logBuf.String()).To(HaveSuffix(c.err.Error()+"\nreleasing the volume disk: the fake fence would not let go\n"), name)
 			Expect(argvFile).NotTo(BeAnExistingFile(), name)
 			Expect(os.ReadDir(tmp)).To(BeEmpty(), name)
 		}
@@ -563,8 +563,8 @@ stat -L -c %d%r%i /proc/self/fd/3 /proc/self/fd/5 >`+shellQuote(filepath.Join(ou
 			want string
 		}{
 			"no file, Release fails": {&attachment{Release: func() error { return errors.New("the fake fence would not let go") }},
-				"releasing the volume image: the fake fence would not let go\nthe Fake volume provider prepared the disk without an error but returned no disk file\n"},
-			"no Release, close fails": {&attachment{File: f}, "closing the volume image: close " + f.Name() + ": file already closed\nthe Fake volume provider prepared the disk without an error but returned no Release function\n"},
+				"releasing the volume disk: the fake fence would not let go\nthe Fake volume provider prepared the disk without an error but returned no disk file\n"},
+			"no Release, close fails": {&attachment{File: f}, "closing the volume disk: close " + f.Name() + ": file already closed\nthe Fake volume provider prepared the disk without an error but returned no Release function\n"},
 		} {
 			p := fake("Fake", "fuse.juicefs", strongMatch)
 			att := c.att
@@ -665,6 +665,6 @@ stat -L -c %d%r%i /proc/self/fd/3 /proc/self/fd/5 >`+shellQuote(filepath.Join(ou
 		writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), `: >`+shellQuote(hypervisorDone)+"\n")
 		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
 		Expect(released).To(BeTrue())
-		Expect(logBuf.String()).To(HaveSuffix("releasing the volume image: the fake fence would not let go\n"))
+		Expect(logBuf.String()).To(HaveSuffix("releasing the volume disk: the fake fence would not let go\n"))
 	})
 })

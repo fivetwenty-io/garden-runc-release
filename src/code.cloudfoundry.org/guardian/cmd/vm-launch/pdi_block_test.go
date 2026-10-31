@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"code.cloudfoundry.org/guardian/backend"
 	. "github.com/onsi/ginkgo/v2"
@@ -50,17 +51,21 @@ func testDescriptorText() string {
 // ext4Superblock describes the fields of an ext4 superblock that
 // checkExt4Superblock reads.
 type ext4Superblock struct {
-	magic       uint16
-	compat      uint32
-	incompat    uint32
-	uuid        string
-	journalInum uint32
+	magic        uint16
+	compat       uint32
+	incompat     uint32
+	uuid         string
+	journalInum  uint32
+	logBlockSize uint32
+	blocksLo     uint32
+	blocksHi     uint32
 }
 
 // goodSuperblock is the superblock of an ext4 filesystem with an internal
-// journal and the specs' UUID.
+// journal and the specs' UUID, of 4096-byte blocks that fill the specs' disk.
 func goodSuperblock() ext4Superblock {
-	return ext4Superblock{magic: ext4Magic, compat: ext4CompatHasJournal, uuid: testBlockUUID, journalInum: 8}
+	return ext4Superblock{magic: ext4Magic, compat: ext4CompatHasJournal, uuid: testBlockUUID, journalInum: 8,
+		logBlockSize: 2, blocksLo: testBlockSize / 4096}
 }
 
 // diskBytes returns n bytes of a disk with sb at byte 1024.
@@ -76,6 +81,9 @@ func (sb ext4Superblock) diskBytes(n int) []byte {
 	Expect(u).To(HaveLen(16))
 	copy(raw[ext4UUIDOffset:], u)
 	le.PutUint32(raw[ext4JournalInumOffset:], sb.journalInum)
+	le.PutUint32(raw[ext4LogBlockSizeOffset:], sb.logBlockSize)
+	le.PutUint32(raw[ext4BlocksCountLoOffset:], sb.blocksLo)
+	le.PutUint32(raw[ext4BlocksCountHiOffset:], sb.blocksHi)
 	return disk
 }
 
@@ -93,9 +101,17 @@ type fakeBlockHost struct {
 	openErr func(path string, flags int) error
 	// replace makes the exclusive open report another inode.
 	replace bool
-	// nodes holds the flags of every node file descriptor it opened.
-	nodes map[int]int
+	// nodes holds every node file descriptor it opened, with the inode it
+	// opened, so that a later file the kernel gives the same number, after
+	// the provider closed the node, is not taken for the node.
+	nodes map[int]fakeNodeFD
 	opens []int
+}
+
+// fakeNodeFD is a node file descriptor the fake host opened.
+type fakeNodeFD struct {
+	flags    int
+	dev, ino uint64
 }
 
 func newFakeBlockHost() *fakeBlockHost {
@@ -104,7 +120,7 @@ func newFakeBlockHost() *fakeBlockHost {
 		nodeType: unix.S_IFBLK,
 		descUID:  overflowUID,
 		size:     testBlockSize,
-		nodes:    map[int]int{},
+		nodes:    map[int]fakeNodeFD{},
 	}
 }
 
@@ -119,7 +135,12 @@ func (h *fakeBlockHost) open(path string, flags int) (int, error) {
 	if err != nil {
 		return -1, err
 	}
-	h.nodes[fd] = flags
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		unix.Close(fd)
+		return -1, err
+	}
+	h.nodes[fd] = fakeNodeFD{flags: flags, dev: st.Dev, ino: st.Ino}
 	return fd, nil
 }
 
@@ -127,17 +148,39 @@ func (h *fakeBlockHost) fstat(fd int, st *unix.Stat_t) error {
 	if err := unix.Fstat(fd, st); err != nil {
 		return err
 	}
-	flags, node := h.nodes[fd]
-	if !node {
+	node, ok := h.nodes[fd]
+	if ok && (node.dev != st.Dev || node.ino != st.Ino) {
+		// The node was closed, and fd now names another file.
+		delete(h.nodes, fd)
+		ok = false
+	}
+	if !ok {
 		st.Uid = h.descUID
 		return nil
 	}
 	st.Mode = h.nodeType | 0o660
 	st.Rdev = h.rdev
-	if h.replace && flags&unix.O_EXCL != 0 {
+	if h.replace && node.flags&unix.O_EXCL != 0 {
 		st.Ino++
 	}
 	return nil
+}
+
+// busyFor makes the first n exclusive opens fail with EBUSY, as they do while
+// another process holds the device, and counts the exclusive opens.
+func (h *fakeBlockHost) busyFor(n int) *int {
+	tries := new(int)
+	h.openErr = func(_ string, flags int) error {
+		if flags&unix.O_EXCL == 0 {
+			return nil
+		}
+		*tries++
+		if *tries <= n {
+			return unix.EBUSY
+		}
+		return nil
+	}
+	return tries
 }
 
 func (h *fakeBlockHost) deviceBytes(int) (uint64, error) {
@@ -241,6 +284,7 @@ var _ = DescribeTable("parseBlockDescriptor refuses anything else",
 	Entry("size 0", strings.Replace(testDescriptorText(), "size=4194304", "size=0", 1), "descriptor size 0 is not a positive byte count"),
 	Entry("an upper-case UUID", strings.Replace(testDescriptorText(), testBlockUUID, strings.ToUpper(testBlockUUID), 1), `descriptor uuid "BC20D783-6145-4623-86BB-35110042B24B" is not a lower-case 8-4-4-4-12 UUID`),
 	Entry("a UUID without dashes", strings.Replace(testDescriptorText(), testBlockUUID, strings.ReplaceAll(testBlockUUID, "-", ""), 1), `descriptor uuid "bc20d7836145462386bb35110042b24b" is not a lower-case 8-4-4-4-12 UUID`),
+	Entry("an all-zero UUID", strings.Replace(testDescriptorText(), testBlockUUID, "00000000-0000-0000-0000-000000000000", 1), "descriptor uuid is all zeros, which cannot identify a filesystem"),
 	Entry("an empty disk name", strings.Replace(testDescriptorText(), "disk_name="+testBlockDisk, "disk_name=", 1), "descriptor disk_name is empty"),
 	Entry("a disk name with a slash", strings.Replace(testDescriptorText(), "disk_name="+testBlockDisk, "disk_name=a/b", 1), `descriptor disk_name "a/b" holds '/', and a disk_name may use only ASCII letters, digits, '.', '_', and '-'`),
 	Entry("a disk name with a control character", strings.Replace(testDescriptorText(), "disk_name="+testBlockDisk, "disk_name=a\tb", 1), `descriptor disk_name "a\tb" holds a control character`),
@@ -375,7 +419,7 @@ var _ = Describe("the block provider", func() {
 		It("refuses any mode but block mode, without opening anything", func() {
 			req := f.request()
 			req.Mode = attachFileImage
-			Expect(f.prepareRefused(req)).To(MatchError("the BOSH disk volume provider attaches only in block mode, not in file-image mode"))
+			Expect(f.prepareRefused(req)).To(MatchError(fmt.Sprintf("volume path %q: the BOSH disk volume provider attaches only in block mode, not in file-image mode", f.dir)))
 			Expect(f.host.opens).To(BeEmpty())
 		})
 
@@ -383,7 +427,7 @@ var _ = Describe("the block provider", func() {
 			req := f.request()
 			req.Index = 2
 			err := f.prepareRefused(req)
-			Expect(err).To(MatchError(ContainSubstring(fmt.Sprintf("volume path %q is a BOSH disk in block mode, which the volume service attaches to one VM at a time, so only instance 0 can use it, and this is instance 2", f.dir))))
+			Expect(err).To(MatchError(fmt.Sprintf("volume path %q is a BOSH disk in block mode, which the volume service attaches to one VM at a time, so only instance 0 can use it, and this is instance 2; scale the app to one instance or give each instance a service of its own", f.dir)))
 			Expect(f.host.opens).To(BeEmpty())
 		})
 
@@ -498,15 +542,74 @@ var _ = Describe("the block provider", func() {
 					err := f.prepareRefused(f.request())
 					Expect(err).To(MatchError(fmt.Sprintf(msg, f.what())))
 					Expect(errors.Is(err, errno)).To(BeTrue())
-					Expect(errors.Is(err, errBlockDeviceBusy)).To(Equal(errno == unix.EBUSY))
+					Expect(errors.Is(err, errBlockDeviceBusy)).To(BeFalse())
+					Expect(f.host.opens).To(HaveLen(2), "an exclusive open that fails for any reason but EBUSY is not tried again")
 				},
-				Entry("mounted or held", unix.EBUSY, "%s is busy: the cell has it mounted, or another process holds it open exclusively, so vm-launch will not attach it; a block device takes one writer"),
 				Entry("not in the kvm group", unix.EACCES, "opening %s: permission denied; Garden makes the node root:kvm with mode 0660, and vm-launch needs the kvm group"),
 				Entry("not in the device cgroup", unix.EPERM, "opening %s: operation not permitted; the container's device cgroup does not allow the device"),
 				Entry("detached", unix.ENXIO, "opening %s: no such device or address; the disk is no longer attached to the cell"),
 				Entry("gone", unix.ENODEV, "opening %s: no such device; the disk is no longer attached to the cell"),
 				Entry("another error", unix.EIO, "opening %s: input/output error"),
 			)
+
+			Describe("while the device is busy", func() {
+				It("tries the exclusive open again until the holder lets go, and takes the time from the launch's budget", func() {
+					tries := f.host.busyFor(3)
+					budget := newLockBudget(10 * time.Second)
+					req := f.request()
+					req.LockBudget = budget
+					began := time.Now()
+					att, err := f.provider.Prepare(req)
+					Expect(err).NotTo(HaveOccurred())
+					DeferCleanup(att.Release)
+					Expect(*tries).To(Equal(4))
+					// The waits are 50, 100, and 200 milliseconds.
+					Expect(time.Since(began)).To(BeNumerically(">=", 350*time.Millisecond))
+					Expect(budget.remaining).To(BeNumerically("<=", 10*time.Second-350*time.Millisecond))
+					Expect(budget.remaining).To(BeNumerically(">", 5*time.Second))
+				})
+
+				It("refuses the device as still in use once the budget runs out, with nothing left open", func() {
+					tries := f.host.busyFor(1 << 30)
+					budget := newLockBudget(300 * time.Millisecond)
+					req := f.request()
+					req.LockBudget = budget
+					began := time.Now()
+					err := f.prepareRefused(req)
+					Expect(time.Since(began)).To(BeNumerically(">=", 300*time.Millisecond))
+					Expect(err).To(MatchError(fmt.Sprintf("%s is still in use after vm-launch waited 300ms for it: the cell has it mounted, or another process, such as an earlier instance's hypervisor, holds it open exclusively; a block device takes one writer", f.what())))
+					Expect(errors.Is(err, errBlockDeviceBusy)).To(BeTrue())
+					Expect(errors.Is(err, unix.EBUSY)).To(BeTrue())
+					Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+					Expect(budget.remaining).To(BeZero())
+					Expect(*tries).To(BeNumerically(">", 1))
+				})
+
+				It("tries once and refuses at once when an earlier volume used up the budget", func() {
+					tries := f.host.busyFor(1 << 30)
+					req := f.request()
+					req.LockBudget = newLockBudget(0)
+					err := f.prepareRefused(req)
+					Expect(err).To(MatchError(HavePrefix(f.what() + " is still in use after vm-launch waited 0s for it: ")))
+					Expect(*tries).To(Equal(1))
+				})
+
+				It("stops waiting when a signal arrives, and exits as the signal says", func() {
+					f.host.busyFor(1 << 30)
+					sigs := make(chan os.Signal, 1)
+					sigs <- syscall.SIGTERM
+					req := f.request()
+					req.LockBudget = newLockBudget(10 * time.Second)
+					req.Signals = sigs
+					began := time.Now()
+					err := f.prepareRefused(req)
+					Expect(time.Since(began)).To(BeNumerically("<", 5*time.Second))
+					var sig *signalledError
+					Expect(errors.As(err, &sig)).To(BeTrue(), "%v", err)
+					Expect(err).To(MatchError("received terminated while waiting for the block device to be released"))
+					Expect(stepExitCode(err)).To(Equal(128 + int(syscall.SIGTERM)))
+				})
+			})
 
 			It("hands BeforeLock the node before the exclusive open, and returns its error with nothing open", func() {
 				req := f.request()
@@ -560,12 +663,39 @@ var _ = Describe("the block provider", func() {
 					"%s holds no ext4 filesystem (superblock magic 0x1234, not 0xef53); the volume driver formats the disk before it hands it over, and the guest never formats a block device"),
 				Entry("an external journal device", func(sb *ext4Superblock) { sb.incompat = ext4IncompatJournalDev },
 					"%s is an external ext4 journal device, not a filesystem"),
-				Entry("another UUID", func(sb *ext4Superblock) { sb.uuid = "00000000-1111-2222-3333-444444444444" },
-					"%s holds the ext4 filesystem 00000000-1111-2222-3333-444444444444, and its descriptor names "+testBlockUUID+"; the device number may now belong to another disk, so vm-launch refuses it"),
+				Entry("another UUID, which the line does not repeat", func(sb *ext4Superblock) { sb.uuid = "00000000-1111-2222-3333-444444444444" },
+					"%s holds an ext4 filesystem whose UUID does not match the one the volume broker recorded for the disk; the device number may now belong to another disk, so vm-launch refuses it"),
+				Entry("an all-zero UUID", func(sb *ext4Superblock) { sb.uuid = "00000000-0000-0000-0000-000000000000" },
+					"%s holds an ext4 filesystem whose UUID is all zeros, which cannot identify the disk, so vm-launch refuses it"),
 				Entry("no journal", func(sb *ext4Superblock) { sb.compat = 0 },
 					"%s holds an ext4 filesystem without a journal; the volume driver formats a block-mode disk with one"),
 				Entry("a journal on another device", func(sb *ext4Superblock) { sb.journalInum = 0 },
 					"%s keeps its ext4 journal on another device, which the guest does not have"),
+				Entry("a block size the kernel does not mount", func(sb *ext4Superblock) { sb.logBlockSize = 7 },
+					"%s holds an ext4 superblock with s_log_block_size 7, a block size the kernel does not mount"),
+				Entry("a filesystem one block larger than the device", func(sb *ext4Superblock) { sb.blocksLo++ },
+					"%s holds an ext4 filesystem of 1025 blocks of 4096 bytes, and the device holds only 1024 such blocks; the guest cannot mount a filesystem that ends past its disk"),
+				Entry("a 64-bit filesystem whose high block count runs past the device", func(sb *ext4Superblock) {
+					sb.incompat, sb.blocksHi = ext4Incompat64Bit, 1
+				}, "%s holds an ext4 filesystem of 4294968320 blocks of 4096 bytes, and the device holds only 1024 such blocks; the guest cannot mount a filesystem that ends past its disk"),
+				Entry("1 KiB blocks past the device", func(sb *ext4Superblock) { sb.logBlockSize, sb.blocksLo = 0, 4097 },
+					"%s holds an ext4 filesystem of 4097 blocks of 1024 bytes, and the device holds only 4096 such blocks; the guest cannot mount a filesystem that ends past its disk"),
+			)
+
+			DescribeTable("accepts a filesystem that fits the device",
+				func(edit func(*ext4Superblock)) {
+					sb := goodSuperblock()
+					edit(&sb)
+					f.writeNode(sb)
+					att, err := f.provider.Prepare(f.request())
+					Expect(err).NotTo(HaveOccurred())
+					Expect(att.Release()).To(Succeed())
+				},
+				Entry("that fills it", func(*ext4Superblock) {}),
+				Entry("that is smaller", func(sb *ext4Superblock) { sb.blocksLo = 512 }),
+				Entry("with 64 KiB blocks", func(sb *ext4Superblock) { sb.logBlockSize, sb.blocksLo = 6, 64 }),
+				Entry("whose unused high block count is set without the 64-bit feature", func(sb *ext4Superblock) { sb.blocksHi = 1 }),
+				Entry("of 64 bits whose high block count is 0", func(sb *ext4Superblock) { sb.incompat = ext4Incompat64Bit }),
 			)
 
 			It("is refused when it ends before the superblock does", func() {
@@ -642,6 +772,30 @@ var _ = Describe("block drives in the hypervisor arguments", func() {
 		Expect(err).To(MatchError(`volume drive vol0 has the identity "a,b", which is not 1 to 20 letters, digits, and hyphens, so QEMU cannot pass it as the drive's serial`))
 		_, err = hypervisorArgv(backend.VMQemu, goldenArt, "/unused", goldenVolumeInitrd, goldenMemMiB, task, []volumeDrive{{path: volumeDrivePath(0), mode: attachBlock}}, "", 0)
 		Expect(err).To(MatchError(ContainSubstring(`volume drive vol0 has the identity ""`)))
+	})
+
+	DescribeTable("predicts Firecracker's identity for a block drive from fixed node numbers",
+		func(st syscall.Stat_t, want string) {
+			withDriveStats(st)
+			pv := preparedVolumes{{Path: "/data", Attachment: &attachment{File: openSizedFile(1 << 20), Mode: attachBlock, Release: func() error { return nil }}, Bytes: 1 << 20}}
+			drives, err := newGuestDrives(backend.VMFirecracker, pv, nil)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(drives.volumes).To(Equal([]guestDrive{{id: want, kind: driveBlock, bytes: 1 << 20}}))
+			Expect(pv[0].Attachment.ID).To(Equal(want))
+		},
+		// Firecracker's build_disk_image_id formats st_dev, st_rdev, and st_ino
+		// as "{}{}{}" and keeps the first 20 bytes. st_rdev is glibc's
+		// makedev encoding: 8:16 is 16 | 8<<8 = 2064, and 259:300 is
+		// 44 | 259<<8 | 256<<12 = 1114924. A /dev on devtmpfs 0:6 has st_dev 6,
+		// and one on a container's tmpfs 0:312 has st_dev 56 | 256<<12 = 1048632.
+		Entry("of /dev/sdb on the host's devtmpfs", syscall.Stat_t{Dev: 6, Rdev: 2064, Ino: 301}, "62064301"),
+		Entry("of an NVMe partition in a container's /dev, cut to 20 bytes", syscall.Stat_t{Dev: 1048632, Rdev: 1114924, Ino: 1234567}, "10486321114924123456"),
+	)
+
+	It("encodes device numbers as glibc's makedev does, which Firecracker's stat reports", func() {
+		Expect(unix.Mkdev(8, 16)).To(Equal(uint64(2064)))
+		Expect(unix.Mkdev(259, 300)).To(Equal(uint64(1114924)))
+		Expect(unix.Mkdev(0, 312)).To(Equal(uint64(1048632)))
 	})
 
 	It("gives a block attachment the block drive kind and puts the identity on the attachment", func() {
@@ -748,14 +902,18 @@ var _ = Describe("the block provider on a loop device", func() {
 	providerFor := func(d *loopDisk) *blockProvider {
 		return &blockProvider{name: "BOSH disk", source: boshDiskDescriptorSource, nodeDir: d.nodeDir, host: linuxBlockHost{}}
 	}
-	// prepareAt finds the provider of the descriptor at dir through the
+	// prepareWithin finds the provider of the descriptor at dir through the
 	// kernel's mount table, as vm-launch does, and prepares the disk with the
-	// provider for d.
-	prepareAt := func(d *loopDisk, dir string) (*attachment, error) {
+	// provider for d, waiting up to wait for a busy device.
+	prepareWithin := func(d *loopDisk, dir string, wait time.Duration) (*attachment, error) {
 		p, m, err := findVolumeProvider("/proc/self/mountinfo", dir)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(p.Name()).To(Equal("BOSH disk"))
-		return providerFor(d).Prepare(prepareRequest{Mount: m, Mode: attachBlock})
+		return providerFor(d).Prepare(prepareRequest{Mount: m, Mode: attachBlock, LockBudget: newLockBudget(wait)})
+	}
+	// prepareAt prepares the disk with a short wait for a busy device.
+	prepareAt := func(d *loopDisk, dir string) (*attachment, error) {
+		return prepareWithin(d, dir, 300*time.Millisecond)
 	}
 	what := func(d *loopDisk, dir string) string {
 		return fmt.Sprintf("the BOSH disk device %s (%s) for volume path %q", d.node, testBlockDisk, dir)
@@ -795,7 +953,7 @@ var _ = Describe("the block provider on a loop device", func() {
 		_, err := prepareAt(disk, dir)
 		Expect(errors.Is(err, errBlockDeviceBusy)).To(BeTrue(), "%v", err)
 		Expect(errors.Is(err, unix.EBUSY)).To(BeTrue())
-		Expect(err).To(MatchError(HavePrefix(what(disk, dir) + " is busy")))
+		Expect(err).To(MatchError(HavePrefix(what(disk, dir) + " is still in use after vm-launch waited 300ms for it")))
 	})
 
 	It("refuses the device while another process holds it open exclusively", func() {
@@ -805,6 +963,7 @@ var _ = Describe("the block provider on a loop device", func() {
 		DeferCleanup(func() { unix.Close(holder) })
 		_, err = prepareAt(disk, dir)
 		Expect(errors.Is(err, errBlockDeviceBusy)).To(BeTrue(), "%v", err)
+		Expect(err).To(MatchError(HavePrefix(what(disk, dir) + " is still in use after vm-launch waited 300ms for it")))
 	})
 
 	It("refuses a node whose device is not the descriptor's", func() {
@@ -826,7 +985,8 @@ var _ = Describe("the block provider on a loop device", func() {
 	It("refuses a device whose filesystem is not the descriptor's", func() {
 		dir := descriptorMount(blockDescriptorText(disk.major, disk.minor, disk.size, "00000000-1111-2222-3333-444444444444", testBlockDisk))
 		_, err := prepareAt(disk, dir)
-		Expect(err).To(MatchError(ContainSubstring(fmt.Sprintf("%s holds the ext4 filesystem %s, and its descriptor names 00000000-1111-2222-3333-444444444444", what(disk, dir), disk.uuid))))
+		Expect(err).To(MatchError(what(disk, dir) + " holds an ext4 filesystem whose UUID does not match the one the volume broker recorded for the disk; the device number may now belong to another disk, so vm-launch refuses it"))
+		Expect(err.Error()).NotTo(ContainSubstring(disk.uuid))
 	})
 
 	It("refuses an ext4 filesystem without a journal", func() {
@@ -836,22 +996,22 @@ var _ = Describe("the block provider on a loop device", func() {
 		Expect(err).To(MatchError(what(bare, dir) + " holds an ext4 filesystem without a journal; the volume driver formats a block-mode disk with one"))
 	})
 
-	It("predicts the Firecracker drive identity from the node's own numbers", func() {
+	It("waits for another process's exclusive hold to end, and then attaches the device", func() {
 		dir := descriptorMount(descriptorFor(disk))
-		att, err := prepareAt(disk, dir)
+		holder, err := unix.Open(disk.dev, unix.O_RDONLY|unix.O_EXCL|unix.O_CLOEXEC, 0)
+		Expect(err).NotTo(HaveOccurred())
+		released := make(chan struct{})
+		go func() {
+			defer close(released)
+			time.Sleep(300 * time.Millisecond)
+			unix.Close(holder)
+		}()
+		DeferCleanup(func() { <-released })
+		att, err := prepareWithin(disk, dir, 10*time.Second)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(att.Release)
-		var st syscall.Stat_t
-		Expect(syscall.Stat(disk.node, &st)).To(Succeed())
-		want := statID(&st)
-		if len(want) > virtioBlockIDBytes {
-			want = want[:virtioBlockIDBytes]
-		}
-		drives, err := newGuestDrives(backend.VMFirecracker, preparedVolumes{{Path: dir, Attachment: att, Bytes: disk.size}}, nil)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(drives.volumes).To(Equal([]guestDrive{{id: want, kind: driveBlock, bytes: disk.size}}))
-		Expect(att.ID).To(Equal(want))
-		Expect(uint64(st.Rdev)).To(Equal(unix.Mkdev(disk.major, disk.minor)))
+		Expect(att.Mode).To(Equal(attachBlock))
+		Eventually(released).Should(BeClosed())
 	})
 
 	It("prepares the volume in block mode through the launch's prepare, with the device's own size", func() {
@@ -874,7 +1034,7 @@ var _ = Describe("the block provider on a loop device", func() {
 		Expect(pv[0].Attachment.Mode).To(Equal(attachBlock))
 
 		_, err = pv.prepare(selectedVolume{Volume: guestVolume{ContainerDir: dir, Index: 0}, Provider: p, Mount: m}, nil, nil, log.New(io.Discard, "", 0))
-		Expect(err).To(MatchError(fmt.Sprintf("volume paths %q and %q reach the same disk image; bind each volume to a directory of its own", dir, dir)))
+		Expect(err).To(MatchError(fmt.Sprintf("volume paths %q and %q reach the same disk; bind each volume to a directory of its own", dir, dir)))
 
 		drives, err := newGuestDrives(backend.VMQemu, pv, nil)
 		Expect(err).NotTo(HaveOccurred())
@@ -882,3 +1042,135 @@ var _ = Describe("the block provider on a loop device", func() {
 		Expect(hv).To(Equal([]volumeDrive{{path: "/proc/self/fd/3", id: drives.volumes[0].id, mode: attachBlock}}))
 	})
 })
+
+var _ = Describe("the launch's prepare of a volume", func() {
+	blockCaps := capabilities{Modes: []attachMode{attachBlock}, Fence: fenceExclusiveOpen, MaxInstances: 1}
+	discard := log.New(io.Discard, "", 0)
+	volumeAt := func(p diskProvider, index int) selectedVolume {
+		return selectedVolume{Volume: guestVolume{ContainerDir: "/data", Index: index}, Provider: p, Mount: mountRecord{ContainerDir: "/data", FSType: "fuse.fake"}}
+	}
+
+	Describe("the provider's instance limit", func() {
+		var (
+			p      *fakeDiskProvider
+			called int
+		)
+
+		BeforeEach(func() {
+			called = 0
+			p = fake("Fake", "fuse.fake", strongMatch)
+			p.prepare = func(prepareRequest) (*attachment, error) {
+				called++
+				return nil, errors.New("the fake provider was asked to prepare the disk")
+			}
+		})
+
+		DescribeTable("refuses an instance at or above the limit before the provider's Prepare runs",
+			func(caps capabilities, index int, msg string) {
+				p.caps = caps
+				var pv preparedVolumes
+				att, err := pv.prepare(volumeAt(p, index), nil, nil, discard)
+				Expect(err).To(MatchError(msg))
+				Expect(att).To(BeNil())
+				Expect(pv).To(BeEmpty())
+				Expect(called).To(BeZero())
+				Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+			},
+			Entry("a block provider of one instance, at instance 1", blockCaps, 1,
+				`volume path "/data" is a Fake in block mode, which the volume service attaches to one VM at a time, so only instance 0 can use it, and this is instance 1; scale the app to one instance or give each instance a service of its own`),
+			Entry("a block provider of one instance, at the highest index", blockCaps, maxInstanceIndex,
+				`volume path "/data" is a Fake in block mode, which the volume service attaches to one VM at a time, so only instance 0 can use it, and this is instance 65535; scale the app to one instance or give each instance a service of its own`),
+			Entry("a file-image provider of two instances, at instance 2",
+				capabilities{Modes: []attachMode{attachFileImage}, Fence: fenceDistributedFlock, MaxInstances: 2}, 2,
+				`volume path "/data" is a Fake in file-image mode, which the volume service attaches to 2 VMs at a time, so only instances 0 to 1 can use it, and this is instance 2; scale the app to 2 instances or give each instance a service of its own`),
+		)
+
+		DescribeTable("hands an instance under the limit, or any instance without a limit, to the provider",
+			func(caps capabilities, index int) {
+				p.caps = caps
+				var pv preparedVolumes
+				_, err := pv.prepare(volumeAt(p, index), nil, nil, discard)
+				Expect(err).To(MatchError("the fake provider was asked to prepare the disk"))
+				Expect(called).To(Equal(1))
+			},
+			Entry("instance 0 of a block provider of one instance", blockCaps, 0),
+			Entry("instance 1 of a provider of two instances", capabilities{Modes: []attachMode{attachFileImage}, Fence: fenceDistributedFlock, MaxInstances: 2}, 1),
+			Entry("instance 5 of a provider without a limit", fileImageCaps, 5),
+		)
+
+		It("refuses a provider that declares a negative limit when it is selected", func() {
+			Expect(checkCapabilities(p, capabilities{Modes: []attachMode{attachFileImage}, Fence: fenceDistributedFlock, MaxInstances: -1})).To(
+				MatchError("the Fake volume provider declares an instance limit of -1; a limit is 0 for none or a positive number of instances"))
+		})
+	})
+
+	// The refusals of a disk that does not match the mode it was prepared in
+	// hand the attachment back, so that the caller releases it after the
+	// refusal's line.
+	DescribeTable("refuses an attachment whose mode or file is not what it asked for, and hands it back to be released",
+		func(caps capabilities, mode attachMode, open func() *os.File, msg string) {
+			released := 0
+			file := open()
+			p := fake("Fake", "fuse.fake", strongMatch)
+			p.caps = caps
+			want := &attachment{File: file, Mode: mode, Release: func() error { released++; return nil }}
+			p.prepare = func(prepareRequest) (*attachment, error) { return want, nil }
+			var pv preparedVolumes
+			att, err := pv.prepare(volumeAt(p, 0), nil, nil, discard)
+			Expect(err).To(MatchError(msg))
+			Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+			Expect(att).To(BeIdenticalTo(want))
+			Expect(pv).To(BeEmpty())
+			Expect(released).To(BeZero(), "prepare released the disk before the refusal's line")
+			discardAttachment(att, discard)
+			Expect(released).To(Equal(1))
+		},
+		Entry("a block-mode disk from a provider asked for file-image mode", fileImageCaps, attachBlock,
+			func() *os.File { return openSizedFile(1 << 20) },
+			`the Fake volume provider was asked for file-image mode for the volume at "/data" and prepared the disk in block mode`),
+		Entry("a file-image disk from a provider asked for block mode", blockCaps, attachFileImage,
+			func() *os.File { return openSizedFile(1 << 20) },
+			`the Fake volume provider was asked for block mode for the volume at "/data" and prepared the disk in file-image mode`),
+		Entry("a regular file in block mode", blockCaps, attachBlock,
+			func() *os.File { return openSizedFile(1 << 20) },
+			`the Fake volume provider prepared the disk for the volume at "/data" in block mode, but its file is not a block device`),
+		Entry("a character device in block mode", blockCaps, attachBlock,
+			func() *os.File { return openDevNull() },
+			`the Fake volume provider prepared the disk for the volume at "/data" in block mode, but its file is not a block device`),
+		Entry("a directory in file-image mode", fileImageCaps, attachFileImage,
+			func() *os.File {
+				d, err := os.Open(GinkgoT().TempDir())
+				Expect(err).NotTo(HaveOccurred())
+				DeferCleanup(d.Close)
+				return d
+			},
+			`the Fake volume provider prepared the disk for the volume at "/data" in file-image mode, but its file is not a regular file`),
+		Entry("a character device in file-image mode", fileImageCaps, attachFileImage,
+			func() *os.File { return openDevNull() },
+			`the Fake volume provider prepared the disk for the volume at "/data" in file-image mode, but its file is not a regular file`),
+	)
+
+	It("records the mode it asked for when the provider leaves it unset", func() {
+		p := fake("Fake", "fuse.fake", strongMatch)
+		file := openSizedFile(1 << 20)
+		p.prepare = func(prepareRequest) (*attachment, error) {
+			return &attachment{File: file, Release: func() error { return nil }}, nil
+		}
+		var pv preparedVolumes
+		att, err := pv.prepare(volumeAt(p, 0), nil, nil, discard)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(att).To(BeNil())
+		Expect(pv).To(HaveLen(1))
+		Expect(pv[0].Attachment.Mode).To(Equal(attachFileImage))
+		Expect(pv[0].Bytes).To(Equal(int64(1 << 20)))
+	})
+})
+
+// openDevNull opens the null device read-write, which is a character device,
+// for the rest of the spec.
+func openDevNull() *os.File {
+	f, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	Expect(err).NotTo(HaveOccurred())
+	DeferCleanup(f.Close)
+	return f
+}

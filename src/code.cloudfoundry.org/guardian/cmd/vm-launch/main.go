@@ -122,10 +122,14 @@
 // volume path is a read-only tmpfs from pdi:bosh-disk that holds a
 // descriptor of the disk, and vm-launch opens the device node that the
 // descriptor names under /dev/pdi with O_EXCL, which no mount or other
-// exclusive open on the cell can share. It checks that the node is the
-// device the descriptor names, that the device has the descriptor's size,
-// and that it holds an ext4 filesystem with a journal and the descriptor's
-// UUID, and it passes the device to the hypervisor as the volume's drive.
+// exclusive open on the cell can share. While the device is busy, as it is
+// while the previous instance's VM on the same cell stops, vm-launch tries
+// again within the same 30 seconds the image locks share, and then fails
+// the launch with exit 125. It checks that the node is the device the
+// descriptor names, that the device has the descriptor's size, and that it
+// holds an ext4 filesystem with a journal, the descriptor's UUID, and no
+// more blocks than the device has, and it passes the device to the
+// hypervisor as the volume's drive.
 // The volume service attaches a BOSH disk to one VM at a time, so only
 // instance 0 of an app can use one, and any other instance fails the launch
 // with exit 125. The guest finds
