@@ -1556,7 +1556,7 @@ exit "${UMOUNT_RC:-0}"`)
 					for _, p := range backupPlaces[:c.places] {
 						calls += backupCall(device, p)
 					}
-					if c.sectors*512 < backupPlaces[4]+1024 {
+					if c.sectors*512 < 2*32768*4096 {
 						calls += cmpCall(device, c.sectors*512)
 					}
 					Expect(r.calls).To(Equal(calls+mkfsCall(device)+mountCall(device, mnt)), "%s, %d sectors", shell.name, c.sectors)
@@ -1569,7 +1569,7 @@ exit "${UMOUNT_RC:-0}"`)
 			func(shellOf func() guestShell) {
 				shell := shellOf()
 				const mib = 1 << 20
-				small := "vm-launch guest setup: the volume image rvm-disk-0.img for " + mnt + " reads as zero in its first 64 KiB but not in all of its %d bytes, and an image this small that vm-launch formatted has no backup superblock that would tell a damaged filesystem from a new image, so it looks like a damaged filesystem, and vm-launch never formats it; if the volume never held data, an interrupted first format can cause this, and deleting rvm-disk-0.img on the volume lets the next start create it fresh; otherwise repair it by hand on the volume, where e2fsck -b needs a backup superblock that a filesystem this small may not have\nREBOOT\n"
+				small := "vm-launch guest setup: the volume image rvm-disk-0.img for " + mnt + " reads as zero in its first 64 KiB but not in all of its %d bytes, and an image this small that vm-launch formatted may have no backup superblock that would tell a damaged filesystem from a new image, so it looks like a damaged filesystem, and vm-launch never formats it; if the volume never held data, an interrupted first format can cause this, and deleting rvm-disk-0.img on the volume lets the next start create it fresh; otherwise repair it by hand on the volume, where e2fsck -b needs a backup superblock that a filesystem this small may not have\nREBOOT\n"
 				for _, c := range []struct {
 					bytes, at int64
 					places    int
@@ -1583,6 +1583,10 @@ exit "${UMOUNT_RC:-0}"`)
 					// One sector short of the backup's end, so the backup at
 					// the start of block 32768 does not fit.
 					{backupPlaces[4] + 1024 - 512, backupPlaces[4] - 2048, 4},
+					// Past the backup's end, with no backup superblock there.
+					{130 * mib, 129 * mib, 6},
+					// One sector short of block group 2.
+					{256*mib - 512, 256*mib - 1024, 6},
 				} {
 					Expect(os.RemoveAll(callLog)).To(Succeed())
 					sizedDevice(c.bytes/512, c.at, []byte{1})
@@ -1602,14 +1606,14 @@ exit "${UMOUNT_RC:-0}"`)
 				Expect(r.out).To(Equal("REACHED_START\n"), "%s", shell.name)
 				Expect(r.calls).To(Equal(ddCall(device)+backupCall(device, backupPlaces[0])+backupCall(device, backupPlaces[1])+backupCall(device, backupPlaces[2])+backupCall(device, backupPlaces[3])+cmpCall(device, 64*mib)+mkfsCall(device)+mountCall(device, mnt)), "%s", shell.name)
 
-				// From the end of the backup on, the backup's place decides,
-				// and data elsewhere does not stop the format.
+				// From block group 2 on, the backup's place decides, and
+				// data elsewhere does not stop the format.
 				Expect(os.RemoveAll(callLog)).To(Succeed())
-				sizedDevice((backupPlaces[4]+1024)/512, 100*mib, []byte{1})
+				sizedDevice(2*32768*4096/512, 100*mib, []byte{1})
 				r = runIn(shell, []string{device}, "DD_MODE=zeros")
 				Expect(r.out).To(Equal("REACHED_START\n"), "%s", shell.name)
 				calls := ddCall(device)
-				for _, p := range backupPlaces[:5] {
+				for _, p := range backupPlaces {
 					calls += backupCall(device, p)
 				}
 				Expect(r.calls).To(Equal(calls+mkfsCall(device)+mountCall(device, mnt)), "%s", shell.name)
@@ -1959,7 +1963,7 @@ exit "${UMOUNT_RC:-0}"`)
 				Expect(guestTeardownKillWait % time.Second).To(BeZero())
 				Expect(guestFlushFailStatus).To(Equal(strconv.Itoa(exitLaunchError)))
 				Expect(guestPFKthread).To(Equal(strconv.Itoa(0x200000)))
-				Expect(guestBackupEnd).To(Equal(strconv.Itoa(32768*4096 + 1024)))
+				Expect(guestFullZeroEnd).To(Equal(strconv.Itoa(2 * 32768 * 4096)))
 				Expect(guestVolumeTeardown).To(ContainSubstring("seconds after SIGTERM"))
 				Expect(guestVolumeTeardown).To(ContainSubstring(" second after SIGKILL"))
 			})

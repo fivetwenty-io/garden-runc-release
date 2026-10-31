@@ -948,10 +948,10 @@ const guestProcMounts = "/proc/mounts"
 // 1024 bytes in starts no block of that size, so the line gives its byte
 // and asks the operator to find the filesystem's block size first.
 //
-// An image too small to hold the superblock of block group 1 with
-// 4096-byte blocks, guestBackupEnd bytes, holds no backup superblock of the
-// filesystem stage 2 itself makes, so a zeroed start cannot be told from a
-// new image by its backups. Such an image is blank only when every one of
+// An image smaller than guestFullZeroEnd bytes may hold no backup
+// superblock of the filesystem stage 2 itself makes, so a zeroed start
+// cannot be told from a new image by its backups. Such an image is blank
+// only when every one of
 // its bytes reads as zero, which cmp checks against /dev/zero without
 // holding the image in memory. An image with data anywhere fails the boot
 // as a damaged filesystem. Both lines also say that a first format that was
@@ -983,23 +983,28 @@ const guestVolumeBackupCheck = `			for rvm_vsb in 1024:8193 2048:16384 4096:3276
 				done
 			done
 			rm -f ` + guestVolumeBackup + `
-			if [ "$((` + guestBackupEnd + ` > rvm_vsectors * ` + sectorBytesText + `))" = 1 ]; then
+			if [ "$((` + guestFullZeroEnd + ` > rvm_vsectors * ` + sectorBytesText + `))" = 1 ]; then
 				rvm_vrc=0
 				cmp -s -n "$((rvm_vsectors * ` + sectorBytesText + `))" "$rvm_vdev" /dev/zero || rvm_vrc=$?
 				case "$rvm_vrc" in
 				0) ;;
-				1) rvm_fail "the volume image $rvm_vimage for $rvm_vpath reads as zero in its first 64 KiB but not in all of its $((rvm_vsectors * ` + sectorBytesText + `)) bytes, and an image this small that vm-launch formatted has no backup superblock that would tell a damaged filesystem from a new image, so it looks like a damaged filesystem, and vm-launch never formats it; if the volume never held data, an interrupted first format can cause this, and deleting $rvm_vimage on the volume lets the next start create it fresh; otherwise repair it by hand on the volume, where e2fsck -b needs a backup superblock that a filesystem this small may not have" ;;
+				1) rvm_fail "the volume image $rvm_vimage for $rvm_vpath reads as zero in its first 64 KiB but not in all of its $((rvm_vsectors * ` + sectorBytesText + `)) bytes, and an image this small that vm-launch formatted may have no backup superblock that would tell a damaged filesystem from a new image, so it looks like a damaged filesystem, and vm-launch never formats it; if the volume never held data, an interrupted first format can cause this, and deleting $rvm_vimage on the volume lets the next start create it fresh; otherwise repair it by hand on the volume, where e2fsck -b needs a backup superblock that a filesystem this small may not have" ;;
 				*) rvm_fail "reading all of $rvm_vdev for $rvm_vname at $rvm_vpath failed, and an image this small must read as zero in full before the guest formats it" ;;
 				esac
 			fi
 `
 
-// guestBackupEnd is the end, in bytes and in decimal as the guest's shell
-// takes it, of the superblock of block group 1 of a filesystem with
-// 4096-byte blocks, 32768 blocks per group, and a 1024-byte superblock: the
-// smallest image that can hold a backup superblock of the filesystem stage 2
-// makes. A spec keeps it in step with the arithmetic.
-const guestBackupEnd = "134218752"
+// guestFullZeroEnd is the start, in bytes and in decimal as the guest's
+// shell takes it, of block group 2 of a filesystem with 4096-byte blocks and
+// 32768 blocks per group. The superblock of block group 1 ends 1024 bytes
+// after block 32768, but mke2fs drops a last group that is shorter than its
+// own overhead plus 50 blocks, so an image a little larger than block group
+// 1's start can still get one group and no backup superblock. Every image
+// below block group 2, a wide margin over that, must therefore read as zero
+// in full before it counts as blank, and one that holds a backup superblock
+// is refused before that read. A spec keeps the value in step with the
+// arithmetic.
+const guestFullZeroEnd = "268435456"
 
 // guestVolumeSetup mounts every volume, in volume order, each on the device
 // that stage 1 found by the drive's identity and passed as stage 2's argument

@@ -266,7 +266,7 @@ var _ = Describe("stage 1's tools in the guest's busybox", func() {
 		_, err = f.WriteAt(make([]byte, 64<<10), 0)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(f.Close()).To(Succeed())
-		Expect(backupCheck(image)).To(Equal("vm-launch guest setup: the volume image rvm-disk-0.img for /home/vcap/data reads as zero in its first 64 KiB but not in all of its " + strconv.Itoa(64<<20) + " bytes, and an image this small that vm-launch formatted has no backup superblock that would tell a damaged filesystem from a new image, so it looks like a damaged filesystem, and vm-launch never formats it; if the volume never held data, an interrupted first format can cause this, and deleting rvm-disk-0.img on the volume lets the next start create it fresh; otherwise repair it by hand on the volume, where e2fsck -b needs a backup superblock that a filesystem this small may not have\nREBOOT\n"))
+		Expect(backupCheck(image)).To(Equal("vm-launch guest setup: the volume image rvm-disk-0.img for /home/vcap/data reads as zero in its first 64 KiB but not in all of its " + strconv.Itoa(64<<20) + " bytes, and an image this small that vm-launch formatted may have no backup superblock that would tell a damaged filesystem from a new image, so it looks like a damaged filesystem, and vm-launch never formats it; if the volume never held data, an interrupted first format can cause this, and deleting rvm-disk-0.img on the volume lets the next start create it fresh; otherwise repair it by hand on the volume, where e2fsck -b needs a backup superblock that a filesystem this small may not have\nREBOOT\n"))
 	})
 
 	It("compares the first n bytes of a file with /dev/zero with cmp -s -n, exiting 0 when they match, 1 when they differ, and 2 when it cannot read", func() {

@@ -554,23 +554,26 @@ var _ = Describe("volume images against a real QEMU", func() {
 		Expect(imageHolds(img, "kept-behind-a-zeroed-head")).To(BeTrue())
 	})
 
-	It("fails the boot on an image too small for a backup superblock whose first 64 KiB are zero but whose filesystem is still there, and never formats it", func() {
-		const small = 64 << 20
-		img := openSizedFile(small)
-		markData(img, "kept-in-a-small-image")
-		fs := readExtImage(img)
-		Expect(fs.blockSize()).To(Equal(int64(4096)))
-		_, err := img.WriteAt(make([]byte, 64<<10), 0)
-		Expect(err).NotTo(HaveOccurred())
-		before := imageDigest(img)
+	DescribeTable("fails the boot on an image too small for a backup superblock whose first 64 KiB are zero but whose filesystem is still there, and never formats it",
+		func(small int64) {
+			img := openSizedFile(small)
+			markData(img, "kept-in-a-small-image")
+			fs := readExtImage(img)
+			Expect(fs.blockSize()).To(Equal(int64(4096)))
+			Expect(fs.blocks()).To(BeNumerically("<=", 32768), "mke2fs made a second block group, which holds a backup superblock")
+			_, err := img.WriteAt(make([]byte, 64<<10), 0)
+			Expect(err).NotTo(HaveOccurred())
+			before := imageDigest(img)
 
-		out := bootData(img, "echo command-ran")
-		Expect(out).To(MatchRegexp(`(?m)^`+regexp.QuoteMeta("vm-launch guest setup: the volume image volume.img for "+dataDir+" reads as zero in its first 64 KiB but not in all of its "+strconv.Itoa(small)+" bytes, and an image this small that vm-launch formatted has no backup superblock that would tell a damaged filesystem from a new image, so it looks like a damaged filesystem, and vm-launch never formats it; if the volume never held data, an interrupted first format can cause this, and deleting volume.img on the volume lets the next start create it fresh; otherwise repair it by hand on the volume, where e2fsck -b needs a backup superblock that a filesystem this small may not have")+`\r?$`), out)
-		Expect(out).NotTo(ContainSubstring(startTag(testNonce)), out)
-		Expect(out).NotTo(ContainSubstring("command-ran"), out)
-		Expect(imageDigest(img)).To(Equal(before), "the guest wrote to the image")
-		Expect(imageHolds(img, "kept-in-a-small-image")).To(BeTrue())
-	})
+			out := bootData(img, "echo command-ran")
+			Expect(out).To(MatchRegexp(`(?m)^`+regexp.QuoteMeta("vm-launch guest setup: the volume image volume.img for "+dataDir+" reads as zero in its first 64 KiB but not in all of its "+strconv.FormatInt(small, 10)+" bytes, and an image this small that vm-launch formatted may have no backup superblock that would tell a damaged filesystem from a new image, so it looks like a damaged filesystem, and vm-launch never formats it; if the volume never held data, an interrupted first format can cause this, and deleting volume.img on the volume lets the next start create it fresh; otherwise repair it by hand on the volume, where e2fsck -b needs a backup superblock that a filesystem this small may not have")+`\r?$`), out)
+			Expect(out).NotTo(ContainSubstring(startTag(testNonce)), out)
+			Expect(out).NotTo(ContainSubstring("command-ran"), out)
+			Expect(imageDigest(img)).To(Equal(before), "the guest wrote to the image")
+			Expect(imageHolds(img, "kept-in-a-small-image")).To(BeTrue())
+		},
+		Entry("of 64 MiB", int64(64<<20)),
+	)
 
 	It("stops a process the command left behind that ignores SIGTERM before it flushes and unmounts the volume, and keeps what both wrote", func() {
 		img := openSizedFile(defaultImageSize)
