@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -1163,6 +1164,179 @@ var _ = Describe("the launch's prepare of a volume", func() {
 		Expect(pv).To(HaveLen(1))
 		Expect(pv[0].Attachment.Mode).To(Equal(attachFileImage))
 		Expect(pv[0].Bytes).To(Equal(int64(1 << 20)))
+	})
+})
+
+var _ = Describe("a size setting on a BOSH disk", func() {
+	blockCaps := capabilities{Modes: []attachMode{attachBlock}, Fence: fenceExclusiveOpen, MaxInstances: 1}
+	discard := log.New(io.Discard, "", 0)
+	sizedVolume := func(p diskProvider, size int64, index int) selectedVolume {
+		return selectedVolume{
+			Volume:   guestVolume{ContainerDir: "/disk", Index: index, Settings: volumeSettings{SizeBytes: size}},
+			Provider: p,
+			Mount:    mountRecord{ContainerDir: "/disk", FSType: "tmpfs"},
+		}
+	}
+	const planLine = `VM_VOLUMES "/disk" sets a size, but it is a BOSH disk, whose size comes from its plan`
+
+	DescribeTable("is refused with the plan line, whatever its value",
+		func(size int64) {
+			Expect(refuseBlockSize(sizedVolume(&blockProvider{name: "BOSH disk"}, size, 0))).To(MatchError(planLine))
+		},
+		Entry("the smallest size an app may ask for", int64(minVolumeSize)),
+		Entry("the default image size, which an explicit size can equal", int64(defaultImageSize)),
+		Entry("the size of the test disk, which an explicit size can equal", int64(testBlockSize)),
+		Entry("a large size", int64(20<<30)),
+		Entry("the largest size", int64(maxVolumeSize)),
+	)
+
+	It("lets a block volume without a size pass", func() {
+		Expect(refuseBlockSize(sizedVolume(&blockProvider{name: "BOSH disk"}, 0, 0))).To(Succeed())
+	})
+
+	It("leaves a size on a volume that is not in block mode to the file-image path", func() {
+		Expect(refuseBlockSize(sizedVolume(juicefsProvider{}, 1<<30, 0))).To(Succeed())
+		Expect(refuseBlockSize(sizedVolume(nfsProvider{}, 1<<30, 0))).To(Succeed())
+	})
+
+	It("passes a volume that has no provider", func() {
+		Expect(refuseBlockSize(sizedVolume(nil, 1<<30, 0))).To(Succeed())
+	})
+
+	It("names the path of the first block volume with a size, in volume order", func() {
+		block := &blockProvider{name: "BOSH disk"}
+		first := sizedVolume(block, 1<<30, 0)
+		first.Volume.ContainerDir = "/first"
+		second := sizedVolume(block, 2<<30, 0)
+		second.Volume.ContainerDir = "/second"
+		plain := sizedVolume(block, 0, 0)
+		plain.Volume.ContainerDir = "/plain"
+		image := sizedVolume(juicefsProvider{}, 1<<30, 0)
+		image.Volume.ContainerDir = "/image"
+		Expect(refuseBlockSizes([]selectedVolume{image, plain, first, second})).To(MatchError(
+			`VM_VOLUMES "/first" sets a size, but it is a BOSH disk, whose size comes from its plan`))
+		Expect(refuseBlockSizes([]selectedVolume{image, plain})).To(Succeed())
+		Expect(refuseBlockSizes(nil)).To(Succeed())
+	})
+
+	Describe("in the launch's prepare of the volume", func() {
+		var (
+			p      *fakeDiskProvider
+			called int
+		)
+
+		BeforeEach(func() {
+			called = 0
+			p = fake("Fake", "fuse.fake", strongMatch)
+			p.caps = blockCaps
+			p.prepare = func(prepareRequest) (*attachment, error) {
+				called++
+				return nil, errors.New("the fake provider was asked to prepare the disk")
+			}
+		})
+
+		It("refuses a size before the provider's Prepare runs, and before an instance limit", func() {
+			var pv preparedVolumes
+			att, err := pv.prepare(sizedVolume(p, 1<<30, 1), nil, nil, discard)
+			Expect(err).To(MatchError(planLine))
+			Expect(att).To(BeNil())
+			Expect(pv).To(BeEmpty())
+			Expect(called).To(BeZero())
+			Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+		})
+
+		It("hands a volume without a size to the provider", func() {
+			var pv preparedVolumes
+			_, err := pv.prepare(sizedVolume(p, 0, 0), nil, nil, discard)
+			Expect(err).To(MatchError("the fake provider was asked to prepare the disk"))
+			Expect(called).To(Equal(1))
+		})
+
+		It("hands a size on a file-image volume to the provider", func() {
+			p.caps = fileImageCaps
+			var pv preparedVolumes
+			_, err := pv.prepare(sizedVolume(p, 1<<30, 0), nil, nil, discard)
+			Expect(err).To(MatchError("the fake provider was asked to prepare the disk"))
+			Expect(called).To(Equal(1))
+		})
+	})
+
+	Describe("at launch", func() {
+		var (
+			art    string
+			tmp    string
+			volDir string
+			logBuf *bytes.Buffer
+			p      *fakeDiskProvider
+			called int
+		)
+
+		BeforeEach(func() {
+			art = makeArtifacts()
+			volDir = GinkgoT().TempDir()
+			infoDir := GinkgoT().TempDir()
+			tmp = GinkgoT().TempDir()
+			GinkgoT().Setenv("TMPDIR", tmp)
+			GinkgoT().Setenv("CF_INSTANCE_INDEX", "0")
+			GinkgoT().Setenv("VCAP_APPLICATION", vcapApp)
+			GinkgoT().Setenv("VCAP_SERVICES", `{"disk":[{"name":"b","credentials":{"password":"`+secretSentinel+`"},"volume_mounts":[`+mountJSON(volDir, "rw")+`]}]}`)
+			DeferCleanup(func(saved string) { mountInfoPath = saved }, mountInfoPath)
+			mountInfoPath = filepath.Join(infoDir, "mountinfo")
+			Expect(os.WriteFile(mountInfoPath, []byte(mountinfoLine(40, volDir, "fuse.fake")), 0o644)).To(Succeed())
+			logBuf = &bytes.Buffer{}
+
+			saved := defaultImageOptions
+			DeferCleanup(func() { defaultImageOptions = saved })
+			defaultImageOptions.IsMountRoot = alwaysMountRoot
+
+			called = 0
+			p = fake("Fake", "fuse.fake", strongMatch)
+			p.caps = blockCaps
+			p.prepare = func(prepareRequest) (*attachment, error) {
+				called++
+				return nil, errors.New("the fake provider was asked to prepare the disk")
+			}
+			withProviders(p)
+		})
+
+		launch := func(volumes string) int {
+			GinkgoT().Setenv("VM_VOLUMES", strings.ReplaceAll(volumes, "$DIR", volDir))
+			logBuf.Reset()
+			argv := []string{"--backend", "vm-qemu", "--allow-volume-shares", "--artifacts", art, "--", "/tmp/lifecycle/launcher", "app", "true", ""}
+			return run(argv, log.New(logBuf, "", 0))
+		}
+
+		DescribeTable("exits 125 with exactly one line before it opens or creates anything",
+			func(size, line string) {
+				argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+				Expect(launch(`{"$DIR":{` + size + `}}`)).To(Equal(exitLaunchError))
+				Expect(logBuf.String()).To(Equal(strings.ReplaceAll(line, "$DIR", quoteForLog(volDir)) + "\n"))
+				Expect(logBuf.String()).NotTo(ContainSubstring(secretSentinel))
+				Expect(called).To(BeZero())
+				Expect(argvFile).NotTo(BeAnExistingFile())
+				Expect(os.ReadDir(tmp)).To(BeEmpty())
+				Expect(os.ReadDir(volDir)).To(BeEmpty())
+			},
+			Entry("a size of 20G", `"size":"20G"`, `VM_VOLUMES $DIR sets a size, but it is a BOSH disk, whose size comes from its plan`),
+			Entry("the smallest size", `"size":"64M"`, `VM_VOLUMES $DIR sets a size, but it is a BOSH disk, whose size comes from its plan`),
+			Entry("the default image size written out", `"size":"1G"`, `VM_VOLUMES $DIR sets a size, but it is a BOSH disk, whose size comes from its plan`),
+			Entry("a size with the private mode written out", `"mode":"private","size":"4G"`, `VM_VOLUMES $DIR sets a size, but it is a BOSH disk, whose size comes from its plan`),
+			Entry("a size with mode share, which the share line refuses first", `"mode":"share","size":"1G"`,
+				`VM_VOLUMES $DIR sets a size, but a share has no image; its space is the volume's own quota`),
+		)
+
+		DescribeTable("lets a block volume without a size reach the provider",
+			func(volumes string) {
+				Expect(launch(volumes)).To(Equal(exitLaunchError))
+				Expect(logBuf.String()).To(ContainSubstring("the fake provider was asked to prepare the disk"))
+				Expect(logBuf.String()).NotTo(ContainSubstring("sets a size"))
+				Expect(called).To(Equal(1))
+			},
+			Entry("no VM_VOLUMES", ""),
+			Entry("an empty object", "{}"),
+			Entry("an entry without settings", "{\"$DIR\":{}}"),
+			Entry("mode private", "{\"$DIR\":{\"mode\":\"private\"}}"),
+		)
 	})
 })
 

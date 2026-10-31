@@ -258,6 +258,37 @@ func (p *blockProvider) Capabilities(mountRecord) capabilities {
 	return capabilities{Modes: []attachMode{attachBlock}, Fence: fenceExclusiveOpen, MaxInstances: 1}
 }
 
+// refuseBlockSize refuses a size setting on a volume whose disk is attached
+// in block mode. A BOSH disk is exactly as large as its plan says, so the
+// app has no size to choose, and the refusal holds for any size the app
+// writes, including one that happens to equal the disk's. It looks only at
+// the settings and the provider, so it runs before anything is opened. A
+// volume without a size, one that is not in block mode, and one without a
+// provider pass.
+func refuseBlockSize(v selectedVolume) error {
+	if v.Provider == nil || !v.Volume.Settings.SizeSet() {
+		return nil
+	}
+	if privateMode(v.Provider.Capabilities(v.Mount)) != attachBlock {
+		return nil
+	}
+	return fmt.Errorf("%s %s sets a size, but it is a BOSH disk, whose size comes from its plan",
+		volumeSettingsEnv, quoteForLog(v.Volume.ContainerDir))
+}
+
+// refuseBlockSizes applies refuseBlockSize to every selected volume, in
+// volume order, and returns the first refusal. The launch calls it once the
+// providers are known, so that no volume is opened, locked, or created
+// before an app's size setting on a BOSH disk is refused.
+func refuseBlockSizes(selected []selectedVolume) error {
+	for _, v := range selected {
+		if err := refuseBlockSize(v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Prepare refuses any mode but block mode, any instance index above 0, and a
 // mount it does not own, and then opens and checks the device through
 // openBlockVolume. The launch's prepare refuses an index above 0 from

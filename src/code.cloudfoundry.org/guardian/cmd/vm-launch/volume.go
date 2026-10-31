@@ -444,6 +444,9 @@ type preparedVolumes []preparedVolume
 func (pv *preparedVolumes) prepare(v selectedVolume, signals <-chan os.Signal, budget *lockBudget, logger *log.Logger) (*attachment, error) {
 	caps := v.Provider.Capabilities(v.Mount)
 	mode := privateMode(caps)
+	if err := refuseBlockSize(v); err != nil {
+		return nil, err
+	}
 	if err := checkInstanceLimit(v.Provider, caps, v.Volume.ContainerDir, mode, v.Volume.Index); err != nil {
 		return nil, err
 	}
