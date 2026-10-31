@@ -832,8 +832,14 @@ const (
 // an image file, and says vm-launch never formats a block volume.
 //
 // A share has no drive, so stage 1 passes it an empty argument, and any
-// other argument is a setup failure. Stage 2 does not mount shares; the code
-// that serves them adds their mount.
+// other argument is a setup failure. Stage 2 mounts it with mount -t virtiofs
+// by its tag, which is shareTagPrefix and the volume's index, such as
+// rvm-vol1, the tag that QEMU gives the share's vhost-user-fs device. It
+// creates the mount point first and gives no mount options. A share that does
+// not mount, for lack of a device with that tag or for any other reason,
+// fails the boot with a line that names the volume's path, because the app
+// would otherwise write to the guest's own disk, which the next start throws
+// away.
 //
 // The mount points are created on the guest root, which is the overlay when
 // the guest has a root disk. vm-launch refuses a volume path under another
@@ -896,6 +902,8 @@ for rvm_vdev in "$@"; do
 		;;
 	` + volumeKindShare + `)
 		[ -z "$rvm_vdev" ] || rvm_fail "stage 1 passed the device $rvm_vdev for the share at $rvm_vpath, which has no drive"
+		mkdir -p "$rvm_vpath" || rvm_fail "creating $rvm_vpath failed"
+		mount -t virtiofs ` + shareTagPrefix + `"$rvm_vi" "$rvm_vpath" || rvm_fail "mounting the share ` + shareTagPrefix + `$rvm_vi at $rvm_vpath failed; the hypervisor must give the guest a virtiofs device with that tag"
 		;;
 	'') rvm_fail "/rvm/mounts gives the volume at $rvm_vpath no kind" ;;
 	*) rvm_fail "/rvm/mounts gives the volume at $rvm_vpath the kind $rvm_vkind, which the guest does not know" ;;
@@ -923,18 +931,18 @@ const (
 )
 
 // guestVolumeTeardown follows the command, once its status is kept in
-// rvm_status: it flushes and unmounts every volume that stage 2 mounted, last
-// first, and leaves the shares, which it did not mount. sync -f flushes the
-// volume's filesystem only, so that the guest root's dirty pages never take
-// up the time the guest has to stop, and the reboot that follows is reboot
-// -nf, which makes no global sync of its own. The volumes are therefore
-// flushed here, before the reboot. A failed unmount loses nothing, because
-// the sync has run, so it is reported and the status stays the command's.
+// rvm_status: it flushes and unmounts every volume that stage 2 mounted,
+// shares included, last first. sync -f flushes the volume's filesystem only,
+// so that the guest root's dirty pages never take up the time the guest has
+// to stop, and the reboot that follows is reboot -nf, which makes no global
+// sync of its own. The volumes are therefore flushed here, before the reboot.
+// For a share, sync -f has the guest kernel ask virtiofsd to flush the shared
+// directory. A failed unmount loses nothing, because the sync has run, so it
+// is reported and the status stays the command's.
 const guestVolumeTeardown = `rvm_vi=$RVM_VOLUMES
 while [ "$rvm_vi" -gt 0 ]; do
 	rvm_vi=$((rvm_vi - 1))
-	eval "rvm_vkind=\$RVM_VOL${rvm_vi}_KIND rvm_vpath=\$RVM_VOL${rvm_vi}_PATH"
-	[ "$rvm_vkind" = ` + volumeKindShare + ` ] && continue
+	eval "rvm_vpath=\$RVM_VOL${rvm_vi}_PATH"
 	sync -f "$rvm_vpath"
 	umount "$rvm_vpath" 2>/dev/null || echo "vm-launch guest: unmounting $rvm_vpath failed; data was already synced"
 done

@@ -28,11 +28,8 @@ import (
 // because the namespace sandbox needs a user namespace and the chroot
 // sandbox needs root, so the container is the sandbox.
 //
-// Until QEMU gets a vhost-user-fs device for each share's socket and the
-// guest mounts each share by its tag, a granted share is refused before
-// anything starts (see refuseUnservedShares and shareModeServed). The rest
-// of this file is the lifecycle that the refusal gives way to, and specs
-// run it through run by setting shareModeServed.
+// QEMU gets a vhost-user-fs device for each share's socket, and the guest
+// mounts each share by its tag (see qemuArgv and guestVolumeSetup).
 //
 // vm-launch binds a listening Unix socket for each share in its private work
 // directory and hands it to virtiofsd as file descriptor 3 with --fd=3, so
