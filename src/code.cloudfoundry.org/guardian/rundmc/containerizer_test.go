@@ -1342,6 +1342,52 @@ var _ = Describe("Rundmc", func() {
 			})
 		})
 
+		Context("with a device releaser", func() {
+			var fakeReleaser *fakes.FakeDeviceReleaser
+
+			BeforeEach(func() {
+				fakeReleaser = new(fakes.FakeDeviceReleaser)
+				containerizer = newContainerizer(rundmc.WithDeviceReleaser(fakeReleaser))
+			})
+
+			It("releases the container's devices after the runtime deletes it", func() {
+				fakeOCIRuntime.DeleteStub = func(lager.Logger, string) error {
+					Expect(fakeReleaser.ReleaseCallCount()).To(BeZero())
+					return nil
+				}
+
+				Expect(containerizer.Destroy(logger, "some-handle")).To(Succeed())
+				Expect(fakeReleaser.ReleaseCallCount()).To(Equal(1))
+				_, handle := fakeReleaser.ReleaseArgsForCall(0)
+				Expect(handle).To(Equal("some-handle"))
+				Expect(fakeCPUCgrouper.CleanupCgroupsCallCount()).To(Equal(1))
+			})
+
+			Context("when the runtime fails to destroy", func() {
+				BeforeEach(func() {
+					fakeOCIRuntime.DeleteReturns(errors.New("pid not found"))
+				})
+
+				It("keeps the devices, which the container may still hold", func() {
+					Expect(containerizer.Destroy(logger, "some-handle")).To(MatchError("pid not found"))
+					Expect(fakeReleaser.ReleaseCallCount()).To(BeZero())
+				})
+			})
+
+			Context("when releasing fails", func() {
+				BeforeEach(func() {
+					fakeReleaser.ReleaseReturns(errors.New("node busy"))
+				})
+
+				It("returns the error so that the destroy is retried", func() {
+					Expect(containerizer.Destroy(logger, "some-handle")).To(MatchError("node busy"))
+				})
+			})
+		})
+
+		It("does not need a device releaser", func() {
+			Expect(containerizer.Destroy(logger, "some-handle")).To(Succeed())
+		})
 	})
 
 	Describe("RemoveBundle", func() {

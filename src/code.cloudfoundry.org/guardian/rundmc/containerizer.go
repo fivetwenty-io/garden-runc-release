@@ -39,6 +39,7 @@ import (
 //counterfeiter:generate . CPUCgrouper
 //counterfeiter:generate . TaskKiller
 //counterfeiter:generate . TaskPidLister
+//counterfeiter:generate . DeviceReleaser
 
 type Depot interface {
 	Destroy(log lager.Logger, handle string) error
@@ -107,6 +108,14 @@ type TaskPidLister interface {
 	TaskPids(log lager.Logger, id string) ([]uint32, error)
 }
 
+// DeviceReleaser removes the host device nodes that a container was given
+// when its bundle was generated. Release is called once the runtime has
+// deleted the container, and it must succeed for a container that was given
+// none and when called again.
+type DeviceReleaser interface {
+	Release(log lager.Logger, handle string) error
+}
+
 type EventStore interface {
 	OnEvent(id string, event string) error
 	Events(id string) []string
@@ -148,6 +157,7 @@ type Containerizer struct {
 	taskStop               bool
 	backendDispatch        bool
 	gvisorStreamer         Streamer
+	deviceReleaser         DeviceReleaser
 }
 
 // Option configures a Containerizer collaborator that only some deployments need.
@@ -191,6 +201,15 @@ func WithBackendDispatch(gvisorStreamer Streamer) Option {
 	return func(c *Containerizer) {
 		c.backendDispatch = true
 		c.gvisorStreamer = gvisorStreamer
+	}
+}
+
+// WithDeviceReleaser makes Destroy release the host device nodes of the
+// container after the runtime has deleted it. Pass it when bundle generation
+// can create such nodes.
+func WithDeviceReleaser(releaser DeviceReleaser) Option {
+	return func(c *Containerizer) {
+		c.deviceReleaser = releaser
 	}
 }
 
@@ -645,6 +664,12 @@ func (c *Containerizer) Destroy(log lager.Logger, handle string) error {
 
 	if err := c.runtime.Delete(log, handle); err != nil {
 		return err
+	}
+
+	if c.deviceReleaser != nil {
+		if err := c.deviceReleaser.Release(log, handle); err != nil {
+			return err
+		}
 	}
 
 	return c.cpuCgrouper.CleanupCgroups(handle)
