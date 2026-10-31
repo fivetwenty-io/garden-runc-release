@@ -118,7 +118,7 @@ func concat(parts ...[]string) []string {
 
 // fcConfigJSON returns the Firecracker configuration file that hypervisorArgv
 // writes for a guest of memMiB MiB, the one Firecracker is started with.
-func fcConfigJSON(initrd string, memMiB int, nw *network, drivePaths []string, rootPath string) string {
+func fcConfigJSON(initrd string, memMiB int, nw *network, drivePaths []volumeDrive, rootPath string) string {
 	work := GinkgoT().TempDir()
 	_, err := hypervisorArgv(backend.VMFirecracker, goldenArt, work, initrd, memMiB, nw, drivePaths, rootPath, 0)
 	Expect(err).NotTo(HaveOccurred())
@@ -159,16 +159,16 @@ var _ = Describe("hypervisor volume drive", func() {
 		})
 
 		It("keeps the volume image on file descriptor 3 and moves the initramfs to 4", func() {
-			files, drive, initrdPath, _, _ := hypervisorFiles([]*os.File{img}, initrd, nil, nil)
+			files, drive, initrdPath, _, _ := hypervisorFiles(imageAttachments(img), initrd, nil, nil)
 			Expect(files).To(HaveLen(2))
 			Expect(files[0]).To(BeIdenticalTo(img))
 			Expect(files[1]).To(BeIdenticalTo(initrd))
-			Expect(drive).To(Equal([]string{volumeDrivePath(0)}))
+			Expect(drive).To(Equal(drivePathsFor(1)))
 			Expect(initrdPath).To(Equal(goldenVolumeInitrd))
 		})
 
 		It("gives no root path without a root image", func() {
-			_, _, _, _, rootPath := hypervisorFiles([]*os.File{img}, initrd, monitor, nil)
+			_, _, _, _, rootPath := hypervisorFiles(imageAttachments(img), initrd, monitor, nil)
 			Expect(rootPath).To(BeEmpty())
 		})
 
@@ -176,19 +176,19 @@ var _ = Describe("hypervisor volume drive", func() {
 			for _, c := range []struct {
 				name          string
 				img, monitor  bool
-				drive         []string
+				drive         []volumeDrive
 				initrd        string
 				monitorFD, fd int
 			}{
 				{name: "alone", initrd: "/proc/self/fd/3", fd: 4},
-				{name: "with a volume", img: true, drive: []string{"/proc/self/fd/3"}, initrd: "/proc/self/fd/4", fd: 5},
+				{name: "with a volume", img: true, drive: imageDrives("/proc/self/fd/3"), initrd: "/proc/self/fd/4", fd: 5},
 				{name: "with a monitor", monitor: true, initrd: "/proc/self/fd/3", monitorFD: 4, fd: 5},
-				{name: "with a volume and a monitor", img: true, monitor: true, drive: []string{"/proc/self/fd/3"}, initrd: "/proc/self/fd/4", monitorFD: 5, fd: 6},
+				{name: "with a volume and a monitor", img: true, monitor: true, drive: imageDrives("/proc/self/fd/3"), initrd: "/proc/self/fd/4", monitorFD: 5, fd: 6},
 			} {
-				var i []*os.File
+				var i []*attachment
 				var m *os.File
 				if c.img {
-					i = []*os.File{img}
+					i = imageAttachments(img)
 				}
 				if c.monitor {
 					m = monitor
@@ -215,12 +215,12 @@ var _ = Describe("hypervisor volume drive", func() {
 	})
 
 	It("attaches the image to QEMU as one raw virtio-blk drive, after the NIC", func() {
-		Expect(qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, task, []string{volumeDrivePath(0)}, 0)).To(Equal(concat(withInitrd(goldenQEMUBase, goldenVolumeInitrd), goldenQEMUTaskNetdev, goldenQEMUDrive)))
-		Expect(qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, nw, []string{volumeDrivePath(0)}, 5)).To(Equal(concat(withInitrd(goldenQEMUBase, goldenVolumeInitrd), goldenQEMUNetdev, goldenQEMUDrive, goldenQEMUMonitor("5"))))
+		Expect(qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, task, drivePathsFor(1), 0)).To(Equal(concat(withInitrd(goldenQEMUBase, goldenVolumeInitrd), goldenQEMUTaskNetdev, goldenQEMUDrive)))
+		Expect(qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, nw, drivePathsFor(1), 5)).To(Equal(concat(withInitrd(goldenQEMUBase, goldenVolumeInitrd), goldenQEMUNetdev, goldenQEMUDrive, goldenQEMUMonitor("5"))))
 	})
 
 	It("pins the QEMU drive to raw, reported errors, and no QEMU locking", func() {
-		opts := qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, task, []string{volumeDrivePath(0)}, 0)
+		opts := qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, task, drivePathsFor(1), 0)
 		drive := opts[len(opts)-3]
 		for _, o := range []string{"format=raw", "werror=report", "rerror=report", "file.locking=off", "cache=writeback"} {
 			Expect(strings.Split(drive, ",")).To(ContainElement(o))
@@ -232,7 +232,7 @@ var _ = Describe("hypervisor volume drive", func() {
 
 	It("gives Firecracker the image as its only drive", func() {
 		for _, n := range []*network{task, nw} {
-			raw := fcConfigJSON(goldenVolumeInitrd, goldenMemMiB, n, []string{volumeDrivePath(0)}, "")
+			raw := fcConfigJSON(goldenVolumeInitrd, goldenMemMiB, n, drivePathsFor(1), "")
 			Expect(raw).To(Equal(strings.Replace(fcWithInitrd(goldenFCNet, goldenVolumeInitrd), `"drives":[]`, goldenFCDrive, 1)))
 
 			var cfg map[string]any
@@ -250,7 +250,7 @@ var _ = Describe("hypervisor volume drive", func() {
 
 	It("writes the Firecracker drive into the config file hypervisorArgv makes", func() {
 		work := GinkgoT().TempDir()
-		argv, err := hypervisorArgv(backend.VMFirecracker, goldenArt, work, goldenVolumeInitrd, goldenMemMiB, task, []string{volumeDrivePath(0)}, "", 0)
+		argv, err := hypervisorArgv(backend.VMFirecracker, goldenArt, work, goldenVolumeInitrd, goldenMemMiB, task, drivePathsFor(1), "", 0)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(argv).To(Equal([]string{goldenArt + "/firecracker/firecracker", "--no-api", "--config-file", work + "/fc.json"}))
 		raw, err := os.ReadFile(filepath.Join(work, "fc.json"))
@@ -258,7 +258,7 @@ var _ = Describe("hypervisor volume drive", func() {
 		Expect(string(raw)).To(ContainSubstring(goldenFCDrive))
 		Expect(string(raw)).To(ContainSubstring(`"initrd_path":"` + goldenVolumeInitrd + `"`))
 
-		qemu, err := hypervisorArgv(backend.VMQemu, goldenArt, work, goldenVolumeInitrd, goldenMemMiB, task, []string{volumeDrivePath(0)}, "", 0)
+		qemu, err := hypervisorArgv(backend.VMQemu, goldenArt, work, goldenVolumeInitrd, goldenMemMiB, task, drivePathsFor(1), "", 0)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(qemu).To(Equal(concat(withInitrd(goldenQEMUBase, goldenVolumeInitrd), goldenQEMUTaskNetdev, goldenQEMUDrive)))
 	})
@@ -273,7 +273,7 @@ var _ = Describe("hypervisor guest root drive", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(argv).To(Equal(concat(goldenQEMUBase, goldenQEMUTaskNetdev, goldenQEMURootDrive("4"))))
 
-		argv, err = hypervisorArgv(backend.VMQemu, goldenArt, "/unused", goldenVolumeInitrd, goldenMemMiB, nw, []string{volumeDrivePath(0)}, procSelfFD(6), 5)
+		argv, err = hypervisorArgv(backend.VMQemu, goldenArt, "/unused", goldenVolumeInitrd, goldenMemMiB, nw, drivePathsFor(1), procSelfFD(6), 5)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(argv).To(Equal(concat(withInitrd(goldenQEMUBase, goldenVolumeInitrd), goldenQEMUNetdev, goldenQEMUDrive, goldenQEMUMonitor("5"), goldenQEMURootDrive("6"))))
 	})
@@ -287,14 +287,14 @@ var _ = Describe("hypervisor guest root drive", func() {
 	})
 
 	It("leaves the volume drive on QEMU unchanged when a root image comes with it", func() {
-		argv, err := hypervisorArgv(backend.VMQemu, goldenArt, "/unused", goldenVolumeInitrd, goldenMemMiB, task, []string{volumeDrivePath(0)}, procSelfFD(5), 0)
+		argv, err := hypervisorArgv(backend.VMQemu, goldenArt, "/unused", goldenVolumeInitrd, goldenMemMiB, task, drivePathsFor(1), procSelfFD(5), 0)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(argv).To(Equal(concat(withInitrd(goldenQEMUBase, goldenVolumeInitrd), goldenQEMUTaskNetdev, goldenQEMUDrive, goldenQEMURootDrive("5"))))
 		Expect(strings.Join(goldenQEMUDrive, " ")).To(ContainSubstring("discard=ignore"))
 	})
 
 	Describe("Firecracker", func() {
-		firecrackerConfig := func(initrd string, drivePaths []string, rootPath string, n *network) (string, map[string]any) {
+		firecrackerConfig := func(initrd string, drivePaths []volumeDrive, rootPath string, n *network) (string, map[string]any) {
 			raw := fcConfigJSON(initrd, goldenMemMiB, n, drivePaths, rootPath)
 			var cfg map[string]any
 			Expect(json.Unmarshal([]byte(raw), &cfg)).To(Succeed())
@@ -318,7 +318,7 @@ var _ = Describe("hypervisor guest root drive", func() {
 		})
 
 		It("puts the root drive after the volume drive and leaves the volume's JSON as it is", func() {
-			raw, _ := firecrackerConfig(goldenVolumeInitrd, []string{volumeDrivePath(0)}, procSelfFD(5), task)
+			raw, _ := firecrackerConfig(goldenVolumeInitrd, drivePathsFor(1), procSelfFD(5), task)
 			rootDrive := strings.Replace(goldenFCRootDrive, "/proc/self/fd/4", "/proc/self/fd/5", 1)
 			volumeDrive := strings.TrimSuffix(strings.TrimPrefix(goldenFCDrive, `"drives":[`), `]`)
 			Expect(raw).To(ContainSubstring(`"drives":[` + volumeDrive + `,` + rootDrive + `]`))
@@ -362,14 +362,34 @@ func goldenFCVolumeDrive(i int, fd string) string {
 	return `{"drive_id":"vol` + strconv.Itoa(i) + `","path_on_host":"/proc/self/fd/` + fd + `","is_root_device":false,"is_read_only":false,"cache_type":"Writeback","io_engine":"Sync"}`
 }
 
-// drivePathsFor returns the paths of n volume images as hypervisorFiles
-// gives them.
-func drivePathsFor(n int) []string {
+// drivePathsFor returns the drives of n volume images as hypervisorFiles
+// gives them after newGuestDrives has named them for QEMU.
+func drivePathsFor(n int) []volumeDrive {
 	paths := make([]string, n)
 	for i := range paths {
 		paths[i] = volumeDrivePath(i)
 	}
-	return paths
+	return imageDrives(paths...)
+}
+
+// imageDrives returns image drives at paths, in volume order, with the QEMU
+// serials newGuestDrives gives them.
+func imageDrives(paths ...string) []volumeDrive {
+	drives := make([]volumeDrive, len(paths))
+	for i, p := range paths {
+		drives[i] = volumeDrive{path: p, id: qemuVolumeSerial(i), mode: attachFileImage}
+	}
+	return drives
+}
+
+// imageAttachments returns files as volume images in file-image mode, in
+// volume order, with the QEMU serials newGuestDrives gives them.
+func imageAttachments(files ...*os.File) []*attachment {
+	atts := make([]*attachment, len(files))
+	for i, f := range files {
+		atts[i] = &attachment{File: f, Mode: attachFileImage, ID: qemuVolumeSerial(i), Release: func() error { return nil }}
+	}
+	return atts
 }
 
 var _ = Describe("hypervisor drives for several volumes", func() {
@@ -404,7 +424,7 @@ var _ = Describe("hypervisor drives for several volumes", func() {
 					imgs[i] = open()
 				}
 				initrd, monitor, root := open(), open(), open()
-				files, drives, initrdPath, monitorFD, rootPath := hypervisorFiles(imgs, initrd, monitor, root)
+				files, drives, initrdPath, monitorFD, rootPath := hypervisorFiles(imageAttachments(imgs...), initrd, monitor, root)
 				Expect(files).To(HaveLen(n+3), "%d volumes", n)
 				for i, img := range imgs {
 					Expect(files[i]).To(BeIdenticalTo(img), "%d volumes, volume %d", n, i)
@@ -420,7 +440,7 @@ var _ = Describe("hypervisor drives for several volumes", func() {
 		})
 
 		It("gives no drive paths for an empty list of images", func() {
-			files, drives, initrdPath, _, _ := hypervisorFiles([]*os.File{}, open(), nil, nil)
+			files, drives, initrdPath, _, _ := hypervisorFiles([]*attachment{}, open(), nil, nil)
 			Expect(files).To(HaveLen(1))
 			Expect(drives).To(BeEmpty())
 			Expect(initrdPath).To(Equal(goldenInitrd))
@@ -453,7 +473,7 @@ var _ = Describe("hypervisor drives for several volumes", func() {
 	})
 
 	It("keeps the drive order of the paths it is given, so the order comes from the caller alone", func() {
-		paths := []string{procSelfFD(6), procSelfFD(3)}
+		paths := imageDrives(procSelfFD(6), procSelfFD(3))
 		argv := qemuArgv(goldenArt, procSelfFD(7), goldenMemMiB, task, paths, 0)
 		Expect(optionAfter(argv, "-drive", "id=vol0")).To(ContainSubstring("file=/proc/self/fd/6,"))
 		Expect(optionAfter(argv, "-drive", "id=vol1")).To(ContainSubstring("file=/proc/self/fd/3,"))
@@ -470,7 +490,7 @@ var _ = Describe("hypervisor drives for several volumes", func() {
 			work := GinkgoT().TempDir()
 			_, err := hypervisorArgv(kind, goldenArt, work, procSelfFD(8), goldenMemMiB, task, drivePathsFor(5), "", 0)
 			Expect(err).To(MatchError("5 volume drives, over the 4 a guest can have"), string(kind))
-			_, err = hypervisorArgv(kind, goldenArt, work, procSelfFD(5), goldenMemMiB, task, []string{volumeDrivePath(0), ""}, "", 0)
+			_, err = hypervisorArgv(kind, goldenArt, work, procSelfFD(5), goldenMemMiB, task, []volumeDrive{drivePathsFor(1)[0], {}}, "", 0)
 			Expect(err).To(MatchError("volume drive vol1 has no path"), string(kind))
 			Expect(os.ReadDir(work)).To(BeEmpty(), string(kind))
 		}
@@ -571,7 +591,7 @@ var _ = Describe("hypervisor drives for several volumes against a real QEMU", fu
 		// The stand-in initramfs only holds its file descriptor's place:
 		// QEMU, started stopped, never loads a kernel.
 		initrd := sparseImage(0)
-		files, drivePaths, _, _, rootPath := hypervisorFiles(imgs, initrd, nil, root)
+		files, drivePaths, _, _, rootPath := hypervisorFiles(imageAttachments(imgs...), initrd, nil, root)
 		argv := withRealRootDrive(qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, taskNetwork(), drivePaths, 0), rootPath)
 		var drives []string
 		for i := 0; i+1 < len(argv); i++ {
@@ -597,7 +617,7 @@ var _ = Describe("hypervisor drives for several volumes against a real QEMU", fu
 		qemu := realQEMU()
 		requireMicrovm(qemu)
 		imgs := []*os.File{sparseImage(1 << 20), sparseImage(1 << 20)}
-		files, drivePaths, _, _, _ := hypervisorFiles(imgs, sparseImage(0), nil, nil)
+		files, drivePaths, _, _, _ := hypervisorFiles(imageAttachments(imgs...), sparseImage(0), nil, nil)
 		argv := qemuArgv(goldenArt, goldenInitrd, goldenMemMiB, taskNetwork(), drivePaths, 0)
 		second := strings.Replace(optionAfter(argv, "-drive", "id=vol1"), "id=vol1", "id=vol0", 1)
 		code, _, stderr := runRealQEMU([]string{qemu, "-S", "-display", "none", "-M", "microvm,accel=tcg", "-nodefaults", "-no-user-config", "-monitor", "stdio",
@@ -619,7 +639,7 @@ var _ = Describe("hypervisor drives for several volumes against a real QEMU", fu
 		f, err := newInitramfs(guestBusybox(), g)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(f.Close)
-		files, drivePaths, initrdPath, _, rootPath := hypervisorFiles(vols, withUserspaceMark(f), nil, root)
+		files, drivePaths, initrdPath, _, rootPath := hypervisorFiles(imageAttachments(vols...), withUserspaceMark(f), nil, root)
 		Expect(drivePaths).To(Equal(drivePathsFor(2)))
 		argv := markedArgv(tcgArgv(qemu, withRealRootDrive(qemuArgv(art, initrdPath, minGuestMemoryMiB, g.nw, drivePaths, 0), rootPath)))
 		code, stdout, stderr := bootRealQEMU(argv, files)

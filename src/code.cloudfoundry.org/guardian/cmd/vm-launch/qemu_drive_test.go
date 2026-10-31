@@ -162,7 +162,7 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 
 	It("accepts the drive option string vm-launch generates", func() {
 		qemu := realQEMU()
-		drive := driveOption(qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), []string{volumeDrivePath(0)}, 0))
+		drive := driveOption(qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), drivePathsFor(1), 0))
 		code, stderr := parseDrive(qemu, noMachine, "-drive", drive)
 		Expect(code).To(Equal(0), "QEMU rejected -drive %s: %s", drive, stderr)
 	})
@@ -170,7 +170,7 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 	It("accepts the -drive and -device pair vm-launch generates on a microvm machine", func() {
 		qemu := realQEMU()
 		requireMicrovm(qemu)
-		argv := qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), []string{volumeDrivePath(0)}, 0)
+		argv := qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), drivePathsFor(1), 0)
 		drive, device := driveOption(argv), deviceOption(argv)
 		Expect(device).To(ContainSubstring("drive=vol0"))
 		code, stderr := parseDrive(qemu, microvm, "-drive", drive, "-device", device)
@@ -180,7 +180,7 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 	It("rejects a -device that names a drive that does not exist, so the pair check above can fail", func() {
 		qemu := realQEMU()
 		requireMicrovm(qemu)
-		argv := qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), []string{volumeDrivePath(0)}, 0)
+		argv := qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), drivePathsFor(1), 0)
 		device := strings.Replace(deviceOption(argv), "drive=vol0", "drive=vol9", 1)
 		code, stderr := parseDrive(qemu, microvm, "-drive", driveOption(argv), "-device", device)
 		Expect(code).NotTo(Equal(0))
@@ -255,7 +255,7 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 	It("rejects a serial property that the device does not have, so the serial check above can fail", func() {
 		qemu := realQEMU()
 		requireMicrovm(qemu)
-		argv := qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), []string{volumeDrivePath(0)}, 0)
+		argv := qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), drivePathsFor(1), 0)
 		device := strings.Replace(deviceOption(argv), ",serial=", ",serial-number=", 1)
 		code, stderr := parseDrive(qemu, microvm, "-drive", driveOption(argv), "-device", device)
 		Expect(code).NotTo(Equal(0))
@@ -264,7 +264,7 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 
 	It("rejects the unprefixed locking option, so the check above can fail", func() {
 		qemu := realQEMU()
-		drive := strings.Replace(driveOption(qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), []string{volumeDrivePath(0)}, 0)), "file.locking=off", "locking=off", 1)
+		drive := strings.Replace(driveOption(qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), drivePathsFor(1), 0)), "file.locking=off", "locking=off", 1)
 		Expect(drive).To(ContainSubstring(",locking=off,"))
 		code, stderr := parseDrive(qemu, noMachine, "-drive", drive)
 		Expect(code).NotTo(Equal(0))
@@ -381,7 +381,8 @@ var _ = Describe("the initramfs memfd against a real QEMU", func() {
 			vols[i] = openSizedFile(size)
 		}
 		root := openSizedFile(8 << 20)
-		drives, err := newGuestDrives(backend.VMQemu, preparedFiles(vols...), root)
+		prepared := preparedFiles(vols...)
+		drives, err := newGuestDrives(backend.VMQemu, prepared, root)
 		Expect(err).NotTo(HaveOccurred())
 		want := map[string]string{drives.rootID: strconv.Itoa(8 << 20 / sectorBytes)}
 		for i, d := range drives.volumes {
@@ -390,7 +391,7 @@ var _ = Describe("the initramfs memfd against a real QEMU", func() {
 		Expect(want).To(HaveLen(len(sizes) + 1))
 
 		f := memfdInitramfs(guestBusybox(), `for d in /sys/block/vd*; do echo "drive=$(cat "$d/serial"):$(cat "$d/size")"; done`, noGuestEnv)
-		files, drivePaths, initrdPath, _, rootPath := hypervisorFiles(vols, withUserspaceMark(f), nil, root)
+		files, drivePaths, initrdPath, _, rootPath := hypervisorFiles(prepared.files(), withUserspaceMark(f), nil, root)
 		argv := markedArgv(tcgArgv(qemu, withRealRootDrive(qemuArgv(art, initrdPath, minGuestMemoryMiB, taskNetwork(), drivePaths, 0), rootPath)))
 		code, stdout, stderr := bootRealQEMU(argv, files)
 		Expect(code).To(Equal(0), "QEMU failed: %s\n%s", stderr, stdout)

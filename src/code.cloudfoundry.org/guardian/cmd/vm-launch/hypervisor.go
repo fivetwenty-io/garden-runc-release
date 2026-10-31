@@ -154,16 +154,18 @@ func checkArtifacts(kind backend.Kind, root string) error {
 // monitorFD, when above 0, is the inherited file descriptor of a connected
 // stream socket that QEMU serves its QMP monitor on.
 //
-// drivePaths names the volume images in volume order, and the guest gets
-// each one as a virtio-blk drive, volumeDriveID(i) for the image at index i,
-// after the NIC and in the same order. Each drive's device carries the serial
-// qemuVolumeSerial(i), which the guest reads as the drive's identity (see
-// newGuestDrives). The format is pinned to raw, so QEMU
-// never probes the guest-written image for a format header such as a qcow2
-// backing file. I/O errors, ENOSPC and EDQUOT included, reach the guest as
-// errors instead of pausing the VM. QEMU's own image locking is off because
-// vm-launch holds the flock that decides who writes the image.
-func qemuArgv(root, initrd string, memMiB int, nw *network, drivePaths []string, monitorFD int) []string {
+// drives are the volume drives in volume order, from hypervisorFiles, and
+// the guest gets each one as a virtio-blk drive, volumeDriveID(i) for the
+// drive at index i, after the NIC and in the same order. Each drive's device
+// carries the drive's identity as its serial, which is qemuVolumeSerial(i)
+// (see newGuestDrives) and which the guest reads back. The format is pinned
+// to raw, so QEMU never probes the guest-written disk for a format header
+// such as a qcow2 backing file. I/O errors, ENOSPC and EDQUOT included, reach
+// the guest as errors instead of pausing the VM. QEMU's own locking is off,
+// because vm-launch holds the fence that decides who writes the disk: the
+// image's flock, or the device's exclusive open. Drives in neither mode are
+// for hypervisorArgv to refuse; qemuArgv attaches them as images.
+func qemuArgv(root, initrd string, memMiB int, nw *network, drives []volumeDrive, monitorFD int) []string {
 	art := func(rel string) string { return filepath.Join(root, rel) }
 	argv := []string{
 		art(artQEMULoader),
@@ -187,13 +189,8 @@ func qemuArgv(root, initrd string, memMiB int, nw *network, drivePaths []string,
 		"-netdev", "user,id="+qemuNetdevID+",net="+qemuNetwork,
 		"-device", "virtio-net-device,netdev="+qemuNetdevID,
 	)
-	for i, drivePath := range drivePaths {
-		id := volumeDriveID(i)
-		argv = append(argv,
-			"-drive", "if=none,id="+id+",file="+drivePath+
-				",format=raw,cache=writeback,aio=threads,file.locking=off,werror=report,rerror=report,discard=ignore",
-			"-device", "virtio-blk-device,drive="+id+",serial="+qemuVolumeSerial(i),
-		)
+	for i, d := range drives {
+		argv = append(argv, qemuVolumeDrive(volumeDriveID(i), d)...)
 	}
 	if monitorFD > 0 {
 		argv = append(argv,
@@ -207,6 +204,33 @@ func qemuArgv(root, initrd string, memMiB int, nw *network, drivePaths []string,
 // qemuNetdevID names the guest's user-mode network, which forwarding rules
 // name too.
 const qemuNetdevID = "n0"
+
+// qemuVolumeDrive returns the QEMU options that attach the volume drive d as
+// the drive id. An image goes through QEMU's file driver with writeback
+// caching. A block device goes through the host_device driver, because the
+// file driver refuses block devices, with cache=none, which opens it with
+// O_DIRECT so that the disk's data stays out of the container's page cache.
+// Both keep discard=ignore and report I/O errors to the guest.
+func qemuVolumeDrive(id string, d volumeDrive) []string {
+	var drive string
+	if d.mode == attachBlock {
+		drive = "if=none,id=" + id + ",format=raw,file.driver=host_device,file.filename=" + d.path +
+			",cache=none,aio=threads,file.locking=off,werror=report,rerror=report,discard=ignore"
+	} else {
+		drive = "if=none,id=" + id + ",file=" + d.path +
+			",format=raw,cache=writeback,aio=threads,file.locking=off,werror=report,rerror=report,discard=ignore"
+	}
+	return []string{"-drive", drive, "-device", "virtio-blk-device,drive=" + id + ",serial=" + d.id}
+}
+
+// volumeDrive is one volume drive as the hypervisor's arguments name it: the
+// path the hypervisor opens it by, the drive's identity, and how the disk
+// reaches the guest. hypervisorFiles takes all three from the attachment.
+type volumeDrive struct {
+	path string
+	id   string
+	mode attachMode
+}
 
 // The hypervisor's inherited files. The hypervisor gets the volume images,
 // one for each volume, the initramfs, a QEMU monitor socket, when there is
@@ -245,17 +269,24 @@ func volumeDrivePath(i int) string {
 }
 
 // hypervisorFiles returns the hypervisor's extra files in order, for
-// exec.Cmd.ExtraFiles, with the paths the hypervisor opens them by. imgs are
-// the volume images in volume order, and drivePaths holds the path of each,
-// in the same order, or nothing without a volume. initrd is the initramfs
-// from newInitramfs. monitor is QEMU's end of the QMP socket or nil, and
+// exec.Cmd.ExtraFiles, with the paths the hypervisor opens them by. vols are
+// the volumes' attachments in volume order, after newGuestDrives has given
+// each its identity, and drives holds the path, the identity, and the mode of
+// each, in the same order, or nothing without a volume. A nil attachment
+// gives a drive with no path, which hypervisorArgv refuses. initrd is the
+// initramfs from newInitramfs. monitor is QEMU's end of the QMP socket or nil, and
 // monitorFD is its file descriptor in the hypervisor, or 0 without one. root
 // is the guest root image from createRootImage or nil, and rootPath is empty
 // without one.
-func hypervisorFiles(imgs []*os.File, initrd, monitor, root *os.File) (files []*os.File, drivePaths []string, initrdPath string, monitorFD int, rootPath string) {
-	for _, img := range imgs {
-		files = append(files, img)
-		drivePaths = append(drivePaths, procSelfFD(firstExtraFD+len(files)-1))
+func hypervisorFiles(vols []*attachment, initrd, monitor, root *os.File) (files []*os.File, drives []volumeDrive, initrdPath string, monitorFD int, rootPath string) {
+	for _, att := range vols {
+		if att == nil || att.File == nil {
+			files = append(files, nil)
+			drives = append(drives, volumeDrive{})
+			continue
+		}
+		files = append(files, att.File)
+		drives = append(drives, volumeDrive{path: procSelfFD(firstExtraFD + len(files) - 1), id: att.ID, mode: att.Mode})
 	}
 	files = append(files, initrd)
 	initrdPath = procSelfFD(firstExtraFD + len(files) - 1)
@@ -267,7 +298,7 @@ func hypervisorFiles(imgs []*os.File, initrd, monitor, root *os.File) (files []*
 		files = append(files, root)
 		rootPath = procSelfFD(firstExtraFD + len(files) - 1)
 	}
-	return files, drivePaths, initrdPath, monitorFD, rootPath
+	return files, drives, initrdPath, monitorFD, rootPath
 }
 
 // qemuRootDrive returns the QEMU options that attach the guest root image,
@@ -344,13 +375,17 @@ type firecrackerNetworkInterface struct {
 // newFirecrackerConfig returns the --config-file content, before it is
 // encoded, for a guest of memMiB MiB: a network interface on Garden's tap
 // device, which Garden creates for every Firecracker container, with or
-// without a port, a drive for each volume image in drivePaths, in volume
-// order and named as on QEMU, and the guest root image as a drive after them
-// when rootPath is set. Firecracker takes no serial, and the identity it
-// gives each drive comes from the file it opens, which newGuestDrives
-// predicts. nw must be set; the port does not change the
-// configuration, because vm-launch itself, not Firecracker, forwards PORT.
-func newFirecrackerConfig(root, initrd string, memMiB int, nw *network, drivePaths []string, rootPath string) firecrackerConfig {
+// without a port, a drive for each volume drive in drives, in volume order
+// and named as on QEMU, and the guest root image as a drive after them when
+// rootPath is set. Firecracker takes no serial, and the identity it gives
+// each drive comes from the file it opens, which newGuestDrives predicts; for
+// a block device that is the device node. An image and a block device get the
+// same drive: Writeback, which passes the guest's flushes on, and the Sync
+// engine. Firecracker opens neither with O_DIRECT, so a block device's data
+// passes through the page cache and counts against the container's memory
+// limit. nw must be set; the port does not change the configuration, because
+// vm-launch itself, not Firecracker, forwards PORT.
+func newFirecrackerConfig(root, initrd string, memMiB int, nw *network, drives []volumeDrive, rootPath string) firecrackerConfig {
 	cfg := firecrackerConfig{
 		BootSource: firecrackerBootSource{
 			KernelImagePath: filepath.Join(root, artVmlinux),
@@ -360,10 +395,10 @@ func newFirecrackerConfig(root, initrd string, memMiB int, nw *network, drivePat
 		Drives:        []firecrackerDrive{},
 		MachineConfig: firecrackerMachineConfig{VCPUCount: guestVCPUs, MemSizeMiB: memMiB},
 	}
-	for i, drivePath := range drivePaths {
+	for i, d := range drives {
 		cfg.Drives = append(cfg.Drives, firecrackerDrive{
 			DriveID:      volumeDriveID(i),
-			PathOnHost:   drivePath,
+			PathOnHost:   d.path,
 			IsRootDevice: false,
 			IsReadOnly:   false,
 			CacheType:    fcDriveCacheType,
@@ -393,24 +428,31 @@ func firecrackerArgv(root, configPath string) []string {
 // it needs into workDir. workDir holds only data files; nothing runs from it.
 // memMiB is the guest memory size from guestMemory, which keeps it between
 // the floor and the ceiling. nw is the guest network, which run always
-// builds, and drivePaths are the paths the hypervisor opens the volume
-// images by, in volume order, or none without a volume; more than maxVolumes
-// of them, or an empty one, is an error. rootPath is the path of the guest
+// builds, and drives are the volume drives from hypervisorFiles, in volume
+// order, or none without a volume. More than maxVolumes of them is an error,
+// and so is a drive without a path, a drive in neither file-image nor block
+// mode, and, on QEMU, a drive whose identity the guest could not read back,
+// because QEMU passes it as the serial. rootPath is the path of the guest
 // root image, or empty when the guest root stays in RAM; that drive comes
 // after the volumes' on both backends. monitorFD is QEMU's QMP socket (see
 // qemuArgv), or 0; Firecracker has no monitor.
-func hypervisorArgv(kind backend.Kind, root, workDir, initrd string, memMiB int, nw *network, drivePaths []string, rootPath string, monitorFD int) ([]string, error) {
-	if len(drivePaths) > maxVolumes {
-		return nil, fmt.Errorf("%d volume drives, over the %d a guest can have", len(drivePaths), maxVolumes)
+func hypervisorArgv(kind backend.Kind, root, workDir, initrd string, memMiB int, nw *network, drives []volumeDrive, rootPath string, monitorFD int) ([]string, error) {
+	if len(drives) > maxVolumes {
+		return nil, fmt.Errorf("%d volume drives, over the %d a guest can have", len(drives), maxVolumes)
 	}
-	for i, p := range drivePaths {
-		if p == "" {
+	for i, d := range drives {
+		switch {
+		case d.path == "":
 			return nil, fmt.Errorf("volume drive %s has no path", volumeDriveID(i))
+		case d.mode != attachFileImage && d.mode != attachBlock:
+			return nil, fmt.Errorf("volume drive %s is in %s, which VM backends do not attach as a drive", volumeDriveID(i), d.mode)
+		case kind == backend.VMQemu && !validDriveID(d.id):
+			return nil, fmt.Errorf("volume drive %s has the identity %q, which is not 1 to %d letters, digits, and hyphens, so QEMU cannot pass it as the drive's serial", volumeDriveID(i), d.id, virtioBlockIDBytes)
 		}
 	}
 	switch kind {
 	case backend.VMQemu:
-		argv := qemuArgv(root, initrd, memMiB, nw, drivePaths, monitorFD)
+		argv := qemuArgv(root, initrd, memMiB, nw, drives, monitorFD)
 		if rootPath != "" {
 			argv = append(argv, qemuRootDrive(rootPath)...)
 		}
@@ -419,7 +461,7 @@ func hypervisorArgv(kind backend.Kind, root, workDir, initrd string, memMiB int,
 		if monitorFD != 0 {
 			return nil, errors.New("firecracker has no QMP monitor")
 		}
-		cfg, err := json.Marshal(newFirecrackerConfig(root, initrd, memMiB, nw, drivePaths, rootPath))
+		cfg, err := json.Marshal(newFirecrackerConfig(root, initrd, memMiB, nw, drives, rootPath))
 		if err != nil {
 			return nil, fmt.Errorf("encoding firecracker config: %w", err)
 		}

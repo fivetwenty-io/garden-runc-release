@@ -239,7 +239,7 @@ var _ = Describe("run with a volume", func() {
 			argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
 			Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError), fstype)
 			Expect(logBuf.String()).To(ContainSubstring(strconv.Quote(fstype)))
-			Expect(logBuf.String()).To(ContainSubstring("VM backends support only JuiceFS and NFS volumes today"))
+			Expect(logBuf.String()).To(ContainSubstring("VM backends support only BOSH disk, JuiceFS, and NFS volumes today"))
 			Expect(logBuf.String()).NotTo(ContainSubstring(secretSentinel))
 			Expect(os.ReadDir(tmp)).To(BeEmpty())
 			Expect(os.ReadDir(volDir)).To(BeEmpty())
@@ -908,7 +908,7 @@ var _ = Describe("run with several volumes", func() {
 		setMountInfo(mountinfoLine(40, dirs[0], "fuse.juicefs"), mountinfoLine(41, dirs[1], "fuse.juicefs"), mountinfoLine(42, dirs[2], "cifs"))
 		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
 		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
-		Expect(logBuf.String()).To(HaveSuffix("volume path " + quoteForLog(dirs[2]) + ` is a "cifs" mount; VM backends support only JuiceFS and NFS volumes today` + "\n"))
+		Expect(logBuf.String()).To(HaveSuffix("volume path " + quoteForLog(dirs[2]) + ` is a "cifs" mount; VM backends support only BOSH disk, JuiceFS, and NFS volumes today` + "\n"))
 		for _, d := range dirs {
 			Expect(os.ReadDir(d)).To(BeEmpty())
 		}

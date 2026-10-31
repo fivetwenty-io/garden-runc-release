@@ -78,14 +78,14 @@ func providerNamesOf(r *providerRegistry) []string {
 var _ = Describe("the volume provider registry", func() {
 	record := func(fstype string) mountRecord { return mountRecord{ContainerDir: "/data", FSType: fstype} }
 
-	It("holds JuiceFS and NFS", func() {
-		Expect(providerNamesOf(diskProviders)).To(Equal([]string{"JuiceFS", "NFS"}))
+	It("holds BOSH disk, JuiceFS, and NFS", func() {
+		Expect(providerNamesOf(diskProviders)).To(Equal([]string{"BOSH disk", "JuiceFS", "NFS"}))
 		p, err := diskProviders.selectProvider(record("fuse.juicefs"))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(p.Name()).To(Equal("JuiceFS"))
 		for _, other := range []string{"", "cifs", "ext4", "fuse", "juicefs", "fuse.juicefs2", "FUSE.JUICEFS"} {
 			_, err := diskProviders.selectProvider(record(other))
-			Expect(err).To(MatchError(`volume path "/data" is a `+strconv.Quote(other)+` mount; VM backends support only JuiceFS and NFS volumes today`), other)
+			Expect(err).To(MatchError(`volume path "/data" is a `+strconv.Quote(other)+` mount; VM backends support only BOSH disk, JuiceFS, and NFS volumes today`), other)
 		}
 	})
 
@@ -164,12 +164,12 @@ var _ = Describe("the volume provider registry", func() {
 		Expect(err).To(MatchError(ContainSubstring("which the A, B, and C volume providers all claim")))
 	})
 
-	It("refuses a provider that offers no file-image mode or no lock that holds across cells", func() {
+	It("refuses a provider that offers neither attach mode, or no lock that holds across cells", func() {
 		noMode := fake("A", "fs", strongMatch)
 		noMode.caps = capabilities{Fence: fenceDistributedFlock}
 		withProviders(noMode)
 		_, err := diskProviders.selectProvider(record("fs"))
-		Expect(err).To(MatchError(`volume path "/data": the A volume provider offers file-image mode, the only mode VM backends attach`))
+		Expect(err).To(MatchError(`volume path "/data": the A volume provider offers neither file-image mode nor block mode, the modes VM backends attach`))
 
 		noFence := fake("A", "fs", strongMatch)
 		noFence.caps = capabilities{Modes: []attachMode{attachFileImage}}
@@ -191,7 +191,7 @@ var _ = Describe("the volume provider registry", func() {
 	It("keeps the cause of a mount table that cannot be read", func() {
 		_, _, err := findIn(filepath.Join(GinkgoT().TempDir(), "absent"), "/data")
 		Expect(errors.Is(err, syscall.ENOENT)).To(BeTrue())
-		Expect(err).To(MatchError(HaveSuffix(`to find the filesystem of volume path "/data": no such file or directory; VM backends support only JuiceFS and NFS volumes today`)))
+		Expect(err).To(MatchError(HaveSuffix(`to find the filesystem of volume path "/data": no such file or directory; VM backends support only BOSH disk, JuiceFS, and NFS volumes today`)))
 	})
 })
 

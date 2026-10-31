@@ -70,12 +70,18 @@ const (
 	// attachFileImage is an image file on a mounted filesystem, which the
 	// hypervisor gets as one open file and the guest formats when blank.
 	attachFileImage attachMode = iota + 1
+	// attachBlock is a whole block device that no host filesystem has
+	// mounted, which the hypervisor gets as one open device node and the
+	// guest never formats.
+	attachBlock
 )
 
 func (m attachMode) String() string {
 	switch m {
 	case attachFileImage:
 		return "file-image mode"
+	case attachBlock:
+		return "block mode"
 	}
 	return fmt.Sprintf("attach mode %d", int(m))
 }
@@ -87,6 +93,10 @@ const (
 	// fenceDistributedFlock is a flock that holds across cells, as it does on
 	// JuiceFS, so that two instances on two cells never write one disk.
 	fenceDistributedFlock fenceKind = iota + 1
+	// fenceExclusiveOpen is an O_EXCL open of a block device, which holds
+	// against every mount and every other exclusive open on the cell, plus
+	// a volume service that attaches the device to one cell at a time.
+	fenceExclusiveOpen
 )
 
 // capabilities describes what a provider does with a mount it owns.
@@ -95,6 +105,21 @@ type capabilities struct {
 	Modes []attachMode
 	// Fence is how far the provider's lock reaches.
 	Fence fenceKind
+	// MaxInstances is how many instances of an app can use one of the
+	// provider's disks at once, or 0 for no limit. A provider whose disk
+	// attaches to one VM at a time says 1.
+	MaxInstances int
+}
+
+// privateMode is the mode vm-launch asks a provider with capabilities c for
+// when the app wants a private disk: file-image mode when the provider offers
+// it, and otherwise block mode. checkCapabilities has refused a provider
+// that offers neither.
+func privateMode(c capabilities) attachMode {
+	if !slices.Contains(c.Modes, attachFileImage) && slices.Contains(c.Modes, attachBlock) {
+		return attachBlock
+	}
+	return attachFileImage
 }
 
 // prepareRequest is what Prepare gets for one volume.
@@ -104,7 +129,10 @@ type prepareRequest struct {
 	// volumesFromEnv derived from the application, process type, and
 	// instance index.
 	ImageName string
-	Mode      attachMode
+	// Index is the app instance's index, from CF_INSTANCE_INDEX, which a
+	// provider that allows one instance checks.
+	Index int
+	Mode  attachMode
 	// Signals stops a lock wait early.
 	Signals <-chan os.Signal
 	// LockBudget is the wait for fences that the launch's volumes share. A
@@ -123,8 +151,18 @@ type prepareRequest struct {
 // attachment is a prepared, fenced disk. It stays fenced until Release.
 type attachment struct {
 	// File is the disk, open read-write, which the hypervisor reopens
-	// through /proc/self/fd.
+	// through /proc/self/fd: an image file in file-image mode, or the
+	// block device node in block mode.
 	File *os.File
+	// Mode is how the disk reaches the guest. A provider may leave it unset,
+	// and vm-launch then records the mode it asked for; a provider that sets
+	// another mode is refused.
+	Mode attachMode
+	// ID is the drive's identity, which newGuestDrives records once the
+	// launch knows its backend and volume order: the serial vm-launch gives
+	// the drive on QEMU, or the identity it predicts Firecracker gives the
+	// drive. Providers leave it empty.
+	ID string
 	// Release drops the fence and closes File. vm-launch calls it once the
 	// hypervisor has exited or never started. It never deletes the disk.
 	Release func() error
@@ -133,7 +171,9 @@ type attachment struct {
 // diskProvider is one volume service's side of the interface. A provider that
 // opens an image must go through openVolumeImage, with the mount ID of its
 // mountRecord in the guestVolume, so that the mount ID is rechecked against
-// the directory it opens.
+// the directory it opens. A provider that opens a block device must go
+// through openBlockVolume, which makes the same recheck on the directory that
+// holds the device's descriptor before it reads the descriptor.
 type diskProvider interface {
 	// Name is how log lines name the provider, such as "JuiceFS".
 	Name() string
@@ -257,8 +297,9 @@ func joinNames(names []string, none string) string {
 // volume with a line that names the filesystem type and the registered
 // providers. Two providers that match equally strongly refuse it too, with a
 // line that names them, because vm-launch never guesses which service owns a
-// disk. The chosen provider must offer file-image mode and a fence that holds
-// across cells, or the volume is refused before anything is created. The
+// disk. The chosen provider must offer file-image mode with a fence that
+// holds across cells, or block mode with an exclusive open and one instance,
+// or the volume is refused before anything is created. The
 // refusals in mountRefusals come first, so a mount one of them names is
 // refused with its own line whatever providers are registered.
 func (r *providerRegistry) selectProvider(m mountRecord) (diskProvider, error) {
@@ -299,16 +340,27 @@ func (r *providerRegistry) selectProvider(m mountRecord) (diskProvider, error) {
 	return p, nil
 }
 
-// checkCapabilities refuses a provider that vm-launch cannot attach safely:
-// one that offers no file-image mode, which is the only mode the hypervisor
-// code attaches, or one whose lock does not hold across cells, which would
-// let two instances write one disk.
+// checkCapabilities refuses a provider that vm-launch cannot attach safely.
+// The mode it checks is the one privateMode picks. A file-image provider's
+// lock must hold across cells, and a block provider must fence with an
+// exclusive open and allow one instance, because otherwise two instances
+// could write one disk. A provider that offers neither mode is refused,
+// because those are the modes the hypervisor code attaches.
 func checkCapabilities(p diskProvider, c capabilities) error {
-	if !slices.Contains(c.Modes, attachFileImage) {
-		return fmt.Errorf("the %s volume provider offers %s, the only mode VM backends attach", p.Name(), attachFileImage)
-	}
-	if c.Fence != fenceDistributedFlock {
-		return fmt.Errorf("the %s volume provider declares no lock that holds across cells; VM backends allow one writer per disk", p.Name())
+	switch {
+	case slices.Contains(c.Modes, attachFileImage):
+		if c.Fence != fenceDistributedFlock {
+			return fmt.Errorf("the %s volume provider declares no lock that holds across cells; VM backends allow one writer per disk", p.Name())
+		}
+	case slices.Contains(c.Modes, attachBlock):
+		if c.Fence != fenceExclusiveOpen {
+			return fmt.Errorf("the %s volume provider attaches a block device without an exclusive open; VM backends allow one writer per disk", p.Name())
+		}
+		if c.MaxInstances != 1 {
+			return fmt.Errorf("the %s volume provider attaches a block device without limiting it to one instance; VM backends allow one writer per disk", p.Name())
+		}
+	default:
+		return fmt.Errorf("the %s volume provider offers neither %s nor %s, the modes VM backends attach", p.Name(), attachFileImage, attachBlock)
 	}
 	return nil
 }
