@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -497,6 +498,56 @@ var _ = Describe("hypervisor drives for several volumes", func() {
 	})
 })
 
+// blockDrive is what the QEMU monitor's "info block -v" reports for one
+// drive: the path it opened and its virtual size in bytes.
+type blockDrive struct {
+	path string
+	size int64
+}
+
+var (
+	blockDriveLine = regexp.MustCompile(`^(\S+) \(#block\d+\): (\S+) \(\w+\)$`)
+	blockSizeLine  = regexp.MustCompile(`^virtual size: .*\((\d+) bytes\)$`)
+)
+
+// parseBlockInfo reads the output of "info block -v" into the drives it
+// lists, by drive ID. A drive line looks like "vol0 (#block154):
+// /proc/self/fd/3 (raw)", and its size follows on a "virtual size" line.
+func parseBlockInfo(out string) map[string]blockDrive {
+	drives := map[string]blockDrive{}
+	var id string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if m := blockDriveLine.FindStringSubmatch(line); m != nil {
+			id = m[1]
+			drives[id] = blockDrive{path: m[2]}
+			continue
+		}
+		if m := blockSizeLine.FindStringSubmatch(line); m != nil && id != "" {
+			size, err := strconv.ParseInt(m[1], 10, 64)
+			Expect(err).NotTo(HaveOccurred())
+			d := drives[id]
+			d.size = size
+			drives[id] = d
+		}
+	}
+	return drives
+}
+
+var _ = Describe("parseBlockInfo", func() {
+	It("reads each drive's path and virtual size from the monitor's output", func() {
+		out := "QEMU 10.0.13 monitor - type 'help' for more information\r\n(qemu) info block -v\r\n" +
+			"vol0 (#block154): /proc/self/fd/3 (raw)\r\n    Attached to:      /machine/peripheral-anon/device[0]\r\n    Cache mode:       writeback\r\n\r\n" +
+			"Images:\r\nimage: /proc/self/fd/3\r\nfile format: raw\r\nvirtual size: 1 MiB (1048576 bytes)\r\ndisk size: 0 B\r\n\r\n" +
+			"root0 (#block303): /proc/self/fd/8 (raw)\r\nImages:\r\nimage: /proc/self/fd/8\r\nvirtual size: 8 MiB (8388608 bytes)\r\n(qemu) quit\r\n"
+		Expect(parseBlockInfo(out)).To(Equal(map[string]blockDrive{
+			"vol0":  {path: "/proc/self/fd/3", size: 1 << 20},
+			"root0": {path: "/proc/self/fd/8", size: 8 << 20},
+		}))
+		Expect(parseBlockInfo("")).To(BeEmpty())
+	})
+})
+
 var _ = Describe("hypervisor drives for several volumes against a real QEMU", func() {
 	// sparseImage returns an open sparse file of size bytes, closed when the
 	// spec ends.
@@ -508,11 +559,14 @@ var _ = Describe("hypervisor drives for several volumes against a real QEMU", fu
 		return f
 	}
 
-	It("accepts four volume drives and the root drive on a microvm machine, each opened from its own file descriptor", func() {
+	It("accepts four volume drives and the root drive on a microvm machine, each opened from its own file descriptor and showing its own image", func() {
 		qemu := realQEMU()
 		requireMicrovm(qemu)
-		imgs := []*os.File{sparseImage(1 << 20), sparseImage(1 << 20), sparseImage(1 << 20), sparseImage(1 << 20)}
-		root := sparseImage(2 << 20)
+		// Every image has a size of its own, so that a drive that opened the
+		// wrong descriptor, or the same one as another drive, shows the wrong
+		// size.
+		imgs := []*os.File{sparseImage(1 << 20), sparseImage(2 << 20), sparseImage(3 << 20), sparseImage(4 << 20)}
+		root := sparseImage(8 << 20)
 		// The stand-in initramfs only holds its file descriptor's place:
 		// QEMU, started stopped, never loads a kernel.
 		initrd := sparseImage(0)
@@ -525,9 +579,17 @@ var _ = Describe("hypervisor drives for several volumes against a real QEMU", fu
 			}
 		}
 		Expect(drives).To(HaveLen(20))
-		code, _, stderr := runRealQEMU(append([]string{qemu, "-S", "-display", "none", "-M", "microvm,accel=tcg",
-			"-nodefaults", "-no-user-config", "-monitor", "stdio"}, drives...), files, "quit\n", 30*time.Second)
+		code, stdout, stderr := runRealQEMU(append([]string{qemu, "-S", "-display", "none", "-M", "microvm,accel=tcg",
+			"-nodefaults", "-no-user-config", "-monitor", "stdio"}, drives...), files, "info block -v\nquit\n", 30*time.Second)
 		Expect(code).To(Equal(0), "QEMU rejected %q: %s", drives, stderr)
+
+		// The volumes are on file descriptors 3 to 6, and the root, after the
+		// initramfs on 7, is on 8.
+		want := map[string]blockDrive{"root0": {path: rootPath, size: 8 << 20}}
+		for i := range imgs {
+			want["vol"+strconv.Itoa(i)] = blockDrive{path: "/proc/self/fd/" + strconv.Itoa(3+i), size: int64(i+1) << 20}
+		}
+		Expect(parseBlockInfo(stdout)).To(Equal(want), "QEMU reported these drives:\n%s", stdout)
 	})
 
 	It("rejects a second drive that reuses the first one's name, so the check above can fail", func() {

@@ -92,8 +92,8 @@ type vcapServices map[string][]struct {
 
 // volumesFromEnv returns the guest volumes named in VCAP_SERVICES, in
 // volume order, or none when the app has none. More than maxVolumes volume
-// mounts, two mounts on one path, a mode other than rw, a container path the
-// guest cannot use, a missing or malformed application_id or process_type in
+// mounts, two mounts on one path, a path on or under another volume's path,
+// a mode other than rw, a container path the guest cannot use, a missing or malformed application_id or process_type in
 // VCAP_APPLICATION, a bad CF_INSTANCE_INDEX, and a task are errors, so a
 // misconfigured app fails to start instead of losing data to the wrong
 // volume. Errors never repeat VCAP_SERVICES, which carries credentials.
@@ -106,10 +106,17 @@ type vcapServices map[string][]struct {
 // Volume order is the byte order of the container paths. It decides each
 // volume's drive, file descriptor, and lock order, so it depends on nothing
 // but the paths: not on the order of the labels in VCAP_SERVICES, which is a
-// JSON object, and not on the order of Go's map iteration. Byte order also
-// puts a path before every path below it. Every volume of an instance gets
-// the same image name, because each image lives in the root of its own
+// JSON object, and not on the order of Go's map iteration. Two instances
+// with the same bindings therefore take their locks in the same order. Two
+// instances whose bindings differ, for example while an app is being
+// rebound, may take them in different orders, and each then holds an image
+// the other wants. Neither deadlocks, because the lock wait is bounded and
+// gives up and releases what the launch holds. Every volume of an instance
+// gets the same image name, because each image lives in the root of its own
 // volume.
+//
+// No volume path may be on or under another, so the guest never has to order
+// its mounts, and a mount can never hide another volume.
 func volumesFromEnv(lookup func(string) (string, bool)) ([]guestVolume, error) {
 	raw, ok := lookup(vcapServicesEnv)
 	if !ok {
@@ -165,6 +172,13 @@ func volumesFromEnv(lookup func(string) (string, bool)) ([]guestVolume, error) {
 			return nil, fmt.Errorf("volume path %s has %d volume mounts; each volume mount on a VM backend needs a path of its own", quoteForLog(mounts[i].dir), j-i)
 		}
 		i = j
+	}
+	dirs := make([]string, len(mounts))
+	for i, m := range mounts {
+		dirs[i] = m.dir
+	}
+	if err := checkNotNested(dirs); err != nil {
+		return nil, err
 	}
 
 	app, err := applicationFromEnv(lookup)
@@ -267,6 +281,34 @@ func checkVolumeDir(p string) error {
 	return nil
 }
 
+// checkNotNested refuses two volume paths of which one is on or under the
+// other, compared after cleaning both. The guest would have to mount the outer
+// volume first and the inner one after it, and unmount them in reverse, and a
+// mount in the wrong order would hide the inner volume or leave the app
+// writing to the wrong disk. Refusing the pair means the guest never orders
+// its mounts. The comparison is pairwise rather than between neighbours,
+// because byte order can put an unrelated path between a path and the paths
+// under it: "/data-old" sorts between "/data" and "/data/inner". dirs hold at
+// most maxVolumes paths.
+func checkNotNested(dirs []string) error {
+	for i, outer := range dirs {
+		co := filepath.Clean(outer)
+		for j, inner := range dirs {
+			if i == j {
+				continue
+			}
+			ci := filepath.Clean(inner)
+			same := ci == co && i < j
+			under := strings.HasPrefix(ci, strings.TrimSuffix(co, "/")+"/")
+			if same || under {
+				return fmt.Errorf("volume path %s is on or under volume path %s; VM backends need every volume path to be outside every other volume path, so give each volume a path of its own",
+					quoteForLog(inner), quoteForLog(outer))
+			}
+		}
+	}
+	return nil
+}
+
 // quoteForLog quotes s for an error line, cut to maxLoggedValueLen bytes.
 func quoteForLog(s string) string {
 	if len(s) > maxLoggedValueLen {
@@ -323,10 +365,13 @@ type selectedVolume struct {
 // and stops at the first refusal. It also refuses two volumes whose mounts
 // show the same directory of one filesystem, the same device numbers and the
 // same root, because both images would then be one file, which the guest
-// would mount twice. That happens when two service instances name one share.
-// A copy that this check cannot see, such as one directory reached through
-// two separate mounts of a network filesystem, waits for its own lock and
-// fails, and preparedVolumes.prepare refuses an image that is open twice.
+// would mount twice. That catches two bind mounts of one directory of one
+// host mount. It cannot catch two service instances of one share, because
+// each service instance is a mount of its own, and a FUSE or NFS mount gets a
+// device number of its own, so the two show different device numbers. Those
+// two volumes reach the same image through two mounts, and the second one
+// waits for the flock that the first holds, because the flock holds across
+// mounts, and fails with the in-use line.
 func findVolumeProviders(mountinfo string, vols []guestVolume) ([]selectedVolume, error) {
 	selected := make([]selectedVolume, 0, len(vols))
 	for _, v := range vols {
@@ -362,36 +407,76 @@ type preparedVolumes []preparedVolume
 // prepare asks v's provider for its disk, in file-image mode, and adds it.
 // An attachment without a usable disk is refused and cleaned up (see
 // checkAttachment), and so is a disk that an earlier volume already holds
-// open. The errors carry the provider's kinds, so stepExitCode maps a signal
-// during a lock wait to 128+N. On an error, prepare returns what the caller
+// open. The provider gets a BeforeLock function that makes this refusal before
+// the provider takes its fence, so that a disk an earlier volume holds is
+// refused at once, with its own line, instead of waiting for a lock that this
+// launch holds itself. The check after Prepare backs it up for a provider that
+// does not call BeforeLock. A lock wait that runs out on a volume after the
+// first gets a longer line, because an earlier volume of this launch may be
+// the holder. The errors carry the provider's kinds, so stepExitCode maps a
+// signal during a lock wait to 128+N. On an error, prepare returns what the caller
 // must discard once it has logged the error, so that the error's line comes
 // before the cleanup's: a provider that fails after it fenced the disk may
 // hand back what it built along with the error. The volumes added before
 // keep their fences, and the caller releases them too.
-func (pv *preparedVolumes) prepare(v selectedVolume, signals <-chan os.Signal, logger *log.Logger) (*attachment, error) {
-	att, err := v.Provider.Prepare(prepareRequest{Mount: v.Mount, ImageName: v.Volume.ImageName, Mode: attachFileImage, Signals: signals})
+func (pv *preparedVolumes) prepare(v selectedVolume, signals <-chan os.Signal, budget *lockBudget, logger *log.Logger) (*attachment, error) {
+	att, err := v.Provider.Prepare(prepareRequest{
+		Mount: v.Mount, ImageName: v.Volume.ImageName, Mode: attachFileImage, Signals: signals,
+		LockBudget: budget,
+		BeforeLock: func(img *os.File) error {
+			_, dev, ino, err := inodeOf(img, v.Volume.ContainerDir)
+			if err != nil {
+				return err
+			}
+			return pv.checkNotHeld(v.Volume.ContainerDir, dev, ino)
+		},
+	})
 	if err != nil {
+		if len(*pv) > 0 && errors.Is(err, errVolumeInUse) {
+			err = &volumeError{kind: errVolumeInUse, cause: err,
+				msg: err.Error() + "; with more than one volume bound, two of this app's bindings may be the same share, in which case an earlier volume of this launch holds the lock"}
+		}
 		return att, err
 	}
 	if err := checkAttachment(v.Provider, att, logger); err != nil {
 		return nil, err
 	}
-	info, err := att.File.Stat()
+	info, dev, ino, err := inodeOf(att.File, v.Volume.ContainerDir)
 	if err != nil {
-		return att, fmt.Errorf("reading the size of the volume image: %w", err)
+		return att, err
+	}
+	if err := pv.checkNotHeld(v.Volume.ContainerDir, dev, ino); err != nil {
+		return att, err
+	}
+	*pv = append(*pv, preparedVolume{Path: v.Volume.ContainerDir, Attachment: att, Bytes: info.Size(), dev: dev, ino: ino})
+	return nil, nil
+}
+
+// inodeOf returns the file info of f and the device and inode it names. dir
+// is the volume path that f belongs to, for the error line.
+func inodeOf(f *os.File, dir string) (os.FileInfo, uint64, uint64, error) {
+	info, err := f.Stat()
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("reading the size of the volume image at %s: %w", quoteForLog(dir), err)
 	}
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
-		return att, fmt.Errorf("reading the inode of the volume image at %s: the file system gave no inode", quoteForLog(v.Volume.ContainerDir))
+		return nil, 0, 0, fmt.Errorf("reading the inode of the volume image at %s: the file system gave no inode", quoteForLog(dir))
 	}
-	for _, prev := range *pv {
-		if prev.dev == st.Dev && prev.ino == st.Ino {
-			return att, fmt.Errorf("volume paths %s and %s reach the same disk image; bind each volume to a directory of its own",
-				quoteForLog(prev.Path), quoteForLog(v.Volume.ContainerDir))
+	return info, uint64(st.Dev), uint64(st.Ino), nil
+}
+
+// checkNotHeld refuses the disk with device dev and inode ino for the volume
+// at dir when an earlier volume already holds it. Two volumes on one disk
+// would give the guest one image twice.
+func (pv preparedVolumes) checkNotHeld(dir string, dev, ino uint64) error {
+	for _, prev := range pv {
+		if prev.dev == dev && prev.ino == ino {
+			return fmt.Errorf("volume paths %s and %s reach the same disk image; bind each volume to a directory of its own",
+				quoteForLog(prev.Path), quoteForLog(dir))
 		}
 	}
-	*pv = append(*pv, preparedVolume{Path: v.Volume.ContainerDir, Attachment: att, Bytes: info.Size(), dev: st.Dev, ino: st.Ino})
-	return nil, nil
+	return nil
 }
 
 // files returns the disks, in volume order, for hypervisorFiles.

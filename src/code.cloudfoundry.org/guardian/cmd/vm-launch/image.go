@@ -36,9 +36,10 @@ const (
 	imageMode = 0o600
 
 	// lockWait is how long vm-launch waits for another instance's VM to
-	// release the image. It is below Diego's default 60 second start timeout,
-	// so a stuck holder makes this instance crash and be retried rather than
-	// time out silently.
+	// release the image, in all, over every volume of the launch (see
+	// lockBudget). It is below Diego's default 60 second start timeout, so a
+	// stuck holder makes this instance crash and be retried rather than time
+	// out silently.
 	lockWait = 30 * time.Second
 	lockPoll = 500 * time.Millisecond
 
@@ -134,6 +135,31 @@ type imageOptions struct {
 	// settleInterval, when set, replaces linkSettleInterval as the wait
 	// between looks at a published image's link count.
 	settleInterval time.Duration
+
+	// BeforeLock, when set, runs once the image is open and has passed its
+	// first check, and before the lock is taken. An error from it fails the
+	// open and closes the image. vm-launch uses it to refuse an image that an
+	// earlier volume of the same launch already holds, which the lock would
+	// otherwise wait for until LockWait ran out.
+	BeforeLock func(img *os.File) error
+
+	// LockBudget, when set, limits the time the lock waits take together, over
+	// every open that shares it. Each wait is still limited to LockWait, and
+	// takes what it waits from the budget.
+	LockBudget *lockBudget
+}
+
+// lockBudget is the time a launch may spend waiting for image locks, shared
+// by all of its volumes, so that a launch with several contended volumes
+// still gives up within one wait and not after the sum of several. The waits
+// are made one after another, so it needs no lock of its own.
+type lockBudget struct {
+	remaining time.Duration
+}
+
+// newLockBudget returns a budget of total, which is not negative.
+func newLockBudget(total time.Duration) *lockBudget {
+	return &lockBudget{remaining: max(total, 0)}
 }
 
 // publishStrategy is how createImage moves a finished temp file to the
@@ -238,9 +264,10 @@ func (e *signalledError) Error() string {
 // the same mount, again without following links, and must be a regular file
 // owned by vm-launch's effective uid, with one link, mode 0600, and exactly
 // Size bytes. vm-launch never repairs, resizes, or removes an image that
-// fails a check. It then takes an exclusive flock, retrying every LockPoll
-// for up to LockWait and giving up early when a signal arrives on sigs. Once
-// it holds the lock, it checks that the name still refers to the locked file,
+// fails a check. It then calls BeforeLock, when there is one, and takes an
+// exclusive flock, retrying every LockPoll for up to LockWait, or for what is
+// left of LockBudget when that is less, and giving up early when a signal
+// arrives on sigs. Once it holds the lock, it checks that the name still refers to the locked file,
 // which an operator or a co-bound app could have deleted or replaced during
 // the wait.
 //
@@ -317,6 +344,11 @@ func openVolumeImage(v *guestVolume, o imageOptions, sigs <-chan os.Signal) (*os
 	// made by vm-launch.
 	if err := checkOpenImage(fd, path, o.Size); err != nil {
 		return nil, err
+	}
+	if o.BeforeLock != nil {
+		if err := o.BeforeLock(img); err != nil {
+			return nil, err
+		}
 	}
 	if err := lockImage(fd, path, o, sigs); err != nil {
 		return nil, err
@@ -1203,9 +1235,17 @@ func checkImage(fd int, path string) (int64, error) {
 }
 
 // lockImage takes an exclusive flock on fd. It tries again every o.LockPoll
-// until o.LockWait has passed, and stops early when a signal arrives.
+// until o.LockWait has passed, or the time left in o.LockBudget, whichever is
+// less, and stops early when a signal arrives. The time it spends goes
+// against the budget, whether or not it gets the lock.
 func lockImage(fd int, path string, o imageOptions, sigs <-chan os.Signal) error {
-	deadline := time.Now().Add(o.LockWait)
+	began := time.Now()
+	wait := o.LockWait
+	if b := o.LockBudget; b != nil {
+		wait = min(wait, b.remaining)
+		defer func() { b.remaining = max(b.remaining-time.Since(began), 0) }()
+	}
+	deadline := began.Add(wait)
 	for {
 		err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB)
 		switch {

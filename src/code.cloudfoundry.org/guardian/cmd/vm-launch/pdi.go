@@ -107,6 +107,17 @@ type prepareRequest struct {
 	Mode      attachMode
 	// Signals stops a lock wait early.
 	Signals <-chan os.Signal
+	// LockBudget is the wait for fences that the launch's volumes share. A
+	// provider that waits for a fence takes the time it waits from it, so
+	// that the waits of all the volumes together stay within one limit. It
+	// may be nil, which leaves the provider's own limit.
+	LockBudget *lockBudget
+	// BeforeLock, when set, is called with the opened and checked disk
+	// before the provider takes its fence. An error from it refuses the
+	// volume, and the provider must release the disk and return that error.
+	// It lets vm-launch refuse a disk that an earlier volume of the launch
+	// already holds, which the provider's fence would otherwise wait for.
+	BeforeLock func(disk *os.File) error
 }
 
 // attachment is a prepared, fenced disk. It stays fenced until Release.

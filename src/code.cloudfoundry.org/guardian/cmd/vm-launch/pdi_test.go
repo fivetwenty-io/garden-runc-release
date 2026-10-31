@@ -258,6 +258,42 @@ var _ = Describe("the JuiceFS provider's Prepare", func() {
 		Expect(stepExitCode(err)).To(Equal(128 + int(syscall.SIGTERM)))
 	})
 
+	It("calls BeforeLock before it takes the fence, and gives the refusal back with the image closed", func() {
+		writeImage(img, defaultImageSize, nil)
+		holder, err := os.OpenFile(img, os.O_RDWR, 0)
+		Expect(err).NotTo(HaveOccurred())
+		defer holder.Close()
+		Expect(syscall.Flock(int(holder.Fd()), syscall.LOCK_EX)).To(Succeed())
+		defaultImageOptions.LockWait = 10 * time.Second
+
+		req := request()
+		var seen *os.File
+		req.BeforeLock = func(f *os.File) error { seen = f; return errors.New("spoken for") }
+		began := time.Now()
+		att, err := juicefsProvider{}.Prepare(req)
+		Expect(err).To(MatchError("spoken for"))
+		Expect(att).To(BeNil())
+		Expect(time.Since(began)).To(BeNumerically("<", time.Second), "it did not wait for the lock")
+		Expect(seen.Name()).To(Equal(img))
+	})
+
+	It("takes the time it waits for the fence from the budget in the request", func() {
+		writeImage(img, defaultImageSize, nil)
+		holder, err := os.OpenFile(img, os.O_RDWR, 0)
+		Expect(err).NotTo(HaveOccurred())
+		defer holder.Close()
+		Expect(syscall.Flock(int(holder.Fd()), syscall.LOCK_EX)).To(Succeed())
+		defaultImageOptions.LockWait = 10 * time.Second
+
+		req := request()
+		req.LockBudget = newLockBudget(150 * time.Millisecond)
+		began := time.Now()
+		_, err = juicefsProvider{}.Prepare(req)
+		Expect(errors.Is(err, errVolumeInUse)).To(BeTrue(), "%v", err)
+		Expect(time.Since(began)).To(BeNumerically("<", 3*time.Second))
+		Expect(req.LockBudget.remaining).To(BeZero())
+	})
+
 	It("opens the directory only on the mount it was given, and creates nothing on another", func() {
 		dirProbe = func(int, string) (mountProbe, error) { return mountProbe{MountID: 41, MountRoot: true}, nil }
 		_, err := juicefsProvider{}.Prepare(request())

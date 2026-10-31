@@ -79,7 +79,8 @@
 // bound to a volume service, the guest gets that volume at the same path the
 // container sees, backed by a raw image file
 // rvm-disk-APPID-PROCESSTYPE-INDEX.img in the root of the volume. An app may
-// have up to four read-write volume mounts, each on a path of its own. APPID is the
+// have up to four read-write volume mounts, each on a path of its own, and
+// no volume path may be on or under another. APPID is the
 // application_id in VCAP_APPLICATION, which must be a lowercase UUID,
 // PROCESSTYPE is its process_type, 1 to 63 lowercase letters, digits,
 // underscores, or hyphens, and INDEX is CF_INSTANCE_INDEX. Two apps bound to
@@ -101,8 +102,8 @@
 // symbolic links, the volume path must be a mount point, and the image must
 // be a regular file owned by the app's uid, with one link and mode 0600.
 // vm-launch never reads the image. It holds an exclusive flock on the image
-// for as long as the VM runs, waiting up to 30 seconds for another instance
-// to release it, checks after the wait that the name still refers to the
+// for as long as the VM runs, waiting up to 30 seconds in all, over every
+// volume, for another instance to release it, checks after the wait that the name still refers to the
 // locked file, and passes the image to the hypervisor as file descriptor 3.
 // With more than one volume, the volumes are taken in the byte order of
 // their paths, and each one's image gets the next file descriptor and the
@@ -110,7 +111,8 @@
 // VCAP_SERVICES. vm-launch prepares them in that order and, when one fails,
 // releases every one it prepared before it. Two volumes that show one
 // directory of one filesystem, so that their images would be one file, fail
-// the launch. The guest finds the image by its size, which no guest root
+// the launch, as does a volume whose image is the file another volume already
+// holds, which vm-launch refuses before it waits for the lock. The guest finds the image by its size, which no guest root
 // image shares, formats it as ext2 when its first 64 KiB are all zero, and
 // mounts it synchronously; a non-blank image that does not mount is never
 // formatted. Every volume image has the same size, so a guest with more than
@@ -596,13 +598,18 @@ func run(argv []string, logger *log.Logger) int {
 	// their Release functions run on the way out of run, after sup.run has
 	// waited for the hypervisor, which shares the open files and with them
 	// the locks. The volumes are prepared in volume order, so two instances
-	// that start at once take their locks in the same order. When a volume
-	// fails, the deferred release lets go of every volume prepared before
-	// it, after the failure's own line.
+	// with the same bindings that start at once take their locks in the same
+	// order. Instances whose bindings differ may cross, and the lock wait
+	// bounds that: it gives up and the deferred release lets go of what the
+	// launch holds. The volumes share one lock wait, as long as a single
+	// volume's, so that no number of contended volumes waits past Diego's
+	// start timeout. When a volume fails, the deferred release lets go of
+	// every volume prepared before it, after the failure's own line.
 	var prepared preparedVolumes
 	defer func() { prepared.release(logger) }()
+	lockWaits := newLockBudget(defaultImageOptions.LockWait)
 	for _, v := range selected {
-		if att, err := prepared.prepare(v, sigs, logger); err != nil {
+		if att, err := prepared.prepare(v, sigs, lockWaits, logger); err != nil {
 			logger.Print(err)
 			discardAttachment(att, logger)
 			return stepExitCode(err)

@@ -827,6 +827,102 @@ var _ = Describe("openVolumeImage", func() {
 			Expect(img).NotTo(BeAnExistingFile(), "vm-launch does not create it again")
 		})
 
+		It("calls BeforeLock with the open image before it waits, and fails at once when it refuses", func() {
+			writeImage(img, defaultImageSize, nil)
+			holder, err := os.OpenFile(img, os.O_RDWR, 0)
+			Expect(err).NotTo(HaveOccurred())
+			defer holder.Close()
+			Expect(unix.Flock(int(holder.Fd()), unix.LOCK_EX)).To(Succeed())
+
+			var seen *os.File
+			opts.LockWait = 10 * time.Second
+			opts.BeforeLock = func(f *os.File) error {
+				seen = f
+				return errors.New("the image is spoken for")
+			}
+			began := time.Now()
+			_, err = open()
+			Expect(err).To(MatchError("the image is spoken for"))
+			Expect(time.Since(began)).To(BeNumerically("<", time.Second))
+			Expect(seen).NotTo(BeNil())
+			Expect(seen.Name()).To(Equal(img))
+			Expect(seen.Stat()).Error().To(HaveOccurred(), "the refused image was closed")
+			Expect(lockedElsewhere(img)).To(BeTrue(), "only the holder's lock is on it")
+		})
+
+		It("goes on to take the lock when BeforeLock accepts", func() {
+			calls := 0
+			opts.BeforeLock = func(*os.File) error { calls++; return nil }
+			f, err := open()
+			Expect(err).NotTo(HaveOccurred())
+			defer f.Close()
+			Expect(calls).To(Equal(1))
+			Expect(lockedElsewhere(img)).To(BeTrue())
+		})
+
+		It("takes the time of every wait from a shared budget, so that two waits cannot add up", func() {
+			writeImage(img, defaultImageSize, nil)
+			holder, err := os.OpenFile(img, os.O_RDWR, 0)
+			Expect(err).NotTo(HaveOccurred())
+			defer holder.Close()
+			Expect(unix.Flock(int(holder.Fd()), unix.LOCK_EX)).To(Succeed())
+
+			opts.LockWait = 10 * time.Second
+			opts.LockBudget = newLockBudget(400 * time.Millisecond)
+			began := time.Now()
+			_, err = open()
+			first := time.Since(began)
+			Expect(errors.Is(err, errVolumeInUse)).To(BeTrue(), "%v", err)
+			Expect(first).To(BeNumerically(">=", 400*time.Millisecond))
+			Expect(first).To(BeNumerically("<", 3*time.Second))
+			Expect(opts.LockBudget.remaining).To(BeZero())
+
+			began = time.Now()
+			_, err = open()
+			Expect(errors.Is(err, errVolumeInUse)).To(BeTrue(), "%v", err)
+			Expect(time.Since(began)).To(BeNumerically("<", 300*time.Millisecond), "an empty budget leaves one try and no wait")
+		})
+
+		It("leaves a budget unspent when the lock is free, and keeps each wait within LockWait", func() {
+			opts.LockBudget = newLockBudget(time.Hour)
+			f, err := open()
+			Expect(err).NotTo(HaveOccurred())
+			defer f.Close()
+			Expect(opts.LockBudget.remaining).To(BeNumerically(">", 59*time.Minute))
+
+			opts.LockWait = 100 * time.Millisecond
+			began := time.Now()
+			_, err = open()
+			Expect(errors.Is(err, errVolumeInUse)).To(BeTrue(), "%v", err)
+			Expect(time.Since(began)).To(BeNumerically("<", 3*time.Second))
+			Expect(opts.LockBudget.remaining).To(BeNumerically("<", time.Hour-100*time.Millisecond))
+		})
+
+		It("still stops a budgeted wait at a signal and spends only what it waited", func() {
+			first, err := open()
+			Expect(err).NotTo(HaveOccurred())
+			defer first.Close()
+
+			sigs := make(chan os.Signal, 1)
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				sigs <- syscall.SIGINT
+			}()
+			opts.LockWait = 10 * time.Second
+			opts.LockBudget = newLockBudget(10 * time.Second)
+			began := time.Now()
+			_, err = openVolumeImage(vol, opts, sigs)
+			Expect(time.Since(began)).To(BeNumerically("<", 5*time.Second))
+			Expect(stepExitCode(err)).To(Equal(128 + int(syscall.SIGINT)))
+			Expect(opts.LockBudget.remaining).To(BeNumerically("<", 10*time.Second))
+			Expect(opts.LockBudget.remaining).To(BeNumerically(">", 5*time.Second))
+		})
+
+		It("never gives a negative budget", func() {
+			Expect(newLockBudget(-time.Second).remaining).To(BeZero())
+			Expect(newLockBudget(time.Second).remaining).To(Equal(time.Second))
+		})
+
 		It("checks the image before it waits", func() {
 			writeImage(img, 1000, nil)
 			holder, err := os.OpenFile(img, os.O_RDWR, 0)

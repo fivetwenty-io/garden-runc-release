@@ -193,6 +193,25 @@ var _ = Describe("run with a volume", func() {
 		}
 	}
 
+	It("exits 125 for a volume path under another volume path before it creates anything", func() {
+		GinkgoT().Setenv("VCAP_SERVICES", vcapWith(map[string][]string{"juicefs": {mountJSON("/data/inner", "rw"), mountJSON("/data", "rw")}}))
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(Equal(`volume path "/data/inner" is on or under volume path "/data"; VM backends need every volume path to be outside every other volume path, so give each volume a path of its own` + "\n"))
+		Expect(argvFile).NotTo(BeAnExistingFile())
+		Expect(os.ReadDir(volDir)).To(BeEmpty())
+		noWorkDirs()
+	})
+
+	It("exits 125 for a volume path and the same path with a trailing slash before it creates anything", func() {
+		GinkgoT().Setenv("VCAP_SERVICES", vcapWith(map[string][]string{"juicefs": {mountJSON("/data", "rw"), mountJSON("/data/", "rw")}}))
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(Equal(`volume path "/data/" is not a clean path` + "\n"))
+		Expect(argvFile).NotTo(BeAnExistingFile())
+		noWorkDirs()
+	})
+
 	It("exits 125 for five volume mounts before it creates anything", func() {
 		GinkgoT().Setenv("VCAP_SERVICES", vcapWith(map[string][]string{"juicefs": {mountJSON(volDir, "rw"), mountJSON("/a", "rw")}, "nfs": {mountJSON("/b", "rw"), mountJSON("/c", "rw"), mountJSON("/d", "rw")}}))
 		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
@@ -636,7 +655,46 @@ var _ = Describe("run with several volumes", func() {
 		Expect(os.ReadDir(tmp)).To(BeEmpty())
 	})
 
-	It("refuses two volumes whose disks are one file, and releases both", func() {
+	// sameImageLine is the refusal of two volumes that reach one image.
+	sameImageLine := func() string {
+		return "volume paths " + quoteForLog(dirs[0]) + " and " + quoteForLog(dirs[1]) + " reach the same disk image; bind each volume to a directory of its own\n"
+	}
+
+	It("refuses at once, without a lock wait, two volumes whose images are one file when the provider takes the lock", func() {
+		requireOpenat2()
+		bind(2)
+		// The wait is long enough that waiting for the lock would fail the
+		// spec on time, and the provider takes a real flock, as JuiceFS does:
+		// both volumes open the one image in dirs[0], so the second one's
+		// flock would conflict with the first one's.
+		defaultImageOptions.LockWait = 20 * time.Second
+		var released []string
+		p := fake("Fake", "fuse.juicefs", strongMatch)
+		p.prepare = func(r prepareRequest) (*attachment, error) {
+			opts := defaultImageOptions
+			opts.BeforeLock = r.BeforeLock
+			opts.LockBudget = r.LockBudget
+			dir := r.Mount.ContainerDir
+			f, err := openVolumeImage(&guestVolume{ContainerDir: dirs[0], ImageName: r.ImageName}, opts, r.Signals)
+			if err != nil {
+				return nil, err
+			}
+			return &attachment{File: f, Release: func() error { released = append(released, dir); return f.Close() }}, nil
+		}
+		withProviders(p)
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+		began := time.Now()
+		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
+		Expect(time.Since(began)).To(BeNumerically("<", 5*time.Second), "the duplicate did not wait for the lock")
+		Expect(logBuf.String()).To(HaveSuffix(sameImageLine()))
+		Expect(logBuf.String()).NotTo(ContainSubstring("in use by another instance"))
+		Expect(released).To(Equal([]string{dirs[0]}))
+		Expect(lockedElsewhere(imgs[0])).To(BeFalse(), "the lock ended with the run")
+		Expect(argvFile).NotTo(BeAnExistingFile())
+		noWorkDirs()
+	})
+
+	It("still refuses two volumes whose disks are one file when the provider calls no BeforeLock, and releases both", func() {
 		bind(2)
 		shared := diskFile(defaultImageSize)
 		Expect(shared.Close()).To(Succeed())
@@ -651,7 +709,7 @@ var _ = Describe("run with several volumes", func() {
 		withProviders(p)
 		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
 		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
-		Expect(logBuf.String()).To(HaveSuffix("volume paths " + quoteForLog(dirs[0]) + " and " + quoteForLog(dirs[1]) + " reach the same disk image; bind each volume to a directory of its own\n"))
+		Expect(logBuf.String()).To(HaveSuffix(sameImageLine()))
 		Expect(released).To(Equal([]string{dirs[1], dirs[0]}))
 		Expect(argvFile).NotTo(BeAnExistingFile())
 	})
@@ -754,8 +812,47 @@ var _ = Describe("run with several volumes", func() {
 
 		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
 		Expect(logBuf.String()).To(ContainSubstring("volume image " + imgs[1] + " is in use by another instance; VM backends allow one writer per image"))
+		Expect(logBuf.String()).To(ContainSubstring("; with more than one volume bound, two of this app's bindings may be the same share, in which case an earlier volume of this launch holds the lock\n"))
 		Expect(statOf(imgs[0]).Size).To(Equal(int64(defaultImageSize)))
 		Expect(lockedElsewhere(imgs[0])).To(BeFalse(), "the first volume's lock ended")
+		Expect(argvFile).NotTo(BeAnExistingFile())
+		noWorkDirs()
+	})
+
+	It("gives all the volumes one lock wait together, so that waits on several contended volumes do not add up", func() {
+		requireOpenat2()
+		bind(3)
+		for _, img := range imgs[1:] {
+			writeImage(img, defaultImageSize, nil)
+		}
+		holders := make([]*os.File, 2)
+		for i, img := range imgs[1:] {
+			h, err := os.OpenFile(img, os.O_RDWR, 0)
+			Expect(err).NotTo(HaveOccurred())
+			defer h.Close()
+			Expect(syscall.Flock(int(h.Fd()), syscall.LOCK_EX)).To(Succeed())
+			holders[i] = h
+		}
+		// The second volume's holder lets go after 600 ms. Each volume would
+		// get the full second on a wait of its own, so the third volume would
+		// fail at about 1.6 s. With one wait for the launch, it fails at about
+		// 1 s.
+		defaultImageOptions.LockWait = time.Second
+		go func() {
+			defer GinkgoRecover()
+			time.Sleep(600 * time.Millisecond)
+			Expect(holders[0].Close()).To(Succeed())
+		}()
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+
+		began := time.Now()
+		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
+		took := time.Since(began)
+		Expect(took).To(BeNumerically(">=", time.Second), "the third volume waited out what was left")
+		Expect(took).To(BeNumerically("<", 1400*time.Millisecond), "the waits did not add up")
+		Expect(logBuf.String()).To(ContainSubstring("volume image " + imgs[2] + " is in use by another instance"))
+		Expect(lockedElsewhere(imgs[0])).To(BeFalse(), "the first volume's lock ended")
+		Expect(lockedElsewhere(imgs[1])).To(BeFalse(), "the second volume's lock ended")
 		Expect(argvFile).NotTo(BeAnExistingFile())
 		noWorkDirs()
 	})

@@ -220,12 +220,54 @@ var _ = Describe("volumesFromEnv", func() {
 			vcap := vcapWith(map[string][]string{
 				"nfs":     {mountJSON("/var/z", "rw"), mountJSON("/data", "rw")},
 				"juicefs": {mountJSON("/data-old", "rw")},
-				"a-label": {mountJSON("/data/inner", "rw")},
+				"a-label": {mountJSON("/data2", "rw")},
 			})
 			vols, err := volumesFromEnv(lookup(withApp(vcap)))
 			Expect(err).NotTo(HaveOccurred())
-			// "-" sorts before "/", and a path comes before every path below it.
-			Expect(vols).To(Equal(volumesAt("/data", "/data-old", "/data/inner", "/var/z")))
+			// Byte order puts "/data-old" before "/data2", and both before "/var/z".
+			Expect(vols).To(Equal(volumesAt("/data", "/data-old", "/data2", "/var/z")))
+		})
+
+		It("accepts paths that only share a name prefix, since neither is under the other", func() {
+			vcap := vcapWith(map[string][]string{"juicefs": {mountJSON("/data", "rw"), mountJSON("/data-old", "rw"), mountJSON("/database", "rw"), mountJSON("/dat", "rw")}})
+			vols, err := volumesFromEnv(lookup(withApp(vcap)))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(vols).To(Equal(volumesAt("/dat", "/data", "/data-old", "/database")))
+		})
+
+		It("rejects a volume path on or under another volume path, whatever order the mounts come in, and names both", func() {
+			for name, c := range map[string]struct {
+				labels       map[string][]string
+				inner, outer string
+			}{
+				"a child of a path":      {map[string][]string{"juicefs": {mountJSON("/data", "rw"), mountJSON("/data/inner", "rw")}}, "/data/inner", "/data"},
+				"in the other order":     {map[string][]string{"a": {mountJSON("/data/inner", "rw")}, "b": {mountJSON("/data", "rw")}}, "/data/inner", "/data"},
+				"a deeper descendant":    {map[string][]string{"juicefs": {mountJSON("/a/b/c/d", "rw"), mountJSON("/a", "rw")}}, "/a/b/c/d", "/a"},
+				"past a path between":    {map[string][]string{"juicefs": {mountJSON("/data", "rw"), mountJSON("/data-old", "rw"), mountJSON("/data/inner", "rw")}}, "/data/inner", "/data"},
+				"among four, across all": {map[string][]string{"a": {mountJSON("/z", "rw")}, "b": {mountJSON("/m/n", "rw")}, "c": {mountJSON("/a", "rw")}, "d": {mountJSON("/m", "rw")}}, "/m/n", "/m"},
+			} {
+				_, err := volumesFromEnv(lookup(withApp(vcapWith(c.labels))))
+				Expect(err).To(MatchError(fmt.Sprintf("volume path %q is on or under volume path %q; VM backends need every volume path to be outside every other volume path, so give each volume a path of its own", c.inner, c.outer)), name)
+			}
+		})
+
+		It("rejects a path and the same path with a trailing slash, which clean to one path", func() {
+			_, err := volumesFromEnv(lookup(withApp(vcapWith(map[string][]string{"juicefs": {mountJSON("/data", "rw"), mountJSON("/data/", "rw")}}))))
+			Expect(err).To(MatchError(`volume path "/data/" is not a clean path`))
+		})
+
+		It("refuses nested paths, and paths that clean to nested ones, in checkNotNested", func() {
+			Expect(checkNotNested([]string{"/data", "/data/"})).To(MatchError(ContainSubstring(`volume path "/data/" is on or under volume path "/data"`)))
+			Expect(checkNotNested([]string{"/data/", "/data"})).To(MatchError(ContainSubstring(`volume path "/data" is on or under volume path "/data/"`)))
+			Expect(checkNotNested([]string{"/data", "/data/x/../inner"})).To(MatchError(ContainSubstring(`volume path "/data/x/../inner" is on or under volume path "/data"`)))
+			Expect(checkNotNested([]string{"/data", "/data-old", "/data2", "/dat"})).To(Succeed())
+			Expect(checkNotNested(nil)).To(Succeed())
+			Expect(checkNotNested([]string{"/data"})).To(Succeed())
+		})
+
+		It("reports a repeated path before a nested one", func() {
+			_, err := volumesFromEnv(lookup(withApp(vcapWith(map[string][]string{"juicefs": {mountJSON("/data", "rw"), mountJSON("/data", "rw"), mountJSON("/data/inner", "rw")}}))))
+			Expect(err).To(MatchError(ContainSubstring(`volume path "/data" has 2 volume mounts`)))
 		})
 
 		It("gives the same order whatever order the labels and bindings come in", func() {

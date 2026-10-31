@@ -41,10 +41,13 @@ func (juicefsProvider) Prepare(req prepareRequest) (*attachment, error) {
 	if req.Mode != attachFileImage {
 		return nil, fmt.Errorf("the JuiceFS volume provider attaches only in %s, not in %s", attachFileImage, req.Mode)
 	}
+	opts := defaultImageOptions
+	opts.BeforeLock = req.BeforeLock
+	opts.LockBudget = req.LockBudget
 	img, err := openVolumeImage(&guestVolume{
 		ContainerDir: req.Mount.ContainerDir, ImageName: req.ImageName,
 		MountID: req.Mount.MountID, MountIDKnown: true,
-	}, defaultImageOptions, req.Signals)
+	}, opts, req.Signals)
 	if err != nil {
 		return nil, err
 	}
