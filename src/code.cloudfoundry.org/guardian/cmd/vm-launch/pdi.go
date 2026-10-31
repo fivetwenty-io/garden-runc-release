@@ -244,8 +244,15 @@ func joinNames(names []string, none string) string {
 // providers. Two providers that match equally strongly refuse it too, with a
 // line that names them, because vm-launch never guesses which service owns a
 // disk. The chosen provider must offer file-image mode and a fence that holds
-// across cells, or the volume is refused before anything is created.
+// across cells, or the volume is refused before anything is created. The
+// refusals in mountRefusals come first, so a mount one of them names is
+// refused with its own line whatever providers are registered.
 func (r *providerRegistry) selectProvider(m mountRecord) (diskProvider, error) {
+	for _, refuse := range mountRefusals {
+		if err := refuse(m); err != nil {
+			return nil, err
+		}
+	}
 	var strong, weak []diskProvider
 	for _, p := range r.providers {
 		switch p.Match(m) {

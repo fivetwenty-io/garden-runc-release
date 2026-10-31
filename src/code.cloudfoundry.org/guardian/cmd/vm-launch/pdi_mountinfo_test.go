@@ -152,7 +152,7 @@ var _ = Describe("selecting the volume's mountinfo line by mount ID", func() {
 	// on, and a later mount over the same mount point.
 	const (
 		volume  = "41 30 0:41 / /data rw,nosuid shared:5 - fuse.juicefs JuiceFS:vol rw,user_id=0\n"
-		shadow  = "60 30 0:60 / /data rw - ext4 /dev/vdb rw\n"
+		shadow  = "60 30 0:60 / /data rw - ext4 /dev/vdb1 rw\n"
 		otherFS = "30 1 0:30 / / rw - overlay overlay rw\n"
 	)
 
