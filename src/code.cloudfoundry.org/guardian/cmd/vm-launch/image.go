@@ -183,6 +183,11 @@ type imageOptions struct {
 	// truncate, when set, replaces ftruncate(2) as the step that grows an
 	// image without preallocation. Tests use it to answer as a full quota does.
 	truncate func(fd int, size int64) error
+
+	// fstatfs, when set, replaces fstatfs(2) as the step that reads the
+	// volume's free space for the quota check (checkSpace). Tests use it to
+	// answer as a volume with a quota does.
+	fstatfs func(fd int, st *unix.Statfs_t) error
 }
 
 // creationSize is the size a new image is published at: the creation step,
@@ -327,7 +332,8 @@ func (e *signalledError) Error() string {
 // again.
 //
 // Still under the lock, it brings the image up to Size (growImage), writing
-// only past the image's current end. An image larger than Size is kept as it
+// only past the image's current end, after asking the volume whether it has
+// the room (checkSpace). An image larger than Size is kept as it
 // is, with a line through Logf. A grow that a signal stops leaves a published
 // image, shorter than Size, that the next launch grows from where it stopped.
 //
@@ -421,8 +427,7 @@ func openVolumeImage(v *guestVolume, o imageOptions, sigs <-chan os.Signal) (*os
 	if err != nil {
 		return nil, err
 	}
-	target := growTarget{volume: quoteForLog(v.ContainerDir), image: quoteForLog(v.ImageName), path: path}
-	if err := growImage(fd, target, size, created, o, sigs); err != nil {
+	if err := growImage(fd, newGrowTarget(dirfd, path), size, created, o, sigs); err != nil {
 		return nil, err
 	}
 	ok = true
@@ -518,8 +523,14 @@ var errCreateAgain = errors.New("the new volume image's temp file was removed wh
 // published name is never removed. A signal on sigs during preallocation
 // removes the temp file and returns the signal's error.
 func createImage(dirfd int, name, path string, o imageOptions, sigs <-chan os.Signal) (int, error) {
+	// The image will be o.Size long once it has grown, and nothing is written
+	// before the volume has been asked whether it has the room.
+	op := createOp(newGrowTarget(dirfd, path), o.Size)
+	if err := o.checkSpace(op); err != nil {
+		return -1, err
+	}
 	if o.Publish == publishLink {
-		return createImageByLink(dirfd, name, path, o, sigs)
+		return createImageByLink(dirfd, name, path, op, o, sigs)
 	}
 	tempName, fd, err := createTempImage(dirfd)
 	if err != nil {
@@ -534,10 +545,10 @@ func createImage(dirfd int, name, path string, o imageOptions, sigs <-chan os.Si
 		return -1, err
 	}
 	if err := sizeNewImage(fd, path, o, sigs); err != nil {
-		return fail(err)
+		return fail(o.creationFailure(op, err))
 	}
 	if err := unix.Fsync(fd); err != nil {
-		return fail(fmt.Errorf("creating volume image %s: syncing it: %w", path, err))
+		return fail(o.creationFailure(op, fmt.Errorf("creating volume image %s: syncing it: %w", path, err)))
 	}
 	if o.afterTempCreate != nil {
 		o.afterTempCreate(dirfd, tempName)
@@ -610,7 +621,7 @@ func renameHint(err error) string {
 // errCreateAgain, and so does a temp name that another file has taken. Any
 // other failure to check the temp name fails the launch with its cause, after
 // removing the temp file.
-func createImageByLink(dirfd int, name, path string, o imageOptions, sigs <-chan os.Signal) (int, error) {
+func createImageByLink(dirfd int, name, path string, op spaceOp, o imageOptions, sigs <-chan os.Signal) (int, error) {
 	tempName, fd, err := createTempImage(dirfd)
 	if err != nil {
 		return -1, fmt.Errorf("creating volume image %s: %w%s", path, err, symlinkHint(err))
@@ -658,17 +669,17 @@ func createImageByLink(dirfd int, name, path string, o imageOptions, sigs <-chan
 		return fail(fmt.Errorf("creating volume image %s: checking the new file's temp name: %w", path, err))
 	}
 	if err := sizeNewImage(fd, path, o, sigs); err != nil {
-		return fail(err)
+		return fail(o.creationFailure(op, err))
 	}
 	if err := unix.Fsync(fd); err != nil {
-		return fail(fmt.Errorf("creating volume image %s: syncing it: %w%s", path, err, quotaHint(err)))
+		return fail(o.creationFailure(op, fmt.Errorf("creating volume image %s: syncing it: %w", path, err)))
 	}
 	if o.afterTempCreate != nil {
 		o.afterTempCreate(dirfd, tempName)
 	}
 	if err := unix.Close(fd); err != nil {
 		removeTempByID(dirfd, tempName, id)
-		return -1, fmt.Errorf("creating volume image %s: closing the new file: %w%s", path, err, quotaHint(err))
+		return -1, o.creationFailure(op, fmt.Errorf("creating volume image %s: closing the new file: %w", path, err))
 	}
 
 	publish := o.link
@@ -1065,9 +1076,22 @@ func sizeNewImage(fd int, path string, o imageOptions, sigs <-chan os.Signal) er
 }
 
 // growTarget names an image in the lines growImage prints: the volume path and
-// the image name, each quoted with quoteForLog, and the image's path.
+// the image name, each quoted with quoteForLog, the image's path, and the
+// descriptor of the volume root that the quota check asks for the free space.
 type growTarget struct {
 	volume, image, path string
+	dirfd               int
+}
+
+// newGrowTarget names the image at path, which is its name in the volume root
+// open as dirfd.
+func newGrowTarget(dirfd int, path string) growTarget {
+	return growTarget{
+		volume: quoteForLog(filepath.Dir(path)),
+		image:  quoteForLog(filepath.Base(path)),
+		path:   path,
+		dirfd:  dirfd,
+	}
 }
 
 // growImage brings the open, locked image fd, which is size bytes long, up to
@@ -1090,9 +1114,12 @@ type growTarget struct {
 //     and the next launch continues from its end. A signal returns a
 //     *signalledError, so the launch exits with 128 plus the signal.
 //
-// Then it syncs the image and checks that it is o.Size bytes. A failed
-// step exits 125 with a line that names the volume, and the image keeps the
-// length it reached.
+// Before it writes anything, it asks the volume whether it has free the bytes
+// the grow adds (checkSpace). Then it syncs the image and checks that it is
+// o.Size bytes. A failed step exits 125 with a line that names the volume, and
+// the image keeps the length it reached. A step that the volume's quota
+// refuses with EDQUOT or ENOSPC is reported in the same words as the check
+// (quotaRefusal).
 func growImage(fd int, t growTarget, size int64, created bool, o imageOptions, sigs <-chan os.Signal) error {
 	want := o.Size
 	switch {
@@ -1103,11 +1130,21 @@ func growImage(fd int, t growTarget, size int64, created bool, o imageOptions, s
 			t.volume, t.image, exactSize(size), exactSize(want), exactSize(size))
 		return nil
 	}
+	op := growOp(t, size, want)
+	if err := o.checkSpace(op); err != nil {
+		return err
+	}
 	if !created {
 		o.logf("volume %s: growing image %s from %s to %s", t.volume, t.image, roughSize(size), exactSize(want))
 	}
-	failed := func(err error) error {
-		return fmt.Errorf("volume %s: growing image %s from %s to %s: %w", t.volume, t.image, roughSize(size), exactSize(want), err)
+	// failed reports a step that failed with the image at stays bytes. A step
+	// that the volume's quota refused is reported in the quota line.
+	failed := func(err error, stays int64) error {
+		if isQuotaErrno(err) {
+			return o.quotaRefusal(op, err, "the image stays at "+roughSize(stays))
+		}
+		return fmt.Errorf("volume %s: growing image %s from %s to %s: %w; the image stays at %s",
+			t.volume, t.image, roughSize(size), exactSize(want), err, roughSize(stays))
 	}
 	if o.Preallocate {
 		g := &growth{target: t, from: size, to: want, end: size, o: o}
@@ -1117,13 +1154,13 @@ func growImage(fd int, t growTarget, size int64, created bool, o imageOptions, s
 				return fmt.Errorf("volume %s: growing image %s to %s: %w; it is %s now, and the next start continues from there",
 					t.volume, t.image, exactSize(want), err, roughSize(g.end))
 			}
-			return failed(fmt.Errorf("%w; the image stays at %s", err, roughSize(g.end)))
+			return failed(err, g.end)
 		}
 	} else if err := truncateUp(fd, want, o); err != nil {
-		return failed(fmt.Errorf("%w; the image stays at %s", err, roughSize(size)))
+		return failed(err, size)
 	}
 	if err := unix.Fsync(fd); err != nil {
-		return failed(fmt.Errorf("syncing it: %w%s", err, quotaHint(err)))
+		return failed(fmt.Errorf("syncing it: %w", err), want)
 	}
 	got, err := checkImage(fd, t.path)
 	if err != nil {
@@ -1152,7 +1189,7 @@ func truncateUp(fd int, size int64, o imageOptions) error {
 		case errors.Is(err, unix.EINTR):
 			continue
 		default:
-			return fmt.Errorf("truncating it to %d bytes: %w%s", size, err, quotaHint(err))
+			return fmt.Errorf("truncating it to %d bytes: %w", size, err)
 		}
 	}
 }
@@ -1245,7 +1282,7 @@ func allocateRange(fd int, path string, from, to int64, o imageOptions, sigs <-c
 		}
 		return nil
 	case !errors.Is(err, unix.EOPNOTSUPP):
-		return fmt.Errorf("allocating %d bytes at offset %d: %w%s", to-from, from, err, quotaHint(err))
+		return fmt.Errorf("allocating %d bytes at offset %d: %w", to-from, from, err)
 	}
 	if g != nil {
 		g.started()
@@ -1318,14 +1355,14 @@ func writeZeros(fd int, from, to int64, o imageOptions, sigs <-chan os.Signal, g
 			}
 			during := "writing zeros"
 			if err := syncWritten(); err != nil {
-				during = fmt.Sprintf("writing zeros, and syncing the zeros written so far failed: %v%s", err, quotaHint(err))
+				during = fmt.Sprintf("writing zeros, and syncing the zeros written so far failed: %v", err)
 			}
 			return &signalledError{Sig: syscall.Signal(signalNumber(sig)), during: during}
 		default:
 		}
 		n := min(zeroChunk-end%zeroChunk, to-end)
 		if err := write(fd, zeros[:n], end); err != nil {
-			werr := fmt.Errorf("writing zeros at offset %d: %w%s", end, err, quotaHint(err))
+			werr := fmt.Errorf("writing zeros at offset %d: %w", end, err)
 			if g != nil {
 				if serr := syncWritten(); serr != nil {
 					werr = fmt.Errorf("%w; syncing the zeros written before it also failed: %v", werr, serr)
@@ -1342,14 +1379,14 @@ func writeZeros(fd int, from, to int64, o imageOptions, sigs <-chan os.Signal, g
 		}
 		if end-synced >= syncInterval {
 			if err := syncFile(fd); err != nil {
-				return fmt.Errorf("syncing the zeros written so far: %w%s", err, quotaHint(err))
+				return fmt.Errorf("syncing the zeros written so far: %w", err)
 			}
 			synced = end
 		}
 	}
 	if synced != end {
 		if err := syncFile(fd); err != nil {
-			return fmt.Errorf("syncing the zeros written so far: %w%s", err, quotaHint(err))
+			return fmt.Errorf("syncing the zeros written so far: %w", err)
 		}
 	}
 	return nil
@@ -1408,16 +1445,6 @@ func roughSize(n int64) string {
 		}
 	}
 	return fmt.Sprintf("%d bytes", n)
-}
-
-// quotaHint says that a volume's quota is the cause of an out-of-space or
-// over-quota errno, which is the likeliest reason a grow or an allocation
-// fails on a shared volume.
-func quotaHint(err error) string {
-	if errors.Is(err, unix.EDQUOT) || errors.Is(err, unix.ENOSPC) {
-		return " (the volume's quota refused it)"
-	}
-	return ""
 }
 
 // newImageCheckError reports a check that failed on the new temp file. The

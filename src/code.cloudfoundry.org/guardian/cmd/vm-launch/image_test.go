@@ -470,6 +470,7 @@ var _ = Describe("openVolumeImage", func() {
 
 	It("reports an image it cannot grow, keeps it published at the creation step, and grows it on the next launch", func() {
 		opts.Size = 1 << 62
+		opts.fstatfs = fakeVolume(1<<62, 1<<62)
 		_, err := open()
 		if err == nil {
 			Skip("this filesystem accepts a 4 EiB file, so growing cannot fail here")
@@ -1104,8 +1105,8 @@ var _ = Describe("preallocateImage", func() {
 				Expect(chunks).To(BeEmpty())
 				Expect(sizeOf()).To(BeZero())
 			},
-			Entry("ENOSPC", unix.ENOSPC, " (the volume's quota refused it)"),
-			Entry("EDQUOT", unix.EDQUOT, " (the volume's quota refused it)"),
+			Entry("ENOSPC", unix.ENOSPC, ""),
+			Entry("EDQUOT", unix.EDQUOT, ""),
 			Entry("EIO", unix.EIO, ""),
 			Entry("ENOSYS, which is not the NFS 4.1 answer", unix.ENOSYS, ""),
 			Entry("EINVAL", unix.EINVAL, ""),
@@ -1204,7 +1205,7 @@ var _ = Describe("preallocateImage", func() {
 			Expect(syncs).To(BeZero())
 		})
 
-		It("reports a write the quota refuses in the middle of the range, with the quota's words, and does not sync", func() {
+		It("reports a write the quota refuses in the middle of the range, and does not sync", func() {
 			newFile(0, "")
 			var writes []int64
 			opts.pwrite = func(fd int, b []byte, off int64) error {
@@ -1216,7 +1217,7 @@ var _ = Describe("preallocateImage", func() {
 			}
 			err := preallocate(0, 5<<20, nil)
 			Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
-			Expect(err).To(MatchError("writing zeros at offset 2097152: disk quota exceeded (the volume's quota refused it)"))
+			Expect(err).To(MatchError("writing zeros at offset 2097152: disk quota exceeded"))
 			Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 			Expect(writes).To(Equal([]int64{0, 1 << 20, 2 << 20}))
 			Expect(chunks).To(Equal([]int64{1 << 20, 2 << 20}), "the failed chunk is not counted")
@@ -1224,12 +1225,12 @@ var _ = Describe("preallocateImage", func() {
 			Expect(sizeOf()).To(Equal(int64(2<<20)), "the two chunks before the failure stay")
 		})
 
-		It("adds the quota's words to an ENOSPC write error, and none to another one", func() {
+		It("keeps the errno of an ENOSPC write error and of another one", func() {
 			for i, c := range []struct {
 				errno error
 				want  string
 			}{
-				{unix.ENOSPC, "writing zeros at offset 0: no space left on device (the volume's quota refused it)"},
+				{unix.ENOSPC, "writing zeros at offset 0: no space left on device"},
 				{unix.EIO, "writing zeros at offset 0: input/output error"},
 			} {
 				errno, want := c.errno, c.want
@@ -1247,7 +1248,7 @@ var _ = Describe("preallocateImage", func() {
 			newFile(0, "")
 			opts.syncFile = func(int) error { return unix.EDQUOT }
 			err := preallocate(0, 2<<20, nil)
-			Expect(err).To(MatchError("syncing the zeros written so far: disk quota exceeded (the volume's quota refused it)"))
+			Expect(err).To(MatchError("syncing the zeros written so far: disk quota exceeded"))
 			Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue())
 
 			err = preallocate(2<<20, 300<<20, nil)
@@ -1371,9 +1372,11 @@ var _ = Describe("creating an image with preallocation", func() {
 
 	It("exits 125 with the quota's words and leaves nothing behind when the allocation is refused", func() {
 		opts.fallocate = func(int, uint32, int64, int64) error { return unix.ENOSPC }
+		opts.fstatfs = fakeVolume(7<<30+1<<29, 10<<30)
 		_, err := openVolumeImage(vol, opts, nil)
 		Expect(errors.Is(err, unix.ENOSPC)).To(BeTrue(), "%v", err)
-		Expect(err).To(MatchError("creating volume image " + img + ": allocating 4194304 bytes at offset 0: no space left on device (the volume's quota refused it)"))
+		Expect(errors.Is(err, errQuotaRefused)).To(BeTrue(), "%v", err)
+		Expect(err).To(MatchError("volume " + quoteForLog(dir) + `: creating image "rvm-disk-0.img" at 4 MiB needs 4 MiB, and the volume's quota refused it (no space left on device); the volume has 7.5 GiB free of 10 GiB; ` + quotaAdvice + "; no image was created"))
 		Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 		Expect(os.ReadDir(dir)).To(BeEmpty())
 	})
@@ -1383,7 +1386,7 @@ var _ = Describe("creating an image with preallocation", func() {
 		opts.syncFile = func(int) error { return unix.EDQUOT }
 		_, err := openVolumeImage(vol, opts, nil)
 		Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
-		Expect(err.Error()).To(HavePrefix("creating volume image " + img + ": syncing the zeros written so far"))
+		Expect(err.Error()).To(HavePrefix("volume " + quoteForLog(dir) + `: creating image "rvm-disk-0.img" at 4 MiB needs 4 MiB, and the volume's quota refused it (disk quota exceeded)`))
 		Expect(os.ReadDir(dir)).To(BeEmpty())
 	})
 
@@ -1397,9 +1400,10 @@ var _ = Describe("creating an image with preallocation", func() {
 			}
 			return pwriteFull(fd, b, off)
 		}
+		opts.fstatfs = fakeVolume(7<<30+1<<29, 10<<30)
 		_, err := openVolumeImage(vol, opts, nil)
 		Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
-		Expect(err).To(MatchError("creating volume image " + img + ": writing zeros at offset 2097152: disk quota exceeded (the volume's quota refused it)"))
+		Expect(err).To(MatchError("volume " + quoteForLog(dir) + `: creating image "rvm-disk-0.img" at 4 MiB needs 4 MiB, and the volume's quota refused it (disk quota exceeded); the volume has 7.5 GiB free of 10 GiB; ` + quotaAdvice + "; no image was created"))
 		Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 		Expect(writes).To(Equal(3), "no write follows the failed one")
 		Expect(os.ReadDir(dir)).To(BeEmpty(), "the part written temp file is removed and no image is published")
@@ -1637,7 +1641,8 @@ var _ = Describe("publishing a new image by link", func() {
 		opts.fallocate = func(int, uint32, int64, int64) error { return unix.ENOSPC }
 		_, err := open()
 		Expect(errors.Is(err, unix.ENOSPC)).To(BeTrue(), "%v", err)
-		Expect(err.Error()).To(HaveSuffix("(the volume's quota refused it)"))
+		Expect(err.Error()).To(ContainSubstring("and the volume's quota refused it (no space left on device)"))
+		Expect(err.Error()).To(HaveSuffix("; no image was created"))
 		Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 		Expect(os.ReadDir(dir)).To(BeEmpty())
 	})
@@ -2289,9 +2294,10 @@ var _ = Describe("growing an image to the size asked for", func() {
 			writeImage(img, 2<<20, nil)
 			markImage()
 			opts.truncate = func(int, int64) error { return unix.EDQUOT }
+			opts.fstatfs = fakeVolume(7<<30+1<<29, 10<<30)
 			_, err := open(nil)
 			Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
-			Expect(err).To(MatchError("volume " + vq + `: growing image "rvm-disk-0.img" from 2 MiB to 8 MiB: truncating it to 8388608 bytes: disk quota exceeded (the volume's quota refused it); the image stays at 2 MiB`))
+			Expect(err).To(MatchError("volume " + vq + `: growing image "rvm-disk-0.img" from 2 MiB to 8 MiB needs 6 MiB, and the volume's quota refused it (disk quota exceeded); the volume has 7.5 GiB free of 10 GiB; ` + quotaAdvice + "; the image stays at 2 MiB"))
 			Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 			Expect(statOf(img).Size).To(Equal(int64(2 << 20)))
 			marksKept(2 << 20)
@@ -2389,9 +2395,10 @@ var _ = Describe("growing an image to the size asked for", func() {
 			writeImage(img, 2<<20, nil)
 			markImage()
 			opts.fallocate = func(int, uint32, int64, int64) error { return unix.ENOSPC }
+			opts.fstatfs = fakeVolume(7<<30+1<<29, 10<<30)
 			_, err := open(nil)
 			Expect(errors.Is(err, unix.ENOSPC)).To(BeTrue(), "%v", err)
-			Expect(err).To(MatchError("volume " + vq + `: growing image "rvm-disk-0.img" from 2 MiB to 8 MiB: allocating 6291456 bytes at offset 2097152: no space left on device (the volume's quota refused it); the image stays at 2 MiB`))
+			Expect(err).To(MatchError("volume " + vq + `: growing image "rvm-disk-0.img" from 2 MiB to 8 MiB needs 6 MiB, and the volume's quota refused it (no space left on device); the volume has 7.5 GiB free of 10 GiB; ` + quotaAdvice + "; the image stays at 2 MiB"))
 			Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 			Expect(statOf(img).Size).To(Equal(int64(2 << 20)))
 			marksKept(2 << 20)
@@ -2519,9 +2526,10 @@ var _ = Describe("growing an image to the size asked for", func() {
 					}
 					return pwriteFull(fd, b, off)
 				}
+				opts.fstatfs = fakeVolume(7<<30+1<<29, 10<<30)
 				_, err := open(nil)
 				Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
-				Expect(err).To(MatchError("volume " + vq + `: growing image "rvm-disk-0.img" from 2 MiB to 8 MiB: writing zeros at offset 4194304: disk quota exceeded (the volume's quota refused it); the image stays at 4 MiB`))
+				Expect(err).To(MatchError("volume " + vq + `: growing image "rvm-disk-0.img" from 2 MiB to 8 MiB needs 6 MiB, and the volume's quota refused it (disk quota exceeded); the volume has 7.5 GiB free of 10 GiB; ` + quotaAdvice + "; the image stays at 4 MiB"))
 				Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 				Expect(events).To(Equal([]growEvent{
 					{off: 2 << 20, len: 1 << 20}, {off: 3 << 20, len: 1 << 20}, {off: 4 << 20, len: 1 << 20}, {sync: true},

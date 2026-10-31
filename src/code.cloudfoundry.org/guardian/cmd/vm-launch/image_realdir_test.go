@@ -284,8 +284,16 @@ var _ = Describe("an image on the directory named by "+imageDirEnv, func() {
 		_, err := nfsProvider{}.Prepare(nfsRequest())
 		GinkgoWriter.Printf("error: %v\n", err)
 		Expect(err).To(HaveOccurred())
-		Expect(errors.Is(err, unix.ENOSPC) || errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
-		Expect(err.Error()).To(HaveSuffix("(the volume's quota refused it)"))
+		// The free space that fstatfs reports refuses an image that is larger
+		// than it, before anything is written. A server whose accounting lags
+		// its enforcement can still refuse the allocation itself, and then the
+		// line says so in the same words.
+		if errors.Is(err, errVolumeFull) {
+			Expect(err.Error()).To(ContainSubstring(", and the volume has "))
+		} else {
+			Expect(errors.Is(err, unix.ENOSPC) || errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
+			Expect(err.Error()).To(ContainSubstring(", and the volume's quota refused it ("))
+		}
 		Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 		entries, rerr := os.ReadDir(dir)
 		Expect(rerr).NotTo(HaveOccurred())

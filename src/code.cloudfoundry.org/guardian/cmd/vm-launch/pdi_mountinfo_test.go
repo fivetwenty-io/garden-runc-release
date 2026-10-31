@@ -537,7 +537,8 @@ var _ = Describe("the real kernel's mount ID and the real mount table", func() {
 		Expect(now.MountRoot).To(BeTrue())
 		Expect(now.MountID).NotTo(Equal(before.MountID))
 
-		opts := imageOptions{Size: defaultImageSize, LockWait: time.Millisecond, LockPoll: time.Millisecond, IsMountRoot: alwaysMountRoot}
+		// The tmpfs holds 1 MiB, so the image is small enough for the quota check.
+		opts := imageOptions{Size: 256 << 10, LockWait: time.Millisecond, LockPoll: time.Millisecond, IsMountRoot: alwaysMountRoot}
 		_, err = openVolumeImage(&guestVolume{ContainerDir: dir, ImageName: "rvm-disk-0.img", MountID: before.MountID, MountIDKnown: true}, opts, nil)
 		Expect(errors.Is(err, errMountChanged)).To(BeTrue(), "%v", err)
 		entries, err := os.ReadDir(dir)
