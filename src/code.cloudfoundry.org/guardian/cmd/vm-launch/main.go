@@ -588,6 +588,10 @@ func run(argv []string, logger *log.Logger) int {
 			logger.Print(err)
 			return stepExitCode(err)
 		}
+		if err := checkAttachment(provider, att); err != nil {
+			logger.Print(err)
+			return exitLaunchError
+		}
 		defer func() {
 			if err := att.Release(); err != nil {
 				logger.Printf("releasing the volume image: %v", err)

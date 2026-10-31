@@ -307,13 +307,13 @@ func mountinfoLine(id int, point, fstype string) string {
 	return fmt.Sprintf("%d 29 0:%d / %s rw,relatime shared:%d - %s src rw\n", id, id, point, id, fstype)
 }
 
-var _ = Describe("checkVolumeProvider", func() {
+var _ = Describe("findVolumeProvider", func() {
 	infoFile := func(lines ...string) string {
 		return writeTempFile("mountinfo", strings.Join(lines, ""))
 	}
 
 	It("accepts a JuiceFS mount", func() {
-		Expect(checkVolumeProvider(infoFile(mountinfoLine(40, "/data", "fuse.juicefs")), "/data")).To(Succeed())
+		Expect(findVolumeProviderErr(infoFile(mountinfoLine(40, "/data", "fuse.juicefs")), "/data")).To(Succeed())
 	})
 
 	It("accepts a JuiceFS mount among other mounts and a line with optional fields", func() {
@@ -322,16 +322,16 @@ var _ = Describe("checkVolumeProvider", func() {
 			"41 30 0:41 / /data rw,nosuid shared:5 master:2 propagate_from:3 - fuse.juicefs JuiceFS:vol rw,user_id=0\n",
 			mountinfoLine(42, "/proc", "proc"),
 		)
-		Expect(checkVolumeProvider(info, "/data")).To(Succeed())
+		Expect(findVolumeProviderErr(info, "/data")).To(Succeed())
 	})
 
 	It("accepts a line with no optional fields", func() {
-		Expect(checkVolumeProvider(infoFile("41 30 0:41 / /data rw - fuse.juicefs JuiceFS:vol rw\n"), "/data")).To(Succeed())
+		Expect(findVolumeProviderErr(infoFile("41 30 0:41 / /data rw - fuse.juicefs JuiceFS:vol rw\n"), "/data")).To(Succeed())
 	})
 
 	It("refuses every other filesystem type and names it", func() {
 		for _, fstype := range []string{"nfs", "nfs4", "fuse.mapfs", "ext4", "fuse", "juicefs", "fuse.juicefs2", "FUSE.JUICEFS"} {
-			err := checkVolumeProvider(infoFile(mountinfoLine(40, "/data", fstype)), "/data")
+			err := findVolumeProviderErr(infoFile(mountinfoLine(40, "/data", fstype)), "/data")
 			Expect(err).To(HaveOccurred(), fstype)
 			Expect(err.Error()).To(ContainSubstring(strconv.Quote(fstype)), fstype)
 			Expect(err.Error()).To(ContainSubstring("VM backends support only JuiceFS volumes today"), fstype)
@@ -349,7 +349,7 @@ var _ = Describe("checkVolumeProvider", func() {
 			"a line with no dash":  {"41 30 0:41 / /data rw shared:1 fuse.juicefs src rw\n", "/data"},
 			"a dash and no fstype": {"41 30 0:41 / /data rw -\n", "/data"},
 		} {
-			err := checkVolumeProvider(infoFile(c.info), c.dir)
+			err := findVolumeProviderErr(infoFile(c.info), c.dir)
 			Expect(err).To(HaveOccurred(), name)
 			Expect(err.Error()).To(ContainSubstring("no mount"), name)
 			Expect(err.Error()).To(ContainSubstring("VM backends support only JuiceFS volumes today"), name)
@@ -357,28 +357,28 @@ var _ = Describe("checkVolumeProvider", func() {
 	})
 
 	It("refuses when the mount table cannot be read", func() {
-		err := checkVolumeProvider(filepath.Join(GinkgoT().TempDir(), "absent"), "/data")
+		err := findVolumeProviderErr(filepath.Join(GinkgoT().TempDir(), "absent"), "/data")
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("reading"))
 	})
 
 	It("refuses when reading the mount table fails part way", func() {
-		err := checkVolumeProvider(GinkgoT().TempDir(), "/data")
+		err := findVolumeProviderErr(GinkgoT().TempDir(), "/data")
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("reading"))
 
 		long := mountinfoLine(40, "/data", "fuse.juicefs") + strings.Repeat("x", 2<<20) + "\n"
-		err = checkVolumeProvider(infoFile(long), "/data")
+		err = findVolumeProviderErr(infoFile(long), "/data")
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("reading"))
 	})
 
 	It("matches the mount point exactly, not by prefix", func() {
 		info := infoFile(mountinfoLine(40, "/data", "fuse.juicefs"), mountinfoLine(41, "/data/vol", "nfs4"), mountinfoLine(42, "/data-old", "ext4"))
-		Expect(checkVolumeProvider(info, "/data")).To(Succeed())
-		err := checkVolumeProvider(info, "/data/vol")
+		Expect(findVolumeProviderErr(info, "/data")).To(Succeed())
+		err := findVolumeProviderErr(info, "/data/vol")
 		Expect(err).To(MatchError(ContainSubstring(`"nfs4"`)))
-		err = checkVolumeProvider(info, "/data-old")
+		err = findVolumeProviderErr(info, "/data-old")
 		Expect(err).To(MatchError(ContainSubstring(`"ext4"`)))
 	})
 
@@ -390,39 +390,39 @@ var _ = Describe("checkVolumeProvider", func() {
 			mountinfoLine(43, `/nl\012dir`, "nfs4"),
 			mountinfoLine(44, `/data\040`, "ext4"),
 		)
-		Expect(checkVolumeProvider(info, "/my data")).To(Succeed())
-		Expect(checkVolumeProvider(info, "/tab\tdir")).To(Succeed())
-		Expect(checkVolumeProvider(info, `/back\slash`)).To(Succeed())
-		Expect(checkVolumeProvider(info, "/nl\ndir")).To(MatchError(ContainSubstring(`"nfs4"`)))
+		Expect(findVolumeProviderErr(info, "/my data")).To(Succeed())
+		Expect(findVolumeProviderErr(info, "/tab\tdir")).To(Succeed())
+		Expect(findVolumeProviderErr(info, `/back\slash`)).To(Succeed())
+		Expect(findVolumeProviderErr(info, "/nl\ndir")).To(MatchError(ContainSubstring(`"nfs4"`)))
 		// The escaped text is not the path.
-		Expect(checkVolumeProvider(info, `/my\040data`)).To(MatchError(ContainSubstring("no mount")))
-		Expect(checkVolumeProvider(info, "/data ")).To(MatchError(ContainSubstring(`"ext4"`)))
+		Expect(findVolumeProviderErr(info, `/my\040data`)).To(MatchError(ContainSubstring("no mount")))
+		Expect(findVolumeProviderErr(info, "/data ")).To(MatchError(ContainSubstring(`"ext4"`)))
 	})
 
 	It("leaves a malformed escape as written", func() {
 		info := infoFile(mountinfoLine(40, `/a\04`, "fuse.juicefs"), mountinfoLine(41, `/b\9zz`, "fuse.juicefs"))
-		Expect(checkVolumeProvider(info, `/a\04`)).To(Succeed())
-		Expect(checkVolumeProvider(info, `/b\9zz`)).To(Succeed())
+		Expect(findVolumeProviderErr(info, `/a\04`)).To(Succeed())
+		Expect(findVolumeProviderErr(info, `/b\9zz`)).To(Succeed())
 	})
 
 	It("leaves an escape above \\377 as written, since it is not a byte", func() {
 		info := infoFile(mountinfoLine(40, `/a\400b`, "fuse.juicefs"), mountinfoLine(41, `/c\777`, "fuse.juicefs"))
-		Expect(checkVolumeProvider(info, `/a\400b`)).To(Succeed())
-		Expect(checkVolumeProvider(info, `/c\777`)).To(Succeed())
-		Expect(checkVolumeProvider(info, "/a\x00b")).To(MatchError(ContainSubstring("no mount")))
+		Expect(findVolumeProviderErr(info, `/a\400b`)).To(Succeed())
+		Expect(findVolumeProviderErr(info, `/c\777`)).To(Succeed())
+		Expect(findVolumeProviderErr(info, "/a\x00b")).To(MatchError(ContainSubstring("no mount")))
 	})
 
 	It("uses the last entry when a later mount shadows the same path", func() {
 		both := func(first, second string) string {
 			return infoFile(mountinfoLine(40, "/data", first), mountinfoLine(50, "/proc", "proc"), mountinfoLine(60, "/data", second))
 		}
-		Expect(checkVolumeProvider(both("nfs4", "fuse.juicefs"), "/data")).To(Succeed())
-		err := checkVolumeProvider(both("fuse.juicefs", "ext4"), "/data")
+		Expect(findVolumeProviderErr(both("nfs4", "fuse.juicefs"), "/data")).To(Succeed())
+		err := findVolumeProviderErr(both("fuse.juicefs", "ext4"), "/data")
 		Expect(err).To(MatchError(ContainSubstring(`"ext4"`)))
 	})
 
 	It("never repeats VCAP_SERVICES", func() {
-		err := checkVolumeProvider(infoFile(mountinfoLine(40, "/data", "nfs4")), "/data")
+		err := findVolumeProviderErr(infoFile(mountinfoLine(40, "/data", "nfs4")), "/data")
 		Expect(err.Error()).NotTo(ContainSubstring(secretSentinel))
 		Expect(err.Error()).NotTo(ContainSubstring("VCAP_SERVICES"))
 	})

@@ -19,9 +19,9 @@ import (
 	. "github.com/onsi/gomega"
 )
 
-// checkVolumeProvider is the mount table check as main runs it, reduced to
-// its error, which is what the specs of the table lookup look at.
-func checkVolumeProvider(mountinfo, dir string) error {
+// findVolumeProviderErr is the error findVolumeProvider returns, which is
+// all the specs of the registry's refusals look at.
+func findVolumeProviderErr(mountinfo, dir string) error {
 	_, _, err := findVolumeProvider(mountinfo, dir)
 	return err
 }
@@ -106,14 +106,14 @@ var _ = Describe("the volume provider registry", func() {
 			{[]diskProvider{fake("A", "fuse.a", strongMatch), fake("B", "fuse.b", strongMatch), fake("C", "fuse.c", strongMatch)}, "A, B, and C"},
 		} {
 			withProviders(c.providers...)
-			err := checkVolumeProvider(writeTempFile("mountinfo", mountinfoLine(40, "/data", "nfs4")), "/data")
+			err := findVolumeProviderErr(writeTempFile("mountinfo", mountinfoLine(40, "/data", "nfs4")), "/data")
 			Expect(err).To(MatchError(HaveSuffix("; VM backends support only "+c.names+" volumes today")), c.names)
 			empty := writeTempFile("mountinfo", "")
-			err = checkVolumeProvider(empty, "/data")
+			err = findVolumeProviderErr(empty, "/data")
 			Expect(err).To(MatchError(`volume path "/data" has no mount entry in `+empty+"; VM backends support only "+c.names+" volumes today"), c.names)
 		}
 		withProviders(fake("A", "fuse.a", strongMatch), fake("B", "fuse.b", strongMatch))
-		Expect(checkVolumeProvider(writeTempFile("mountinfo", mountinfoLine(40, "/data", "fuse.b")), "/data")).To(Succeed())
+		Expect(findVolumeProviderErr(writeTempFile("mountinfo", mountinfoLine(40, "/data", "fuse.b")), "/data")).To(Succeed())
 	})
 
 	It("keeps the providers in name order, whatever order they register in", func() {
@@ -410,6 +410,42 @@ p=; for a in "$@"; do [ "$p" = --config-file ] && { cp "$a" `+shellQuote(filepat
 		Expect(got.Signals).NotTo(BeNil())
 		Expect(argvFile).NotTo(BeAnExistingFile())
 		Expect(os.ReadDir(tmp)).To(BeEmpty())
+	})
+
+	It("exits 125 and names the provider when Prepare returns an unusable attachment without an error", func() {
+		for name, c := range map[string]struct {
+			make func(f *os.File, released *bool) *attachment
+			want string
+		}{
+			"no attachment": {func(*os.File, *bool) *attachment { return nil }, "returned no attachment"},
+			"no file": {func(_ *os.File, released *bool) *attachment {
+				return &attachment{Release: func() error { *released = true; return nil }}
+			}, "returned no disk file"},
+			"no Release": {func(f *os.File, _ *bool) *attachment { return &attachment{File: f} }, "returned no Release function"},
+		} {
+			f, err := os.CreateTemp(out, "disk")
+			Expect(err).NotTo(HaveOccurred())
+			released := false
+			att := c.make(f, &released)
+			if att != nil && att.File != nil {
+				defer f.Close()
+			}
+			p := fake("Fake", "fuse.juicefs", strongMatch)
+			p.prepare = func(prepareRequest) (*attachment, error) { return att, nil }
+			withProviders(p)
+			logBuf.Reset()
+			argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+			Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError), name)
+			Expect(logBuf.String()).To(HaveSuffix("the Fake volume provider prepared the disk without an error but "+c.want+"\n"), name)
+			Expect(argvFile).NotTo(BeAnExistingFile(), name)
+			Expect(os.ReadDir(tmp)).To(BeEmpty(), name)
+			if name == "no file" {
+				Expect(released).To(BeTrue(), "the half-built attachment is released")
+			}
+			if name == "no Release" {
+				Expect(f.Close()).NotTo(Succeed(), "the file was closed")
+			}
+		}
 	})
 
 	It("releases the attachment after the hypervisor exits, and logs a release that fails", func() {
