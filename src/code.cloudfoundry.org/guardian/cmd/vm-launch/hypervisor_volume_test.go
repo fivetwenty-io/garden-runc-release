@@ -445,6 +445,18 @@ var _ = Describe("hypervisor drives for several volumes", func() {
 			Expect(drives).To(BeEmpty())
 			Expect(initrdPath).To(Equal(goldenInitrd))
 		})
+
+		It("gives an attachment without a file a drive with no path that keeps its volume index, and a nil attachment the index -1", func() {
+			img := open()
+			files, drives, _, _, _ := hypervisorFiles([]*attachment{{File: img, Mode: attachFileImage, ID: "vol0", Index: 0}, {Mode: attachBlock, Index: 2}, nil}, open(), nil, nil)
+			Expect(files).To(HaveLen(4))
+			Expect(files[1]).To(BeNil())
+			Expect(files[2]).To(BeNil())
+			Expect(drives).To(HaveLen(3))
+			Expect(drives[0].path).To(Equal(procSelfFD(3)))
+			Expect(drives[1]).To(Equal(volumeDrive{index: 2}))
+			Expect(drives[2]).To(Equal(volumeDrive{index: -1}))
+		})
 	})
 
 	It("gives QEMU one drive for each volume, in volume order, after the NIC and before the monitor and the root drive", func() {
@@ -490,8 +502,14 @@ var _ = Describe("hypervisor drives for several volumes", func() {
 			work := GinkgoT().TempDir()
 			_, err := hypervisorArgv(kind, goldenArt, work, procSelfFD(8), goldenMemMiB, task, drivePathsFor(5), "", 0)
 			Expect(err).To(MatchError("5 volume drives, over the 4 a guest can have"), string(kind))
-			_, err = hypervisorArgv(kind, goldenArt, work, procSelfFD(5), goldenMemMiB, task, []volumeDrive{drivePathsFor(1)[0], {}}, "", 0)
+			_, err = hypervisorArgv(kind, goldenArt, work, procSelfFD(5), goldenMemMiB, task, []volumeDrive{drivePathsFor(1)[0], {index: 1}}, "", 0)
 			Expect(err).To(MatchError("volume drive vol1 has no path"), string(kind))
+			// A share at volume index 1 takes no drive, so the second
+			// drive is volume 2's, and the error names it by its index.
+			_, err = hypervisorArgv(kind, goldenArt, work, procSelfFD(5), goldenMemMiB, task, []volumeDrive{drivePathsFor(1)[0], {index: 2}}, "", 0)
+			Expect(err).To(MatchError("volume drive vol2 has no path"), string(kind))
+			_, err = hypervisorArgv(kind, goldenArt, work, procSelfFD(5), goldenMemMiB, task, []volumeDrive{drivePathsFor(1)[0], {index: -1}}, "", 0)
+			Expect(err).To(MatchError("the volume drive at place 1 among the drives has no path and no volume index"), string(kind))
 			Expect(os.ReadDir(work)).To(BeEmpty(), string(kind))
 		}
 	})
