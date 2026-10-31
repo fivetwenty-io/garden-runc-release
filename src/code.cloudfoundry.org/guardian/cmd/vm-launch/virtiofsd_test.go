@@ -921,6 +921,30 @@ var _ = Describe("the virtiofsd of each share", func() {
 		Expect(logBuf.String()).NotTo(ContainSubstring("killing the hypervisor"))
 	})
 
+	It("gives a virtiofsd its stop grace when run stops it before the reap's own stop has begun", func() {
+		s, rec := servers(vfsServe, 1)
+		s.stopGrace = 5 * time.Second
+		Expect(s.start(nil)).To(Succeed())
+		g, done, _ := guest()
+		s.guestStarted(g.Process)
+		pid := recordedPid(rec, 0)
+		Expect(g.Process.Kill()).To(Succeed())
+		<-done
+		// The reap is recorded, as hypervisorReaped does before it hands the
+		// stop to a goroutine, and that goroutine has not run yet when run
+		// returns from the supervisor and ends the servers itself. The
+		// virtiofsd sees the disconnect a moment later, and run's stop must
+		// wait for it and for its last line instead of killing it at once.
+		_, first := s.markReaped()
+		Expect(first).To(BeTrue())
+		time.AfterFunc(200*time.Millisecond, func() { _ = os.WriteFile(gone, nil, 0o600) })
+		s.guestEnded()
+		Expect(processGone(pid)).To(BeTrue())
+		Expect(s.servers[0].state.Success()).To(BeTrue())
+		Expect(logBuf.String()).To(HaveSuffix("Client disconnected, shutting down\n"))
+		Expect(logBuf.String()).NotTo(ContainSubstring("killing"))
+	})
+
 	It("kills QEMU as it starts when a virtiofsd has already ended", func() {
 		s, _ := servers(vfsCrash, 1)
 		Expect(s.start(nil)).To(Succeed())

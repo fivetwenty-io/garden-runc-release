@@ -696,21 +696,25 @@ func (s *shareServers) guestStarted(p *os.Process) {
 
 // markReaped records that QEMU has been reaped, or that run is past the
 // supervisor without one, and closes guestDone. It reports whether this
-// call was the one that did, and the grace each virtiofsd then gets, which
-// is the stop grace when QEMU ran, since virtiofsd sees it disconnect, and none
-// when QEMU never started, since nothing will ever connect.
+// call was the one that did. It also reports the grace each virtiofsd gets
+// to end on its own, which is the stop grace when QEMU ran, since virtiofsd
+// sees it disconnect, and none when QEMU never started, since nothing will
+// ever connect. Every call reports that grace, the later ones too, because
+// the stop that the first call's caller starts in the background may not
+// have begun when run's own stop asks, and then run's stop is the one that
+// counts.
 func (s *shareServers) markReaped() (grace time.Duration, first bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.guest != nil {
+		grace = s.stopGrace
+	}
 	if s.guestReaped {
-		return 0, false
+		return grace, false
 	}
 	s.guestReaped = true
 	close(s.guestDone)
-	if s.guest != nil {
-		return s.stopGrace, true
-	}
-	return 0, true
+	return grace, true
 }
 
 // hypervisorReaped is the supervisor's reaped hook, which runs as soon as
