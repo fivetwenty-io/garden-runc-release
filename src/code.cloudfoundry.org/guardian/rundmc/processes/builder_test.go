@@ -1325,3 +1325,162 @@ var _ = Describe("ProcBuilder", func() {
 func ptr(i uint64) *uint64 {
 	return &i
 }
+
+var _ = Describe("the volume flags of the wrapped vm-launch", func() {
+	const (
+		kvmGid        = 108
+		virtiofsdPath = "/opt/garden-vm/artifacts/virtiofsd/virtiofsd-wrapper"
+	)
+
+	var (
+		envDeterminer *fakes.FakeEnvDeterminer
+		bndl          goci.Bndl
+		processSpec   garden.ProcessSpec
+		user          *users.ExecUser
+		kind          backend.Kind
+		marked        bool
+		builderOpts   []processes.Option
+		builtEnv      []string
+	)
+
+	launcherArgs := []string{"--backend", "vm-qemu", "--", "/tmp/lifecycle/launcher", "app", "true", ""}
+
+	BeforeEach(func() {
+		envDeterminer = new(fakes.FakeEnvDeterminer)
+		builtEnv = []string{"A=b"}
+		bndl = goci.Bundle().WithCapabilities("CAP_CHOWN", "CAP_KILL")
+		kind = backend.VMQemu
+		marked = true
+		builderOpts = []processes.Option{processes.WithKVMGid(kvmGid)}
+		processSpec = garden.ProcessSpec{Path: processes.VMLaunchPath, Args: launcherArgs, Env: []string{"A=b"}}
+		user = &users.ExecUser{Uid: 2000, Gid: 2000}
+	})
+
+	build := func() *specs.Process {
+		GinkgoHelper()
+		envDeterminer.EnvForReturns(builtEnv)
+		bndl.Spec.Annotations = map[string]string{backend.AnnotationKey: string(kind)}
+		spec := processSpec
+		if marked {
+			spec = processes.MarkVMLaunch(spec)
+		}
+		return processes.NewBuilder(envDeterminer, []string{"CAP_CHOWN", "CAP_KILL"}, builderOpts...).BuildProcess(bndl, spec, user)
+	}
+
+	Describe("VMLaunchVolumeFlags", func() {
+		DescribeTable("renders the flags for each setting",
+			func(allowShares bool, path string, syncMounts bool, expected []string) {
+				Expect(processes.VMLaunchVolumeFlags(allowShares, path, syncMounts)).To(Equal(expected))
+			},
+			Entry("the defaults pass nothing", false, virtiofsdPath, true, []string(nil)),
+			Entry("shares on pass the allow flag and the path", true, virtiofsdPath, true,
+				[]string{"--allow-volume-shares", "--virtiofsd-path", virtiofsdPath}),
+			Entry("shares on without a path pass the allow flag alone", true, "", true,
+				[]string{"--allow-volume-shares"}),
+			Entry("shares off never pass the path", false, virtiofsdPath, true, []string(nil)),
+			Entry("synchronous mounts off pass only that flag", false, virtiofsdPath, false,
+				[]string{"--volume-sync-mounts=false"}),
+			Entry("both pass all three flags in a fixed order", true, virtiofsdPath, false,
+				[]string{"--allow-volume-shares", "--virtiofsd-path", virtiofsdPath, "--volume-sync-mounts=false"}),
+		)
+
+		It("names the flags vm-launch reads", func() {
+			Expect(processes.VMLaunchAllowVolumeSharesFlag).To(Equal("--allow-volume-shares"))
+			Expect(processes.VMLaunchVirtiofsdFlag).To(Equal("--virtiofsd-path"))
+			Expect(processes.VMLaunchVolumeSyncMountsFlag).To(Equal("--volume-sync-mounts"))
+		})
+	})
+
+	Context("when no flag is set", func() {
+		It("builds the argv it built before: the path, then vm-launch's own arguments", func() {
+			Expect(build().Args).To(Equal(append([]string{processes.VMLaunchPath}, launcherArgs...)))
+		})
+
+		It("builds the same argv when the option is given an empty list", func() {
+			builderOpts = append(builderOpts, processes.WithVMLaunchFlags())
+			Expect(build().Args).To(Equal(append([]string{processes.VMLaunchPath}, launcherArgs...)))
+		})
+	})
+
+	Context("with shares allowed", func() {
+		BeforeEach(func() {
+			builderOpts = append(builderOpts, processes.WithVMLaunchFlags(processes.VMLaunchVolumeFlags(true, virtiofsdPath, true)...))
+		})
+
+		It("puts the share flags between the path and vm-launch's own arguments", func() {
+			Expect(build().Args).To(Equal(append(
+				[]string{processes.VMLaunchPath, "--allow-volume-shares", "--virtiofsd-path", virtiofsdPath},
+				launcherArgs...)))
+		})
+
+		It("passes them to a vm-firecracker vm-launch too, which refuses a share itself", func() {
+			kind = backend.VMFirecracker
+			Expect(build().Args[:2]).To(Equal([]string{processes.VMLaunchPath, "--allow-volume-shares"}))
+		})
+	})
+
+	Context("with synchronous mounts off", func() {
+		BeforeEach(func() {
+			builderOpts = append(builderOpts, processes.WithVMLaunchFlags(processes.VMLaunchVolumeFlags(false, virtiofsdPath, false)...))
+		})
+
+		It("passes --volume-sync-mounts=false alone", func() {
+			Expect(build().Args).To(Equal(append(
+				[]string{processes.VMLaunchPath, "--volume-sync-mounts=false"},
+				launcherArgs...)))
+		})
+	})
+
+	Context("with every flag set", func() {
+		BeforeEach(func() {
+			builderOpts = append(builderOpts, processes.WithVMLaunchFlags(processes.VMLaunchVolumeFlags(true, virtiofsdPath, false)...))
+		})
+
+		It("passes all three", func() {
+			Expect(build().Args).To(Equal(append(
+				[]string{processes.VMLaunchPath, "--allow-volume-shares", "--virtiofsd-path", virtiofsdPath, "--volume-sync-mounts=false"},
+				launcherArgs...)))
+		})
+
+		It("puts the transparent proxy flag first for a vm-firecracker vm-launch with PORT", func() {
+			kind = backend.VMFirecracker
+			builtEnv = []string{"A=b", "PORT=8080"}
+
+			Expect(build().Args).To(Equal(append(
+				[]string{processes.VMLaunchPath, "--transparent-proxy", "--allow-volume-shares", "--virtiofsd-path", virtiofsdPath, "--volume-sync-mounts=false"},
+				launcherArgs...)))
+		})
+
+		It("adds nothing to a vm-launch run without the containerizer's marker", func() {
+			marked = false
+			Expect(build().Args).To(Equal(append([]string{processes.VMLaunchPath}, launcherArgs...)))
+		})
+
+		It("adds nothing to a process other than vm-launch in a vm bundle", func() {
+			processSpec = garden.ProcessSpec{Path: "/bin/ls", Args: []string{"-l"}}
+			Expect(build().Args).To(Equal([]string{"/bin/ls", "-l"}))
+		})
+
+		It("adds nothing in a bundle that is not a vm one", func() {
+			kind = backend.OCIRunc
+			Expect(build().Args).To(Equal(append([]string{processes.VMLaunchPath}, launcherArgs...)))
+		})
+	})
+
+	It("keeps its own copy of the list", func() {
+		flags := []string{"--allow-volume-shares"}
+		builderOpts = append(builderOpts, processes.WithVMLaunchFlags(flags...))
+		flags[0] = "--changed"
+
+		Expect(build().Args[1]).To(Equal("--allow-volume-shares"))
+	})
+
+	It("does not let one build change the next", func() {
+		builderOpts = append(builderOpts, processes.WithVMLaunchFlags("--volume-sync-mounts=false"))
+		first := build().Args
+		second := build().Args
+
+		Expect(second).To(Equal(first))
+		Expect(second).To(Equal(append([]string{processes.VMLaunchPath, "--volume-sync-mounts=false"}, launcherArgs...)))
+	})
+})

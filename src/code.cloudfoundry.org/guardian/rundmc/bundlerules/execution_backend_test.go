@@ -427,3 +427,10 @@ var _ = Describe("ExecutionBackendRule", func() {
 		})
 	}
 })
+
+var _ = Describe("the virtiofsd wrapper's path in a vm-* container", func() {
+	It("sits under the artifacts mount, where the runtime config installs it", func() {
+		Expect(bundlerules.VMVirtiofsdPath).To(Equal("/opt/garden-vm/artifacts/virtiofsd/virtiofsd-wrapper"))
+		Expect(bundlerules.VMVirtiofsdPath).To(HavePrefix(bundlerules.VMArtifactsMountPath + "/"))
+	})
+})

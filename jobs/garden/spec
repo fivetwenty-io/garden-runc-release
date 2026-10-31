@@ -281,6 +281,47 @@ properties:
       used when at least one vm-* entry is listed in garden.execution_backends.
     default: /var/vcap/data/vm-runtime/artifacts
 
+  garden.vm_block_volumes:
+    description: |
+      Give a vm-* container the host block device that a pdi: descriptor bind
+      mount names, such as a BOSH persistent disk that the bosh-disk plan
+      serves in block mode. Garden makes a root:kvm 0660 device node for it at
+      /dev/pdi/MAJOR-MINOR and allows the container to use it, and it refuses
+      a container whose device has the wrong size or is mounted, held, or
+      busy on the host. Off by default, and then a container never gets a
+      device. It renders --vm-block-volumes, and it requires a vm-* entry in
+      garden.execution_backends.
+    default: false
+
+  garden.vm_volume_shares:
+    description: |
+      Let an app on a vm-qemu container ask for a volume as a share, by
+      setting "mode": "share" for the volume path in VM_VOLUMES, so that
+      several instances see one directory through virtiofs. Off by default,
+      and then vm-launch refuses a share request and the app fails to start
+      with exit status 125. A vm-firecracker container cannot serve a share
+      whatever the value. Garden passes --allow-volume-shares and, from the artifacts
+      directory, the path /opt/garden-vm/artifacts/virtiofsd/virtiofsd-wrapper
+      as --virtiofsd-path to vm-launch, so the wrapper must be installed
+      there before an app asks for a share. File locks do not cross guests on
+      a share. It renders --vm-volume-shares, and it requires a vm-* entry in
+      garden.execution_backends.
+    default: false
+
+  garden.vm_volume_sync_mounts:
+    description: |
+      Mount a journalled ext4 image volume of a vm-* container with sync and
+      dirsync, which makes each write reach the volume before the app goes
+      on. The default, true, keeps today's behaviour. Set it to false to drop
+      both options and trade that safety for speed, since the journal still
+      keeps the filesystem consistent. A legacy ext2 image without a journal
+      keeps sync and dirsync whatever the value, and a block volume is not
+      affected. The job renders --vm-volume-async-mounts only when the value
+      is false, and Garden then passes --volume-sync-mounts=false to
+      vm-launch, so the default changes no argument. Setting false requires a
+      vm-* entry in garden.execution_backends.
+    default: true
+
   garden.tcp_keepalive_time:
     description: Sets the `net.ipv4.tcp_keepalive_time` kernel parameter in containers. If not specified, the value from the linux init_net namespace is used.
 
