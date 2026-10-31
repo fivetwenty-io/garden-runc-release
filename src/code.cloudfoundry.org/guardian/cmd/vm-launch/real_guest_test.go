@@ -42,6 +42,18 @@ func bootRealGuest(g guestContents) string {
 // order, and the guest root image root, either of which can be nil, and with
 // g as it is, so g names the root image's size when root is not nil.
 func bootRealGuestWith(g guestContents, vols []*os.File, root *os.File) string {
+	stdout := bootRealGuestEdited(g, vols, root, nil)
+	Expect(stdout).To(ContainSubstring(startTag(testNonce)), stdout)
+	return stdout
+}
+
+// bootRealGuestEdited is bootRealGuestWith that hands QEMU's argv and file
+// list to edit, when it is not nil, and boots with what edit returns, so a
+// spec can give the hypervisor drives that differ from the ones /rvm/disks
+// names. It does not require the start tag, since a guest that fails its
+// setup reboots before it, and QEMU exits 0 after that too. It returns the
+// console output.
+func bootRealGuestEdited(g guestContents, vols []*os.File, root *os.File, edit func(argv []string, files []*os.File) ([]string, []*os.File)) string {
 	art := realArtifacts()
 	qemu := realQEMU()
 	requireMicrovm(qemu)
@@ -49,11 +61,89 @@ func bootRealGuestWith(g guestContents, vols []*os.File, root *os.File) string {
 	Expect(err).NotTo(HaveOccurred())
 	DeferCleanup(f.Close)
 	files, drivePaths, initrdPath, _, rootPath := hypervisorFiles(imageAttachments(vols...), withUserspaceMark(f), nil, root)
-	argv := markedArgv(tcgArgv(qemu, withRealRootDrive(qemuArgv(art, initrdPath, minGuestMemoryMiB, g.nw, drivePaths, 0), rootPath)))
-	code, stdout, stderr := bootRealQEMU(argv, files)
+	argv := withRealRootDrive(qemuArgv(art, initrdPath, minGuestMemoryMiB, g.nw, drivePaths, 0), rootPath)
+	if edit != nil {
+		argv, files = edit(argv, files)
+	}
+	code, stdout, stderr := bootRealQEMU(markedArgv(tcgArgv(qemu, argv)), files)
 	Expect(code).To(Equal(0), "QEMU failed: %s\n%s", stderr, stdout)
-	Expect(stdout).To(ContainSubstring(startTag(testNonce)), stdout)
 	return stdout
+}
+
+// withDriveSerials returns argv with the serial of each virtio-blk device
+// that serials names, by the id of the device's drive, set to the value
+// given. It fails the spec unless argv holds exactly one device for each id,
+// so a drive that was renamed cannot leave a spec passing with nothing
+// changed.
+func withDriveSerials(argv []string, serials map[string]string) []string {
+	out := slices.Clone(argv)
+	for id, serial := range serials {
+		prefix := "virtio-blk-device,drive=" + id + ",serial="
+		n := 0
+		for i, a := range out {
+			if strings.HasPrefix(a, prefix) {
+				out[i] = prefix + serial
+				n++
+			}
+		}
+		Expect(n).To(Equal(1), "%d virtio-blk devices for the drive %s in %q", n, id, argv)
+	}
+	return out
+}
+
+// extraDriveID names the drive that withExtraDrive adds.
+const extraDriveID = "extra0"
+
+// withExtraDrive returns argv and files with one more virtio-blk drive, the
+// open file extra, after every other. The device gets the serial when it is
+// not empty and none when it is.
+func withExtraDrive(argv []string, files []*os.File, extra *os.File, serial string) ([]string, []*os.File) {
+	path := procSelfFD(firstExtraFD + len(files))
+	device := "virtio-blk-device,drive=" + extraDriveID
+	if serial != "" {
+		device += ",serial=" + serial
+	}
+	argv = slices.Concat(argv, []string{
+		"-drive", "if=none,id=" + extraDriveID + ",file=" + path + ",format=raw,cache=writeback,aio=threads,file.locking=off,werror=report,rerror=report,discard=ignore",
+		"-device", device,
+	})
+	return argv, append(slices.Clone(files), extra)
+}
+
+// imageDigest returns the SHA-256 of all of the image f, from its start, so
+// that two calls tell whether a guest wrote to it between them.
+func imageDigest(f *os.File) string {
+	info, err := f.Stat()
+	Expect(err).NotTo(HaveOccurred())
+	h := sha256.New()
+	_, err = io.Copy(h, io.NewSectionReader(f, 0, info.Size()))
+	Expect(err).NotTo(HaveOccurred())
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// imageHolds reports whether the bytes of the image f hold needle anywhere,
+// which is how a spec finds out which host image a guest file landed on.
+func imageHolds(f *os.File, needle string) bool {
+	const chunk = 1 << 20
+	buf := make([]byte, chunk+len(needle))
+	var off int64
+	// kept is the number of bytes at the start of buf that the last read
+	// ended with, since the needle can straddle two reads.
+	kept := 0
+	for {
+		n, err := f.ReadAt(buf[kept:kept+chunk], off)
+		total := kept + n
+		if bytes.Contains(buf[:total], []byte(needle)) {
+			return true
+		}
+		if errors.Is(err, io.EOF) {
+			return false
+		}
+		Expect(err).NotTo(HaveOccurred())
+		off += int64(n)
+		kept = min(len(needle)-1, total)
+		copy(buf, buf[total-kept:total])
+	}
 }
 
 // realRootBytes is the size of the guest root image of the specs that boot a

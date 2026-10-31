@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -312,6 +313,142 @@ echo "sync-f-volume=$?"
 		Expect(out).To(ContainSubstring(exitTag(testNonce) + "0"))
 		Expect(out).NotTo(ContainSubstring("vm-launch guest setup"), out)
 	})
+})
+
+var _ = Describe("a root and two 1 GiB volumes against a real QEMU", func() {
+	// volumeDirs are the mount paths of the two volumes, in volume order.
+	volumeDirs := []string{"/home/vcap/data", "/home/vcap/logs"}
+
+	// threeDriveGuest returns a guest that runs command with a root image and
+	// the two volumes at volumeDirs, with the identities a launch gives them.
+	threeDriveGuest := func(command string) guestContents {
+		g := taskGuest(command)
+		g.vols = []guestVolume{{ContainerDir: volumeDirs[0], ImageName: "volume.img"}, {ContainerDir: volumeDirs[1], ImageName: "volume.img"}}
+		g.drives.volumes = qemuImageDrives(defaultImageSize, defaultImageSize)
+		withRealRoot(&g)
+		return g
+	}
+
+	// newVolumes returns two blank volume images of defaultImageSize.
+	newVolumes := func() []*os.File {
+		return []*os.File{openSizedFile(defaultImageSize), openSizedFile(defaultImageSize)}
+	}
+
+	// refusedBoot boots the guest with the drives that edit gives QEMU, on
+	// blank images, and expects stage 1 to fail the boot with a line that
+	// matches reason before the command starts, and to leave the root and
+	// both volumes exactly as they were, with no file system on any.
+	refusedBoot := func(edit func(argv []string, files []*os.File) ([]string, []*os.File), reason string) {
+		vols, root := newVolumes(), realRootImage()
+		images := append([]*os.File{root}, vols...)
+		before := make([]string, len(images))
+		for i, img := range images {
+			before[i] = imageDigest(img)
+		}
+
+		g := threeDriveGuest("echo command-ran")
+		stdout := bootRealGuestEdited(g, vols, root, edit)
+
+		Expect(stdout).To(MatchRegexp(`(?m)^vm-launch guest setup: `+reason+`\r?$`), stdout)
+		Expect(stdout).NotTo(ContainSubstring(startTag(testNonce)), stdout)
+		Expect(stdout).NotTo(ContainSubstring("command-ran"), stdout)
+		Expect(stdout).NotTo(ContainSubstring("vm-launch guest setup: mounting"), stdout)
+		for i, img := range images {
+			Expect(imageDigest(img)).To(Equal(before[i]), "image %d changed\n%s", i, stdout)
+			Expect(extLabel(img)).To(BeEmpty(), "image %d holds a file system\n%s", i, stdout)
+		}
+	}
+
+	It("puts each volume on its own drive, so the file that the guest wrote at each mount path is on that volume's image and on no other, and is there at the next boot", func() {
+		markers := []struct{ name, text string }{
+			{"data-marker", "rvm-first-volume-marker-4f9c1a7e"},
+			{"logs-marker", "rvm-second-volume-marker-b27d83e0"},
+		}
+		vols, root := newVolumes(), realRootImage()
+		out := bootRealGuestWith(threeDriveGuest(`echo `+markers[0].text+` >`+volumeDirs[0]+`/`+markers[0].name+`
+echo `+markers[1].text+` >`+volumeDirs[1]+`/`+markers[1].name+`
+`), vols, root)
+		Expect(out).NotTo(ContainSubstring("vm-launch guest setup"), out)
+		Expect(out).To(ContainSubstring(exitTag(testNonce)+"0"), out)
+
+		// Each text is on the image of its own volume, in volume order, and
+		// on neither of the others.
+		holds := func(img *os.File) []bool {
+			return []bool{imageHolds(img, markers[0].text), imageHolds(img, markers[1].text)}
+		}
+		Expect(holds(vols[0])).To(Equal([]bool{true, false}), "the first volume image")
+		Expect(holds(vols[1])).To(Equal([]bool{false, true}), "the second volume image")
+		Expect(holds(root)).To(Equal([]bool{false, false}), "the root image")
+		for i, img := range vols {
+			Expect(extLabel(img)).To(Equal("rvm-volume"), "volume image %d", i)
+		}
+		Expect(extLabel(root)).To(Equal("rvm-root"))
+
+		// A second boot gets a new root and the volumes as they were. Each
+		// marker is at its own mount path, which holds that marker and no
+		// other file.
+		out = bootRealGuestWith(threeDriveGuest(`for p in `+strings.Join(volumeDirs, " ")+`; do
+	echo "files=$p:$(ls $p | grep -v '^lost+found$' | tr '\n' ' ')"
+done
+echo "data=$(cat `+volumeDirs[0]+`/`+markers[0].name+`)"
+echo "logs=$(cat `+volumeDirs[1]+`/`+markers[1].name+`)"
+echo "elsewhere=$(ls `+volumeDirs[0]+`/`+markers[1].name+` `+volumeDirs[1]+`/`+markers[0].name+` 2>/dev/null | wc -l)"
+`), vols, realRootImage())
+		Expect(out).NotTo(ContainSubstring("vm-launch guest setup"), out)
+		Expect(out).To(ContainSubstring(exitTag(testNonce)+"0"), out)
+		Expect(out).To(MatchRegexp(`(?m)^files=`+volumeDirs[0]+`:`+markers[0].name+` \r?$`), out)
+		Expect(out).To(MatchRegexp(`(?m)^files=`+volumeDirs[1]+`:`+markers[1].name+` \r?$`), out)
+		Expect(out).To(MatchRegexp(`(?m)^data=`+markers[0].text+`\r?$`), out)
+		Expect(out).To(MatchRegexp(`(?m)^logs=`+markers[1].text+`\r?$`), out)
+		Expect(out).To(MatchRegexp(`(?m)^elsewhere=0\r?$`), out)
+		for i, img := range vols {
+			Expect(extLabel(img)).To(Equal("rvm-volume"), "volume image %d", i)
+		}
+		Expect(holds(vols[0])).To(Equal([]bool{true, false}), "the first volume image")
+		Expect(holds(vols[1])).To(Equal([]bool{false, true}), "the second volume image")
+	})
+
+	DescribeTable("fails the boot with stage 1's line when QEMU's drive identities are not the ones in /rvm/disks, and formats nothing",
+		func(serials map[string]string, reason string) {
+			refusedBoot(func(argv []string, files []*os.File) ([]string, []*os.File) {
+				return withDriveSerials(argv, serials), files
+			}, reason)
+		},
+		// The root image is 64 MiB and a volume 1 GiB, so a root that carries
+		// the first volume's identity and a volume that carries the root's
+		// is a pair of drives that stage 1 can tell are not the ones it
+		// was told about, by size, whichever it looks at first.
+		Entry("the root and the first volume exchanging identities",
+			map[string]string{rootDriveID: qemuVolumeSerial(0), volumeDriveID(0): qemuRootSerial},
+			fmt.Sprintf(`the (guest root drive|volume drive vol0) /dev/vd[a-z]+ has (%d|%d) sectors, and /rvm/disks gives it (%d|%d), so the guest will not use it`,
+				realRootBytes/sectorBytes, defaultImageSize/sectorBytes, defaultImageSize/sectorBytes, realRootBytes/sectorBytes)),
+		Entry("the second volume carrying an identity that /rvm/disks gives no drive",
+			map[string]string{volumeDriveID(1): "rvm-vol9"},
+			`the block device /dev/vd[a-z]+ has the identity rvm-vol9, which /rvm/disks gives no drive, so the guest will not boot with it`),
+		Entry("both volumes carrying the first volume's identity",
+			map[string]string{volumeDriveID(1): qemuVolumeSerial(0)},
+			`two block devices, /dev/vd[a-z]+ and /dev/vd[a-z]+, have the identity rvm-vol0 of the volume drive vol0, so the guest cannot tell which one it is`),
+		Entry("the root carrying a volume's identity",
+			map[string]string{rootDriveID: qemuVolumeSerial(1)},
+			`(two block devices, /dev/vd[a-z]+ and /dev/vd[a-z]+, have the identity rvm-vol1 of the volume drive vol1, so the guest cannot tell which one it is|the volume drive vol1 /dev/vd[a-z]+ has [0-9]+ sectors, and /rvm/disks gives it [0-9]+, so the guest will not use it)`),
+	)
+
+	DescribeTable("fails the boot with stage 1's line when QEMU gives the guest one more virtio-blk device than /rvm/disks names, and formats nothing",
+		func(serial, reason string) {
+			extra := openSizedFile(defaultImageSize)
+			extraBefore := imageDigest(extra)
+			refusedBoot(func(argv []string, files []*os.File) ([]string, []*os.File) {
+				return withExtraDrive(argv, files, extra, serial)
+			}, reason)
+			Expect(imageDigest(extra)).To(Equal(extraBefore), "the extra image changed")
+		},
+		Entry("a device with an identity that /rvm/disks gives no drive", "rvm-extra",
+			`the block device /dev/vd[a-z]+ has the identity rvm-extra, which /rvm/disks gives no drive, so the guest will not boot with it`),
+		Entry("a device without an identity", "",
+			`the block device /dev/vd[a-z]+ has no identity, so it is no drive /rvm/disks names, and the guest will not boot with it`),
+		Entry("a device with the identity of a volume the guest also has", qemuVolumeSerial(1),
+			`two block devices, /dev/vd[a-z]+ and /dev/vd[a-z]+, have the identity rvm-vol1 of the volume drive vol1, so the guest cannot tell which one it is`),
+	)
 })
 
 // withRealRootGuest returns a guest that runs command on a real root image.
