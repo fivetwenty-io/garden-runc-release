@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -384,14 +386,16 @@ fi
 // busybox calls sync(2) first, which writes every dirty page of the guest
 // root to the root image, data that is discarded at once and that could keep
 // the hypervisor up past its grace period. Each volume has its own flush
-// (see guestVolumeTeardown), and an image volume's mount is synchronous.
+// (see guestVolumeTeardown), and an image volume's mount is synchronous
+// unless the operator turned that off for images with a journal.
 //
 // First, stage 2 defines rvm_fail, which every setup step uses, and turns
 // off console echo. It then mounts /dev/shm, brings up lo and eth0 from
 // /rvm/net (in every guest, a task's included), prepares the open-files
 // limit from /rvm/limits, and checks that /rvm/env sources. A guest with
 // volumes then mounts each one by its kind, formatting only a blank volume
-// image and never a block volume (see guestVolumeSetup). When a setup step
+// image, preening every other image with e2fsck -p, and never formatting or
+// checking a block volume (see guestVolumeSetup). When a setup step
 // fails, stage 2 reboots before the start tag, so vm-launch reports a guest
 // that never started its command and shows the console output, which ends
 // with the failed step. Last before the start tag, stage 2 starts the stop
@@ -775,29 +779,57 @@ const (
 // that stage 1 found by the drive's identity and passed as stage 2's argument
 // in the same place (see guestRootInit), at the path and as the kind that
 // /rvm/mounts gives it (see mountsFile). A count of arguments other than the
-// volume count in /rvm/mounts, a volume without a path, and a kind stage 2
-// does not know are setup failures. The kind decides everything else, and
-// only the image arm can format.
+// volume count in /rvm/mounts, a sync mount setting other than true or false,
+// a volume without a path, and a kind stage 2 does not know are setup
+// failures. The kind decides everything else, and only the image arm can
+// format or check a filesystem.
 //
-// An image volume must have a block device. Stage 2 formats only an image
-// whose first 64 KiB it reads itself as all zero, which is a new image or
-// one whose creator died before the first boot; the host never tells it an
-// image is new. A read error is a setup failure, never a blank image. An
-// image that is not blank and does not mount is never formatted: that is a
-// setup failure for an operator to look at. busybox mke2fs makes ext2, which
-// the kernel's ext4 driver mounts. The sync and dirsync options put every
-// completed write on the image before the syscall returns, because the
-// hypervisors stop at once on SIGTERM, without a guest shutdown, so a
-// failure that reboots after some volumes are mounted loses nothing on them.
+// An image volume must have a block device, and the guest must have the
+// guest filesystem tools that vm-launch puts below guestToolsDir. Stage 2
+// runs them by their full paths and never falls back to busybox's mke2fs,
+// so a missing tool fails the boot before stage 2 reads the device. Stage 2
+// formats only an image whose first 64 KiB it reads itself as all zero,
+// which is a new image or one whose creator died before the first boot; the
+// host never tells it an image is new. A read error is a setup failure,
+// never a blank image. A blank image gets a journalled ext4 from the shipped
+// mke2fs with the pinned mke2fs.conf (see guestVolumeMke2fsArgs). The format
+// skips zeroing the inode tables and the journal, so it never writes the
+// image's whole size, which is safe because vm-launch makes every image with
+// fallocate or zero writes, so every block of a blank image reads as zero.
+//
+// Every image that is not blank is preened with e2fsck -p before it mounts,
+// at every boot. e2fsck(8) gives its exit status as the sum of 1 for errors
+// it corrected, 2 for a corrected system that should reboot, 4 for errors
+// it left, 8 for an operational error, 16 for a usage error, 32 for a
+// cancelled check, and 128 for a library error. A status below 4 lets the
+// boot go on: the reboot that 2 asks for matters only for a mounted
+// filesystem, and the image is not mounted yet, so stage 2 says so and goes
+// on. A status of 4 or more fails the boot with a line that names the image
+// and asks an operator to inspect it, and the image is never formatted.
+// Stage 2 never runs e2fsck -y. An image that is not blank and does not
+// mount after its preen is never formatted either.
+//
+// An image mounts with sync and dirsync, which put every completed write on
+// the image before the syscall returns, because the hypervisors stop at once
+// on SIGTERM, without a guest shutdown, so a failure that reboots after some
+// volumes are mounted loses nothing on them. noinit_itable keeps the kernel
+// from zeroing inode tables, which mke2fs left unwritten and which already
+// read as zero. When the operator turned sync mounts off (see
+// volumeSyncMountsFlag), an image whose filesystem has a journal, as tune2fs
+// -l reports it, mounts without sync and dirsync, because the journal keeps
+// the filesystem consistent through a sudden stop. An image without a
+// journal, such as an rvm.6 ext2 image or a new image too small for one,
+// keeps sync and dirsync, and so does an image whose features tune2fs cannot
+// read, with a line that says so.
 //
 // A block volume is a whole disk that holds the app's data, and stage 2
-// never reads its start, formats it, or checks it. It must have a block
-// device, which stage 2 mounts as ext4 with noatime and errors=remount-ro
-// and without sync or dirsync, so the disk keeps the speed of a local disk;
-// the teardown's sync -f flushes it after the command. A disk that does not
-// mount, a blank one included, fails the boot with a line that names the
-// volume's disk, never an image file, and says vm-launch never formats a
-// block volume.
+// never reads its start, formats it, or checks it, because the volume driver
+// checks it before it hands it over. It must have a block device, which stage
+// 2 mounts as ext4 with noatime and errors=remount-ro and without sync or
+// dirsync, so the disk keeps the speed of a local disk; the teardown's sync
+// -f flushes it after the command. A disk that does not mount, a blank one
+// included, fails the boot with a line that names the volume's disk, never
+// an image file, and says vm-launch never formats a block volume.
 //
 // A share has no drive, so stage 1 passes it an empty argument, and any
 // other argument is a setup failure. Stage 2 does not mount shares; the code
@@ -812,6 +844,10 @@ case "${RVM_VOLUMES:-}" in
 *) rvm_fail "the volume count in /rvm/mounts is not a number from 1 to ` + maxVolumesText + `" ;;
 esac
 [ "$#" -eq "$RVM_VOLUMES" ] || rvm_fail "stage 1 passed $# volume devices for the $RVM_VOLUMES volumes in /rvm/mounts"
+case "${RVM_SYNC_MOUNTS:-}" in
+true | false) ;;
+*) rvm_fail "the sync mount setting in /rvm/mounts is not true or false" ;;
+esac
 rvm_vi=0
 for rvm_vdev in "$@"; do
 	eval "rvm_vkind=\${RVM_VOL${rvm_vi}_KIND:-} rvm_vpath=\${RVM_VOL${rvm_vi}_PATH:-} rvm_vimage=\${RVM_VOL${rvm_vi}_IMAGE:-}"
@@ -819,6 +855,10 @@ for rvm_vdev in "$@"; do
 	case "$rvm_vkind" in
 	` + string(driveImage) + `)
 		[ -b "$rvm_vdev" ] || rvm_fail "no block device for the volume image $rvm_vimage at $rvm_vpath"
+		for rvm_vtool in ` + guestMke2fs + ` ` + guestE2fsck + ` ` + guestTune2fs + `; do
+			[ -f "$rvm_vtool" ] && [ -x "$rvm_vtool" ] || rvm_fail "the guest has no $rvm_vtool for the volume image $rvm_vimage at $rvm_vpath, and it never formats or checks a volume image with another tool"
+		done
+		[ -f ` + guestMke2fsConfig + ` ] && [ -r ` + guestMke2fsConfig + ` ] || rvm_fail "the guest has no ` + guestMke2fsConfig + ` for the volume image $rvm_vimage at $rvm_vpath"
 		mkdir -p "$rvm_vpath" || rvm_fail "creating $rvm_vpath failed"
 		dd if="$rvm_vdev" of=` + guestVolumeHead + ` bs=4096 count=16 || rvm_fail "reading the start of $rvm_vdev failed"
 		tr -d '\000' <` + guestVolumeHead + ` >` + guestVolumeUsed + ` || rvm_fail "checking whether $rvm_vdev is blank failed"
@@ -826,10 +866,27 @@ for rvm_vdev in "$@"; do
 		[ -s ` + guestVolumeHead + ` ] && [ ! -s ` + guestVolumeUsed + ` ] && rvm_blank=1
 		rm -f ` + guestVolumeHead + ` ` + guestVolumeUsed + `
 		if [ -n "$rvm_blank" ]; then
-			mke2fs -F -m 0 -L rvm-volume "$rvm_vdev" || rvm_fail "formatting the blank volume image $rvm_vimage for $rvm_vpath failed"
-			mount -t ext4 -o sync,dirsync,noatime,errors=remount-ro "$rvm_vdev" "$rvm_vpath" || rvm_fail "mounting the newly formatted volume image $rvm_vimage at $rvm_vpath failed"
+			MKE2FS_CONFIG=` + guestMke2fsConfig + ` ` + guestMke2fs + ` ` + guestVolumeMke2fsArgs + ` "$rvm_vdev" || rvm_fail "formatting the blank volume image $rvm_vimage for $rvm_vpath failed"
 		else
-			mount -t ext4 -o sync,dirsync,noatime,errors=remount-ro "$rvm_vdev" "$rvm_vpath" || rvm_fail "mounting the volume image $rvm_vimage at $rvm_vpath failed; it is not blank, so vm-launch will not format it; inspect or delete $rvm_vimage on the volume"
+			rvm_vrc=0
+			` + guestE2fsck + ` -p "$rvm_vdev" || rvm_vrc=$?
+			[ "$rvm_vrc" -lt 4 ] || rvm_fail "the volume image $rvm_vimage has errors that e2fsck -p can't repair; inspect it on the volume (e2fsck -p exited $rvm_vrc for $rvm_vpath, and vm-launch never formats an image that is not blank)"
+			[ $((rvm_vrc & 2)) -eq 0 ] || echo "vm-launch guest: e2fsck -p repaired the volume image $rvm_vimage and asked for a reboot, which only a mounted filesystem needs; the image is not mounted yet, so the guest goes on"
+		fi
+		rvm_vopts=` + guestImageSyncOptions + `,` + guestImageMountOptions + `
+		if [ "$RVM_SYNC_MOUNTS" = false ]; then
+			if rvm_vfeat=$(` + guestTune2fs + ` -l "$rvm_vdev" 2>/dev/null) && rvm_vfeat=$(printf '%s\n' "$rvm_vfeat" | sed -n 's/^Filesystem features:[[:space:]]*//p') && [ -n "$rvm_vfeat" ]; then
+				case " $rvm_vfeat " in
+				*" has_journal "*) rvm_vopts=` + guestImageMountOptions + ` ;;
+				esac
+			else
+				echo "vm-launch guest: reading the filesystem features of the volume image $rvm_vimage failed, so it mounts with sync and dirsync"
+			fi
+		fi
+		if [ -n "$rvm_blank" ]; then
+			mount -t ext4 -o "$rvm_vopts" "$rvm_vdev" "$rvm_vpath" || rvm_fail "mounting the newly formatted volume image $rvm_vimage at $rvm_vpath failed"
+		else
+			mount -t ext4 -o "$rvm_vopts" "$rvm_vdev" "$rvm_vpath" || rvm_fail "mounting the volume image $rvm_vimage at $rvm_vpath failed; it is not blank, so vm-launch will not format it; inspect or delete $rvm_vimage on the volume"
 		fi
 		;;
 	` + string(driveBlock) + `)
@@ -846,6 +903,24 @@ for rvm_vdev in "$@"; do
 	rvm_vi=$((rvm_vi + 1))
 done
 `
+
+// guestVolumeMke2fsArgs are the arguments with which stage 2 formats a blank
+// volume image, before the device. The filesystem is ext4 with the features
+// of the pinned mke2fs.conf, 4096-byte blocks, no reserved blocks, and the
+// label rvm-volume. lazy_itable_init and lazy_journal_init leave the inode
+// tables and the journal unwritten, and assume_storage_prezeroed, from
+// e2fsprogs 1.47.0, marks the inode tables as zeroed, so the format writes
+// only metadata and never the image's whole size. nodiscard keeps mke2fs
+// from discarding the whole device first. All of it relies on every block of
+// a blank image reading as zero.
+const guestVolumeMke2fsArgs = "-t ext4 -F -b 4096 -m 0 -L rvm-volume -E lazy_itable_init=1,lazy_journal_init=1,nodiscard,assume_storage_prezeroed=1"
+
+// guestImageSyncOptions are the mount options that make an image's mount
+// synchronous, and guestImageMountOptions the ones every image mounts with.
+const (
+	guestImageSyncOptions  = "sync,dirsync"
+	guestImageMountOptions = "noatime,noinit_itable,errors=remount-ro"
+)
 
 // guestVolumeTeardown follows the command, once its status is kept in
 // rvm_status: it flushes and unmounts every volume that stage 2 mounted, last
@@ -913,7 +988,8 @@ func volumesOnDrives(g guestContents) ([]volumeOnDrive, error) {
 }
 
 // mountsFile returns the guest /rvm/mounts, which stage 2 sources before it
-// mounts the volumes: their number as RVM_VOLUMES and, for each volume by its
+// mounts the volumes: their number as RVM_VOLUMES, the operator's sync mount
+// setting as RVM_SYNC_MOUNTS, true unless g.noVolumeSync, and, for each volume by its
 // volume index, its kind as RVM_VOLn_KIND and its quoted path as
 // RVM_VOLn_PATH, and for an image volume its image name as RVM_VOLn_IMAGE. A
 // share has the kind share and no image. Any other volume's kind is the one
@@ -922,13 +998,16 @@ func volumesOnDrives(g guestContents) ([]volumeOnDrive, error) {
 // that stage 2 may format. Volume drives that do not match the guest's
 // volumes (see volumesOnDrives), and a drive kind other than image or block,
 // are an error, because stage 2 could then treat a disk as the wrong kind.
+// Stage 2 decides from the setting and from the filesystem whether an image
+// mounts with sync and dirsync, because only the guest sees whether an
+// image's filesystem has a journal (see guestVolumeSetup).
 func mountsFile(g guestContents) (string, error) {
 	pairs, err := volumesOnDrives(g)
 	if err != nil {
 		return "", err
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "RVM_VOLUMES=%d\n", len(pairs))
+	fmt.Fprintf(&b, "RVM_VOLUMES=%d\nRVM_SYNC_MOUNTS=%t\n", len(pairs), !g.noVolumeSync)
 	for n, p := range pairs {
 		if p.drive == nil {
 			fmt.Fprintf(&b, "RVM_VOL%d_KIND=%s\nRVM_VOL%d_PATH=%s\n", n, volumeKindShare, n, shellQuote(p.vol.ContainerDir))
@@ -1075,6 +1154,203 @@ type guestContents struct {
 	// per inode of its filesystem, or 0 without one; both go in /rvm/disks.
 	rootBytes      int64
 	rootInodeRatio int64
+	// tools are the guest filesystem tools (see openGuestTools), which stage
+	// 2 needs for an image or block volume, or nil for a guest that has
+	// neither. The caller closes them after the initramfs is written.
+	tools *guestTools
+	// noVolumeSync is set when the operator turned sync mounts off (see
+	// volumeSyncMountsFlag), so that stage 2 mounts an image whose
+	// filesystem has a journal without sync and dirsync. The zero value
+	// keeps every image's mount synchronous.
+	noVolumeSync bool
+}
+
+// The guest filesystem tools. A guest with an image or block volume gets
+// four static binaries and a pinned mke2fs.conf, all below guestToolsDir.
+// They are not in /bin, where stage 1 installs busybox's applets and
+// formats the guest root with busybox's own mke2fs, so a stage that wants
+// the e2fsprogs tools names them by these paths.
+const (
+	guestToolsDir     = "/rvm/tools"
+	guestMke2fs       = guestToolsDir + "/mke2fs"
+	guestE2fsck       = guestToolsDir + "/e2fsck"
+	guestTune2fs      = guestToolsDir + "/tune2fs"
+	guestExt4grow     = guestToolsDir + "/ext4grow"
+	guestMke2fsConfig = guestToolsDir + "/mke2fs.conf"
+)
+
+// guestToolNames are the tools' file names, which are the same in the
+// artifacts directory, where the cell's runtime config installs them side by
+// side with busybox, and below guestToolsDir in the guest.
+var guestToolNames = []string{"mke2fs", "e2fsck", "tune2fs", "ext4grow"}
+
+// guestMke2fsConfText is the mke2fs.conf the guest's mke2fs reads through
+// MKE2FS_CONFIG. It is the profile that the e2fsprogs 1.47.4 build of the
+// guest tools carries inside mke2fs, written out here so that the filesystem
+// features of a new image are the ones we measured and do not move with the
+// tools. An ext4 image gets a journal, extents, flex_bg, 64bit,
+// resize_inode, which reserves the descriptor room that online growth uses,
+// and metadata checksums.
+const guestMke2fsConfText = `[defaults]
+	base_features = sparse_super,large_file,filetype,resize_inode,dir_index,ext_attr
+	default_mntopts = acl,user_xattr
+	enable_periodic_fsck = 0
+	blocksize = 4096
+	inode_size = 256
+	inode_ratio = 16384
+
+[fs_types]
+	ext3 = {
+		features = has_journal
+	}
+	ext4 = {
+		features = has_journal,extent,huge_file,flex_bg,metadata_csum,metadata_csum_seed,64bit,dir_nlink,extra_isize,orphan_file
+	}
+	small = {
+		blocksize = 1024
+		inode_ratio = 4096
+	}
+	floppy = {
+		blocksize = 1024
+		inode_ratio = 8192
+	}
+	big = {
+		inode_ratio = 32768
+	}
+	huge = {
+		inode_ratio = 65536
+	}
+	news = {
+		inode_ratio = 4096
+	}
+	largefile = {
+		inode_ratio = 1048576
+		blocksize = -1
+	}
+	largefile4 = {
+		inode_ratio = 4194304
+		blocksize = -1
+	}
+	hurd = {
+		blocksize = 4096
+		inode_size = 128
+		warn_y2038_dates = 0
+	}
+`
+
+// noGuestToolsHint ends every refusal about a guest tool, so that the line
+// tells an operator what the cell lacks.
+const noGuestToolsHint = "; the cell needs the guest e2fsprogs artifact (mke2fs, e2fsck, tune2fs, and ext4grow in the artifacts directory) for a guest with an image or block volume"
+
+// guestTool is one tool, opened and checked.
+type guestTool struct {
+	name string
+	file *os.File
+	size int64
+}
+
+// guestTools are the guest filesystem tools of one launch, each held open
+// from the moment openGuestTools checked it, so that the bytes that go into
+// the initramfs are those of the file that passed the check.
+type guestTools struct {
+	tools []guestTool
+}
+
+// needsGuestTools reports whether a guest with volumes volumes, of which
+// shares are served as shares, has an image or block volume. Only an image
+// or a block volume is formatted, checked, or grown by the guest.
+func needsGuestTools(volumes, shares int) bool { return volumes > shares }
+
+// openGuestTools opens each of guestToolNames in the artifacts directory
+// root. A tool must be a regular, executable, non-empty file that is
+// root's own or reached through symbolic links that stay inside root. A
+// link out of root is refused, because in the container the artifacts
+// directory is the only part of the cell's disk that is there, and a link
+// to anywhere else would put a file into the guest that the operator did
+// not install. The error names the first tool that fails and says that the
+// cell needs the guest e2fsprogs artifact. The caller closes the result.
+func openGuestTools(root string) (*guestTools, error) {
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return nil, fmt.Errorf("guest tool: the artifacts directory %s cannot be resolved: %w%s", root, err, noGuestToolsHint)
+	}
+	t := &guestTools{}
+	for _, name := range guestToolNames {
+		tool, err := openGuestTool(root, realRoot, name)
+		if err != nil {
+			t.Close()
+			return nil, err
+		}
+		t.tools = append(t.tools, tool)
+	}
+	return t, nil
+}
+
+// openGuestTool opens and checks the tool name in root, whose resolved path
+// is realRoot.
+func openGuestTool(root, realRoot, name string) (guestTool, error) {
+	fail := func(format string, args ...any) (guestTool, error) {
+		return guestTool{}, fmt.Errorf("guest tool %s "+format+"%s", append(append([]any{name}, args...), noGuestToolsHint)...)
+	}
+	p := filepath.Join(root, name)
+	target, err := filepath.EvalSymlinks(p)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return fail("is missing: %s does not exist", p)
+	case err != nil:
+		return fail("cannot be resolved: %v", err)
+	case !strings.HasPrefix(target, realRoot+string(filepath.Separator)):
+		return fail("at %s resolves to %s, which is not a file inside the artifacts directory", p, target)
+	}
+	// The resolved path is opened without following a link, so a link
+	// that appears after the check cannot take the open elsewhere, and
+	// without blocking, so that a FIFO in its place fails the type check
+	// instead of hanging the launch.
+	f, err := os.OpenFile(target, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return fail("cannot be opened: %v", err)
+	}
+	info, err := f.Stat()
+	switch {
+	case err != nil:
+		err = fmt.Errorf("guest tool %s cannot be examined: %w%s", name, err, noGuestToolsHint)
+	case !info.Mode().IsRegular():
+		_, err = fail("at %s is not a regular file", p)
+	case info.Mode().Perm()&0o111 == 0:
+		_, err = fail("at %s is not executable", p)
+	case info.Size() == 0:
+		_, err = fail("at %s is empty", p)
+	}
+	if err != nil {
+		f.Close()
+		return guestTool{}, err
+	}
+	return guestTool{name: name, file: f, size: info.Size()}, nil
+}
+
+// Close closes every tool. It is safe on nil and to call twice.
+func (t *guestTools) Close() {
+	if t == nil {
+		return
+	}
+	for _, tool := range t.tools {
+		tool.file.Close()
+	}
+	t.tools = nil
+}
+
+// archiveSteps returns the archive steps that add the tools directory, the
+// tools, and mke2fs.conf.
+func (t *guestTools) archiveSteps(cw *cpioWriter) []func() error {
+	steps := []func() error{func() error { return cw.Dir(strings.TrimPrefix(guestToolsDir, "/"), 0o755) }}
+	for _, tool := range t.tools {
+		steps = append(steps, func() error {
+			return cw.File(strings.TrimPrefix(guestToolsDir+"/"+tool.name, "/"), 0o755, tool.size, io.NewSectionReader(tool.file, 0, tool.size))
+		})
+	}
+	return append(steps, func() error {
+		return cw.File(strings.TrimPrefix(guestMke2fsConfig, "/"), 0o644, int64(len(guestMke2fsConfText)), strings.NewReader(guestMke2fsConfText))
+	})
 }
 
 // newInitramfs builds the guest initramfs (see writeInitramfs) in a sealed
@@ -1183,6 +1459,9 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, g 
 	}
 	if g.nw != nil && len(g.nw.ports) > 0 {
 		steps = append(steps, func() error { return cw.FIFO(strings.TrimPrefix(guestListenTick, "/"), 0o600) })
+	}
+	if g.tools != nil {
+		steps = append(steps, g.tools.archiveSteps(cw)...)
 	}
 	if len(g.vols) > 0 {
 		mounts, err := mountsFile(g)

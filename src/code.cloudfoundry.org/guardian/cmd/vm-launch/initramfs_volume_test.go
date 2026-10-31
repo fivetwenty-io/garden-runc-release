@@ -3,6 +3,9 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -15,6 +18,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"golang.org/x/sys/unix"
 )
 
 // The /rvm/init script, stage 2 of the guest's boot, of a guest without a
@@ -206,7 +210,7 @@ var _ = Describe("guest volume initramfs", func() {
 		Expect(names).To(Equal([]string{"bin", "dev", "dev/console", "dev/null", "etc", "proc", "sys", "tmp", "rvm",
 			"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "rvm/limits", "etc/resolv.conf", "rvm/mounts", "rvm/disks", "rvm/init", "init", cpioTrailer}))
 		Expect(string(byName["rvm/mounts"].data)).To(Equal(
-			"RVM_VOLUMES=1\nRVM_VOL0_KIND=image\nRVM_VOL0_PATH='/data/it'\\''s $here'\nRVM_VOL0_IMAGE='rvm-disk-3.img'\n"))
+			"RVM_VOLUMES=1\nRVM_SYNC_MOUNTS=true\nRVM_VOL0_KIND=image\nRVM_VOL0_PATH='/data/it'\\''s $here'\nRVM_VOL0_IMAGE='rvm-disk-3.img'\n"))
 		Expect(byName["rvm/mounts"].mode).To(Equal(uint32(0o100644)))
 		Expect(string(byName["rvm/disks"].data)).To(Equal("RVM_VOLUMES=1\nRVM_VOL0_KIND=image\nRVM_VOL0_ID=rvm-vol0\nRVM_VOL0_SECTORS=2097152\n"))
 		Expect(string(byName["rvm/init"].data)).To(Equal(initScript(testNonce, true)))
@@ -220,13 +224,13 @@ var _ = Describe("guest volume initramfs", func() {
 		got, err := mountsFile(g)
 		Expect(err).NotTo(HaveOccurred())
 		// A block volume has no image file, so /rvm/mounts names none for it.
-		Expect(got).To(Equal("RVM_VOLUMES=3\n" +
+		Expect(got).To(Equal("RVM_VOLUMES=3\nRVM_SYNC_MOUNTS=true\n" +
 			"RVM_VOL0_KIND=image\nRVM_VOL0_PATH='/data/it'\\''s $here'\nRVM_VOL0_IMAGE='rvm-disk-3.img'\n" +
 			"RVM_VOL1_KIND=block\nRVM_VOL1_PATH='/home/vcap/logs'\n" +
 			"RVM_VOL2_KIND=image\nRVM_VOL2_PATH='/x y'\nRVM_VOL2_IMAGE='z'\n"))
-		out, err := exec.Command("/bin/sh", "-c", `. "$1"; printf '%s|' "${RVM_VOLUME_PATH-unset}" "$RVM_VOLUMES" "$RVM_VOL0_KIND" "$RVM_VOL0_PATH" "$RVM_VOL0_IMAGE" "$RVM_VOL1_KIND" "$RVM_VOL1_PATH" "${RVM_VOL1_IMAGE-unset}" "$RVM_VOL2_PATH" "$RVM_VOL2_IMAGE"`, "sh", writeTempFile("mounts", got)).Output()
+		out, err := exec.Command("/bin/sh", "-c", `. "$1"; printf '%s|' "${RVM_VOLUME_PATH-unset}" "$RVM_VOLUMES" "$RVM_SYNC_MOUNTS" "$RVM_VOL0_KIND" "$RVM_VOL0_PATH" "$RVM_VOL0_IMAGE" "$RVM_VOL1_KIND" "$RVM_VOL1_PATH" "${RVM_VOL1_IMAGE-unset}" "$RVM_VOL2_PATH" "$RVM_VOL2_IMAGE"`, "sh", writeTempFile("mounts", got)).Output()
 		Expect(err).NotTo(HaveOccurred())
-		Expect(string(out)).To(Equal("unset|3|image|/data/it's $here|rvm-disk-3.img|block|/home/vcap/logs|unset|/x y|z|"))
+		Expect(string(out)).To(Equal("unset|3|true|image|/data/it's $here|rvm-disk-3.img|block|/home/vcap/logs|unset|/x y|z|"))
 
 		// /rvm/disks gives each drive the same kind, from the same entry.
 		disks, err := disksFile(g)
@@ -249,6 +253,26 @@ var _ = Describe("guest volume initramfs", func() {
 			_, err = mountsFile(g)
 			Expect(err).To(MatchError(fmt.Sprintf(`drive vol1 holds a %q, and the guest mounts only "image" and "block" volume drives`, kind)), "kind %q", kind)
 		}
+	})
+
+	It("records in /rvm/mounts whether the operator keeps image mounts synchronous, which they are unless it says otherwise", func() {
+		g := taskGuest("true")
+		g.vols = []guestVolume{*vol, {ContainerDir: "/disk", ImageName: "unused"}}
+		g.drives.volumes = qemuImageDrives(defaultImageSize, defaultImageSize)
+		g.drives.volumes[1].kind = driveBlock
+		got, err := mountsFile(g)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got).To(HavePrefix("RVM_VOLUMES=2\nRVM_SYNC_MOUNTS=true\nRVM_VOL0_KIND=image\n"))
+		Expect(strings.Count(got, "RVM_SYNC_MOUNTS")).To(Equal(1))
+
+		g.noVolumeSync = true
+		off, err := mountsFile(g)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(off).To(Equal(strings.Replace(got, "RVM_SYNC_MOUNTS=true\n", "RVM_SYNC_MOUNTS=false\n", 1)))
+		var archive bytes.Buffer
+		Expect(writeInitramfsArchive(&archive, strings.NewReader("busybox"), int64(len("busybox")), g)).To(Succeed())
+		_, byName := archiveEntries(archive.Bytes())
+		Expect(string(byName["rvm/mounts"].data)).To(Equal(off))
 	})
 
 	It("adds /rvm/mounts after the network files of an LRP", func() {
@@ -284,12 +308,28 @@ var _ = Describe("guest volume initramfs", func() {
 			guestStopReaderStop + guestListenStop + guestOOMReport(testNonce) + guestVolumeTeardown + "echo RVM_EXIT_" + testNonce + "=$rvm_status >/dev/console || echo RVM_EXIT_" + testNonce + "=$rvm_status\nreboot -nf\n"))
 	})
 
-	It("formats only after a blank check, and mounts synchronously with the ext4 driver", func() {
+	It("formats only after a blank check, with the shipped mke2fs and its pinned configuration, and preens every other image", func() {
 		Expect(guestVolumeSetup).To(HavePrefix(". /rvm/mounts\n"))
 		Expect(guestVolumeSetup).To(ContainSubstring(`dd if="$rvm_vdev" of=/rvm/volume-head bs=4096 count=16 || rvm_fail`))
-		Expect(guestVolumeSetup).To(ContainSubstring(`mke2fs -F -m 0 -L rvm-volume "$rvm_vdev"`))
-		Expect(guestVolumeSetup).To(ContainSubstring(`mount -t ext4 -o sync,dirsync,noatime,errors=remount-ro "$rvm_vdev" "$rvm_vpath"`))
-		Expect(strings.Count(guestVolumeSetup, "mke2fs")).To(Equal(1))
+		Expect(guestVolumeSetup).To(ContainSubstring("\n\t\t\tMKE2FS_CONFIG=/rvm/tools/mke2fs.conf /rvm/tools/mke2fs -t ext4 -F -b 4096 -m 0 -L rvm-volume -E lazy_itable_init=1,lazy_journal_init=1,nodiscard,assume_storage_prezeroed=1 \"$rvm_vdev\" || rvm_fail"))
+		Expect(guestVolumeSetup).To(ContainSubstring("\n\t\t\t/rvm/tools/e2fsck -p \"$rvm_vdev\" || rvm_vrc=$?\n"))
+		Expect(guestVolumeSetup).To(ContainSubstring(`mount -t ext4 -o "$rvm_vopts" "$rvm_vdev" "$rvm_vpath"`))
+		Expect(guestVolumeSetup).To(ContainSubstring("rvm_vopts=sync,dirsync,noatime,noinit_itable,errors=remount-ro\n"))
+		Expect(guestVolumeSetup).To(ContainSubstring(`*" has_journal "*) rvm_vopts=noatime,noinit_itable,errors=remount-ro ;;`))
+		// Every e2fsprogs tool runs by its full path, never as a busybox
+		// applet, and nothing runs e2fsck in a mode that answers yes. The
+		// lines stage 2 prints are in double quotes and may name a tool.
+		commands := regexp.MustCompile(`"[^"]*"`).ReplaceAllString(guestVolumeSetup, `""`)
+		for _, tool := range []string{"mke2fs", "e2fsck", "tune2fs", "ext4grow", "resize2fs"} {
+			Expect(strings.Count(commands, tool)).To(Equal(strings.Count(commands, guestToolsDir+"/"+tool)), "%s runs without its path", tool)
+		}
+		Expect(strings.Count(commands, guestMke2fs+" -")).To(Equal(1))
+		Expect(strings.Count(commands, guestE2fsck+" -")).To(Equal(1))
+		Expect(strings.Count(commands, guestTune2fs+" -")).To(Equal(1))
+		Expect(guestVolumeSetup).NotTo(ContainSubstring("-y"))
+		Expect(guestVolumeSetup).NotTo(ContainSubstring("resize2fs"))
+		Expect(guestMke2fs).To(Equal("/rvm/tools/mke2fs"))
+		Expect(guestMke2fsConfig).To(Equal("/rvm/tools/mke2fs.conf"))
 	})
 
 	// volumeArm returns the text of the arm of stage 2's kind case for kind,
@@ -307,7 +347,7 @@ var _ = Describe("guest volume initramfs", func() {
 		image := volumeArm(string(driveImage))
 		block := volumeArm(string(driveBlock))
 		share := volumeArm(volumeKindShare)
-		for _, risky := range []string{"mke2fs", "dd ", "rvm_blank", guestVolumeHead} {
+		for _, risky := range []string{"mke2fs", "e2fsck", "tune2fs", guestToolsDir, "MKE2FS_CONFIG", "dd ", "rvm_blank", guestVolumeHead, "rvm_vopts", "$RVM_SYNC_MOUNTS"} {
 			Expect(image).To(ContainSubstring(risky))
 			Expect(strings.Count(guestVolumeSetup, risky)).To(Equal(strings.Count(image, risky)), "%s outside the image arm", risky)
 			Expect(block).NotTo(ContainSubstring(risky))
@@ -351,18 +391,21 @@ var _ = Describe("guest volume initramfs", func() {
 		var (
 			dir     string
 			bin     string
+			tools   string
 			callLog string
 			device  string
 			mnt     string
 		)
 
-		// writeKinds writes the test /rvm/mounts, as mountsFile writes it,
-		// for mounts, the paths of the volumes in volume order, each of the
-		// kind at its place in kinds and each image with its own image name.
-		writeKinds := func(kinds []driveKind, mounts ...string) {
+		// writeKindsSync writes the test /rvm/mounts, as mountsFile writes
+		// it, for mounts, the paths of the volumes in volume order, each of
+		// the kind at its place in kinds and each image with its own image
+		// name, with sync mounts turned off when noSync is set.
+		writeKindsSync := func(kinds []driveKind, noSync bool, mounts ...string) {
 			GinkgoHelper()
 			Expect(kinds).To(HaveLen(len(mounts)))
 			g := taskGuest("true")
+			g.noVolumeSync = noSync
 			for i, m := range mounts {
 				g.vols = append(g.vols, guestVolume{ContainerDir: m, ImageName: "rvm-disk-" + strconv.Itoa(i) + ".img"})
 				g.drives.volumes = append(g.drives.volumes, guestDrive{id: qemuVolumeSerial(i), kind: kinds[i], bytes: defaultImageSize})
@@ -370,6 +413,11 @@ var _ = Describe("guest volume initramfs", func() {
 			content, err := mountsFile(g)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(os.WriteFile(filepath.Join(dir, "mounts"), []byte(content), 0o644)).To(Succeed())
+		}
+		// writeKinds is writeKindsSync with sync mounts kept on.
+		writeKinds := func(kinds []driveKind, mounts ...string) {
+			GinkgoHelper()
+			writeKindsSync(kinds, false, mounts...)
 		}
 		// writeMounts writes the test /rvm/mounts for image volumes at
 		// mounts.
@@ -386,6 +434,8 @@ var _ = Describe("guest volume initramfs", func() {
 			dir = GinkgoT().TempDir()
 			bin = filepath.Join(dir, "bin")
 			Expect(os.Mkdir(bin, 0o755)).To(Succeed())
+			tools = filepath.Join(dir, "tools")
+			Expect(os.Mkdir(tools, 0o755)).To(Succeed())
 			callLog = filepath.Join(dir, "calls")
 			device = filepath.Join(dir, "vda")
 			mnt = filepath.Join(dir, "mnt", "da'ta")
@@ -393,11 +443,27 @@ var _ = Describe("guest volume initramfs", func() {
 			// Each stub records its argv. dd writes what DD_MODE says to its
 			// of= file, or, for the device named in DD_DATA_IF, data; the
 			// others exit with their *_RC, and mount fails for the mount
-			// point MOUNT_FAIL_AT names.
-			stub := func(name, body string) {
+			// point MOUNT_FAIL_AT names. The guest filesystem tools are in
+			// their own directory, which stands in for /rvm/tools: mke2fs
+			// also records the configuration it was given, and tune2fs
+			// prints TUNE2FS_FEATURES as the filesystem's features, or no
+			// feature line with TUNE2FS_NO_FEATURES.
+			stubIn := func(at, name, body string) {
 				script := "#!/bin/sh\necho \"" + name + " $*\" >> " + shellQuote(callLog) + "\n" + body + "\n"
-				Expect(os.WriteFile(filepath.Join(bin, name), []byte(script), 0o755)).To(Succeed())
+				Expect(os.WriteFile(filepath.Join(at, name), []byte(script), 0o755)).To(Succeed())
 			}
+			stub := func(name, body string) { stubIn(bin, name, body) }
+			stubIn(tools, "mke2fs", `echo "MKE2FS_CONFIG=${MKE2FS_CONFIG-unset}" >> `+shellQuote(callLog)+`
+exit "${MKE2FS_RC:-0}"`)
+			stubIn(tools, "e2fsck", `echo "rvm-volume: clean, 11/65536 files, 4127/262144 blocks"
+exit "${E2FSCK_RC:-0}"`)
+			stubIn(tools, "tune2fs", `echo "tune2fs 1.47.4 (6-Mar-2025)" >&2
+[ "${TUNE2FS_RC:-0}" = 0 ] || exit "$TUNE2FS_RC"
+echo "Filesystem volume name:   rvm-volume"
+[ -n "${TUNE2FS_NO_FEATURES:-}" ] || echo "Filesystem features:      ${TUNE2FS_FEATURES-has_journal ext_attr resize_inode dir_index filetype extent 64bit}"
+echo "Filesystem flags:         signed_directory_hash "`)
+			stubIn(tools, "ext4grow", `exit 0`)
+			Expect(os.WriteFile(filepath.Join(tools, "mke2fs.conf"), []byte(guestMke2fsConfText), 0o644)).To(Succeed())
 			stub("dd", `for a; do case $a in of=*) of=${a#of=} ;; if=*) in=${a#if=} ;; esac; done
 mode=$DD_MODE
 [ -n "${DD_DATA_IF:-}" ] && [ "$in" = "$DD_DATA_IF" ] && mode=data
@@ -407,7 +473,6 @@ data) { head -c 1024 /dev/zero; printf 'E'; head -c 64511 /dev/zero; } > "$of" ;
 empty) : > "$of" ;;
 fail) echo "dd: can't open device" >&2; exit 1 ;;
 esac`)
-			stub("mke2fs", `exit "${MKE2FS_RC:-0}"`)
 			stub("mount", `for a; do last=$a; done
 [ -n "${MOUNT_FAIL_AT:-}" ] && [ "$last" = "$MOUNT_FAIL_AT" ] && exit 32
 exit "${MOUNT_RC:-0}"`)
@@ -430,14 +495,15 @@ exit "${MOUNT_RC:-0}"`)
 			script := strings.NewReplacer(
 				"/rvm/mounts", filepath.Join(dir, "mounts"),
 				"/rvm/volume-", filepath.Join(dir, "volume-"),
+				guestToolsDir+"/", tools+"/",
 				`[ -b "$rvm_vdev" ]`, `[ -f "$rvm_vdev" ]`,
 				"dd if=", filepath.Join(bin, "dd")+" if=",
-				"mke2fs -F", filepath.Join(bin, "mke2fs")+" -F",
 				"mount -t", filepath.Join(bin, "mount")+" -t",
 				"reboot -nf", "echo REBOOT",
 			).Replace(guestFailFunc+guestVolumeSetup) + "echo REACHED_START\n"
 			Expect(script).NotTo(ContainSubstring(guestVolumeHead))
 			Expect(script).NotTo(ContainSubstring(guestVolumeUsed))
+			Expect(script).NotTo(ContainSubstring(guestToolsDir))
 			Expect(script).NotTo(ContainSubstring("-b \""))
 			Expect(strings.Count(script, filepath.Join(bin, "mount")+" -t")).To(Equal(strings.Count(guestVolumeSetup, "mount -t")))
 
@@ -456,8 +522,17 @@ exit "${MOUNT_RC:-0}"`)
 
 		// The stubs' expected argv lines, built once BeforeEach set the paths.
 		mountCall := func(device, mnt string) string {
-			return "mount -t ext4 -o sync,dirsync,noatime,errors=remount-ro " + device + " " + mnt + "\n"
+			return "mount -t ext4 -o sync,dirsync,noatime,noinit_itable,errors=remount-ro " + device + " " + mnt + "\n"
 		}
+		asyncMountCall := func(device, mnt string) string {
+			return "mount -t ext4 -o noatime,noinit_itable,errors=remount-ro " + device + " " + mnt + "\n"
+		}
+		mkfsCall := func(device string) string {
+			return "mke2fs -t ext4 -F -b 4096 -m 0 -L rvm-volume -E lazy_itable_init=1,lazy_journal_init=1,nodiscard,assume_storage_prezeroed=1 " + device + "\n" +
+				"MKE2FS_CONFIG=" + filepath.Join(tools, "mke2fs.conf") + "\n"
+		}
+		fsckCall := func(device string) string { return "e2fsck -p " + device + "\n" }
+		tune2fsCall := func(device string) string { return "tune2fs -l " + device + "\n" }
 		ddCall := func(device string) string {
 			return "dd if=" + device + " of=" + filepath.Join(dir, "volume-head") + " bs=4096 count=16\n"
 		}
@@ -470,16 +545,16 @@ exit "${MOUNT_RC:-0}"`)
 			r := run("DD_MODE=zeros")
 			Expect(r.out).To(ContainSubstring("REACHED_START"))
 			Expect(r.out).NotTo(ContainSubstring("REBOOT"))
-			Expect(r.calls).To(Equal(ddCall(device) + "mke2fs -F -m 0 -L rvm-volume " + device + "\n" + mountCall(device, mnt)))
+			Expect(r.calls).To(Equal(ddCall(device) + mkfsCall(device) + mountCall(device, mnt)))
 			Expect(mnt).To(BeADirectory())
 			Expect(filepath.Join(dir, "volume-head")).NotTo(BeAnExistingFile())
 			Expect(filepath.Join(dir, "volume-used")).NotTo(BeAnExistingFile())
 		})
 
-		It("mounts an image with data without formatting it", func() {
+		It("preens an image with data with e2fsck -p and mounts it without formatting it", func() {
 			r := run("DD_MODE=data")
-			Expect(r.out).To(ContainSubstring("REACHED_START"))
-			Expect(r.calls).To(Equal(ddCall(device) + mountCall(device, mnt)))
+			Expect(r.out).To(Equal("rvm-volume: clean, 11/65536 files, 4127/262144 blocks\nREACHED_START\n"))
+			Expect(r.calls).To(Equal(ddCall(device) + fsckCall(device) + mountCall(device, mnt)))
 		})
 
 		It("mounts every volume on the device stage 1 passed in its place, in volume order, and formats only the blank ones", func() {
@@ -490,11 +565,11 @@ exit "${MOUNT_RC:-0}"`)
 			}
 			writeMounts(mounts...)
 			r := runWith(devices, "DD_MODE=zeros", "DD_DATA_IF="+devices[1])
-			Expect(r.out).To(Equal("REACHED_START\n"))
+			Expect(r.out).To(Equal("rvm-volume: clean, 11/65536 files, 4127/262144 blocks\nREACHED_START\n"))
 			Expect(r.calls).To(Equal(
-				ddCall(devices[0]) + "mke2fs -F -m 0 -L rvm-volume " + devices[0] + "\n" + mountCall(devices[0], mounts[0]) +
-					ddCall(devices[1]) + mountCall(devices[1], mounts[1]) +
-					ddCall(devices[2]) + "mke2fs -F -m 0 -L rvm-volume " + devices[2] + "\n" + mountCall(devices[2], mounts[2])))
+				ddCall(devices[0]) + mkfsCall(devices[0]) + mountCall(devices[0], mounts[0]) +
+					ddCall(devices[1]) + fsckCall(devices[1]) + mountCall(devices[1], mounts[1]) +
+					ddCall(devices[2]) + mkfsCall(devices[2]) + mountCall(devices[2], mounts[2])))
 			for _, m := range mounts {
 				Expect(m).To(BeADirectory())
 			}
@@ -508,8 +583,9 @@ exit "${MOUNT_RC:-0}"`)
 			}
 			writeMounts(mounts...)
 			r := runWith(devices, "DD_MODE=data", "MOUNT_FAIL_AT="+mounts[1])
-			Expect(r.out).To(Equal("vm-launch guest setup: mounting the volume image rvm-disk-1.img at " + mounts[1] + " failed; it is not blank, so vm-launch will not format it; inspect or delete rvm-disk-1.img on the volume\nREBOOT\n"))
-			Expect(r.calls).To(Equal(ddCall(devices[0]) + mountCall(devices[0], mounts[0]) + ddCall(devices[1]) + mountCall(devices[1], mounts[1])))
+			clean := "rvm-volume: clean, 11/65536 files, 4127/262144 blocks\n"
+			Expect(r.out).To(Equal(clean + clean + "vm-launch guest setup: mounting the volume image rvm-disk-1.img at " + mounts[1] + " failed; it is not blank, so vm-launch will not format it; inspect or delete rvm-disk-1.img on the volume\nREBOOT\n"))
+			Expect(r.calls).To(Equal(ddCall(devices[0]) + fsckCall(devices[0]) + mountCall(devices[0], mounts[0]) + ddCall(devices[1]) + fsckCall(devices[1]) + mountCall(devices[1], mounts[1])))
 			Expect(mounts[2]).NotTo(BeAnExistingFile())
 		})
 
@@ -523,14 +599,20 @@ exit "${MOUNT_RC:-0}"`)
 			}
 		})
 
-		It("fails at once, touching nothing, when /rvm/mounts has no volume count it can use or no path for a volume", func() {
+		It("fails at once, touching nothing, when /rvm/mounts has no volume count it can use, no sync mount setting it knows, or no path for a volume", func() {
 			mounts := filepath.Join(dir, "mounts")
+			const volume = "RVM_VOL0_KIND=image\nRVM_VOL0_PATH=/x\nRVM_VOL0_IMAGE=a\n"
 			for content, line := range map[string]string{
-				"":                                  "the volume count in " + mounts + " is not a number from 1 to 4",
-				"RVM_VOLUMES=0\n":                   "the volume count in " + mounts + " is not a number from 1 to 4",
-				"RVM_VOLUMES=5\n":                   "the volume count in " + mounts + " is not a number from 1 to 4",
-				"RVM_VOLUMES=x\n":                   "the volume count in " + mounts + " is not a number from 1 to 4",
-				"RVM_VOLUMES=1\nRVM_VOL0_IMAGE=a\n": mounts + " gives volume 0 no path",
+				"":                "the volume count in " + mounts + " is not a number from 1 to 4",
+				"RVM_VOLUMES=0\n": "the volume count in " + mounts + " is not a number from 1 to 4",
+				"RVM_VOLUMES=5\n": "the volume count in " + mounts + " is not a number from 1 to 4",
+				"RVM_VOLUMES=x\n": "the volume count in " + mounts + " is not a number from 1 to 4",
+				"RVM_VOLUMES=1\nRVM_SYNC_MOUNTS=true\nRVM_VOL0_IMAGE=a\n": mounts + " gives volume 0 no path",
+				"RVM_VOLUMES=1\n" + volume:                                "the sync mount setting in " + mounts + " is not true or false",
+				"RVM_VOLUMES=1\nRVM_SYNC_MOUNTS=\n" + volume:              "the sync mount setting in " + mounts + " is not true or false",
+				"RVM_VOLUMES=1\nRVM_SYNC_MOUNTS=yes\n" + volume:           "the sync mount setting in " + mounts + " is not true or false",
+				"RVM_VOLUMES=1\nRVM_SYNC_MOUNTS=False\n" + volume:         "the sync mount setting in " + mounts + " is not true or false",
+				"RVM_VOLUMES=1\nRVM_SYNC_MOUNTS=0\n" + volume:             "the sync mount setting in " + mounts + " is not true or false",
 			} {
 				Expect(os.WriteFile(mounts, []byte(content), 0o644)).To(Succeed())
 				r := run("DD_MODE=zeros")
@@ -542,6 +624,7 @@ exit "${MOUNT_RC:-0}"`)
 		It("never formats an image with data that does not mount", func() {
 			r := run("DD_MODE=data", "MOUNT_RC=32")
 			Expect(r.out).To(ContainSubstring("vm-launch guest setup: mounting the volume image rvm-disk-0.img at " + mnt + " failed; it is not blank, so vm-launch will not format it; inspect or delete rvm-disk-0.img on the volume"))
+			Expect(r.calls).To(Equal(ddCall(device) + fsckCall(device) + mountCall(device, mnt)))
 			Expect(r.out).To(ContainSubstring("REBOOT"))
 			Expect(r.out).NotTo(ContainSubstring("REACHED_START"))
 			Expect(r.calls).NotTo(ContainSubstring("mke2fs"))
@@ -564,7 +647,7 @@ exit "${MOUNT_RC:-0}"`)
 			r := run("DD_MODE=zeros", "MKE2FS_RC=1")
 			Expect(r.out).To(ContainSubstring("vm-launch guest setup: formatting the blank volume image rvm-disk-0.img for " + mnt + " failed"))
 			Expect(r.out).NotTo(ContainSubstring("REACHED_START"))
-			Expect(r.calls).NotTo(ContainSubstring("mount -t"))
+			Expect(r.calls).To(Equal(ddCall(device) + mkfsCall(device)))
 		})
 
 		It("fails when a newly formatted image does not mount", func() {
@@ -588,6 +671,134 @@ exit "${MOUNT_RC:-0}"`)
 			Expect(r.out).To(ContainSubstring("vm-launch guest setup: creating " + mnt + " failed"))
 			Expect(r.calls).NotTo(ContainSubstring("dd "))
 		})
+
+		// cleanLine is what the e2fsck stub prints, as e2fsck -p does for a
+		// clean filesystem.
+		const cleanLine = "rvm-volume: clean, 11/65536 files, 4127/262144 blocks\n"
+
+		DescribeTable("goes on after a preen whose exit status is below 4, and says so when e2fsck asks for a reboot, because the image is not mounted yet",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				for _, rc := range []int{0, 1, 2, 3} {
+					Expect(os.RemoveAll(callLog)).To(Succeed())
+					r := runIn(shell, []string{device}, "DD_MODE=data", "E2FSCK_RC="+strconv.Itoa(rc))
+					want := cleanLine
+					if rc&2 != 0 {
+						want += "vm-launch guest: e2fsck -p repaired the volume image rvm-disk-0.img and asked for a reboot, which only a mounted filesystem needs; the image is not mounted yet, so the guest goes on\n"
+					}
+					Expect(r.out).To(Equal(want+"REACHED_START\n"), "%s, e2fsck status %d", shell.name, rc)
+					Expect(r.calls).To(Equal(ddCall(device)+fsckCall(device)+mountCall(device, mnt)), "%s, e2fsck status %d", shell.name, rc)
+				}
+			},
+			shellEntries(""),
+		)
+
+		DescribeTable("fails the boot when the preen exits 4 or more, naming the image, and never formats or mounts it",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				// 4 is errors left uncorrected, 8 an operational error, 16 a
+				// usage error, 32 a cancelled check, and 128 a library error,
+				// and e2fsck adds them up.
+				for _, rc := range []int{4, 5, 6, 7, 8, 12, 16, 32, 128} {
+					Expect(os.RemoveAll(callLog)).To(Succeed())
+					r := runIn(shell, []string{device}, "DD_MODE=data", "E2FSCK_RC="+strconv.Itoa(rc))
+					Expect(r.out).To(Equal(cleanLine+"vm-launch guest setup: the volume image rvm-disk-0.img has errors that e2fsck -p can't repair; inspect it on the volume (e2fsck -p exited "+strconv.Itoa(rc)+" for "+mnt+", and vm-launch never formats an image that is not blank)\nREBOOT\n"), "%s, e2fsck status %d", shell.name, rc)
+					Expect(r.calls).To(Equal(ddCall(device)+fsckCall(device)), "%s, e2fsck status %d", shell.name, rc)
+				}
+			},
+			shellEntries(""),
+		)
+
+		DescribeTable("fails the boot before it reads the image when a guest filesystem tool is missing, and never falls back to another mke2fs",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				for _, name := range []string{"mke2fs", "e2fsck", "tune2fs"} {
+					for _, how := range []string{"missing", "not executable", "a directory"} {
+						Expect(os.RemoveAll(callLog)).To(Succeed())
+						Expect(os.RemoveAll(mnt)).To(Succeed())
+						tool := filepath.Join(tools, name)
+						saved, err := os.ReadFile(tool)
+						Expect(err).NotTo(HaveOccurred())
+						Expect(os.Remove(tool)).To(Succeed())
+						switch how {
+						case "not executable":
+							Expect(os.WriteFile(tool, saved, 0o644)).To(Succeed())
+						case "a directory":
+							Expect(os.Mkdir(tool, 0o755)).To(Succeed())
+						}
+						// A busybox-like mke2fs on PATH must never stand in.
+						Expect(os.WriteFile(filepath.Join(bin, name), []byte("#!/bin/sh\necho \"path "+name+" $*\" >> "+shellQuote(callLog)+"\n"), 0o755)).To(Succeed())
+						for _, mode := range []string{"zeros", "data"} {
+							r := runIn(shell, []string{device}, "DD_MODE="+mode)
+							Expect(r.out).To(Equal("vm-launch guest setup: the guest has no "+tool+" for the volume image rvm-disk-0.img at "+mnt+", and it never formats or checks a volume image with another tool\nREBOOT\n"), "%s, %s %s, %s image", shell.name, name, how, mode)
+							Expect(r.calls).To(BeEmpty(), "%s, %s %s", shell.name, name, how)
+							Expect(mnt).NotTo(BeAnExistingFile())
+						}
+						Expect(os.RemoveAll(tool)).To(Succeed())
+						Expect(os.WriteFile(tool, saved, 0o755)).To(Succeed())
+						Expect(os.Remove(filepath.Join(bin, name))).To(Succeed())
+					}
+				}
+
+				conf := filepath.Join(tools, "mke2fs.conf")
+				Expect(os.Remove(conf)).To(Succeed())
+				r := runIn(shell, []string{device}, "DD_MODE=zeros")
+				Expect(r.out).To(Equal("vm-launch guest setup: the guest has no "+conf+" for the volume image rvm-disk-0.img at "+mnt+"\nREBOOT\n"), "%s", shell.name)
+				Expect(r.calls).To(BeEmpty(), "%s", shell.name)
+			},
+			shellEntries(""),
+		)
+
+		DescribeTable("drops sync and dirsync only from an image whose filesystem has a journal when the operator turned sync mounts off",
+			func(shellOf func() guestShell, mode string, env []string, wantSync bool, line string) {
+				shell := shellOf()
+				writeKindsSync([]driveKind{driveImage}, true, mnt)
+				r := runIn(shell, []string{device}, append([]string{"DD_MODE=" + mode}, env...)...)
+				prepare := ddCall(device) + fsckCall(device)
+				out := cleanLine
+				if mode == "zeros" {
+					prepare, out = ddCall(device)+mkfsCall(device), ""
+				}
+				if line != "" {
+					out += "vm-launch guest: reading the filesystem features of the volume image rvm-disk-0.img failed, so it mounts with sync and dirsync\n"
+				}
+				Expect(r.out).To(Equal(out+"REACHED_START\n"), "%s", shell.name)
+				mount := asyncMountCall(device, mnt)
+				if wantSync {
+					mount = mountCall(device, mnt)
+				}
+				Expect(r.calls).To(Equal(prepare+tune2fsCall(device)+mount), "%s", shell.name)
+
+				// With sync mounts on, which is the default, tune2fs never runs
+				// and the mount keeps sync and dirsync whatever the features.
+				Expect(os.Remove(callLog)).To(Succeed())
+				writeKinds([]driveKind{driveImage}, mnt)
+				r = runIn(shell, []string{device}, append([]string{"DD_MODE=" + mode}, env...)...)
+				Expect(r.calls).To(Equal(prepare+mountCall(device, mnt)), "%s", shell.name)
+			},
+			shellEntries("a preened journalled image", "data", []string{}, false, ""),
+			shellEntries("a journalled image whose feature list ends in has_journal", "data", []string{"TUNE2FS_FEATURES=ext_attr dir_index filetype has_journal"}, false, ""),
+			shellEntries("a newly formatted journalled image", "zeros", []string{}, false, ""),
+			shellEntries("a legacy ext2 image", "data", []string{"TUNE2FS_FEATURES=dir_index filetype sparse_super"}, true, ""),
+			shellEntries("a new image too small for a journal", "zeros", []string{"TUNE2FS_FEATURES=ext_attr resize_inode dir_index filetype extent 64bit flex_bg"}, true, ""),
+			shellEntries("an image with an external journal device feature only", "data", []string{"TUNE2FS_FEATURES=journal_dev filetype"}, true, ""),
+			shellEntries("an image with no features", "data", []string{"TUNE2FS_FEATURES="}, true, "unread"),
+			shellEntries("an image whose features tune2fs cannot read", "data", []string{"TUNE2FS_RC=1"}, true, "unread"),
+			shellEntries("an image for which tune2fs prints no feature line", "data", []string{"TUNE2FS_NO_FEATURES=1"}, true, "unread"),
+		)
+
+		DescribeTable("leaves a block volume's mount and checks alone when the operator turned sync mounts off",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				writeKindsSync([]driveKind{driveBlock}, true, mnt)
+				zeroDevice := make([]byte, 128<<10)
+				Expect(os.WriteFile(device, zeroDevice, 0o600)).To(Succeed())
+				r := runIn(shell, []string{device}, "DD_MODE=data")
+				Expect(r.out).To(Equal("REACHED_START\n"), "%s", shell.name)
+				Expect(r.calls).To(Equal("mount -t ext4 -o noatime,errors=remount-ro "+device+" "+mnt+"\n"), "%s", shell.name)
+			},
+			shellEntries(""),
+		)
 
 		// blockMountCall is the stub's argv line for a block volume's mount.
 		blockMountCall := func(device, mnt string) string {
@@ -657,9 +868,9 @@ exit "${MOUNT_RC:-0}"`)
 				r := runIn(shell, devices, "DD_MODE=zeros")
 				Expect(r.out).To(Equal("REACHED_START\n"), "%s", shell.name)
 				Expect(r.calls).To(Equal(
-					ddCall(devices[0])+"mke2fs -F -m 0 -L rvm-volume "+devices[0]+"\n"+mountCall(devices[0], mounts[0])+
+					ddCall(devices[0])+mkfsCall(devices[0])+mountCall(devices[0], mounts[0])+
 						blockMountCall(devices[1], mounts[1])+
-						ddCall(devices[2])+"mke2fs -F -m 0 -L rvm-volume "+devices[2]+"\n"+mountCall(devices[2], mounts[2])), "%s", shell.name)
+						ddCall(devices[2])+mkfsCall(devices[2])+mountCall(devices[2], mounts[2])), "%s", shell.name)
 			},
 			shellEntries(""),
 		)
@@ -671,19 +882,19 @@ exit "${MOUNT_RC:-0}"`)
 				devices := []string{filepath.Join(dir, "vda"), "", filepath.Join(dir, "vdb")}
 				zeroDevice(devices[0])
 				zeroDevice(devices[2])
-				Expect(os.WriteFile(filepath.Join(dir, "mounts"), []byte("RVM_VOLUMES=3\n"+
+				Expect(os.WriteFile(filepath.Join(dir, "mounts"), []byte("RVM_VOLUMES=3\nRVM_SYNC_MOUNTS=true\n"+
 					"RVM_VOL0_KIND=image\nRVM_VOL0_PATH="+shellQuote(mounts[0])+"\nRVM_VOL0_IMAGE=a.img\n"+
 					"RVM_VOL1_KIND=share\nRVM_VOL1_PATH="+shellQuote(mounts[1])+"\n"+
 					"RVM_VOL2_KIND=block\nRVM_VOL2_PATH="+shellQuote(mounts[2])+"\n"), 0o644)).To(Succeed())
 				r := runIn(shell, devices, "DD_MODE=data")
-				Expect(r.out).To(Equal("REACHED_START\n"), "%s", shell.name)
-				Expect(r.calls).To(Equal(ddCall(devices[0])+mountCall(devices[0], mounts[0])+blockMountCall(devices[2], mounts[2])), "%s", shell.name)
+				Expect(r.out).To(Equal("rvm-volume: clean, 11/65536 files, 4127/262144 blocks\nREACHED_START\n"), "%s", shell.name)
+				Expect(r.calls).To(Equal(ddCall(devices[0])+fsckCall(devices[0])+mountCall(devices[0], mounts[0])+blockMountCall(devices[2], mounts[2])), "%s", shell.name)
 				Expect(mounts[1]).NotTo(BeAnExistingFile())
 
 				Expect(os.Remove(callLog)).To(Succeed())
 				devices[1] = devices[2]
 				r = runIn(shell, devices, "DD_MODE=data")
-				Expect(r.out).To(Equal("vm-launch guest setup: stage 1 passed the device "+devices[2]+" for the share at "+mounts[1]+", which has no drive\nREBOOT\n"), "%s", shell.name)
+				Expect(r.out).To(Equal("rvm-volume: clean, 11/65536 files, 4127/262144 blocks\nvm-launch guest setup: stage 1 passed the device "+devices[2]+" for the share at "+mounts[1]+", which has no drive\nREBOOT\n"), "%s", shell.name)
 			},
 			shellEntries(""),
 		)
@@ -697,7 +908,7 @@ exit "${MOUNT_RC:-0}"`)
 					"plain": "/rvm/mounts gives the volume at " + mnt + " the kind plain, which the guest does not know",
 					"Image": "/rvm/mounts gives the volume at " + mnt + " the kind Image, which the guest does not know",
 				} {
-					Expect(os.WriteFile(filepath.Join(dir, "mounts"), []byte("RVM_VOLUMES=1\nRVM_VOL0_KIND="+kind+"\nRVM_VOL0_PATH="+shellQuote(mnt)+"\nRVM_VOL0_IMAGE=a.img\n"), 0o644)).To(Succeed())
+					Expect(os.WriteFile(filepath.Join(dir, "mounts"), []byte("RVM_VOLUMES=1\nRVM_SYNC_MOUNTS=true\nRVM_VOL0_KIND="+kind+"\nRVM_VOL0_PATH="+shellQuote(mnt)+"\nRVM_VOL0_IMAGE=a.img\n"), 0o644)).To(Succeed())
 					r := runIn(shell, []string{device}, "DD_MODE=zeros")
 					Expect(r.out).To(Equal(strings.ReplaceAll("vm-launch guest setup: "+line+"\nREBOOT\n", "/rvm/mounts", filepath.Join(dir, "mounts"))), "%s, kind %q", shell.name, kind)
 					Expect(r.calls).To(BeEmpty(), "%s, kind %q", shell.name, kind)
@@ -1585,5 +1796,282 @@ exit 0`)
 		Expect(os.RemoveAll(filepath.Join(dir, "disk"))).To(Succeed())
 		Expect(os.WriteFile(filepath.Join(dir, "disk"), nil, 0o600)).To(Succeed())
 		failed(run(shell, bothDisks), "creating the guest root mount points failed", mke2fs)
+	})
+})
+
+// goldenMke2fsConfSHA256 is the sha256 of the pinned mke2fs.conf. Changing
+// the file changes the features and the inode layout of every new image, so
+// a change has to change this digest on purpose.
+const goldenMke2fsConfSHA256 = "14c13f4289408325fed71bb93daecea347debae7fab0fd062288c9bd4867cd7e"
+
+// openFDCount returns the number of descriptors this process holds.
+func openFDCount() int {
+	entries, err := os.ReadDir("/proc/self/fd")
+	Expect(err).NotTo(HaveOccurred())
+	return len(entries)
+}
+
+var _ = Describe("the guest filesystem tools", func() {
+	// toolsDir returns an artifacts directory that holds the four tools,
+	// each with bytes of its own, and returns the bytes by name.
+	toolsDir := func() (string, map[string]string) {
+		dir := GinkgoT().TempDir()
+		want := map[string]string{}
+		for _, name := range guestToolNames {
+			want[name] = "static " + name + strings.Repeat("\x00\xff", 40)
+			Expect(os.WriteFile(filepath.Join(dir, name), []byte(want[name]), 0o755)).To(Succeed())
+		}
+		return dir, want
+	}
+
+	volumeGuest := func() guestContents {
+		g := taskGuest("true")
+		g.vols = []guestVolume{{ContainerDir: "/data", ImageName: "rvm-disk-3.img"}}
+		g.drives.volumes = qemuImageDrives(defaultImageSize)
+		return g
+	}
+
+	archive := func(g guestContents) (names []string, byName map[string]cpioEntry) {
+		bb := filepath.Join(GinkgoT().TempDir(), "busybox")
+		Expect(os.WriteFile(bb, []byte("busybox"), 0o755)).To(Succeed())
+		f, err := newInitramfs(bb, g)
+		Expect(err).NotTo(HaveOccurred())
+		defer f.Close()
+		return archiveEntries(fileBytes(f))
+	}
+
+	It("names the tools at fixed guest paths below /rvm/tools, away from the applets that stage 1 installs in /bin", func() {
+		Expect([]string{guestMke2fs, guestE2fsck, guestTune2fs, guestExt4grow, guestMke2fsConfig}).To(Equal([]string{
+			"/rvm/tools/mke2fs", "/rvm/tools/e2fsck", "/rvm/tools/tune2fs", "/rvm/tools/ext4grow", "/rvm/tools/mke2fs.conf"}))
+		Expect(guestToolNames).To(Equal([]string{"mke2fs", "e2fsck", "tune2fs", "ext4grow"}))
+		for _, p := range []string{guestMke2fs, guestE2fsck, guestTune2fs, guestExt4grow, guestMke2fsConfig} {
+			Expect(p).NotTo(HavePrefix("/bin/"))
+		}
+	})
+
+	It("pins the mke2fs.conf the guest's mke2fs reads", func() {
+		sum := sha256.Sum256([]byte(guestMke2fsConfText))
+		Expect(hex.EncodeToString(sum[:])).To(Equal(goldenMke2fsConfSHA256))
+		Expect(guestMke2fsConfText).To(HaveSuffix("\n"))
+		Expect(guestMke2fsConfText).To(ContainSubstring("base_features = sparse_super,large_file,filetype,resize_inode,dir_index,ext_attr\n"))
+		Expect(guestMke2fsConfText).To(MatchRegexp(`ext4 = \{\n\t\tfeatures = has_journal,extent,[a-z_,]*64bit[a-z_,]*\n\t\}`))
+	})
+
+	It("puts the four tools and mke2fs.conf in the initramfs of a guest with a volume, with the modes the guest runs them with", func() {
+		dir, want := toolsDir()
+		tools, err := openGuestTools(dir)
+		Expect(err).NotTo(HaveOccurred())
+		defer tools.Close()
+		g := volumeGuest()
+		g.tools = tools
+
+		names, byName := archive(g)
+		Expect(byName).To(HaveKey("rvm/tools"))
+		Expect(byName["rvm/tools"].mode).To(Equal(uint32(0o040755)))
+		for _, name := range guestToolNames {
+			e, ok := byName["rvm/tools/"+name]
+			Expect(ok).To(BeTrue(), name)
+			Expect(e.mode).To(Equal(uint32(0o100755)), name)
+			Expect(string(e.data)).To(Equal(want[name]), name)
+		}
+		conf := byName["rvm/tools/mke2fs.conf"]
+		Expect(conf.mode).To(Equal(uint32(0o100644)))
+		Expect(string(conf.data)).To(Equal(guestMke2fsConfText))
+		Expect(slices.Index(names, "rvm/tools")).To(BeNumerically("<", slices.Index(names, "rvm/tools/mke2fs")), "a directory comes before what it holds")
+		Expect(byName).To(HaveKey("rvm/mounts"))
+	})
+
+	It("adds nothing to a guest without the tools, so it boots exactly as before", func() {
+		dir, _ := toolsDir()
+		tools, err := openGuestTools(dir)
+		Expect(err).NotTo(HaveOccurred())
+		defer tools.Close()
+
+		without := taskGuest("true")
+		names, byName := archive(without)
+		for _, n := range names {
+			Expect(n).NotTo(HavePrefix("rvm/tools"))
+		}
+		Expect(string(byName["rvm/init"].data)).To(Equal(goldenInitNet))
+
+		with := without
+		with.tools = tools
+		moreNames, moreByName := archive(with)
+		var added []string
+		for _, n := range moreNames {
+			if !slices.Contains(names, n) {
+				added = append(added, n)
+				continue
+			}
+			Expect(moreByName[n]).To(Equal(byName[n]), n)
+		}
+		Expect(added).To(Equal([]string{"rvm/tools", "rvm/tools/mke2fs", "rvm/tools/e2fsck", "rvm/tools/tune2fs", "rvm/tools/ext4grow", "rvm/tools/mke2fs.conf"}))
+		Expect(moreNames).To(HaveLen(len(names) + len(added)))
+	})
+
+	It("writes the bytes of the file it checked, not those of a file put in its place afterwards", func() {
+		dir, want := toolsDir()
+		tools, err := openGuestTools(dir)
+		Expect(err).NotTo(HaveOccurred())
+		defer tools.Close()
+		for _, name := range guestToolNames {
+			swap := filepath.Join(dir, name+".new")
+			Expect(os.WriteFile(swap, []byte("swapped "+name), 0o755)).To(Succeed())
+			Expect(os.Rename(swap, filepath.Join(dir, name))).To(Succeed())
+		}
+		g := volumeGuest()
+		g.tools = tools
+		_, byName := archive(g)
+		for _, name := range guestToolNames {
+			Expect(string(byName["rvm/tools/"+name].data)).To(Equal(want[name]), name)
+		}
+		// A second archive from the same tools has the same bytes.
+		_, again := archive(g)
+		Expect(string(again["rvm/tools/ext4grow"].data)).To(Equal(want["ext4grow"]))
+	})
+
+	DescribeTable("needs the tools for any volume that is not a share",
+		func(volumes, shares int, want bool) { Expect(needsGuestTools(volumes, shares)).To(Equal(want)) },
+		Entry("no volume", 0, 0, false),
+		Entry("one volume", 1, 0, true),
+		Entry("four volumes", 4, 0, true),
+		Entry("one share", 1, 1, false),
+		Entry("a share and an image", 2, 1, true),
+	)
+
+	Describe("openGuestTools", func() {
+		hint := "the cell needs the guest e2fsprogs artifact"
+
+		DescribeTable("refuses a tool that is missing, naming it and what the cell needs",
+			func(missing string) {
+				dir, _ := toolsDir()
+				Expect(os.Remove(filepath.Join(dir, missing))).To(Succeed())
+				before := openFDCount()
+				tools, err := openGuestTools(dir)
+				Expect(tools).To(BeNil())
+				Expect(err).To(MatchError(ContainSubstring("guest tool " + missing + " is missing")))
+				Expect(err).To(MatchError(ContainSubstring(hint)))
+				Expect(err).To(MatchError(ContainSubstring(filepath.Join(dir, missing))))
+				Expect(openFDCount()).To(Equal(before), "a refusal closes the tools it had opened")
+			},
+			Entry("mke2fs", "mke2fs"),
+			Entry("e2fsck", "e2fsck"),
+			Entry("tune2fs", "tune2fs"),
+			Entry("ext4grow", "ext4grow"),
+		)
+
+		It("refuses a directory with none of them", func() {
+			_, err := openGuestTools(GinkgoT().TempDir())
+			Expect(err).To(MatchError(ContainSubstring("guest tool mke2fs is missing")))
+			Expect(err).To(MatchError(ContainSubstring(hint)))
+		})
+
+		It("refuses an artifacts directory that does not exist", func() {
+			_, err := openGuestTools(filepath.Join(GinkgoT().TempDir(), "nope"))
+			Expect(err).To(MatchError(ContainSubstring("the artifacts directory")))
+			Expect(err).To(MatchError(ContainSubstring(hint)))
+		})
+
+		DescribeTable("refuses a tool that is not a regular executable file",
+			func(name string, prepare func(path string), reason string) {
+				dir, _ := toolsDir()
+				path := filepath.Join(dir, name)
+				Expect(os.Remove(path)).To(Succeed())
+				prepare(path)
+				before := openFDCount()
+				tools, err := openGuestTools(dir)
+				Expect(tools).To(BeNil())
+				Expect(err).To(MatchError(ContainSubstring("guest tool " + name + " at " + path + " " + reason)))
+				Expect(err).To(MatchError(ContainSubstring(hint)))
+				Expect(openFDCount()).To(Equal(before))
+			},
+			Entry("a directory", "e2fsck", func(p string) { Expect(os.Mkdir(p, 0o755)).To(Succeed()) }, "is not a regular file"),
+			Entry("a FIFO, which must not hang the launch", "tune2fs", func(p string) { Expect(unix.Mkfifo(p, 0o755)).To(Succeed()) }, "is not a regular file"),
+			Entry("a file without an execute bit", "mke2fs", func(p string) { Expect(os.WriteFile(p, []byte("x"), 0o644)).To(Succeed()) }, "is not executable"),
+			Entry("a file that only another class may execute", "ext4grow", func(p string) { Expect(os.WriteFile(p, []byte("x"), 0o640)).To(Succeed()) }, "is not executable"),
+			Entry("an empty file", "ext4grow", func(p string) { Expect(os.WriteFile(p, nil, 0o755)).To(Succeed()) }, "is empty"),
+		)
+
+		It("accepts a tool that is a symbolic link to a file inside the artifacts directory", func() {
+			dir, want := toolsDir()
+			Expect(os.Mkdir(filepath.Join(dir, "versions"), 0o755)).To(Succeed())
+			Expect(os.Rename(filepath.Join(dir, "mke2fs"), filepath.Join(dir, "versions", "mke2fs-1.47.4"))).To(Succeed())
+			Expect(os.Symlink("versions/mke2fs-1.47.4", filepath.Join(dir, "mke2fs"))).To(Succeed())
+			// An artifacts directory reached through a link is the same directory.
+			via := filepath.Join(GinkgoT().TempDir(), "art")
+			Expect(os.Symlink(dir, via)).To(Succeed())
+
+			for _, root := range []string{dir, via} {
+				tools, err := openGuestTools(root)
+				Expect(err).NotTo(HaveOccurred(), root)
+				g := volumeGuest()
+				g.tools = tools
+				_, byName := archive(g)
+				tools.Close()
+				Expect(string(byName["rvm/tools/mke2fs"].data)).To(Equal(want["mke2fs"]), root)
+			}
+		})
+
+		DescribeTable("refuses a symbolic link that leaves the artifacts directory",
+			func(target func(dir, outside string) string) {
+				dir, _ := toolsDir()
+				outside := GinkgoT().TempDir()
+				Expect(os.WriteFile(filepath.Join(outside, "mke2fs"), []byte("elsewhere"), 0o755)).To(Succeed())
+				Expect(os.Remove(filepath.Join(dir, "tune2fs"))).To(Succeed())
+				Expect(os.Symlink(target(dir, outside), filepath.Join(dir, "tune2fs"))).To(Succeed())
+				before := openFDCount()
+				tools, err := openGuestTools(dir)
+				Expect(tools).To(BeNil())
+				Expect(err).To(MatchError(ContainSubstring("guest tool tune2fs at " + filepath.Join(dir, "tune2fs") + " resolves to ")))
+				Expect(err).To(MatchError(ContainSubstring("not a file inside the artifacts directory")))
+				Expect(err).To(MatchError(ContainSubstring(hint)))
+				Expect(openFDCount()).To(Equal(before))
+			},
+			Entry("an absolute path", func(_, outside string) string { return filepath.Join(outside, "mke2fs") }),
+			Entry("a relative path up out of the directory", func(dir, outside string) string {
+				rel, err := filepath.Rel(dir, filepath.Join(outside, "mke2fs"))
+				Expect(err).NotTo(HaveOccurred())
+				return rel
+			}),
+		)
+
+		It("refuses a link that leads out through another link, and a link to the artifacts directory itself", func() {
+			dir, _ := toolsDir()
+			outside := GinkgoT().TempDir()
+			Expect(os.WriteFile(filepath.Join(outside, "real"), []byte("elsewhere"), 0o755)).To(Succeed())
+			Expect(os.Symlink(filepath.Join(outside, "real"), filepath.Join(dir, "hop"))).To(Succeed())
+			Expect(os.Remove(filepath.Join(dir, "e2fsck"))).To(Succeed())
+			Expect(os.Symlink("hop", filepath.Join(dir, "e2fsck"))).To(Succeed())
+			_, err := openGuestTools(dir)
+			Expect(err).To(MatchError(ContainSubstring("guest tool e2fsck")))
+			Expect(err).To(MatchError(ContainSubstring("not a file inside the artifacts directory")))
+
+			Expect(os.Remove(filepath.Join(dir, "e2fsck"))).To(Succeed())
+			Expect(os.Symlink(".", filepath.Join(dir, "e2fsck"))).To(Succeed())
+			_, err = openGuestTools(dir)
+			Expect(err).To(MatchError(ContainSubstring("guest tool e2fsck")))
+		})
+
+		It("refuses a dangling symbolic link as missing", func() {
+			dir, _ := toolsDir()
+			Expect(os.Remove(filepath.Join(dir, "ext4grow"))).To(Succeed())
+			Expect(os.Symlink("gone", filepath.Join(dir, "ext4grow"))).To(Succeed())
+			_, err := openGuestTools(dir)
+			Expect(err).To(MatchError(ContainSubstring("guest tool ext4grow is missing")))
+			Expect(err).To(MatchError(ContainSubstring(hint)))
+		})
+
+		It("closes its tools once, and tolerates nil", func() {
+			dir, _ := toolsDir()
+			before := openFDCount()
+			tools, err := openGuestTools(dir)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(openFDCount()).To(Equal(before + len(guestToolNames)))
+			tools.Close()
+			tools.Close()
+			Expect(openFDCount()).To(Equal(before))
+			var none *guestTools
+			none.Close()
+		})
 	})
 })

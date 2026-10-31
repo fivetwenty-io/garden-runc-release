@@ -1,0 +1,400 @@
+//go:build linux
+
+package main
+
+import (
+	"encoding/binary"
+	"hash/crc32"
+	"os"
+	"os/exec"
+	"regexp"
+	"strconv"
+	"strings"
+	"syscall"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+)
+
+// The fields of the ext2 superblock, which starts 1024 bytes into the
+// filesystem, that the volume specs read and change, as offsets into the
+// superblock.
+const (
+	extSuperblockOffset = 1024
+	extSuperblockBytes  = 1024
+
+	extLogBlockSize    = 0x18
+	extFirstDataBlock  = 0x14
+	extState           = 0x3a
+	extInodeSize       = 0x58
+	extFeatureCompat   = 0x5c
+	extFeatureIncompat = 0x60
+	extFeatureROCompat = 0x64
+	extUUID            = 0x68
+	extDescSize        = 0xfe
+	extChecksumSeed    = 0x270
+	extChecksum        = 0x3fc
+
+	extStateValid = 0x1
+
+	extCompatHasJournal     = 0x4
+	extCompatResizeInode    = 0x10
+	extIncompatExtents      = 0x40
+	extIncompat64Bit        = 0x80
+	extIncompatFlexBG       = 0x200
+	extIncompatCsumSeed     = 0x2000
+	extROCompatMetadataCsum = 0x400
+)
+
+// extRootInode is the root directory's inode number, and its inode is the
+// second in the first group's inode table.
+const extRootInode = 2
+
+// The fields of an ext2 inode that the specs change.
+const (
+	extInodeMode       = 0x00
+	extInodeLinks      = 0x1a
+	extInodeGeneration = 0x64
+	extInodeChecksumLo = 0x7c
+	extInodeExtraIsize = 0x80
+	extInodeChecksumHi = 0x82
+)
+
+// castagnoli is the CRC32C table of ext4's metadata checksums.
+var castagnoli = crc32.MakeTable(crc32.Castagnoli)
+
+// ext4CRC32C continues the CRC32C crc over p as ext4 computes its
+// checksums, without the inversions of the standard CRC.
+func ext4CRC32C(crc uint32, p []byte) uint32 { return ^crc32.Update(^crc, castagnoli, p) }
+
+// extImage is the ext2, ext3, or ext4 filesystem in a host image file, read
+// and changed from the host while no guest runs on it.
+type extImage struct {
+	f  *os.File
+	sb []byte
+}
+
+// readExtImage reads the superblock of the filesystem in f.
+func readExtImage(f *os.File) *extImage {
+	GinkgoHelper()
+	sb := make([]byte, extSuperblockBytes)
+	_, err := f.ReadAt(sb, extSuperblockOffset)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(binary.LittleEndian.Uint16(sb[0x38:])).To(Equal(uint16(0xef53)), "the image holds no ext filesystem")
+	return &extImage{f: f, sb: sb}
+}
+
+func (e *extImage) u16(off int) uint32 { return uint32(binary.LittleEndian.Uint16(e.sb[off:])) }
+func (e *extImage) u32(off int) uint32 { return binary.LittleEndian.Uint32(e.sb[off:]) }
+
+// hasJournal reports whether the filesystem has an internal journal.
+func (e *extImage) hasJournal() bool { return e.u32(extFeatureCompat)&extCompatHasJournal != 0 }
+
+// checksummed reports whether the filesystem's metadata carry checksums,
+// which every change from the host must then recompute.
+func (e *extImage) checksummed() bool {
+	return e.u32(extFeatureROCompat)&extROCompatMetadataCsum != 0
+}
+
+// uuid returns the filesystem's UUID, which a new format would change.
+func (e *extImage) uuid() string { return string(e.sb[extUUID : extUUID+16]) }
+
+// clean reports whether the superblock marks the filesystem cleanly
+// unmounted.
+func (e *extImage) clean() bool { return e.u16(extState)&extStateValid != 0 }
+
+// markUnclean clears the clean flag, as a guest that stopped without
+// unmounting the filesystem leaves it, so that e2fsck -p checks it in full.
+func (e *extImage) markUnclean() {
+	GinkgoHelper()
+	binary.LittleEndian.PutUint16(e.sb[extState:], uint16(e.u16(extState)&^extStateValid))
+	if e.checksummed() {
+		binary.LittleEndian.PutUint32(e.sb[extChecksum:], ext4CRC32C(^uint32(0), e.sb[:extChecksum]))
+	}
+	_, err := e.f.WriteAt(e.sb, extSuperblockOffset)
+	Expect(err).NotTo(HaveOccurred())
+}
+
+// rootInode returns the root directory's inode and its offset in the image.
+func (e *extImage) rootInode() ([]byte, int64) {
+	GinkgoHelper()
+	blockSize := int64(1024) << e.u32(extLogBlockSize)
+	descSize := 32
+	if e.u32(extFeatureIncompat)&extIncompat64Bit != 0 {
+		descSize = int(e.u16(extDescSize))
+	}
+	desc := make([]byte, descSize)
+	_, err := e.f.ReadAt(desc, (int64(e.u32(extFirstDataBlock))+1)*blockSize)
+	Expect(err).NotTo(HaveOccurred())
+	table := int64(binary.LittleEndian.Uint32(desc[8:]))
+	if descSize >= 64 {
+		table |= int64(binary.LittleEndian.Uint32(desc[0x28:])) << 32
+	}
+	inodeSize := int64(e.u16(extInodeSize))
+	off := table*blockSize + (extRootInode-1)*inodeSize
+	inode := make([]byte, inodeSize)
+	_, err = e.f.ReadAt(inode, off)
+	Expect(err).NotTo(HaveOccurred())
+	return inode, off
+}
+
+// rootLinks returns the root directory's link count.
+func (e *extImage) rootLinks() uint16 {
+	inode, _ := e.rootInode()
+	return binary.LittleEndian.Uint16(inode[extInodeLinks:])
+}
+
+// editRoot changes the root directory's inode with edit and writes it back
+// with its checksum recomputed, so that e2fsck sees the change itself and
+// not a checksum error.
+func (e *extImage) editRoot(edit func(inode []byte)) {
+	GinkgoHelper()
+	inode, off := e.rootInode()
+	edit(inode)
+	if e.checksummed() {
+		seed := e.u32(extChecksumSeed)
+		if e.u32(extFeatureIncompat)&extIncompatCsumSeed == 0 {
+			seed = ext4CRC32C(^uint32(0), e.sb[extUUID:extUUID+16])
+		}
+		hi := len(inode) > 128 && binary.LittleEndian.Uint16(inode[extInodeExtraIsize:]) >= extInodeChecksumHi+2-128
+		binary.LittleEndian.PutUint16(inode[extInodeChecksumLo:], 0)
+		if hi {
+			binary.LittleEndian.PutUint16(inode[extInodeChecksumHi:], 0)
+		}
+		var number [4]byte
+		binary.LittleEndian.PutUint32(number[:], extRootInode)
+		sum := ext4CRC32C(ext4CRC32C(ext4CRC32C(seed, number[:]), inode[extInodeGeneration:extInodeGeneration+4]), inode)
+		binary.LittleEndian.PutUint16(inode[extInodeChecksumLo:], uint16(sum))
+		if hi {
+			binary.LittleEndian.PutUint16(inode[extInodeChecksumHi:], uint16(sum>>16))
+		}
+	}
+	_, err := e.f.WriteAt(inode, off)
+	Expect(err).NotTo(HaveOccurred())
+}
+
+// hostBlocks returns the bytes the host file f holds blocks for.
+func hostBlocks(f *os.File) int64 {
+	GinkgoHelper()
+	info, err := f.Stat()
+	Expect(err).NotTo(HaveOccurred())
+	st, ok := info.Sys().(*syscall.Stat_t)
+	Expect(ok).To(BeTrue())
+	return st.Blocks * 512
+}
+
+// legacyImage returns a volume image of size bytes that holds the ext2
+// filesystem an rvm.6 guest made on a blank image, with the guest's own
+// busybox mke2fs and its arguments of that release.
+func legacyImage(size int64) *os.File {
+	GinkgoHelper()
+	f := openSizedFile(size)
+	out, err := exec.Command(guestBusybox(), "mke2fs", "-F", "-m", "0", "-L", "rvm-volume", f.Name()).CombinedOutput()
+	Expect(err).NotTo(HaveOccurred(), string(out))
+	img := readExtImage(f)
+	Expect(img.hasJournal()).To(BeFalse(), "busybox mke2fs made a journal")
+	return f
+}
+
+// volumeMounts returns, for each mount= line of mountsCommand in out, the
+// ext4 mount options of the path it names.
+func volumeMounts(out string) map[string][]string {
+	GinkgoHelper()
+	got := map[string][]string{}
+	for _, m := range regexp.MustCompile(`(?m)^mount=(\S+) (\S*)\r?$`).FindAllStringSubmatch(out, -1) {
+		Expect(got).NotTo(HaveKey(m[1]), out)
+		Expect(m[2]).NotTo(BeEmpty(), "%s is not an ext4 mount\n%s", m[1], out)
+		got[m[1]] = strings.Split(m[2], ",")
+	}
+	return got
+}
+
+// mountsCommand prints a mount= line with the ext4 mount options of each
+// of paths.
+func mountsCommand(paths ...string) string {
+	return `for p in ` + strings.Join(paths, " ") + `; do
+	echo "mount=$p $(grep " $p ext4 " /proc/mounts | cut -d ' ' -f 4)"
+done
+`
+}
+
+var _ = Describe("volume images against a real QEMU", func() {
+	const dataDir = "/home/vcap/data"
+
+	// imageGuest returns a guest that runs command with a root image and an
+	// image volume at each of dirs, in volume order, of the sizes given.
+	imageGuest := func(command string, dirs []string, sizes ...int64) guestContents {
+		Expect(dirs).To(HaveLen(len(sizes)))
+		g := taskGuest(command)
+		for _, d := range dirs {
+			g.vols = append(g.vols, guestVolume{ContainerDir: d, ImageName: "volume.img"})
+		}
+		g.drives.volumes = qemuImageDrives(sizes...)
+		withRealRoot(&g)
+		return g
+	}
+	// bootData boots a guest that runs command with img as its one volume
+	// at dataDir, and returns the console output, which a failed setup
+	// leaves without the start tag.
+	bootData := func(img *os.File, command string) string {
+		info, err := img.Stat()
+		Expect(err).NotTo(HaveOccurred())
+		return bootRealGuestEdited(imageGuest(command, []string{dataDir}, info.Size()), []*os.File{img}, realRootImage(), nil)
+	}
+	// markData boots a guest that leaves text in a file on img and expects
+	// the boot to go through.
+	markData := func(img *os.File, text string) {
+		out := bootData(img, "echo "+text+" >"+dataDir+"/mark")
+		Expect(out).NotTo(ContainSubstring("vm-launch guest setup"), out)
+		Expect(out).To(ContainSubstring(exitTag(testNonce)+"0"), out)
+	}
+
+	It("formats a new image as a journalled ext4 without writing the image's size, mounts it with sync and noinit_itable, and preens it at the next boot", func() {
+		img := openSizedFile(defaultImageSize)
+		if hostBlocks(img) != 0 {
+			Skip("the file system under the temporary directory does not keep a truncated file sparse")
+		}
+		out := bootData(img, mountsCommand(dataDir)+"echo kept >"+dataDir+"/mark\n")
+		Expect(out).NotTo(ContainSubstring("vm-launch guest setup"), out)
+		Expect(out).NotTo(ContainSubstring("e2fsck"), out)
+		Expect(out).To(ContainSubstring(exitTag(testNonce)+"0"), out)
+		options := volumeMounts(out)[dataDir]
+		Expect(options).To(ContainElements("sync", "dirsync", "noatime", "noinit_itable"), out)
+
+		fs := readExtImage(img)
+		Expect(extLabel(img)).To(Equal("rvm-volume"))
+		Expect(fs.hasJournal()).To(BeTrue(), "the new image has no journal")
+		Expect(fs.u32(extFeatureCompat) & extCompatResizeInode).NotTo(BeZero())
+		for _, feature := range []uint32{extIncompatExtents, extIncompat64Bit, extIncompatFlexBG} {
+			Expect(fs.u32(extFeatureIncompat)&feature).NotTo(BeZero(), "incompat feature %#x", feature)
+		}
+		Expect(fs.checksummed()).To(BeTrue())
+		Expect(int64(1024) << fs.u32(extLogBlockSize)).To(Equal(int64(4096)))
+		// The journal of a 1 GiB ext4 is 32 MiB, and the inode tables take
+		// 16 MiB, so an image that holds less than 16 MiB had neither
+		// written in zeros, by mke2fs or by the kernel after the mount.
+		GinkgoWriter.Printf("the new 1 GiB image holds %d KiB on the host\n", hostBlocks(img)/1024)
+		Expect(hostBlocks(img)).To(BeNumerically("<", 16<<20), "the format or the mount wrote the journal or the inode tables")
+		uuid := fs.uuid()
+
+		// The next boot checks the image, finds it clean, and mounts it as
+		// it was.
+		out = bootData(img, `echo "mark=$(cat `+dataDir+`/mark)"`)
+		Expect(out).NotTo(ContainSubstring("vm-launch guest setup"), out)
+		Expect(out).To(MatchRegexp(`(?m)^rvm-volume: clean, [0-9]+/[0-9]+ files, [0-9]+/[0-9]+ blocks\r?$`), out)
+		Expect(out).To(MatchRegexp(`(?m)^mark=kept\r?$`), out)
+		Expect(out).To(ContainSubstring(exitTag(testNonce)+"0"), out)
+		Expect(readExtImage(img).uuid()).To(Equal(uuid), "the image was formatted again")
+	})
+
+	DescribeTable("repairs an image with an error that e2fsck -p fixes, and mounts it with its files",
+		func(newImage func() *os.File) {
+			img := newImage()
+			markData(img, "before-the-repair")
+			fs := readExtImage(img)
+			uuid := fs.uuid()
+			Expect(fs.rootLinks()).To(Equal(uint16(3)), "a root with lost+found and no other directory")
+			fs.editRoot(func(inode []byte) { binary.LittleEndian.PutUint16(inode[extInodeLinks:], 7) })
+			fs.markUnclean()
+
+			out := bootData(img, `echo "mark=$(cat `+dataDir+`/mark)"`)
+			Expect(out).To(MatchRegexp(`(?m)^rvm-volume was not cleanly unmounted, check forced\.\r?$`), out)
+			Expect(out).To(MatchRegexp(`(?m)^rvm-volume: Inode 2 ref count is 7, should be 3\.  FIXED\.\r?$`), out)
+			Expect(out).NotTo(ContainSubstring("vm-launch guest setup"), out)
+			Expect(out).To(MatchRegexp(`(?m)^mark=before-the-repair\r?$`), out)
+			Expect(out).To(ContainSubstring(exitTag(testNonce)+"0"), out)
+
+			fs = readExtImage(img)
+			Expect(fs.rootLinks()).To(Equal(uint16(3)), "the repair is not on the image")
+			Expect(fs.clean()).To(BeTrue(), "the image was not left clean")
+			Expect(fs.uuid()).To(Equal(uuid), "the image was formatted again")
+		},
+		Entry("a journalled ext4 image that a guest formatted", func() *os.File { return openSizedFile(defaultImageSize) }),
+		Entry("an ext2 image from rvm.6", func() *os.File { return legacyImage(defaultImageSize) }),
+	)
+
+	// refusedImage boots a guest on img and expects stage 2 to fail the boot
+	// because e2fsck -p exits with status before the command starts.
+	refusedImage := func(img *os.File, status int) string {
+		out := bootData(img, "echo command-ran")
+		Expect(out).To(MatchRegexp(`(?m)^vm-launch guest setup: the volume image volume\.img has errors that e2fsck -p can't repair; inspect it on the volume \(e2fsck -p exited `+strconv.Itoa(status)+` for `+dataDir+`, and vm-launch never formats an image that is not blank\)\r?$`), out)
+		Expect(out).NotTo(ContainSubstring(startTag(testNonce)), out)
+		Expect(out).NotTo(ContainSubstring("command-ran"), out)
+		Expect(out).NotTo(ContainSubstring("vm-launch guest setup: mounting"), out)
+		return out
+	}
+
+	DescribeTable("fails the boot on an image whose filesystem e2fsck -p can't repair, and never formats it",
+		func(newImage func() *os.File) {
+			img := newImage()
+			markData(img, "kept-through-the-failure")
+			fs := readExtImage(img)
+			uuid := fs.uuid()
+			fs.editRoot(func(inode []byte) { binary.LittleEndian.PutUint16(inode[extInodeMode:], syscall.S_IFREG|0o644) })
+			fs.markUnclean()
+
+			out := refusedImage(img, 4)
+			Expect(out).To(MatchRegexp(`(?m)^rvm-volume: Root inode is not a directory\.`), out)
+			Expect(out).To(MatchRegexp(`(?m)^rvm-volume: UNEXPECTED INCONSISTENCY; RUN fsck MANUALLY\.`), out)
+			fs = readExtImage(img)
+			Expect(fs.uuid()).To(Equal(uuid), "the image was formatted")
+			Expect(extLabel(img)).To(Equal("rvm-volume"))
+			Expect(imageHolds(img, "kept-through-the-failure")).To(BeTrue(), "the file's data is gone from the image")
+		},
+		Entry("a journalled ext4 image that a guest formatted", func() *os.File { return openSizedFile(defaultImageSize) }),
+		Entry("an ext2 image from rvm.6", func() *os.File { return legacyImage(defaultImageSize) }),
+	)
+
+	It("fails the boot on an image that is not blank and holds no filesystem, and leaves every byte of it", func() {
+		img := openSizedFile(defaultImageSize)
+		// The bytes go inside the first 64 KiB, which is what the blank
+		// check reads.
+		_, err := img.WriteAt([]byte("not a filesystem, and not blank either"), 8<<10)
+		Expect(err).NotTo(HaveOccurred())
+		before := imageDigest(img)
+		out := refusedImage(img, 8)
+		Expect(out).To(ContainSubstring("Bad magic number in super-block"), out)
+		Expect(imageDigest(img)).To(Equal(before), "the guest wrote to the image")
+		Expect(extLabel(img)).To(BeEmpty())
+	})
+
+	It("drops sync and dirsync only from the images with a journal when the operator turns sync mounts off", func() {
+		dirs := []string{"/home/vcap/new", "/home/vcap/legacy", "/home/vcap/small"}
+		const smallImage = 4 << 20
+		newImg, legacy, small := openSizedFile(defaultImageSize), legacyImage(defaultImageSize), openSizedFile(smallImage)
+		vols := []*os.File{newImg, legacy, small}
+		guest := func(noSync bool) guestContents {
+			g := imageGuest(mountsCommand(dirs...), dirs, defaultImageSize, defaultImageSize, smallImage)
+			g.noVolumeSync = noSync
+			return g
+		}
+
+		out := bootRealGuestWith(guest(true), vols, realRootImage())
+		Expect(out).NotTo(ContainSubstring("vm-launch guest setup"), out)
+		Expect(out).NotTo(ContainSubstring("reading the filesystem features"), out)
+		Expect(out).To(ContainSubstring(exitTag(testNonce)+"0"), out)
+		// The new 1 GiB image gets a journal, and a 4 MiB one is too small
+		// for one, so it keeps sync and dirsync as the rvm.6 image does.
+		Expect(readExtImage(newImg).hasJournal()).To(BeTrue())
+		Expect(readExtImage(legacy).hasJournal()).To(BeFalse())
+		Expect(readExtImage(small).hasJournal()).To(BeFalse())
+		mounts := volumeMounts(out)
+		Expect(mounts).To(HaveLen(3), out)
+		Expect(mounts[dirs[0]]).NotTo(ContainElement("sync"), out)
+		Expect(mounts[dirs[0]]).NotTo(ContainElement("dirsync"), out)
+		Expect(mounts[dirs[0]]).To(ContainElements("noatime", "noinit_itable"), out)
+		for _, d := range dirs[1:] {
+			Expect(mounts[d]).To(ContainElements("sync", "dirsync", "noatime", "noinit_itable"), "%s\n%s", d, out)
+		}
+
+		// With the default, every image keeps sync and dirsync, the
+		// journalled one included.
+		out = bootRealGuestWith(guest(false), vols, realRootImage())
+		Expect(out).NotTo(ContainSubstring("vm-launch guest setup"), out)
+		mounts = volumeMounts(out)
+		Expect(mounts).To(HaveLen(3), out)
+		for _, d := range dirs {
+			Expect(mounts[d]).To(ContainElements("sync", "dirsync", "noatime", "noinit_itable"), "%s\n%s", d, out)
+		}
+	})
+})

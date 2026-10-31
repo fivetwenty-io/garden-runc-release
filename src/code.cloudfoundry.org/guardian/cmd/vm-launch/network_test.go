@@ -518,7 +518,9 @@ var _ = Describe("guest network", func() {
 })
 
 // makeArtifacts returns an artifacts directory with every file both backends
-// need, none of them runnable. Specs replace the hypervisor with writeFakeHypervisor.
+// need, none of them runnable, and the four guest filesystem tools, which a
+// guest with an image or block volume needs. Specs replace the hypervisor with
+// writeFakeHypervisor.
 func makeArtifacts() string {
 	art := GinkgoT().TempDir()
 	for _, d := range []string{"kernel", "qemu/lib", "qemu/share", "firecracker"} {
@@ -527,6 +529,9 @@ func makeArtifacts() string {
 	for _, f := range []string{"kernel/bzImage", "kernel/vmlinux", "qemu/qemu-system-x86_64-microvm", "busybox",
 		"qemu/ld-linux-x86-64.so.2", "firecracker/firecracker"} {
 		Expect(os.WriteFile(filepath.Join(art, f), []byte("x"), 0o644)).To(Succeed())
+	}
+	for _, name := range guestToolNames {
+		Expect(os.WriteFile(filepath.Join(art, name), []byte("tool "+name), 0o755)).To(Succeed())
 	}
 	return art
 }
