@@ -532,8 +532,10 @@ var _ = Describe("guest volume initramfs", func() {
 			// guest's busybox in GUEST_BUSYBOX, or the host's. e2fsck kills
 			// itself with the signal E2FSCK_SIG, and ext4grow leaves every
 			// mount read-only with EXT4GROW_RO. sync -f fails for the path
-			// SYNC_FAIL_AT names, and umount, with UMOUNT_RC, says why it
-			// fails. kill ends the test processes that KILL_ENDS or TERM_ENDS
+			// SYNC_FAIL_AT names, and only the first time for the one
+			// SYNC_FAIL_ONCE_AT names, and for the one SYNC_HANG_AT names it
+			// kills the teardown's shell, as the host ends a guest whose
+			// flush hangs; umount, with UMOUNT_RC, says why it fails. kill ends the test processes that KILL_ENDS or TERM_ENDS
 			// name for its signal, and sleep, when it has run as many times as
 			// an entry pid:n of SLEEP_ENDS says, ends that process. The guest filesystem
 			// tools are in their own directory, which stands in for
@@ -635,6 +637,13 @@ esac
 for p in $ends; do rm -rf `+shellQuote(proc)+`/"$p"; done
 exit 0`)
 			stub("sync", `[ -z "${SYNC_FAIL_AT:-}" ] || [ "$2" != "$SYNC_FAIL_AT" ] || { echo "sync: $2: Input/output error" >&2; exit 1; }
+once=`+shellQuote(filepath.Join(dir, "sync-failed-once"))+`
+if [ -n "${SYNC_FAIL_ONCE_AT:-}" ] && [ "$2" = "$SYNC_FAIL_ONCE_AT" ] && [ ! -e "$once" ]; then
+	: >"$once"
+	echo "sync: $2: Input/output error" >&2
+	exit 1
+fi
+[ -z "${SYNC_HANG_AT:-}" ] || [ "$2" != "$SYNC_HANG_AT" ] || { kill -KILL "$(cat `+shellQuote(filepath.Join(dir, "teardown-pid"))+`)"; exit 1; }
 exit 0`)
 			stub("umount", `[ "${UMOUNT_RC:-0}" = 0 ] || echo "umount: can't unmount $1: Device or resource busy" >&2
 exit "${UMOUNT_RC:-0}"`)
@@ -713,16 +722,33 @@ exit "${UMOUNT_RC:-0}"`)
 		backupCall := func(device string, at int64) string {
 			return "dd if=" + device + " of=" + filepath.Join(dir, "volume-backup") + " bs=2 skip=" + strconv.FormatInt((at+56)/2, 10) + " count=1\n"
 		}
+		// cmpCall is the stub's argv line for the check that the first n
+		// bytes of device read as zero.
+		cmpCall := func(device string, n int64) string {
+			return "cmp -s -n " + strconv.FormatInt(n, 10) + " " + device + " /dev/zero\n"
+		}
+		// fullZeroEnd is guestFullZeroEnd as a number, the most that the
+		// check that an image reads as zero ever reads.
+		const fullZeroEnd = 2 * 32768 * 4096
 		// blankCalls are the reads of an image whose first 64 KiB are zero:
-		// the start, and the magic of a backup superblock at the start of
-		// block group 1 and 1024 bytes in, for 1024-, 2048-, and 4096-byte
-		// blocks, all of which a 1 GiB device holds.
+		// the start, the magic of a backup superblock at the start of block
+		// group 1 and 1024 bytes in, for 1024-, 2048-, and 4096-byte blocks,
+		// all of which a 1 GiB device holds, and the check that its first
+		// fullZeroEnd bytes read as zero.
 		blankCalls := func(device string) string {
 			calls := ddCall(device)
 			for _, at := range backupPlaces {
 				calls += backupCall(device, at)
 			}
-			return calls
+			return calls + cmpCall(device, fullZeroEnd)
+		}
+		// blankImage makes device a sparse 1 GiB file of zeros, the size
+		// /sys/block gives it, so that the check that its first fullZeroEnd
+		// bytes read as zero passes.
+		blankImage := func(device string) {
+			GinkgoHelper()
+			Expect(os.WriteFile(device, nil, 0o600)).To(Succeed())
+			Expect(os.Truncate(device, 1<<30)).To(Succeed())
 		}
 		// preenCalls are the calls for an image with data up to its mount:
 		// the start, the superblock, the preen, and the superblock again.
@@ -732,7 +758,7 @@ exit "${UMOUNT_RC:-0}"`)
 		growCall := func(device, mnt string) string { return "ext4grow " + device + " " + mnt + "\n" }
 
 		BeforeEach(func() {
-			Expect(os.WriteFile(device, nil, 0o600)).To(Succeed())
+			blankImage(device)
 		})
 
 		It("formats and mounts a blank image", func() {
@@ -755,7 +781,7 @@ exit "${UMOUNT_RC:-0}"`)
 			devices := []string{filepath.Join(dir, "vdc"), filepath.Join(dir, "vda"), filepath.Join(dir, "vdb")}
 			mounts := []string{filepath.Join(dir, "data"), filepath.Join(dir, "logs"), filepath.Join(dir, "cache dir")}
 			for _, d := range devices {
-				Expect(os.WriteFile(d, nil, 0o600)).To(Succeed())
+				blankImage(d)
 			}
 			writeMounts(mounts...)
 			r := runWith(devices, "DD_MODE=zeros", "DD_DATA_IF="+devices[1])
@@ -1112,9 +1138,9 @@ exit "${UMOUNT_RC:-0}"`)
 				shell := shellOf()
 				devices := []string{filepath.Join(dir, "vdc"), filepath.Join(dir, "vda"), filepath.Join(dir, "vdb")}
 				mounts := []string{filepath.Join(dir, "data"), filepath.Join(dir, "disk"), filepath.Join(dir, "cache dir")}
-				for _, d := range devices {
-					zeroDevice(d)
-				}
+				blankImage(devices[0])
+				zeroDevice(devices[1])
+				blankImage(devices[2])
 				writeKinds([]driveKind{driveImage, driveBlock, driveImage}, mounts...)
 				r := runIn(shell, devices, "DD_MODE=zeros")
 				Expect(r.out).To(Equal("REACHED_START\n"), "%s", shell.name)
@@ -1487,12 +1513,6 @@ exit "${UMOUNT_RC:-0}"`)
 			}
 			setSectors(device, strconv.FormatInt(sectors, 10)+"\n")
 		}
-		// cmpCall is the stub's argv line for the check that the first n
-		// bytes of device read as zero.
-		cmpCall := func(device string, n int64) string {
-			return "cmp -s -n " + strconv.FormatInt(n, 10) + " " + device + " /dev/zero\n"
-		}
-
 		DescribeTable("never formats an image whose first 64 KiB are zero but which holds a backup superblock's magic, and fails the boot as a damaged filesystem",
 			func(shellOf func() guestShell, place int, groupBlock, blockSize int) {
 				shell := shellOf()
@@ -1520,20 +1540,34 @@ exit "${UMOUNT_RC:-0}"`)
 			shellEntries("1024 bytes into block 32768 of 4096 bytes", 5, 32768, 4096),
 		)
 
-		DescribeTable("formats an image whose first 64 KiB are zero when no backup superblock's magic is where one would be",
+		// zeroLine is the line for an image whose first 64 KiB read as zero
+		// but whose first n bytes do not.
+		zeroLine := func(n int64) string {
+			return "vm-launch guest setup: the volume image rvm-disk-0.img for " + mnt + " reads as zero in its first 64 KiB but not in all of its first " + strconv.FormatInt(n, 10) + " bytes, and a filesystem that vm-launch made on an image no larger than that, which the host may have grown since, may have no backup superblock that would tell a damaged filesystem from a new image, so it looks like a damaged filesystem, and vm-launch never formats it; if the volume never held data, an interrupted first format can cause this, and deleting rvm-disk-0.img on the volume lets the next start create it fresh; otherwise repair it by hand on the volume, where e2fsck -b needs a backup superblock that a filesystem this small may not have\nREBOOT\n"
+		}
+
+		DescribeTable("takes no backup superblock from bytes that are not its magic, and formats an image only when its first 256 MiB read as zero too",
 			func(shellOf func() guestShell) {
 				shell := shellOf()
+				// An image of zeros is new.
+				sparseDevice(0, nil)
+				r := runIn(shell, []string{device}, "DD_MODE=zeros")
+				Expect(r.out).To(Equal("REACHED_START\n"), "%s", shell.name)
+				Expect(r.calls).To(Equal(blankCalls(device)+mkfsCall(device)+mountCall(device, mnt)), "%s", shell.name)
+
 				// The magic in the other byte order, the magic one byte off,
-				// and other data at the magic's place are no superblock.
+				// and other data at the magic's place are no superblock, so
+				// every place is read, and the read of the first 256 MiB
+				// then finds the data.
 				for _, c := range []struct {
 					at int64
 					b  []byte
-				}{{0, nil}, {backupPlaces[4] + 56, []byte{0xef, 0x53}}, {backupPlaces[4] + 57, []byte{0x53, 0xef}}, {backupPlaces[0] + 56, []byte{0x53, 0x00}}, {backupPlaces[2] + 100, []byte{0x53, 0xef}}} {
+				}{{backupPlaces[4] + 56, []byte{0xef, 0x53}}, {backupPlaces[4] + 57, []byte{0x53, 0xef}}, {backupPlaces[0] + 56, []byte{0x53, 0x00}}, {backupPlaces[2] + 100, []byte{0x53, 0xef}}} {
 					Expect(os.RemoveAll(callLog)).To(Succeed())
 					sparseDevice(c.at, c.b)
 					r := runIn(shell, []string{device}, "DD_MODE=zeros")
-					Expect(r.out).To(Equal("REACHED_START\n"), "%s, %d", shell.name, c.at)
-					Expect(r.calls).To(Equal(blankCalls(device)+mkfsCall(device)+mountCall(device, mnt)), "%s, %d", shell.name, c.at)
+					Expect(r.out).To(Equal(zeroLine(fullZeroEnd)), "%s, %d", shell.name, c.at)
+					Expect(r.calls).To(Equal(blankCalls(device)), "%s, %d", shell.name, c.at)
 				}
 			},
 			shellEntries(""),
@@ -1556,20 +1590,17 @@ exit "${UMOUNT_RC:-0}"`)
 					for _, p := range backupPlaces[:c.places] {
 						calls += backupCall(device, p)
 					}
-					if c.sectors*512 < 2*32768*4096 {
-						calls += cmpCall(device, c.sectors*512)
-					}
+					calls += cmpCall(device, min(c.sectors*512, fullZeroEnd))
 					Expect(r.calls).To(Equal(calls+mkfsCall(device)+mountCall(device, mnt)), "%s, %d sectors", shell.name, c.sectors)
 				}
 			},
 			shellEntries(""),
 		)
 
-		DescribeTable("never formats an image too small to hold a backup superblock of a 4096-byte-block filesystem unless every byte of it reads as zero",
+		DescribeTable("never formats an image whose first 64 KiB are zero unless its first 256 MiB, or all of a smaller image, read as zero too",
 			func(shellOf func() guestShell) {
 				shell := shellOf()
 				const mib = 1 << 20
-				small := "vm-launch guest setup: the volume image rvm-disk-0.img for " + mnt + " reads as zero in its first 64 KiB but not in all of its %d bytes, and an image this small that vm-launch formatted may have no backup superblock that would tell a damaged filesystem from a new image, so it looks like a damaged filesystem, and vm-launch never formats it; if the volume never held data, an interrupted first format can cause this, and deleting rvm-disk-0.img on the volume lets the next start create it fresh; otherwise repair it by hand on the volume, where e2fsck -b needs a backup superblock that a filesystem this small may not have\nREBOOT\n"
 				for _, c := range []struct {
 					bytes, at int64
 					places    int
@@ -1583,20 +1614,31 @@ exit "${UMOUNT_RC:-0}"`)
 					// One sector short of the backup's end, so the backup at
 					// the start of block 32768 does not fit.
 					{backupPlaces[4] + 1024 - 512, backupPlaces[4] - 2048, 4},
-					// Past the backup's end, with no backup superblock there.
+					// Past the band where mke2fs drops the short last group,
+					// still inside the full-zero margin.
 					{130 * mib, 129 * mib, 6},
 					// One sector short of block group 2.
 					{256*mib - 512, 256*mib - 1024, 6},
+					// The same filesystems after the host grew their image
+					// past 256 MiB and before the guest grew them: the data
+					// lies in the first 256 MiB, and no backup superblock
+					// does.
+					{256 * mib, 1 * mib, 6},
+					{1024 * mib, 1 * mib, 6},
+					{1024 * mib, 64*mib - 1, 6},
+					{1024 * mib, 129 * mib, 6},
+					{4096 * mib, 256*mib - 1, 6},
 				} {
 					Expect(os.RemoveAll(callLog)).To(Succeed())
 					sizedDevice(c.bytes/512, c.at, []byte{1})
 					r := runIn(shell, []string{device}, "DD_MODE=zeros")
-					Expect(r.out).To(Equal(fmt.Sprintf(small, c.bytes)), "%s, %d bytes, data at %d", shell.name, c.bytes, c.at)
+					read := min(c.bytes, fullZeroEnd)
+					Expect(r.out).To(Equal(zeroLine(read)), "%s, %d bytes, data at %d", shell.name, c.bytes, c.at)
 					calls := ddCall(device)
 					for _, p := range backupPlaces[:c.places] {
 						calls += backupCall(device, p)
 					}
-					Expect(r.calls).To(Equal(calls+cmpCall(device, c.bytes)), "%s, %d bytes, data at %d", shell.name, c.bytes, c.at)
+					Expect(r.calls).To(Equal(calls+cmpCall(device, read)), "%s, %d bytes, data at %d", shell.name, c.bytes, c.at)
 				}
 
 				// Every byte zero: a new image, which stage 2 formats.
@@ -1606,25 +1648,32 @@ exit "${UMOUNT_RC:-0}"`)
 				Expect(r.out).To(Equal("REACHED_START\n"), "%s", shell.name)
 				Expect(r.calls).To(Equal(ddCall(device)+backupCall(device, backupPlaces[0])+backupCall(device, backupPlaces[1])+backupCall(device, backupPlaces[2])+backupCall(device, backupPlaces[3])+cmpCall(device, 64*mib)+mkfsCall(device)+mountCall(device, mnt)), "%s", shell.name)
 
-				// From block group 2 on, the backup's place decides, and
-				// data elsewhere does not stop the format.
-				Expect(os.RemoveAll(callLog)).To(Succeed())
-				sizedDevice(2*32768*4096/512, 100*mib, []byte{1})
-				r = runIn(shell, []string{device}, "DD_MODE=zeros")
-				Expect(r.out).To(Equal("REACHED_START\n"), "%s", shell.name)
-				calls := ddCall(device)
-				for _, p := range backupPlaces {
-					calls += backupCall(device, p)
+				// From 256 MiB on, data does not stop the format, since a
+				// filesystem that reaches there has a backup superblock,
+				// which stage 2 has looked for already.
+				for _, c := range []struct{ bytes, at int64 }{{256*mib + 512, 256 * mib}, {1024 * mib, 512 * mib}, {1024 * mib, 1024*mib - 1}} {
+					Expect(os.RemoveAll(callLog)).To(Succeed())
+					sizedDevice(c.bytes/512, c.at, []byte{1})
+					r = runIn(shell, []string{device}, "DD_MODE=zeros")
+					Expect(r.out).To(Equal("REACHED_START\n"), "%s, %d bytes, data at %d", shell.name, c.bytes, c.at)
+					calls := ddCall(device)
+					for _, p := range backupPlaces {
+						calls += backupCall(device, p)
+					}
+					Expect(r.calls).To(Equal(calls+cmpCall(device, fullZeroEnd)+mkfsCall(device)+mountCall(device, mnt)), "%s, %d bytes, data at %d", shell.name, c.bytes, c.at)
 				}
-				Expect(r.calls).To(Equal(calls+mkfsCall(device)+mountCall(device, mnt)), "%s", shell.name)
 
-				// A read that fails is never taken as zero.
-				Expect(os.RemoveAll(callLog)).To(Succeed())
-				sizedDevice(64*mib/512, 0, nil)
-				r = runIn(shell, []string{device}, "DD_MODE=zeros", "CMP_FAIL=1")
-				Expect(r.out).To(Equal("cmp: can't read the device\nvm-launch guest setup: reading all of "+device+" for the volume image rvm-disk-0.img at "+mnt+" failed, and an image this small must read as zero in full before the guest formats it\nREBOOT\n"), "%s", shell.name)
-				Expect(r.calls).To(ContainSubstring(cmpCall(device, 64*mib)), "%s", shell.name)
-				Expect(r.calls).NotTo(ContainSubstring("mke2fs"), "%s", shell.name)
+				// A read that fails is never taken as zero, on a small image
+				// or a large one.
+				for _, bytes := range []int64{64 * mib, 1024 * mib} {
+					Expect(os.RemoveAll(callLog)).To(Succeed())
+					sizedDevice(bytes/512, 0, nil)
+					r = runIn(shell, []string{device}, "DD_MODE=zeros", "CMP_FAIL=1")
+					read := min(bytes, fullZeroEnd)
+					Expect(r.out).To(Equal("cmp: can't read the device\nvm-launch guest setup: reading the first "+strconv.FormatInt(read, 10)+" bytes of "+device+" for the volume image rvm-disk-0.img at "+mnt+" failed, and they must all read as zero before the guest formats the image\nREBOOT\n"), "%s, %d bytes", shell.name, bytes)
+					Expect(r.calls).To(HaveSuffix(cmpCall(device, read)), "%s, %d bytes", shell.name, bytes)
+					Expect(r.calls).NotTo(ContainSubstring("mke2fs"), "%s, %d bytes", shell.name, bytes)
+				}
 			},
 			shellEntries(""),
 		)
@@ -1729,14 +1778,16 @@ exit "${UMOUNT_RC:-0}"`)
 		)
 
 		Describe("the teardown", func() {
-			// teardownIn runs the teardown in shell after pre, with the
+			// teardownRun runs the teardown in shell after pre, with the
 			// command's status, the test /proc, which holds an entry for PID
 			// 1 and one for the shell itself, and kill, sleep, sync, and
 			// umount called as the stubs by path, since the shell has kill
 			// as a builtin and the guest's busybox runs its own applets
 			// first. kill -1 would signal every process the test user owns,
-			// so the spec checks that no kill reaches the shell's own.
-			teardownIn := func(shell guestShell, pre, status string, env ...string) setupRun {
+			// so the spec checks that no kill reaches the shell's own. It
+			// returns how the shell exited, and teardownIn expects it to
+			// exit 0.
+			teardownRun := func(shell guestShell, pre, status string, env ...string) (setupRun, error) {
 				GinkgoHelper()
 				procs := shellQuote(proc)
 				script := strings.NewReplacer(
@@ -1759,8 +1810,7 @@ exit "${UMOUNT_RC:-0}"`)
 					pre + "(exit " + status + ")\nrvm_status=$?\n" + script + "echo \"status=$rvm_status\"\n"
 				cmd := exec.Command(shell.argv[0], append(slices.Clone(shell.argv[1:]), "-c", script)...)
 				cmd.Env = append([]string{"PATH=" + bin + ":/usr/bin:/bin"}, env...)
-				out, err := cmd.CombinedOutput()
-				Expect(err).NotTo(HaveOccurred(), string(out))
+				out, runErr := cmd.CombinedOutput()
 				// The next run's shell has its own PID, and this one's
 				// entry would stand for a process that still runs.
 				self, err := os.ReadFile(filepath.Join(dir, "teardown-pid"))
@@ -1769,7 +1819,13 @@ exit "${UMOUNT_RC:-0}"`)
 				Expect(os.RemoveAll(filepath.Join(proc, strings.TrimSpace(string(self))))).To(Succeed())
 				calls, err := os.ReadFile(callLog)
 				Expect(err).NotTo(HaveOccurred())
-				return setupRun{out: string(out), calls: string(calls)}
+				return setupRun{out: string(out), calls: string(calls)}, runErr
+			}
+			teardownIn := func(shell guestShell, pre, status string, env ...string) setupRun {
+				GinkgoHelper()
+				r, err := teardownRun(shell, pre, status, env...)
+				Expect(err).NotTo(HaveOccurred(), r.out)
+				return r
 			}
 			teardown := func(status string, env ...string) setupRun {
 				GinkgoHelper()
@@ -1789,6 +1845,14 @@ exit "${UMOUNT_RC:-0}"`)
 			// sleeps are the n polls of a wait.
 			sleeps := func(n int) string { return strings.Repeat("sleep "+guestTeardownPollText+"\n", n) }
 			flush := func(path string) string { return "sync -f " + path + "\numount " + path + "\n" }
+			// early is the flush of each of paths before the waits.
+			early := func(paths ...string) string {
+				calls := ""
+				for _, p := range paths {
+					calls += "sync -f " + p + "\n"
+				}
+				return calls
+			}
 			// threeKinds writes an image at data on /dev/vdb, a share at
 			// shared, and a block volume at disk on /dev/vdc, and returns the
 			// three paths and the shell that sets the devices stage 2 kept.
@@ -1814,10 +1878,10 @@ exit "${UMOUNT_RC:-0}"`)
 			const termLine = "vm-launch guest: processes the command left were still running 2 seconds after SIGTERM, so the guest sends them SIGKILL before it flushes the volumes\n"
 			const killLine = "vm-launch guest: processes were still running 1 second after SIGKILL, so what they write after the flush may be lost\n"
 
-			It("stops what the command left, syncs the volume's filesystem only, unmounts it, and keeps the command's status", func() {
+			It("flushes the volume once, stops what the command left, syncs the volume's filesystem only, unmounts it, and keeps the command's status", func() {
 				r := teardown("7")
 				Expect(r.out).To(Equal("status=7\n"))
-				Expect(r.calls).To(Equal(stops + flush(mnt)))
+				Expect(r.calls).To(Equal(early(mnt) + stops + flush(mnt)))
 			})
 
 			It("syncs and unmounts every volume, last first", func() {
@@ -1825,16 +1889,63 @@ exit "${UMOUNT_RC:-0}"`)
 				writeMounts(mounts...)
 				r := teardown("3")
 				Expect(r.out).To(Equal("status=3\n"))
-				Expect(r.calls).To(Equal(stops + flush(mounts[2]) + flush(mounts[1]) + flush(mounts[0])))
+				Expect(r.calls).To(Equal(early(mounts[2], mounts[1], mounts[0]) + stops + flush(mounts[2]) + flush(mounts[1]) + flush(mounts[0])))
 			})
 
-			DescribeTable("syncs and unmounts a block volume and a share as it does an image, last first",
+			DescribeTable("flushes the image and block volumes before the waits, and syncs and unmounts them, last first, before the shares",
 				func(shellOf func() guestShell) {
 					shell := shellOf()
 					paths, pre := threeKinds()
 					r := teardownIn(shell, pre, "5")
 					Expect(r.out).To(Equal("status=5\n"), "%s", shell.name)
-					Expect(r.calls).To(Equal(stops+flush(paths[2])+flush(paths[1])+flush(paths[0])), "%s", shell.name)
+					Expect(r.calls).To(Equal(early(paths[2], paths[0])+stops+flush(paths[2])+flush(paths[0])+flush(paths[1])), "%s", shell.name)
+
+					// Shares, too, go last first, after every drive volume.
+					paths = []string{filepath.Join(dir, "shared a"), filepath.Join(dir, "disk"), filepath.Join(dir, "shared b"), filepath.Join(dir, "data")}
+					Expect(os.WriteFile(filepath.Join(dir, "mounts"), []byte("RVM_VOLUMES=4\n"+
+						"RVM_VOL0_KIND=share\nRVM_VOL0_PATH="+shellQuote(paths[0])+"\n"+
+						"RVM_VOL1_KIND=block\nRVM_VOL1_PATH="+shellQuote(paths[1])+"\n"+
+						"RVM_VOL2_KIND=share\nRVM_VOL2_PATH="+shellQuote(paths[2])+"\n"+
+						"RVM_VOL3_KIND=image\nRVM_VOL3_PATH="+shellQuote(paths[3])+"\nRVM_VOL3_IMAGE=a.img\n"), 0o644)).To(Succeed())
+					Expect(os.RemoveAll(callLog)).To(Succeed())
+					r = teardownIn(shell, "rvm_vdev_1=/dev/vdb rvm_vdev_3=/dev/vdc\n", "5")
+					Expect(r.out).To(Equal("status=5\n"), "%s", shell.name)
+					Expect(r.calls).To(Equal(early(paths[3], paths[1])+stops+flush(paths[3])+flush(paths[1])+flush(paths[2])+flush(paths[0])), "%s", shell.name)
+				},
+				shellEntries(""),
+			)
+
+			DescribeTable("flushes and unmounts every drive volume before a share whose flush fails or hangs",
+				func(shellOf func() guestShell) {
+					shell := shellOf()
+					paths, pre := threeKinds()
+					all := names(paths)
+					r := teardownIn(shell, pre, "0", "SYNC_FAIL_AT="+paths[1])
+					Expect(r.out).To(Equal(flushFailed(all[1], paths[1])+reported+"status="+guestFlushFailStatus+"\n"), "%s", shell.name)
+					Expect(r.calls).To(Equal(early(paths[2], paths[0])+stops+flush(paths[2])+flush(paths[0])+flush(paths[1])), "%s", shell.name)
+
+					// The host ends the guest while the share's flush hangs,
+					// and the drive volumes are already flushed and unmounted.
+					Expect(os.RemoveAll(callLog)).To(Succeed())
+					r, err := teardownRun(shell, pre, "0", "SYNC_HANG_AT="+paths[1])
+					Expect(err).To(HaveOccurred(), "%s: %s", shell.name, r.out)
+					Expect(r.out).NotTo(ContainSubstring("status="), "%s", shell.name)
+					Expect(r.calls).To(Equal(early(paths[2], paths[0])+stops+flush(paths[2])+flush(paths[0])+"sync -f "+paths[1]+"\n"), "%s", shell.name)
+				},
+				shellEntries(""),
+			)
+
+			DescribeTable("says nothing of a flush before the waits that fails, and lets the flush after them decide",
+				func(shellOf func() guestShell) {
+					shell := shellOf()
+					paths, pre := threeKinds()
+					for _, i := range []int{0, 2} {
+						Expect(os.RemoveAll(callLog)).To(Succeed())
+						Expect(os.RemoveAll(filepath.Join(dir, "sync-failed-once"))).To(Succeed())
+						r := teardownIn(shell, pre, "0", "SYNC_FAIL_ONCE_AT="+paths[i])
+						Expect(r.out).To(Equal("status=0\n"), "%s, %s", shell.name, paths[i])
+						Expect(r.calls).To(Equal(early(paths[2], paths[0])+stops+flush(paths[2])+flush(paths[0])+flush(paths[1])), "%s, %s", shell.name, paths[i])
+					}
 				},
 				shellEntries(""),
 			)
@@ -1847,7 +1958,7 @@ exit "${UMOUNT_RC:-0}"`)
 						Expect(os.RemoveAll(callLog)).To(Succeed())
 						r := teardownIn(shell, pre, "0", "SYNC_FAIL_AT="+paths[i])
 						Expect(r.out).To(Equal(flushFailed(name, paths[i])+reported+"status="+guestFlushFailStatus+"\n"), "%s, %s", shell.name, name)
-						Expect(r.calls).To(Equal(stops+flush(paths[2])+flush(paths[1])+flush(paths[0])), "%s, %s", shell.name, name)
+						Expect(r.calls).To(Equal(early(paths[2], paths[0])+stops+flush(paths[2])+flush(paths[0])+flush(paths[1])), "%s, %s", shell.name, name)
 					}
 				},
 				shellEntries(""),
@@ -1861,7 +1972,7 @@ exit "${UMOUNT_RC:-0}"`)
 					r := teardownIn(shell, pre, "3", "SYNC_FAIL_AT="+paths[0])
 					Expect(r.out).To(Equal(flushFailed(all[0], paths[0])+"status=3\n"), "%s", shell.name)
 					r = teardownIn(shell, pre, "4", "UMOUNT_RC=1")
-					Expect(r.out).To(Equal(umountFailed(all[2], paths[2])+umountFailed(all[1], paths[1])+umountFailed(all[0], paths[0])+"status=4\n"), "%s", shell.name)
+					Expect(r.out).To(Equal(umountFailed(all[2], paths[2])+umountFailed(all[0], paths[0])+umountFailed(all[1], paths[1])+"status=4\n"), "%s", shell.name)
 				},
 				shellEntries(""),
 			)
@@ -1872,7 +1983,7 @@ exit "${UMOUNT_RC:-0}"`)
 					paths, pre := threeKinds()
 					all := names(paths)
 					r := teardownIn(shell, pre, "0", "UMOUNT_RC=1")
-					Expect(r.out).To(Equal(umountFailed(all[2], paths[2])+umountFailed(all[1], paths[1])+umountFailed(all[0], paths[0])+reported+"status="+guestFlushFailStatus+"\n"), "%s", shell.name)
+					Expect(r.out).To(Equal(umountFailed(all[2], paths[2])+umountFailed(all[0], paths[0])+umountFailed(all[1], paths[1])+reported+"status="+guestFlushFailStatus+"\n"), "%s", shell.name)
 				},
 				shellEntries(""),
 			)
@@ -1890,7 +2001,7 @@ exit "${UMOUNT_RC:-0}"`)
 					// Gone at SIGTERM: no wait at all.
 					r := teardownIn(shell, "", "0", "TERM_ENDS=42")
 					Expect(r.out).To(Equal("status=0\n"), "%s", shell.name)
-					Expect(r.calls).To(Equal(stops+flush(mnt)), "%s", shell.name)
+					Expect(r.calls).To(Equal(early(mnt)+stops+flush(mnt)), "%s", shell.name)
 
 					// Gone after three polls: the wait ends there.
 					process("42", "app", running)
@@ -1898,7 +2009,7 @@ exit "${UMOUNT_RC:-0}"`)
 					Expect(os.RemoveAll(filepath.Join(dir, "sleeps"))).To(Succeed())
 					r = teardownIn(shell, "", "0", "SLEEP_ENDS=42:3")
 					Expect(r.out).To(Equal("status=0\n"), "%s", shell.name)
-					Expect(r.calls).To(Equal("kill -TERM -1\n"+sleeps(3)+"kill -KILL -1\n"+flush(mnt)), "%s", shell.name)
+					Expect(r.calls).To(Equal(early(mnt)+"kill -TERM -1\n"+sleeps(3)+"kill -KILL -1\n"+flush(mnt)), "%s", shell.name)
 
 					// Ignores SIGTERM: the whole wait, a line, and SIGKILL.
 					process("42", "app", running)
@@ -1906,7 +2017,7 @@ exit "${UMOUNT_RC:-0}"`)
 					Expect(os.RemoveAll(filepath.Join(dir, "sleeps"))).To(Succeed())
 					r = teardownIn(shell, "", "0", "KILL_ENDS=42")
 					Expect(r.out).To(Equal(termLine+"status=0\n"), "%s", shell.name)
-					Expect(r.calls).To(Equal("kill -TERM -1\n"+sleeps(20)+"kill -KILL -1\n"+flush(mnt)), "%s", shell.name)
+					Expect(r.calls).To(Equal(early(mnt)+"kill -TERM -1\n"+sleeps(20)+"kill -KILL -1\n"+flush(mnt)), "%s", shell.name)
 
 					// Survives SIGKILL, as a process in an uninterruptible
 					// sleep does: both waits and both lines, then the flush.
@@ -1914,7 +2025,7 @@ exit "${UMOUNT_RC:-0}"`)
 					Expect(os.RemoveAll(callLog)).To(Succeed())
 					r = teardownIn(shell, "", "6")
 					Expect(r.out).To(Equal(termLine+killLine+"status=6\n"), "%s", shell.name)
-					Expect(r.calls).To(Equal("kill -TERM -1\n"+sleeps(20)+"kill -KILL -1\n"+sleeps(10)+flush(mnt)), "%s", shell.name)
+					Expect(r.calls).To(Equal(early(mnt)+"kill -TERM -1\n"+sleeps(20)+"kill -KILL -1\n"+sleeps(10)+flush(mnt)), "%s", shell.name)
 				},
 				shellEntries(""),
 			)
@@ -1929,7 +2040,7 @@ exit "${UMOUNT_RC:-0}"`)
 					Expect(os.MkdirAll(filepath.Join(proc, "45"), 0o755)).To(Succeed())
 					r := teardownIn(shell, "", "0")
 					Expect(r.out).To(Equal("status=0\n"), "%s", shell.name)
-					Expect(r.calls).To(Equal(stops+flush(mnt)), "%s", shell.name)
+					Expect(r.calls).To(Equal(early(mnt)+stops+flush(mnt)), "%s", shell.name)
 				},
 				shellEntries(""),
 			)
@@ -1940,14 +2051,14 @@ exit "${UMOUNT_RC:-0}"`)
 					process("46", "x) Z 1 1 1 0 -1 2129984", running)
 					r := teardownIn(shell, "", "0", "SLEEP_ENDS=46:2")
 					Expect(r.out).To(Equal("status=0\n"), "%s", shell.name)
-					Expect(r.calls).To(Equal("kill -TERM -1\n"+sleeps(2)+"kill -KILL -1\n"+flush(mnt)), "%s", shell.name)
+					Expect(r.calls).To(Equal(early(mnt)+"kill -TERM -1\n"+sleeps(2)+"kill -KILL -1\n"+flush(mnt)), "%s", shell.name)
 
 					process("47", "y", "S 1")
 					Expect(os.RemoveAll(callLog)).To(Succeed())
 					Expect(os.RemoveAll(filepath.Join(dir, "sleeps"))).To(Succeed())
 					r = teardownIn(shell, "", "0", "SLEEP_ENDS=47:1")
 					Expect(r.out).To(Equal("status=0\n"), "%s", shell.name)
-					Expect(r.calls).To(Equal("kill -TERM -1\n"+sleeps(1)+"kill -KILL -1\n"+flush(mnt)), "%s", shell.name)
+					Expect(r.calls).To(Equal(early(mnt)+"kill -TERM -1\n"+sleeps(1)+"kill -KILL -1\n"+flush(mnt)), "%s", shell.name)
 				},
 				shellEntries(""),
 			)
@@ -1968,13 +2079,23 @@ exit "${UMOUNT_RC:-0}"`)
 				Expect(guestVolumeTeardown).To(ContainSubstring(" second after SIGKILL"))
 			})
 
-			It("signals the leftover processes before any flush, and flushes nothing before the waits end", func() {
+			It("flushes once before it signals the leftover processes, and makes the flush that decides and every unmount after the waits end", func() {
+				term := strings.Index(guestVolumeTeardown, "kill -TERM -1")
+				Expect(term).To(BeNumerically(">", 0))
 				firstFlush := strings.Index(guestVolumeTeardown, "sync -f")
 				Expect(firstFlush).To(BeNumerically(">", 0))
+				Expect(firstFlush).To(BeNumerically("<", term))
+				Expect(strings.Count(guestVolumeTeardown[:term], "sync -f")).To(Equal(1))
+				Expect(guestVolumeTeardown[:term]).NotTo(ContainSubstring("umount"))
+				Expect(guestVolumeTeardown[:term]).NotTo(ContainSubstring("rvm_vbad"))
+				Expect(guestVolumeTeardown[:term]).NotTo(ContainSubstring("echo"))
+				lastFlush := strings.LastIndex(guestVolumeTeardown, "sync -f")
+				firstUmount := strings.Index(guestVolumeTeardown, "umount")
+				Expect(firstUmount).To(BeNumerically(">", lastFlush))
 				for _, before := range []string{"kill -TERM -1", "kill -KILL -1", guestTeardownKillSeconds + " second after SIGKILL"} {
 					at := strings.Index(guestVolumeTeardown, before)
 					Expect(at).To(BeNumerically(">", 0), before)
-					Expect(at).To(BeNumerically("<", firstFlush), before)
+					Expect(at).To(BeNumerically("<", lastFlush), before)
 				}
 			})
 		})

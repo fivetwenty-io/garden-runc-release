@@ -252,22 +252,35 @@ var _ = Describe("stage 1's tools in the guest's busybox", func() {
 		Entry("4096-byte blocks", 4096, 32768, int64(256<<20)),
 	)
 
-	It("refuses a filesystem with 4096-byte blocks too small for a backup superblock once its first 64 KiB are zeroed, and formats one that reads as zero in full", func() {
-		bb := guestBusybox()
-		image := filepath.Join(GinkgoT().TempDir(), "rvm-disk-0.img")
-		Expect(os.WriteFile(image, nil, 0o600)).To(Succeed())
-		Expect(os.Truncate(image, 64<<20)).To(Succeed())
-		Expect(backupCheck(image)).To(Equal("BLANK\n"))
+	// zeroLine is the line for an image whose first 64 KiB read as zero but
+	// whose first n bytes do not.
+	zeroLine := func(n int64) string {
+		return "vm-launch guest setup: the volume image rvm-disk-0.img for /home/vcap/data reads as zero in its first 64 KiB but not in all of its first " + strconv.FormatInt(n, 10) + " bytes, and a filesystem that vm-launch made on an image no larger than that, which the host may have grown since, may have no backup superblock that would tell a damaged filesystem from a new image, so it looks like a damaged filesystem, and vm-launch never formats it; if the volume never held data, an interrupted first format can cause this, and deleting rvm-disk-0.img on the volume lets the next start create it fresh; otherwise repair it by hand on the volume, where e2fsck -b needs a backup superblock that a filesystem this small may not have\nREBOOT\n"
+	}
 
-		out, err := exec.Command(bb, "mke2fs", "-F", "-b", "4096", "-L", "rvm-volume", image).CombinedOutput()
-		Expect(err).NotTo(HaveOccurred(), string(out))
-		f, err := os.OpenFile(image, os.O_RDWR, 0)
-		Expect(err).NotTo(HaveOccurred())
-		_, err = f.WriteAt(make([]byte, 64<<10), 0)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(f.Close()).To(Succeed())
-		Expect(backupCheck(image)).To(Equal("vm-launch guest setup: the volume image rvm-disk-0.img for /home/vcap/data reads as zero in its first 64 KiB but not in all of its " + strconv.Itoa(64<<20) + " bytes, and an image this small that vm-launch formatted may have no backup superblock that would tell a damaged filesystem from a new image, so it looks like a damaged filesystem, and vm-launch never formats it; if the volume never held data, an interrupted first format can cause this, and deleting rvm-disk-0.img on the volume lets the next start create it fresh; otherwise repair it by hand on the volume, where e2fsck -b needs a backup superblock that a filesystem this small may not have\nREBOOT\n"))
-	})
+	DescribeTable("refuses a filesystem with 4096-byte blocks too small for a backup superblock once its first 64 KiB are zeroed, also once the host grew its image, and formats one that reads as zero",
+		func(grown, read int64) {
+			bb := guestBusybox()
+			image := filepath.Join(GinkgoT().TempDir(), "rvm-disk-0.img")
+			Expect(os.WriteFile(image, nil, 0o600)).To(Succeed())
+			Expect(os.Truncate(image, 64<<20)).To(Succeed())
+			Expect(backupCheck(image)).To(Equal("BLANK\n"))
+
+			out, err := exec.Command(bb, "mke2fs", "-F", "-b", "4096", "-L", "rvm-volume", image).CombinedOutput()
+			Expect(err).NotTo(HaveOccurred(), string(out))
+			f, err := os.OpenFile(image, os.O_RDWR, 0)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = f.WriteAt(make([]byte, 64<<10), 0)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(f.Close()).To(Succeed())
+			if grown > 0 {
+				Expect(os.Truncate(image, grown)).To(Succeed())
+			}
+			Expect(backupCheck(image)).To(Equal(zeroLine(read)))
+		},
+		Entry("at 64 MiB", int64(0), int64(64<<20)),
+		Entry("grown to 1 GiB, where the read stops at 256 MiB", int64(1<<30), int64(256<<20)),
+	)
 
 	It("compares the first n bytes of a file with /dev/zero with cmp -s -n, exiting 0 when they match, 1 when they differ, and 2 when it cannot read", func() {
 		bb := guestBusybox()

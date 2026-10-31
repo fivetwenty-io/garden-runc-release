@@ -414,10 +414,11 @@ fi
 // 2's own steps, such as the unquoted status in the exit line or the volume
 // teardown. A guest with ports watches, while the command runs, whether
 // anything listens on each (see guestListenWatch). With volumes, stage 2
-// stops the processes the command left behind and then syncs and unmounts
-// each volume, after the command and before it reports the status, and a
-// volume that does not flush or unmount turns a status of 0 into a failure
-// (see guestVolumeTeardown).
+// flushes the image and block volumes once, stops the processes the command
+// left behind, and then syncs and unmounts each volume, the drive volumes
+// before the shares, after the command and before it reports the status,
+// and a volume that does not flush or unmount turns a status of 0 into a
+// failure (see guestVolumeTeardown).
 func initScript(nonce string, volume bool) string {
 	setup := guestFailFunc + guestConsoleSetup + guestShmSetup + guestNetworkSetup + guestLimitsSetup + guestEnvChecks
 	if volume {
@@ -948,16 +949,19 @@ const guestProcMounts = "/proc/mounts"
 // 1024 bytes in starts no block of that size, so the line gives its byte
 // and asks the operator to find the filesystem's block size first.
 //
-// An image smaller than guestFullZeroEnd bytes may hold no backup
-// superblock of the filesystem stage 2 itself makes, so a zeroed start
-// cannot be told from a new image by its backups. Such an image is blank
-// only when every one of
-// its bytes reads as zero, which cmp checks against /dev/zero without
-// holding the image in memory. An image with data anywhere fails the boot
-// as a damaged filesystem. Both lines also say that a first format that was
-// interrupted leaves such an image, and that deleting an image that never
-// held data has the next start create it fresh, because the guest has no
-// way to tell the two apart.
+// A filesystem that stage 2 made on an image smaller than guestFullZeroEnd
+// bytes may hold no backup superblock, and the host may have grown the image
+// since, so neither the backups nor the device's size tell a zeroed start
+// from a new image. Every image whose start reads as zero and whose backup
+// places hold no magic is therefore blank only when its first
+// guestFullZeroEnd bytes, or all of a smaller image, read as zero too, which
+// cmp checks against /dev/zero without holding the image in memory. The read
+// runs whatever the device's size, and it costs at most guestFullZeroEnd
+// bytes once, at the first boot of a new image. An image with data anywhere
+// in those bytes fails the boot as a damaged filesystem. Both lines also say
+// that a first format that was interrupted leaves such an image, and that
+// deleting an image that never held data has the next start create it
+// fresh, because the guest has no way to tell the two apart.
 //
 // A read error fails the boot too, and never counts as blank. dd reads the
 // two bytes of each place on its own, so od never has to skip past the end
@@ -983,15 +987,15 @@ const guestVolumeBackupCheck = `			for rvm_vsb in 1024:8193 2048:16384 4096:3276
 				done
 			done
 			rm -f ` + guestVolumeBackup + `
-			if [ "$((` + guestFullZeroEnd + ` > rvm_vsectors * ` + sectorBytesText + `))" = 1 ]; then
-				rvm_vrc=0
-				cmp -s -n "$((rvm_vsectors * ` + sectorBytesText + `))" "$rvm_vdev" /dev/zero || rvm_vrc=$?
-				case "$rvm_vrc" in
-				0) ;;
-				1) rvm_fail "the volume image $rvm_vimage for $rvm_vpath reads as zero in its first 64 KiB but not in all of its $((rvm_vsectors * ` + sectorBytesText + `)) bytes, and an image this small that vm-launch formatted may have no backup superblock that would tell a damaged filesystem from a new image, so it looks like a damaged filesystem, and vm-launch never formats it; if the volume never held data, an interrupted first format can cause this, and deleting $rvm_vimage on the volume lets the next start create it fresh; otherwise repair it by hand on the volume, where e2fsck -b needs a backup superblock that a filesystem this small may not have" ;;
-				*) rvm_fail "reading all of $rvm_vdev for $rvm_vname at $rvm_vpath failed, and an image this small must read as zero in full before the guest formats it" ;;
-				esac
-			fi
+			rvm_vzero=$((rvm_vsectors * ` + sectorBytesText + `))
+			[ "$((rvm_vzero > ` + guestFullZeroEnd + `))" = 0 ] || rvm_vzero=` + guestFullZeroEnd + `
+			rvm_vrc=0
+			cmp -s -n "$rvm_vzero" "$rvm_vdev" /dev/zero || rvm_vrc=$?
+			case "$rvm_vrc" in
+			0) ;;
+			1) rvm_fail "the volume image $rvm_vimage for $rvm_vpath reads as zero in its first 64 KiB but not in all of its first $rvm_vzero bytes, and a filesystem that vm-launch made on an image no larger than that, which the host may have grown since, may have no backup superblock that would tell a damaged filesystem from a new image, so it looks like a damaged filesystem, and vm-launch never formats it; if the volume never held data, an interrupted first format can cause this, and deleting $rvm_vimage on the volume lets the next start create it fresh; otherwise repair it by hand on the volume, where e2fsck -b needs a backup superblock that a filesystem this small may not have" ;;
+			*) rvm_fail "reading the first $rvm_vzero bytes of $rvm_vdev for $rvm_vname at $rvm_vpath failed, and they must all read as zero before the guest formats the image" ;;
+			esac
 `
 
 // guestFullZeroEnd is the start, in bytes and in decimal as the guest's
@@ -999,11 +1003,13 @@ const guestVolumeBackupCheck = `			for rvm_vsb in 1024:8193 2048:16384 4096:3276
 // 32768 blocks per group. The superblock of block group 1 ends 1024 bytes
 // after block 32768, but mke2fs drops a last group that is shorter than its
 // own overhead plus 50 blocks, so an image a little larger than block group
-// 1's start can still get one group and no backup superblock. Every image
-// below block group 2, a wide margin over that, must therefore read as zero
-// in full before it counts as blank, and one that holds a backup superblock
-// is refused before that read. A spec keeps the value in step with the
-// arithmetic.
+// 1's start can still get one group and no backup superblock. A filesystem
+// that ends below block group 2, a wide margin over that, may thus have no
+// backup, and the host may grow its image past that point before the guest
+// grows the filesystem. Every image must therefore read as zero up to here,
+// or to its end when it is smaller, before it counts as blank, and one that
+// holds a backup superblock is refused before that read. A spec keeps the
+// value in step with the arithmetic.
 const guestFullZeroEnd = "268435456"
 
 // guestVolumeSetup mounts every volume, in volume order, each on the device
@@ -1020,14 +1026,15 @@ const guestFullZeroEnd = "268435456"
 // guest filesystem tools that vm-launch puts below guestToolsDir. Stage 2
 // runs them by their full paths and never falls back to busybox's mke2fs,
 // so a missing tool fails the boot before stage 2 reads the device. Stage 2
-// formats only an image whose first 64 KiB it reads itself as all zero and
+// formats only an image whose first 64 KiB it reads itself as all zero,
 // that holds no backup superblock where an ext2, ext3, or ext4 filesystem
-// keeps one, or, for an image too small to hold one, that reads as zero in
-// full (see guestVolumeBackupCheck). That is a new image or one whose
-// creator died before the first boot; the host never tells it an image is
-// new. A read error is a setup failure, never a blank image, and an image
-// whose start is zero but which holds a backup superblock, or a small one
-// with data past its start, fails the boot as a damaged filesystem. A blank image gets a journalled ext4 from the shipped
+// keeps one, and whose first guestFullZeroEnd bytes, or all of whose bytes
+// when it is smaller, read as zero (see guestVolumeBackupCheck). That is a
+// new image or one whose creator died before the first boot; the host never
+// tells it an image is new. A read error is a setup failure, never a blank
+// image, and an image whose start is zero but which holds a backup
+// superblock, or data elsewhere in those bytes, fails the boot as a damaged
+// filesystem. A blank image gets a journalled ext4 from the shipped
 // mke2fs with the pinned mke2fs.conf (see guestVolumeMke2fsArgs). The format
 // skips zeroing the inode tables and the journal, so it never writes the
 // image's whole size, which is safe because vm-launch makes every image with
@@ -1258,38 +1265,62 @@ const (
 )
 
 // guestVolumeTeardown follows the command, once its status is kept in
-// rvm_status. It first stops every process the command left behind, so
-// that nothing writes to a volume after its flush and nothing keeps a
-// volume busy: kill -TERM -1, which reaches every process but stage 2,
-// which is PID 1, a wait of up to guestTeardownTermWait that ends as soon
-// as no other process runs, then kill -KILL -1 and a wait of up to
-// guestTeardownKillWait, which covers the time the kernel takes to end the
-// killed processes and close their files. Each wait polls every
-// guestTeardownPoll (see guestOtherProcesses). A process that is still
-// running at the end of either wait is reported with a line, and the
-// teardown goes on.
+// rvm_status. It first flushes every image and block volume once with
+// sync -f, last first, before any wait, because a block volume, and an image
+// when the operator turned sync mounts off, mounts without sync, and the
+// host kills the hypervisor at stopDeadline whether or not the teardown has
+// reached its later flush. That flush only moves the writeback earlier, so
+// it prints nothing and changes no status, and the later flush, which every
+// volume gets, decides whether a volume's data is safe. A share gets no
+// early flush, since a share whose virtiofsd hangs would hold up the drive
+// volumes' flush with it.
 //
-// It then flushes and unmounts every volume that stage 2 mounted, shares
-// included, last first. sync -f flushes the volume's filesystem only, so
-// that the guest root's dirty pages never take up the time the guest has to
-// stop, and the reboot that follows is reboot -nf, which makes no global
-// sync of its own. The volumes are therefore flushed here, before the
-// reboot. For a share, sync -f has the guest kernel ask virtiofsd to flush
-// the shared directory. sync -f exits non-zero when syncfs(2) fails, which
-// from Linux 5.8 includes a writeback error that the host's disk or quota
-// gave the drive, so a failed flush means that data the app wrote may be
-// lost. A failed flush and a failed unmount each print a line that names
-// the volume's kind, its path, and its image, device, or share tag, with
-// what the tool said. When either fails for any volume and the command
-// exited 0, stage 2 reports guestFlushFailStatus, vm-launch's own exit
-// status for a launch that failed, in place of the command's, so a task
-// whose output may be lost never passes. A command that failed keeps its
-// own status.
+// It then stops every process the command left behind, so that nothing
+// writes to a volume after its last flush and nothing keeps a volume busy:
+// kill -TERM -1, which reaches every process but stage 2, which is PID 1, a
+// wait of up to guestTeardownTermWait that ends as soon as no other process
+// runs, then kill -KILL -1 and a wait of up to guestTeardownKillWait, which
+// covers the time the kernel takes to end the killed processes and close
+// their files. Each wait polls every guestTeardownPoll (see
+// guestOtherProcesses). A process that is still running at the end of
+// either wait is reported with a line, and the teardown goes on.
+//
+// It then flushes and unmounts every volume that stage 2 mounted: every image
+// and block volume first, last first, and then every share, last first, so a
+// share that hangs in its flush or unmount never keeps a drive volume from
+// its own. vm-launch refuses a volume path under another (see
+// checkNotNested), so no unmount waits on another. A volume of a kind stage 2
+// does not know, which setup refuses, goes with the shares. sync -f flushes
+// the volume's filesystem only, so that the guest root's dirty pages never
+// take up the time the guest has to stop, and the reboot that follows is
+// reboot -nf, which makes no global sync of its own. The volumes are
+// therefore flushed here, before the reboot. For a share, sync -f has the
+// guest kernel ask virtiofsd to flush the shared directory. sync -f exits
+// non-zero when syncfs(2) fails, which from Linux 5.8 includes a writeback
+// error that the host's disk or quota gave the drive, so a failed flush means
+// that data the app wrote may be lost. A failed flush and a failed unmount
+// each print a line that names the volume's kind, its path, and its image,
+// device, or share tag, with what the tool said. When either fails for any
+// volume and the command exited 0, stage 2 reports guestFlushFailStatus,
+// vm-launch's own exit status for a launch that failed, in place of the
+// command's, so a task whose output may be lost never passes. A command that
+// failed keeps its own status.
 //
 // The waits take at most guestTeardownTermWait plus guestTeardownKillWait,
 // 3 seconds, which a spec keeps inside stopDeadline, the time the guest
-// command and this teardown share after a stop request.
-const guestVolumeTeardown = guestOtherProcesses + `kill -TERM -1 2>/dev/null
+// command and this teardown share after a stop request. The early flush
+// adds little to the teardown's time, because it writes what the later
+// flush would otherwise write, and a deadline that ends the guest during
+// the waits loses only what the leftover processes wrote after it.
+const guestVolumeTeardown = guestOtherProcesses + `rvm_vi=$RVM_VOLUMES
+while [ "$rvm_vi" -gt 0 ]; do
+	rvm_vi=$((rvm_vi - 1))
+	eval "rvm_vkind=\${RVM_VOL${rvm_vi}_KIND:-} rvm_vpath=\$RVM_VOL${rvm_vi}_PATH"
+	case "$rvm_vkind" in
+	` + string(driveImage) + ` | ` + string(driveBlock) + `) sync -f "$rvm_vpath" >/dev/null 2>&1 ;;
+	esac
+done
+kill -TERM -1 2>/dev/null
 rvm_n=0
 while [ "$rvm_n" -lt ` + guestTeardownTermPolls + ` ] && rvm_others; do
 	sleep ` + guestTeardownPollText + `
@@ -1304,24 +1335,27 @@ while [ "$rvm_n" -lt ` + guestTeardownKillPolls + ` ] && rvm_others; do
 done
 rvm_others && echo "vm-launch guest: processes were still running ` + guestTeardownKillSeconds + ` second after SIGKILL, so what they write after the flush may be lost"
 rvm_vbad=
-rvm_vi=$RVM_VOLUMES
-while [ "$rvm_vi" -gt 0 ]; do
-	rvm_vi=$((rvm_vi - 1))
-	eval "rvm_vkind=\${RVM_VOL${rvm_vi}_KIND:-} rvm_vpath=\$RVM_VOL${rvm_vi}_PATH rvm_vimage=\${RVM_VOL${rvm_vi}_IMAGE:-} rvm_vdev=\${rvm_vdev_$rvm_vi:-}"
-	case "$rvm_vkind" in
-	` + string(driveImage) + `) rvm_vname="the volume image $rvm_vimage on $rvm_vdev" ;;
-	` + string(driveBlock) + `) rvm_vname="the block volume on $rvm_vdev" ;;
-	` + volumeKindShare + `) rvm_vname="the share ` + shareTagPrefix + `$rvm_vi" ;;
-	*) rvm_vname="the volume of kind $rvm_vkind" ;;
-	esac
-	if ! rvm_verr=$(sync -f "$rvm_vpath" 2>&1); then
-		echo "vm-launch guest: flushing $rvm_vname at $rvm_vpath with sync -f failed (${rvm_verr:-it gave no reason}), so data the app wrote to it may be lost"
-		rvm_vbad=1
-	fi
-	if ! rvm_verr=$(umount "$rvm_vpath" 2>&1); then
-		echo "vm-launch guest: unmounting $rvm_vname at $rvm_vpath failed (${rvm_verr:-it gave no reason}), so writes that reached it after its flush may be lost"
-		rvm_vbad=1
-	fi
+for rvm_vpass in drive other; do
+	rvm_vi=$RVM_VOLUMES
+	while [ "$rvm_vi" -gt 0 ]; do
+		rvm_vi=$((rvm_vi - 1))
+		eval "rvm_vkind=\${RVM_VOL${rvm_vi}_KIND:-} rvm_vpath=\$RVM_VOL${rvm_vi}_PATH rvm_vimage=\${RVM_VOL${rvm_vi}_IMAGE:-} rvm_vdev=\${rvm_vdev_$rvm_vi:-}"
+		case "$rvm_vpass:$rvm_vkind" in
+		drive:` + string(driveImage) + `) rvm_vname="the volume image $rvm_vimage on $rvm_vdev" ;;
+		drive:` + string(driveBlock) + `) rvm_vname="the block volume on $rvm_vdev" ;;
+		drive:* | other:` + string(driveImage) + ` | other:` + string(driveBlock) + `) continue ;;
+		other:` + volumeKindShare + `) rvm_vname="the share ` + shareTagPrefix + `$rvm_vi" ;;
+		*) rvm_vname="the volume of kind $rvm_vkind" ;;
+		esac
+		if ! rvm_verr=$(sync -f "$rvm_vpath" 2>&1); then
+			echo "vm-launch guest: flushing $rvm_vname at $rvm_vpath with sync -f failed (${rvm_verr:-it gave no reason}), so data the app wrote to it may be lost"
+			rvm_vbad=1
+		fi
+		if ! rvm_verr=$(umount "$rvm_vpath" 2>&1); then
+			echo "vm-launch guest: unmounting $rvm_vname at $rvm_vpath failed (${rvm_verr:-it gave no reason}), so writes that reached it after its flush may be lost"
+			rvm_vbad=1
+		fi
+	done
 done
 if [ -n "$rvm_vbad" ] && [ "$rvm_status" = 0 ]; then
 	echo "vm-launch guest: the command exited 0, but a volume did not flush or unmount, so the guest reports the status ` + guestFlushFailStatus + `"
