@@ -520,6 +520,36 @@ func (pv *preparedVolumes) prepare(v selectedVolume, signals <-chan os.Signal, b
 	return nil, nil
 }
 
+// checkPreparedOrder refuses prepared volumes that are not the volumes of
+// vols that are not shares, each with its own volume index and path, in
+// volume order. The guest's /rvm/disks and /rvm/mounts pair each volume that
+// is not a share with the next drive (see volumesOnDrives), and a drive's
+// serial carries the volume index of its prepared volume, so a prepared
+// volume out of place would put one volume's disk at another volume's path.
+// prepare adds the volumes in that order, and this check keeps any other
+// order from reaching the guest.
+func checkPreparedOrder(vols []guestVolume, prepared preparedVolumes) error {
+	next := 0
+	for n, v := range vols {
+		if v.Settings.Mode == volumeShare {
+			continue
+		}
+		if next == len(prepared) {
+			return fmt.Errorf("the volume at %s (volume index %d) has no prepared disk", quoteForLog(v.ContainerDir), n)
+		}
+		p := prepared[next]
+		if p.Index != n || p.Path != v.ContainerDir {
+			return fmt.Errorf("the disk prepared for the volume at %s (volume index %d) is in the place of the volume at %s (volume index %d), so the guest would mount it at the wrong path", quoteForLog(p.Path), p.Index, quoteForLog(v.ContainerDir), n)
+		}
+		next++
+	}
+	if next != len(prepared) {
+		p := prepared[next]
+		return fmt.Errorf("the disk prepared for the volume at %s (volume index %d) comes after the last volume that is not a share", quoteForLog(p.Path), p.Index)
+	}
+	return nil
+}
+
 // inodeOf returns the file info of f and the device and inode it names. dir
 // is the volume path that f belongs to, for the error line.
 func inodeOf(f *os.File, dir string) (os.FileInfo, uint64, uint64, error) {

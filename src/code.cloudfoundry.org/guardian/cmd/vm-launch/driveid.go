@@ -43,16 +43,19 @@ const (
 	qemuVolumeSerialPrefix = "rvm-vol"
 )
 
-// qemuVolumeSerial is the QEMU serial of the volume at index i in volume
-// order: rvm-vol0 for the first.
+// qemuVolumeSerial is the QEMU serial of the volume whose volume index is i
+// (see selectedVolume.Index): rvm-vol0 for the first. A share before a volume
+// keeps its own number, so the volume's serial and its RVM_VOLn entries in
+// /rvm/disks carry the same n, and no serial ever names a share's number.
 func qemuVolumeSerial(i int) string {
 	return qemuVolumeSerialPrefix + strconv.Itoa(i)
 }
 
 // driveKind is what a volume drive holds, as RVM_VOLn_KIND names it: a disk
 // image on a volume service's filesystem, or a whole block device. It comes
-// from the attachment's mode (see driveKindOf). Shares come with their own
-// provider, and until then disksFile refuses any other kind.
+// from the attachment's mode (see driveKindOf). A share has no drive: its
+// kind in /rvm/disks and /rvm/mounts comes from its volume's setting (see
+// volumesOnDrives), and a drive of any other kind is refused.
 type driveKind string
 
 const (
@@ -124,7 +127,9 @@ func firecrackerDriveID(f *os.File) (string, error) {
 // the identity the guest will read from it: the volumes in volume order,
 // whose attachments are the files the hypervisor opens, and the guest root
 // image root, or nil without one. On QEMU the identities are the serials that
-// qemuArgv and qemuRootDrive pass. On Firecracker they are predicted from the
+// qemuArgv and qemuRootDrive pass, and a volume's serial carries its volume
+// index (see qemuVolumeSerial), so the volumes must come in rising volume
+// index, as prepare adds them. On Firecracker they are predicted from the
 // open files, so they must be the files the hypervisor gets; for a block
 // device that is the device node's own inode. Each volume's identity is
 // recorded on its attachment (attachment.ID), where hypervisorFiles takes it
@@ -158,7 +163,10 @@ func newGuestDrives(kind backend.Kind, volumes preparedVolumes, root *os.File) (
 		if err != nil {
 			return guestDrives{}, fmt.Errorf("%s: %w", name, err)
 		}
-		id, err := identify(v.Attachment.File, qemuVolumeSerial(i))
+		if v.Index < 0 || (i > 0 && v.Index <= volumes[i-1].Index) {
+			return guestDrives{}, fmt.Errorf("%s has the volume index %d, which does not follow the volume before it in volume order", name, v.Index)
+		}
+		id, err := identify(v.Attachment.File, qemuVolumeSerial(v.Index))
 		if err != nil {
 			return guestDrives{}, fmt.Errorf("predicting the %s drive identity of %s: %w", kind, name, err)
 		}

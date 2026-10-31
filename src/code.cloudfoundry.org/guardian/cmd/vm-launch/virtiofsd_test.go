@@ -1023,8 +1023,8 @@ var _ = Describe("the virtiofsd of each share", func() {
 const quietSleep = "sleep 30 </dev/null >/dev/null 2>&1"
 
 // writeShareHypervisor replaces the executable at path with a fake QEMU that
-// records its argv, its pid, and the volume path the initramfs gives the
-// guest, runs before, reports guest status 0 under the initramfs's nonce,
+// records its argv, its pid, and the volume entries of the initramfs's
+// /rvm/mounts and /rvm/disks, in that order, runs before, reports guest status 0 under the initramfs's nonce,
 // runs after, and creates gone as it exits.
 func writeShareHypervisor(path, before, after, gone string) string {
 	argvFile := path + ".argv"
@@ -1037,7 +1037,7 @@ for a in "$@"; do
 	prev=$a
 done
 nonce=$(gzip -dc "$initrd" | grep -a -o 'RVM_START_[0-9a-f]*' | head -n 1 | cut -d_ -f3)
-gzip -dc "$initrd" | grep -a -o "RVM_VOLUME_PATH=[^[:space:]]*" > ` + shellQuote(path+".volume") + `
+gzip -dc "$initrd" | grep -a -o "RVM_VOL[0-9][0-9]*_[A-Z]*=[^[:space:]]*" > ` + shellQuote(path+".volume") + `
 ` + before + `
 echo "RVM_START_$nonce"
 echo "RVM_EXIT_$nonce=0"
@@ -1117,7 +1117,7 @@ var _ = Describe("run with a granted share", func() {
 		// loaded machine cannot spend keeps its clean end from being a kill.
 		virtiofsdStopGrace = 5 * time.Second
 		vfs, rec := fakeVirtiofsd(vfsServe, gone)
-		writeShareHypervisor(hv, "", "", gone)
+		argvFile := writeShareHypervisor(hv, "", "", gone)
 		Expect(runWith(vfs)).To(Equal(0), logBuf.String())
 		argv := strings.Split(strings.TrimSpace(readRecord(rec, 0, "argv")), "\n")
 		Expect(argv[len(argv)-1]).To(Equal("--shared-dir=" + shareDir))
@@ -1126,7 +1126,13 @@ var _ = Describe("run with a granted share", func() {
 		Expect(readRecord(rec, 0, "unix")).To(MatchRegexp(regexpQuote(tmp) + `/vm-launch-[^/]+/rvm-vol0\.sock`))
 		Expect(workDirsIn(tmp)).To(BeEmpty())
 		Expect(os.ReadDir(shareDir)).To(BeEmpty())
-		Expect(os.ReadFile(hv + ".volume")).To(BeEmpty())
+		// The guest is told of the share at its volume index, with no drive,
+		// and QEMU gets no drive for it.
+		Expect(os.ReadFile(hv + ".volume")).To(Equal([]byte("RVM_VOL0_KIND=share\nRVM_VOL0_PATH=" + shellQuote(shareDir) + "\n" +
+			"RVM_VOL0_KIND=share\n")))
+		hvArgv, err := os.ReadFile(argvFile)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(hvArgv)).NotTo(ContainSubstring("virtio-blk-device"))
 		Expect(logBuf.String()).To(ContainSubstring(`virtiofsd for "` + shareDir + `": ` + virtiofsdReady + "\n"))
 		Expect(logBuf.String()).To(ContainSubstring("Client disconnected, shutting down\n"))
 		Expect(logBuf.String()).NotTo(ContainSubstring("killing"))
@@ -1188,27 +1194,61 @@ var _ = Describe("run with a granted share", func() {
 		Expect(os.ReadDir(rec)).To(BeEmpty())
 	})
 
-	It("gives a private volume beside the share its image, and the share none", func() {
-		// The share is created first, so it sorts first and is volume 0.
-		privDir := GinkgoT().TempDir()
-		Expect(os.WriteFile(mountInfoPath, []byte(mountinfoLine(40, shareDir, "fuse.juicefs")+mountinfoLine(41, privDir, "fuse.juicefs")), 0o644)).To(Succeed())
-		GinkgoT().Setenv("VCAP_SERVICES", `{"juicefs":[{"name":"b","credentials":{"password":"`+secretSentinel+`"},"volume_mounts":[`+mountJSON(shareDir, "rw")+`,`+mountJSON(privDir, "rw")+`]}]}`)
-		vfs, rec := fakeVirtiofsd(vfsServe, gone)
-		argvFile := writeShareHypervisor(hv, "", "", gone)
-		Expect(runWith(vfs)).To(Equal(0), logBuf.String())
+	DescribeTable("gives a private volume beside the share its image, and the share none, and numbers both by volume index",
+		func(shareFirst bool) {
+			// Volumes are numbered in path order, and a path sorts before the
+			// same path with more after it.
+			privDir := shareDir + "-private"
+			made := privDir
+			if !shareFirst {
+				privDir, shareDir = shareDir, shareDir+"-share"
+				made = shareDir
+				GinkgoT().Setenv("VM_VOLUMES", `{"`+shareDir+`":{"mode":"share"}}`)
+			}
+			Expect(os.Mkdir(made, 0o755)).To(Succeed())
+			DeferCleanup(os.RemoveAll, made)
+			shareIndex, privIndex := 0, 1
+			if !shareFirst {
+				shareIndex, privIndex = 1, 0
+			}
+			Expect(os.WriteFile(mountInfoPath, []byte(mountinfoLine(40, shareDir, "fuse.juicefs")+mountinfoLine(41, privDir, "fuse.juicefs")), 0o644)).To(Succeed())
+			GinkgoT().Setenv("VCAP_SERVICES", `{"juicefs":[{"name":"b","credentials":{"password":"`+secretSentinel+`"},"volume_mounts":[`+mountJSON(shareDir, "rw")+`,`+mountJSON(privDir, "rw")+`]}]}`)
+			vfs, rec := fakeVirtiofsd(vfsServe, gone)
+			argvFile := writeShareHypervisor(hv, "", "", gone)
+			Expect(runWith(vfs)).To(Equal(0), logBuf.String())
 
-		Expect(os.ReadDir(shareDir)).To(BeEmpty())
-		image := filepath.Join(privDir, "rvm-disk-"+testAppID+"-web-2.img")
-		Expect(image).To(BeAnExistingFile())
-		Expect(readRecord(rec, 0, "argv")).To(ContainSubstring("--shared-dir=" + shareDir + "\n"))
-		Expect(filepath.Join(rec, "1")).NotTo(BeAnExistingFile())
-		// The guest is told about the private volume only, which is the one
-		// drive.
-		Expect(os.ReadFile(hv + ".volume")).To(Equal([]byte("RVM_VOLUME_PATH=" + shellQuote(privDir) + "\n")))
-		argv, err := os.ReadFile(argvFile)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(strings.Count(string(argv), "virtio-blk-device")).To(Equal(1))
-	})
+			Expect(os.ReadDir(shareDir)).To(BeEmpty())
+			image := filepath.Join(privDir, "rvm-disk-"+testAppID+"-web-2.img")
+			Expect(image).To(BeAnExistingFile())
+			Expect(readRecord(rec, 0, "argv")).To(ContainSubstring("--shared-dir=" + shareDir + "\n"))
+			Expect(readRecord(rec, 0, "unix")).To(ContainSubstring("/" + shareTag(shareIndex) + ".sock"))
+			Expect(filepath.Join(rec, "1")).NotTo(BeAnExistingFile())
+
+			// The share keeps its volume index and has no drive. The private
+			// volume keeps its own, on the one drive, whose serial carries
+			// the same number, so no drive takes the share's number.
+			entries := func(n int, share, private string) string {
+				if n == shareIndex {
+					return share
+				}
+				return private
+			}
+			shareMount := fmt.Sprintf("RVM_VOL%d_KIND=share\nRVM_VOL%d_PATH=%s\n", shareIndex, shareIndex, shellQuote(shareDir))
+			privMount := fmt.Sprintf("RVM_VOL%d_KIND=image\nRVM_VOL%d_PATH=%s\nRVM_VOL%d_IMAGE=%s\n", privIndex, privIndex, shellQuote(privDir), privIndex, shellQuote(filepath.Base(image)))
+			shareDisk := fmt.Sprintf("RVM_VOL%d_KIND=share\n", shareIndex)
+			privDisk := fmt.Sprintf("RVM_VOL%d_KIND=image\nRVM_VOL%d_ID=rvm-vol%d\nRVM_VOL%d_SECTORS=%d\n", privIndex, privIndex, privIndex, privIndex, defaultImageSize/sectorBytes)
+			Expect(os.ReadFile(hv + ".volume")).To(Equal([]byte(
+				entries(0, shareMount, privMount) + entries(1, shareMount, privMount) +
+					entries(0, shareDisk, privDisk) + entries(1, shareDisk, privDisk))))
+			argv, err := os.ReadFile(argvFile)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(strings.Count(string(argv), "virtio-blk-device")).To(Equal(1))
+			Expect(string(argv)).To(ContainSubstring(fmt.Sprintf(",serial=rvm-vol%d\n", privIndex)))
+			Expect(string(argv)).NotTo(ContainSubstring(fmt.Sprintf("serial=rvm-vol%d", shareIndex)))
+		},
+		Entry("with the share first in path order", true),
+		Entry("with the share second in path order", false),
+	)
 })
 
 // workDirsIn returns the vm-launch work directories left in dir.

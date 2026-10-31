@@ -693,6 +693,14 @@ func run(argv []string, logger *log.Logger) int {
 			return stepExitCode(err)
 		}
 	}
+	// The guest numbers the volumes by volume index, shares included, and
+	// /rvm/disks pairs each volume that is not a share with the next drive.
+	// The prepared disks must line up with that, or a disk would reach
+	// another volume's path.
+	if err := checkPreparedOrder(vols, prepared); err != nil {
+		logger.Print(err)
+		return exitLaunchError
+	}
 	// The guest root image is sized from the quota the work directory has
 	// left. The guest tells its drives apart by identity, so the root may
 	// have any volume image's size.

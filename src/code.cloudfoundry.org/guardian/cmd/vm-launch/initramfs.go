@@ -865,30 +865,82 @@ while [ "$rvm_vi" -gt 0 ]; do
 done
 `
 
-// mountsFile returns the guest /rvm/mounts, which stage 2 sources before it
-// mounts the volumes: their number as RVM_VOLUMES and, for each volume in
-// volume order, its kind as RVM_VOLn_KIND and its quoted path as
-// RVM_VOLn_PATH, and for an image volume its image name as RVM_VOLn_IMAGE.
-// The kind is the one disksFile gives the volume's drive in /rvm/disks, taken
-// from the same entry of g.drives, so the two stages never disagree on which
-// volume is an image that stage 2 may format. Volume drives that do not match
-// the guest's volumes one for one, and a kind other than image or block, are
-// an error, because stage 2 could then treat a disk as the wrong kind.
-func mountsFile(g guestContents) (string, error) {
+// volumeOnDrive is one guest volume with the drive that holds it, or with no
+// drive for a share.
+type volumeOnDrive struct {
+	vol   guestVolume
+	drive *guestDrive
+}
+
+// volumesOnDrives pairs each of g.vols, in volume order, with its drive. A
+// volume whose setting is a share has no drive, and every other volume takes
+// the next entry of g.drives.volumes, which are the drives of the volumes
+// that are not shares, in the same order (see checkPreparedOrder). The place
+// of each pair is the volume index, so /rvm/disks and /rvm/mounts number a
+// share and the volumes beside it as the guest numbers them, and a share
+// never shifts a drive onto another volume's number. More guest volumes than
+// a guest can have, and drives that do not match the volumes that are not
+// shares one for one, are an error, because a guess could then mount one
+// volume's disk at another volume's path.
+func volumesOnDrives(g guestContents) ([]volumeOnDrive, error) {
+	if len(g.vols) > maxVolumes {
+		return nil, fmt.Errorf("%d guest volumes, over the %d a guest can have", len(g.vols), maxVolumes)
+	}
 	d := g.drives.volumes
-	if len(d) != len(g.vols) {
-		return "", fmt.Errorf("%d volume drives for %d guest volumes", len(d), len(g.vols))
+	shares := 0
+	for _, v := range g.vols {
+		if v.Settings.Mode == volumeShare {
+			shares++
+		}
+	}
+	if len(d) != len(g.vols)-shares {
+		if shares == 0 {
+			return nil, fmt.Errorf("%d volume drives for %d guest volumes", len(d), len(g.vols))
+		}
+		return nil, fmt.Errorf("%d volume drives for %d guest volumes, %d of them shares, which have no drive", len(d), len(g.vols), shares)
+	}
+	pairs := make([]volumeOnDrive, len(g.vols))
+	next := 0
+	for n, v := range g.vols {
+		pairs[n].vol = v
+		if v.Settings.Mode == volumeShare {
+			continue
+		}
+		pairs[n].drive = &d[next]
+		next++
+	}
+	return pairs, nil
+}
+
+// mountsFile returns the guest /rvm/mounts, which stage 2 sources before it
+// mounts the volumes: their number as RVM_VOLUMES and, for each volume by its
+// volume index, its kind as RVM_VOLn_KIND and its quoted path as
+// RVM_VOLn_PATH, and for an image volume its image name as RVM_VOLn_IMAGE. A
+// share has the kind share and no image. Any other volume's kind is the one
+// disksFile gives the volume's drive in /rvm/disks, taken from the same entry
+// of g.drives, so the two stages never disagree on which volume is an image
+// that stage 2 may format. Volume drives that do not match the guest's
+// volumes (see volumesOnDrives), and a drive kind other than image or block,
+// are an error, because stage 2 could then treat a disk as the wrong kind.
+func mountsFile(g guestContents) (string, error) {
+	pairs, err := volumesOnDrives(g)
+	if err != nil {
+		return "", err
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "RVM_VOLUMES=%d\n", len(g.vols))
-	for i, v := range g.vols {
-		switch d[i].kind {
+	fmt.Fprintf(&b, "RVM_VOLUMES=%d\n", len(pairs))
+	for n, p := range pairs {
+		if p.drive == nil {
+			fmt.Fprintf(&b, "RVM_VOL%d_KIND=%s\nRVM_VOL%d_PATH=%s\n", n, volumeKindShare, n, shellQuote(p.vol.ContainerDir))
+			continue
+		}
+		switch p.drive.kind {
 		case driveImage:
-			fmt.Fprintf(&b, "RVM_VOL%d_KIND=%s\nRVM_VOL%d_PATH=%s\nRVM_VOL%d_IMAGE=%s\n", i, d[i].kind, i, shellQuote(v.ContainerDir), i, shellQuote(v.ImageName))
+			fmt.Fprintf(&b, "RVM_VOL%d_KIND=%s\nRVM_VOL%d_PATH=%s\nRVM_VOL%d_IMAGE=%s\n", n, p.drive.kind, n, shellQuote(p.vol.ContainerDir), n, shellQuote(p.vol.ImageName))
 		case driveBlock:
-			fmt.Fprintf(&b, "RVM_VOL%d_KIND=%s\nRVM_VOL%d_PATH=%s\n", i, d[i].kind, i, shellQuote(v.ContainerDir))
+			fmt.Fprintf(&b, "RVM_VOL%d_KIND=%s\nRVM_VOL%d_PATH=%s\n", n, p.drive.kind, n, shellQuote(p.vol.ContainerDir))
 		default:
-			return "", fmt.Errorf("drive %s holds a %q, and the guest mounts only %q and %q volume drives", volumeDriveID(i), d[i].kind, driveImage, driveBlock)
+			return "", fmt.Errorf("drive %s holds a %q, and the guest mounts only %q and %q volume drives", volumeDriveID(n), p.drive.kind, driveImage, driveBlock)
 		}
 	}
 	return b.String(), nil
@@ -902,15 +954,16 @@ const sectorBytes = 512
 // (see newGuestDrives) and its size in sectors: the guest root image as
 // RVM_ROOT_ID and RVM_ROOT_SECTORS, with RVM_ROOT_INODE_RATIO, when g has one,
 // the number of volumes as RVM_VOLUMES, which is always there, and each
-// volume, in volume order, as RVM_VOLn_KIND, RVM_VOLn_ID, and
-// RVM_VOLn_SECTORS. The sizes are those of the files the hypervisor gets,
-// as the providers opened them, and stage 1 checks each drive's against
+// volume, by its volume index, as RVM_VOLn_KIND, RVM_VOLn_ID, and
+// RVM_VOLn_SECTORS. A share has no drive, so it gets RVM_VOLn_KIND=share
+// alone, which stage 1 passes over. The sizes are those of the files the
+// hypervisor gets, as the providers opened them, and stage 1 checks each drive's against
 // them. Drives may share a size, because stage 1 tells them apart by
 // identity alone. Drives that would share an identity, an identity the guest
 // could not match, a size that is not whole sectors, a drive without an
-// identity, and volume drives that do not match the guest's volumes one for
-// one are an error, because stage 1 would then refuse to boot, and a guess
-// could format a volume or mount one at another's path.
+// identity, and volume drives that do not match the guest's volumes (see
+// volumesOnDrives) are an error, because stage 1 would then refuse to boot,
+// and a guess could format a volume or mount one at another's path.
 func disksFile(g guestContents) (string, error) {
 	var b strings.Builder
 	d := g.drives
@@ -932,15 +985,21 @@ func disksFile(g guestContents) (string, error) {
 		named = append(named, namedDriveID{name: "the guest root image", id: d.rootID})
 		fmt.Fprintf(&b, "RVM_ROOT_ID=%s\nRVM_ROOT_SECTORS=%d\nRVM_ROOT_INODE_RATIO=%d\n", d.rootID, g.rootBytes/sectorBytes, g.rootInodeRatio)
 	}
-	switch {
-	case len(d.volumes) > maxVolumes:
+	if len(d.volumes) > maxVolumes {
 		return "", fmt.Errorf("%d volume drives, over the %d a guest can have", len(d.volumes), maxVolumes)
-	case len(d.volumes) != len(g.vols):
-		return "", fmt.Errorf("%d volume drives for %d guest volumes", len(d.volumes), len(g.vols))
 	}
-	fmt.Fprintf(&b, "RVM_VOLUMES=%d\n", len(d.volumes))
-	for i, v := range d.volumes {
-		drive := volumeDriveID(i)
+	pairs, err := volumesOnDrives(g)
+	if err != nil {
+		return "", err
+	}
+	fmt.Fprintf(&b, "RVM_VOLUMES=%d\n", len(pairs))
+	for n, p := range pairs {
+		if p.drive == nil {
+			fmt.Fprintf(&b, "RVM_VOL%d_KIND=%s\n", n, volumeKindShare)
+			continue
+		}
+		v := *p.drive
+		drive := volumeDriveID(n)
 		if v.kind != driveImage && v.kind != driveBlock {
 			return "", fmt.Errorf("drive %s holds a %q, and the guest supports only %q and %q volume drives", drive, v.kind, driveImage, driveBlock)
 		}
@@ -948,7 +1007,7 @@ func disksFile(g guestContents) (string, error) {
 			return "", fmt.Errorf("the volume image of %d bytes on drive %s is not a positive whole number of %d-byte sectors", v.bytes, drive, sectorBytes)
 		}
 		named = append(named, namedDriveID{name: "drive " + drive, id: v.id})
-		fmt.Fprintf(&b, "RVM_VOL%d_KIND=%s\nRVM_VOL%d_ID=%s\nRVM_VOL%d_SECTORS=%d\n", i, v.kind, i, v.id, i, v.bytes/sectorBytes)
+		fmt.Fprintf(&b, "RVM_VOL%d_KIND=%s\nRVM_VOL%d_ID=%s\nRVM_VOL%d_SECTORS=%d\n", n, v.kind, n, v.id, n, v.bytes/sectorBytes)
 	}
 	if err := checkDriveIDs(named, ""); err != nil {
 		return "", err
@@ -998,8 +1057,9 @@ type guestContents struct {
 	nw *network
 	// env is the guest environment, /rvm/env (see buildGuestEnv).
 	env string
-	// vols are the guest volumes in volume order, which stage 2 mounts, each
-	// on the drive at the same index of drives.volumes.
+	// vols are the guest volumes in volume order, which stage 2 mounts. A
+	// share has no drive, and each other volume is on the next entry of
+	// drives.volumes (see volumesOnDrives).
 	vols []guestVolume
 	// drives are the drives the guest formats or mounts, with their
 	// identities and, for the volumes, their sizes as the providers opened

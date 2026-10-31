@@ -157,8 +157,10 @@ func checkArtifacts(kind backend.Kind, root string) error {
 // drives are the volume drives in volume order, from hypervisorFiles, and
 // the guest gets each one as a virtio-blk drive, volumeDriveID(i) for the
 // drive at index i, after the NIC and in the same order. Each drive's device
-// carries the drive's identity as its serial, which is qemuVolumeSerial(i)
-// (see newGuestDrives) and which the guest reads back. The format is pinned
+// carries the drive's identity as its serial, which is qemuVolumeSerial of
+// the volume's volume index (see newGuestDrives) and which the guest reads
+// back. A share has no drive, so i counts the drives alone and is QEMU's own
+// name for the drive, which the guest never sees. The format is pinned
 // to raw, so QEMU never probes the guest-written disk for a format header
 // such as a qcow2 backing file. I/O errors, ENOSPC and EDQUOT included, reach
 // the guest as errors instead of pausing the VM. QEMU's own locking is off,

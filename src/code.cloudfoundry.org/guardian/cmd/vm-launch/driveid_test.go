@@ -47,7 +47,7 @@ func preparedFiles(files ...*os.File) preparedVolumes {
 	for i, f := range files {
 		info, err := f.Stat()
 		Expect(err).NotTo(HaveOccurred())
-		pv = append(pv, preparedVolume{Path: "/data" + strconv.Itoa(i), Attachment: &attachment{File: f, Mode: attachFileImage, Release: func() error { return nil }}, Bytes: info.Size()})
+		pv = append(pv, preparedVolume{Index: i, Path: "/data" + strconv.Itoa(i), Attachment: &attachment{File: f, Mode: attachFileImage, Release: func() error { return nil }}, Bytes: info.Size()})
 	}
 	return pv
 }
