@@ -565,6 +565,50 @@ var _ = Describe("PDIDevices", func() {
 			})
 		})
 
+		When("sixteen claims for different handles race for one device", func() {
+			It("lets exactly one win and leaves one claim and one node", func() {
+				Expect(volumes.Release(logger, "handle-1")).To(Succeed())
+
+				const racers = 16
+				errs := make(chan error, racers)
+				start := make(chan struct{})
+				var wg sync.WaitGroup
+				for i := 0; i < racers; i++ {
+					handle := fmt.Sprintf("racer-%d", i)
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						racer := desiredSpec
+						racer.Handle = handle
+						<-start
+						_, err := volumes.Claim(racer)
+						errs <- err
+					}()
+				}
+				close(start)
+				wg.Wait()
+				close(errs)
+
+				succeeded, refused := 0, 0
+				for err := range errs {
+					if err == nil {
+						succeeded++
+					} else {
+						refused++
+					}
+				}
+				Expect(succeeded).To(Equal(1))
+				Expect(refused).To(Equal(racers - 1))
+
+				claims, err := filepath.Glob(claimPath("*"))
+				Expect(err).NotTo(HaveOccurred())
+				Expect(claims).To(HaveLen(1))
+				nodes, err := filepath.Glob(nodePath("*"))
+				Expect(err).NotTo(HaveOccurred())
+				Expect(nodes).To(Equal([]string{nodePath("8-16")}))
+			})
+		})
+
 		When("a second container names the same device", func() {
 			It("refuses it and leaves the first container's node and claim in place", func() {
 				Expect(applyErr).NotTo(HaveOccurred())
@@ -844,7 +888,7 @@ var _ = Describe("PDIDevices", func() {
 			})
 
 			It("refuses the container", func() {
-				expectRefused("is a descriptor tmpfs from pdi:bosh-disk that is not read-only")
+				expectRefused("is a descriptor tmpfs from pdi:bosh-disk whose filesystem is not read-only")
 			})
 		})
 
@@ -854,7 +898,7 @@ var _ = Describe("PDIDevices", func() {
 			})
 
 			It("refuses the container, because another mount of the tmpfs can write", func() {
-				expectRefused("is a descriptor tmpfs from pdi:bosh-disk that is not read-only")
+				expectRefused("is a descriptor tmpfs from pdi:bosh-disk whose filesystem is not read-only")
 			})
 		})
 

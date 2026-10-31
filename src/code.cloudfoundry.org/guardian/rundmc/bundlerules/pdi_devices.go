@@ -278,7 +278,7 @@ func (p *PDIDevices) descriptorAt(source string, mounts []pdiMountEntry) (pdiDes
 		return pdiDescriptor{}, false, refuse("%s is a %s mount from %s, and a descriptor must be on tmpfs", source, entry.fsType, entry.source)
 	}
 	if !entry.readOnly() {
-		return pdiDescriptor{}, false, refuse("%s is a descriptor tmpfs from %s that is not read-only", source, entry.source)
+		return pdiDescriptor{}, false, refuse("%s is a descriptor tmpfs from %s whose filesystem is not read-only", source, entry.source)
 	}
 
 	file, err := src.ReadDescriptor()
@@ -381,7 +381,7 @@ func (p *PDIDevices) claim(handle string, dev pdiDevice) error {
 		if rmErr := p.release(p.Logger, major, minor); rmErr != nil {
 			p.Logger.Error("pdi-device-probe-cleanup-failed", rmErr, lager.Data{"device": dev.numbers()})
 		}
-		return refuse("device %s named by %s failed the exclusive probe, so it may be mounted, held, busy, or the wrong size on the host: %s", dev.numbers(), dev.source, err)
+		return refuse("device %s named by %s failed the exclusive probe: %s", dev.numbers(), dev.source, err)
 	}
 	return nil
 }

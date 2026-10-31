@@ -212,7 +212,7 @@ type CommonCommand struct {
 		VMArtifactsDir string   `long:"vm-artifacts-dir" default:"/var/vcap/data/vm-runtime/artifacts" description:"Host directory with the VM kernels and hypervisors, bound read-only into vm-* containers at /opt/garden-vm/artifacts."`
 		VMLaunchBin    string   `long:"vm-launch-bin" description:"Host path of the static vm-launch binary, bound read-only into vm-* containers at /opt/garden-vm/vm-launch. Required when a vm-* backend is enabled."`
 		VMKVMGid       uint32   `long:"vm-kvm-gid" description:"Host gid that owns /dev/kvm, added to the vm-launch process. Resolved from the host kvm group when not set."`
-		VMBlockVolumes bool     `long:"vm-block-volumes" description:"Give a vm-* container the block device named by each bind mount whose source is a read-only pdi: descriptor tmpfs, as a root:kvm 0660 node at /dev/pdi/MAJOR-MINOR with a read-write device cgroup rule. A device that is the wrong size, mounted, held, or busy on the host refuses the container. Off by default."`
+		VMBlockVolumes bool     `long:"vm-block-volumes" description:"Give a vm-* container the block device named by each bind mount whose source is a read-only pdi: descriptor tmpfs, as a root:kvm 0660 node at /dev/pdi/MAJOR-MINOR with a read-write device cgroup rule. A device that is the wrong size, mounted, held, or busy on the host refuses the container. The descriptor bind mount must be read-write. Off by default."`
 	} `group:"Execution Backends"`
 
 	CPUThrottling struct {
