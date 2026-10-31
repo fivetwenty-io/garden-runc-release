@@ -43,8 +43,7 @@ var _ = Describe("which providers can be shared", func() {
 		Expect(fileImageCaps.Sharing).NotTo(Equal(sharingShared))
 	})
 
-	It("names share mode in a line", func() {
-		Expect(attachShare.String()).To(Equal("share mode"))
+	It("names file-image mode in a line", func() {
 		Expect(attachFileImage.String()).To(Equal("file-image mode"))
 	})
 })
@@ -77,13 +76,13 @@ var _ = Describe("grantShares", func() {
 		It("is a JuiceFS volume on QEMU with the operator's switch on", func() {
 			grants, err := grantShares(backend.VMQemu, true, []selectedVolume{juice("/shared", volumeShare)})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(grants).To(Equal([]shareGrant{{Index: 0, Path: "/shared", Dir: "/shared", Tag: "rvm-vol0", Provider: "JuiceFS"}}))
+			Expect(grants).To(Equal([]shareGrant{{Index: 0, Path: "/shared", Mount: mountRecord{ContainerDir: "/shared"}, Tag: "rvm-vol0", Provider: "JuiceFS"}}))
 		})
 
 		It("is a kernel NFSv4 volume on QEMU with the operator's switch on", func() {
 			grants, err := grantShares(backend.VMQemu, true, []selectedVolume{nfs("/shared", volumeShare)})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(grants).To(Equal([]shareGrant{{Index: 0, Path: "/shared", Dir: "/shared", Tag: "rvm-vol0", Provider: "NFS"}}))
+			Expect(grants).To(Equal([]shareGrant{{Index: 0, Path: "/shared", Mount: mountRecord{ContainerDir: "/shared"}, Tag: "rvm-vol0", Provider: "NFS"}}))
 		})
 
 		It("takes its index and tag from its place among all the volumes, and skips the private ones", func() {
@@ -92,8 +91,8 @@ var _ = Describe("grantShares", func() {
 			})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(grants).To(Equal([]shareGrant{
-				{Index: 1, Path: "/b", Dir: "/b", Tag: "rvm-vol1", Provider: "NFS"},
-				{Index: 3, Path: "/d", Dir: "/d", Tag: "rvm-vol3", Provider: "JuiceFS"},
+				{Index: 1, Path: "/b", Mount: mountRecord{ContainerDir: "/b"}, Tag: "rvm-vol1", Provider: "NFS"},
+				{Index: 3, Path: "/d", Mount: mountRecord{ContainerDir: "/d"}, Tag: "rvm-vol3", Provider: "JuiceFS"},
 			}))
 		})
 
@@ -203,18 +202,6 @@ func (a *askingProvider) Capabilities(m mountRecord) capabilities {
 	*a.asked = append(*a.asked, m.ContainerDir)
 	return a.fakeDiskProvider.Capabilities(m)
 }
-
-var _ = Describe("refuseUnservedShares", func() {
-	It("accepts no grants", func() {
-		Expect(refuseUnservedShares(nil)).To(Succeed())
-		Expect(refuseUnservedShares([]shareGrant{})).To(Succeed())
-	})
-
-	It("refuses any grant with a line that names the first share's path", func() {
-		err := refuseUnservedShares([]shareGrant{{Index: 2, Path: "/shared", Tag: "rvm-vol2"}, {Index: 3, Path: "/other"}})
-		Expect(err).To(MatchError(`VM_VOLUMES "/shared" is granted a share, but this vm-launch cannot serve shares yet; the volume would get a private disk instead`))
-	})
-})
 
 var _ = Describe("the --allow-volume-shares flag", func() {
 	It("is named allow-volume-shares", func() {
@@ -326,16 +313,18 @@ var _ = Describe("run with a share request", func() {
 		refused(shareLine(`is not available for a Block volume; only JuiceFS and NFSv4 volumes can be shared`), "--backend", "vm-qemu", "--allow-volume-shares")
 	})
 
-	It("grants a JuiceFS share on QEMU with the switch on, and stops before it serves it", func() {
-		refused(`VM_VOLUMES `+quoteForLog(volDir)+` is granted a share, but this vm-launch cannot serve shares yet; the volume would get a private disk instead`,
-			"--backend", "vm-qemu", "--allow-volume-shares")
+	noVirtiofsd := func() string {
+		return `VM_VOLUMES ` + quoteForLog(volDir) + ` is granted a share, but vm-launch was not given --virtiofsd-path, so nothing can serve it; the operator must install virtiofsd and pass its path`
+	}
+
+	It("grants a JuiceFS share on QEMU with the switch on, and stops before it boots when there is no virtiofsd", func() {
+		refused(noVirtiofsd(), "--backend", "vm-qemu", "--allow-volume-shares")
 	})
 
-	It("grants a kernel NFSv4 share on QEMU with the switch on, and stops before it serves it", func() {
+	It("grants a kernel NFSv4 share on QEMU with the switch on, and stops before it boots when there is no virtiofsd", func() {
 		setMountInfo(nfsMountinfoLine(40, volDir, "nfs4", "10.0.0.5:/export", labNFSOptions))
 		GinkgoT().Setenv("VCAP_SERVICES", `{"nfs":[{"name":"b","credentials":{"password":"`+secretSentinel+`"},"volume_mounts":[`+mountJSON(volDir, "rw")+`]}]}`)
-		refused(`VM_VOLUMES `+quoteForLog(volDir)+` is granted a share, but this vm-launch cannot serve shares yet; the volume would get a private disk instead`,
-			"--backend", "vm-qemu", "--allow-volume-shares")
+		refused(noVirtiofsd(), "--backend", "vm-qemu", "--allow-volume-shares")
 		refused(shareLine(`is not allowed on this cell; the operator has not turned on volume shares`), "--backend", "vm-qemu")
 	})
 

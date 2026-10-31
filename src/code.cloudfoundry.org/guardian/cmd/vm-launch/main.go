@@ -7,7 +7,7 @@
 //
 // Usage:
 //
-//	vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--artifacts DIR] -- PATH [ARGS...]
+//	vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--artifacts DIR] -- PATH [ARGS...]
 //
 // When PATH is the CF launcher ("launcher APP-DIR START-COMMAND ..."), the
 // guest runs START-COMMAND. Otherwise it runs PATH and ARGS, shell-quoted.
@@ -124,6 +124,21 @@
 // that owns it. JuiceFS owns fuse.juicefs, and NFS owns nfs4 mounted with
 // local_lock=none. Any other type, an NFSv3 or mapfs mount, or a path with no
 // mount entry fails the launch with exit 125 before anything boots.
+//
+// Shares: a volume that VM_VOLUMES sets to "mode": "share", on vm-qemu with
+// --allow-volume-shares, gets no image. vm-launch serves the volume's own
+// directory to the guest over virtiofs instead, with one virtiofsd for each
+// share, run from the executable that --virtiofsd-path names (on a cell, the
+// virtiofsd-wrapper the virtiofsd install provides), and a granted share
+// without --virtiofsd-path fails the launch with exit 125. Each virtiofsd
+// runs as vm-launch's user with no capabilities and an empty environment, gets a
+// listening Unix socket in the work directory, and must report that it is
+// ready within 5 seconds, all of them together, before the guest boots; its
+// log lines go to stderr with the share's path in front. A virtiofsd that
+// ends before the guest has reported its status stops the guest, and
+// vm-launch exits 125 with a line that names the share. Once the hypervisor
+// has exited, every virtiofsd that still runs gets half a second to end and
+// then SIGKILL.
 //
 // Environment: the guest command sees the container's environment after the
 // changes the CF launcher would have made to it. vm-launch reads its
@@ -276,7 +291,11 @@
 //	       volume images of different sizes, a VM_VOLUMES value that is not
 //	       a JSON object of volume paths, names a path no volume mounts, or
 //	       sets a mode or size it does not allow, or asks for a share that
-//	       the backend, the volume, or the operator does not allow, or
+//	       the backend, the volume, or the operator does not allow, a
+//	       granted share without a usable --virtiofsd-path, whose mount changed,
+//	       or whose virtiofsd could not start, ended, or was not ready
+//	       within 5 seconds, a share whose virtiofsd ended before the guest
+//	       reported a status, or
 //	       an image another instance still holds after 30 seconds, a
 //	       guest environment that is too large, with one entry over
 //	       131071 bytes or more than 1 MiB in all, or a value that holds a
@@ -287,9 +306,9 @@
 //	       https URL, or every attempt failing
 //	128+N  vm-launch received signal N (SIGTERM or SIGINT), or the hypervisor
 //	       died from signal N, before the guest reported a status; this
-//	       includes a signal while vm-launch waits for the volume image or
-//	       resolves CredHub references, and a guest command that did not
-//	       stop within 8 seconds of the signal
+//	       includes a signal while vm-launch waits for the volume image,
+//	       resolves CredHub references, or starts virtiofsd, and a guest
+//	       command that did not stop within 8 seconds of the signal
 //
 // A guest command can exit with any of these values itself; whenever vm-launch
 // picks the status, it also writes a "vm-launch:" line to stderr.
@@ -362,7 +381,7 @@ const transparentProxyFlag = "transparent-proxy"
 // line, for every guest size vm-launch allows.
 const stopDeadline = 8 * time.Second
 
-const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--artifacts DIR] -- PATH [ARGS...]\n"
+const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--artifacts DIR] -- PATH [ARGS...]\n"
 
 type config struct {
 	backend   backend.Kind
@@ -375,6 +394,9 @@ type config struct {
 	// allowVolumeShares is the operator's switch for share mode. Without it
 	// an app that asks for a share in VM_VOLUMES is refused (see grantShares).
 	allowVolumeShares bool
+	// virtiofsd is the path of the executable that runs virtiofsd, which
+	// serves a granted share (see virtiofsd.go), or empty.
+	virtiofsd string
 }
 
 // init holds the main goroutine, and with it run, to the thread-group
@@ -529,12 +551,12 @@ func run(argv []string, logger *log.Logger) int {
 		selected, err = findVolumeProviders(mountInfoPath, vols)
 	}
 	// A share is granted or refused here, with the providers known and
-	// still before CredHub, the ports, and the work directory. A grant is
-	// not served yet, so it ends the launch too (see refuseUnservedShares).
+	// still before CredHub, the ports, and the work directory, and so is a
+	// grant that this vm-launch has no virtiofsd to serve.
+	var shares []shareGrant
 	if err == nil {
-		var shares []shareGrant
 		if shares, err = grantShares(cfg.backend, cfg.allowVolumeShares, selected); err == nil {
-			err = refuseUnservedShares(shares)
+			err = checkVirtiofsd(cfg.virtiofsd, shares)
 		}
 	}
 	if err != nil {
@@ -634,14 +656,16 @@ func run(argv []string, logger *log.Logger) int {
 		}
 	}
 	// The guest's /init finds a volume's drive by its size, and /rvm/disks
-	// gives one size, the first volume's. With more than one volume of that
-	// size, /init sees two drives of the size and fails the boot before it
-	// formats anything. A volume of another size would instead be left
-	// unmounted while the app wrote to the guest root, so it is refused.
+	// gives one size, the first prepared volume's. With more than one volume
+	// of that size, /init sees two drives of the size and fails the boot
+	// before it formats anything. A volume of another size would instead be
+	// left unmounted while the app wrote to the guest root, so it is refused.
+	// A share has no image and is not among the prepared volumes, so the
+	// first prepared volume is found by its volume index.
 	var vol *guestVolume
 	var volumeBytes int64
 	if len(prepared) > 0 {
-		vol, volumeBytes = &vols[0], prepared[0].Bytes
+		vol, volumeBytes = &vols[prepared[0].Index], prepared[0].Bytes
 		for _, v := range prepared[1:] {
 			if v.Bytes != volumeBytes {
 				logger.Printf("the volume images at %s and %s are %d and %d bytes; the guest finds its volumes by size, so every volume image must have the first one's size",
@@ -714,6 +738,17 @@ func run(argv []string, logger *log.Logger) int {
 		}
 		defer monitor.Close()
 	}
+	// Each share's virtiofsd listens on a socket in the work directory,
+	// which QEMU connects to by path. The sockets exist from here on, and
+	// the processes start just before QEMU does. The deferred stop covers
+	// every way out before the explicit one after sup.run, and kills every
+	// virtiofsd that runs.
+	shareSrv, err := newShareServers(cfg.virtiofsd, workDir, shares, logger)
+	if err != nil {
+		logger.Print(err)
+		return exitLaunchError
+	}
+	defer shareSrv.stop(0)
 	files, drivePaths, initrdPath, monitorFD, rootPath := hypervisorFiles(prepared.files(), initrd, qemuMonitor, rootImg)
 	hvArgv, err := hypervisorArgv(cfg.backend, cfg.artifacts, workDir, initrdPath, memMiB, nw, drivePaths, rootPath, monitorFD)
 	if err != nil {
@@ -728,8 +763,27 @@ func run(argv []string, logger *log.Logger) int {
 	default:
 	}
 
+	// Every virtiofsd is ready before QEMU starts, and one that has ended
+	// since keeps QEMU from starting at all.
+	if err := shareSrv.start(sigs); err != nil {
+		logger.Print(err)
+		return stepExitCode(err)
+	}
+	if reason := shareSrv.failureReason(); reason != "" {
+		logger.Printf("%s; exiting %d", reason, exitLaunchError)
+		return exitLaunchError
+	}
+
 	cmd := newHypervisorCmd(hvArgv, files)
 	sup := supervisor{stdout: os.Stdout, logger: logger, signals: sigs, grace: killGrace, deadline: stopDeadline, started: closeInherited}
+	if len(shares) > 0 {
+		// A virtiofsd that ends while QEMU runs kills it, which takes QEMU's
+		// process, known once it has started.
+		sup.started = func() {
+			closeInherited()
+			shareSrv.guestStarted(cmd.Process)
+		}
+	}
 	// Firecracker starts without a capability whether or not vm-launch was
 	// given --transparent-proxy, so a grant that reaches vm-launch some other
 	// way never reaches the hypervisor.
@@ -766,6 +820,9 @@ func run(argv []string, logger *log.Logger) int {
 		sup.listen = gates.set
 	}
 	res, err := sup.run(cmd, nonce)
+	// QEMU has been reaped, or never started, so every virtiofsd stops now,
+	// and its last lines come before the exit line.
+	shareSrv.guestEnded()
 	if gates != nil {
 		// The gates' last lines about the ports come before the exit line.
 		gates.end()
@@ -778,6 +835,13 @@ func run(argv []string, logger *log.Logger) int {
 		logger.Print(oomMessage(res.guestOOMKills, memMiB))
 	}
 	code, reason := exitCode(res)
+	// A share that stopped being served while the guest still needed it is
+	// the cause, whatever QEMU's own end looked like. Once the guest has
+	// reported its status, it has flushed and unmounted its volumes, so the
+	// status stays the command's.
+	if shareReason := shareSrv.failureReason(); shareReason != "" && !res.markerFound {
+		code, reason = exitLaunchError, shareReason
+	}
 	if reason != "" {
 		logger.Printf("%s; exiting %d", reason, code)
 	}
@@ -824,11 +888,24 @@ func parseArgs(argv []string) (config, error) {
 	artifacts := fs.String("artifacts", defaultArtifactsDir, "directory holding the kernel, hypervisor, and busybox")
 	transparent := fs.Bool(transparentProxyFlag, false, "dial the Firecracker guest from each client's address, which takes CAP_NET_RAW")
 	allowShares := fs.Bool(allowVolumeSharesFlag, false, "allow an app to ask for a volume as a share in VM_VOLUMES, which only QEMU can serve")
+	virtiofsd := fs.String(virtiofsdFlag, "", "path of the executable that runs virtiofsd, which serves shares")
 	if err := fs.Parse(argv); err != nil {
 		return config{}, err
 	}
 
 	cfg := config{backend: backend.Kind(*kind), transparent: *transparent, allowVolumeShares: *allowShares}
+	virtiofsdSet := false
+	fs.Visit(func(f *flag.Flag) { virtiofsdSet = virtiofsdSet || f.Name == virtiofsdFlag })
+	if virtiofsdSet {
+		if *virtiofsd == "" {
+			return config{}, fmt.Errorf("--%s must not be empty", virtiofsdFlag)
+		}
+		abs, err := filepath.Abs(*virtiofsd)
+		if err != nil {
+			return config{}, fmt.Errorf("resolving --%s: %w", virtiofsdFlag, err)
+		}
+		cfg.virtiofsd = abs
+	}
 	if _, err := requiredArtifacts(cfg.backend); err != nil {
 		return config{}, err
 	}

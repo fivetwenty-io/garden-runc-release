@@ -70,19 +70,12 @@ const (
 	// attachFileImage is an image file on a mounted filesystem, which the
 	// hypervisor gets as one open file and the guest formats when blank.
 	attachFileImage attachMode = iota + 1
-	// attachShare is a host directory served to the guest over virtiofs,
-	// which QEMU alone offers. No provider lists it in Modes: a provider
-	// opts in with sharingShared, and vm-launch decides each share in
-	// grantShares.
-	attachShare
 )
 
 func (m attachMode) String() string {
 	switch m {
 	case attachFileImage:
 		return "file-image mode"
-	case attachShare:
-		return "share mode"
 	}
 	return fmt.Sprintf("attach mode %d", int(m))
 }
@@ -101,8 +94,9 @@ type sharing int
 
 const (
 	// sharingPrivate is one writer per disk, which every volume gets unless
-	// the app asks for a share. It is also what a provider that declares
-	// nothing gets, so a provider is never shared by accident.
+	// the app asks for a share. A provider that declares nothing, the zero
+	// value, is undeclared, and grantShares refuses its shares as it refuses
+	// a private provider's, so a provider is never shared by accident.
 	sharingPrivate sharing = iota + 1
 	// sharingShared is a volume that vm-launch offers over virtiofs on QEMU
 	// when the app asks for a share and the operator allows it.
@@ -116,7 +110,7 @@ type capabilities struct {
 	// Fence is how far the provider's lock reaches.
 	Fence fenceKind
 	// Sharing says whether the provider's volumes can be shared. The zero
-	// value is private.
+	// value is undeclared, which grantShares treats as private.
 	Sharing sharing
 }
 

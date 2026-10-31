@@ -188,6 +188,14 @@ type capOps interface {
 // change is read back, and any failure is an error, so the hypervisor never
 // starts holding a capability.
 func confineHypervisor(ops capOps, path string) error {
+	return confineProcess(ops, path, "the hypervisor", "hypervisor")
+}
+
+// confineProcess is confineHypervisor for any process that vm-launch starts
+// without capabilities: the hypervisor, and virtiofsd for a share (see
+// virtiofsd.go). what names the process in a line, as "the hypervisor" or
+// "virtiofsd", and noun names it after "a root", as "hypervisor".
+func confineProcess(ops capOps, path, what, noun string) error {
 	setpcap := capBit(unix.CAP_SETPCAP)
 
 	if err := ops.clearAmbient(); err != nil && !errors.Is(err, unix.EINVAL) {
@@ -253,7 +261,7 @@ func confineHypervisor(ops capOps, path string) error {
 			return fmt.Errorf("reading the bounding set back: %w", err)
 		}
 		if still != 0 {
-			return fmt.Errorf("vm-launch runs as root without CAP_SETPCAP, so its bounding set keeps capabilities (%#x), which a root hypervisor gets", still)
+			return fmt.Errorf("vm-launch runs as root without CAP_SETPCAP, so its bounding set keeps capabilities (%#x), which a root %s gets", still, noun)
 		}
 	}
 
@@ -262,7 +270,7 @@ func confineHypervisor(ops capOps, path string) error {
 		return fmt.Errorf("reading the file capabilities of %s: %w", path, err)
 	}
 	if hasFileCaps {
-		return fmt.Errorf("%s has file capabilities, which could give the hypervisor capabilities", path)
+		return fmt.Errorf("%s has file capabilities, which could give %s capabilities", path, what)
 	}
 	return nil
 }
@@ -384,13 +392,19 @@ func confinedPrepare(cmd *exec.Cmd) func() error {
 // it only when vm-launch dies. release is safe to run more than once. When
 // prepare or the start fails, the thread ends at once and release is nil.
 func startConfined(cmd *exec.Cmd, prepare func() error) (release func(), err error) {
+	return startConfinedAs(cmd, prepare, "the hypervisor")
+}
+
+// startConfinedAs is startConfined for any confined process. what names it
+// in the error for a failed prepare, as "the hypervisor" or "virtiofsd".
+func startConfinedAs(cmd *exec.Cmd, prepare func() error, what string) (release func(), err error) {
 	started := make(chan error, 1)
 	done := make(chan struct{})
 	go func() {
 		runtime.LockOSThread()
 		err := prepare()
 		if err != nil {
-			err = fmt.Errorf("confining the hypervisor's capabilities: %w", err)
+			err = fmt.Errorf("confining %s's capabilities: %w", what, err)
 		} else {
 			err = cmd.Start()
 		}
