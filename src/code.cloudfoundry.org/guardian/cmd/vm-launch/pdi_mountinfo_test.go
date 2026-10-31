@@ -227,7 +227,7 @@ var _ = Describe("selecting the volume's mountinfo line by mount ID", func() {
 	It("refuses an ID with no line, whatever mounts share its path, and names the providers", func() {
 		_, _, err := findWithID(table(otherFS, volume, shadow), "/data", 99)
 		Expect(err).To(MatchError(ContainSubstring(`volume path "/data" has no mount entry for its mount ID 99 in `)))
-		Expect(err).To(MatchError(HaveSuffix("; VM backends support only JuiceFS volumes today")))
+		Expect(err).To(MatchError(HaveSuffix("; VM backends support only JuiceFS and NFS volumes today")))
 	})
 
 	It("does not take a line whose ID only starts with the ID", func() {
@@ -244,7 +244,7 @@ var _ = Describe("selecting the volume's mountinfo line by mount ID", func() {
 		_, _, err := findWithID(table("garbage", "41 30 0:41 / /data rw - fuse.juicefs", otherFS), "/data", 41)
 		Expect(err).To(MatchError(ContainSubstring("the line for mount ID 41 in ")))
 		Expect(err).To(MatchError(ContainSubstring("is malformed: want at least 10 fields, have 8")))
-		Expect(err).To(MatchError(HaveSuffix("; VM backends support only JuiceFS volumes today")))
+		Expect(err).To(MatchError(HaveSuffix("; VM backends support only JuiceFS and NFS volumes today")))
 
 		_, m, err := findWithID(table("garbage", "42 30 0:41", volume, "43 x"), "/data", 41)
 		Expect(err).NotTo(HaveOccurred())
@@ -260,7 +260,7 @@ var _ = Describe("selecting the volume's mountinfo line by mount ID", func() {
 			_, m, err := findWithID(table(lines...), "/data", 41)
 			Expect(err).To(MatchError(ContainSubstring("the line for mount ID 41 in ")), name)
 			Expect(err).To(MatchError(ContainSubstring("is malformed")), name)
-			Expect(err).To(MatchError(HaveSuffix("; VM backends support only JuiceFS volumes today")), name)
+			Expect(err).To(MatchError(HaveSuffix("; VM backends support only JuiceFS and NFS volumes today")), name)
 			Expect(m).To(Equal(mountRecord{}), name)
 		}
 	})

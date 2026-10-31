@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -200,13 +201,13 @@ var _ = Describe("openVolumeImage", func() {
 		dirfd, err := unix.Open(dir, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 		Expect(err).NotTo(HaveOccurred())
 		defer unix.Close(dirfd)
-		fd, err := openImageFile(dirfd, "rvm-disk-0.img", img, opts)
+		fd, err := openImageFile(dirfd, "rvm-disk-0.img", img, opts, nil)
 		Expect(err).NotTo(HaveOccurred())
 		defer unix.Close(fd)
 		Expect(statOf(img).Size).To(Equal(int64(8 << 20)))
 		Expect(os.ReadFile(img)).To(HavePrefix("keep"))
 
-		fd2, err := openImageFile(dirfd, "rvm-disk-new.img", filepath.Join(dir, "rvm-disk-new.img"), opts)
+		fd2, err := openImageFile(dirfd, "rvm-disk-new.img", filepath.Join(dir, "rvm-disk-new.img"), opts, nil)
 		Expect(err).NotTo(HaveOccurred())
 		defer unix.Close(fd2)
 		Expect(statOf(filepath.Join(dir, "rvm-disk-new.img")).Size).To(Equal(int64(defaultImageSize)))
@@ -605,7 +606,7 @@ var _ = Describe("openVolumeImage", func() {
 				DeferCleanup(func() { unix.Close(fd); _ = unix.Unlinkat(dirfd, name, 0) })
 				Expect(unix.Fchmod(fd, 0o644)).To(Succeed())
 
-				err = sizeNewImage(fd, img, defaultImageSize)
+				err = sizeNewImage(fd, img, imageOptions{Size: defaultImageSize}, nil)
 				Expect(err).To(HaveOccurred())
 				Expect(errors.Is(err, errImageMode)).To(BeTrue(), "%v", err)
 				Expect(err.Error()).To(HavePrefix("creating volume image " + img + ": the new file failed a check"))
@@ -620,7 +621,7 @@ var _ = Describe("openVolumeImage", func() {
 				Expect(unix.Linkat(dirfd, name, dirfd, "second-link", 0)).To(Succeed())
 				DeferCleanup(func() { _ = unix.Unlinkat(dirfd, "second-link", 0) })
 
-				err = sizeNewImage(fd, img, defaultImageSize)
+				err = sizeNewImage(fd, img, imageOptions{Size: defaultImageSize}, nil)
 				Expect(errors.Is(err, errImageLinks)).To(BeTrue(), "%v", err)
 				Expect(err.Error()).NotTo(ContainSubstring("force file owners"))
 			})
@@ -825,5 +826,379 @@ var _ = Describe("openVolumeImage", func() {
 	It("rejects a nil volume", func() {
 		_, err := openVolumeImage(nil, opts, nil)
 		Expect(err).To(MatchError(ContainSubstring("no volume")))
+	})
+})
+
+var _ = Describe("preallocateImage", func() {
+	var (
+		dir  string
+		path string
+		f    *os.File
+		opts imageOptions
+		// Each fallocate call and each chunk of zeros the spec saw.
+		calls  []fallocateCall
+		chunks []int64
+		syncs  int
+	)
+
+	// newFile makes an image of size bytes whose first bytes are data.
+	newFile := func(size int64, data string) {
+		var err error
+		f, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { f.Close() })
+		_, err = f.WriteAt([]byte(data), 0)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(f.Truncate(size)).To(Succeed())
+	}
+	preallocate := func(from, to int64, sigs <-chan os.Signal) error {
+		return preallocateImage(int(f.Fd()), path, from, to, opts, sigs)
+	}
+	// unsupported answers fallocate as an NFS 4.1 mount does.
+	unsupported := func(fd int, mode uint32, off, length int64) error {
+		calls = append(calls, fallocateCall{mode, off, length})
+		return unix.EOPNOTSUPP
+	}
+	sizeOf := func() int64 {
+		st, err := f.Stat()
+		Expect(err).NotTo(HaveOccurred())
+		return st.Size()
+	}
+
+	BeforeEach(func() {
+		dir = GinkgoT().TempDir()
+		path = filepath.Join(dir, "image")
+		calls, chunks, syncs = nil, nil, 0
+		opts = imageOptions{
+			afterZeroChunk: func(end int64) { chunks = append(chunks, end) },
+			syncFile:       func(int) error { syncs++; return nil },
+		}
+	})
+
+	Describe("on a filesystem that allocates", func() {
+		It("calls fallocate with KEEP_SIZE on the new range only, and leaves the length alone", func() {
+			newFile(0, "")
+			opts.fallocate = func(fd int, mode uint32, off, length int64) error {
+				calls = append(calls, fallocateCall{mode, off, length})
+				return unix.Fallocate(fd, mode, off, length)
+			}
+			Expect(preallocate(0, 4<<20, nil)).To(Succeed())
+			Expect(calls).To(Equal([]fallocateCall{{unix.FALLOC_FL_KEEP_SIZE, 0, 4 << 20}}))
+			Expect(sizeOf()).To(BeZero(), "the caller sets the length")
+			Expect(chunks).To(BeEmpty(), "no zeros are written")
+			Expect(syncs).To(BeZero())
+		})
+
+		It("allocates the blocks of the range when the filesystem supports it", func() {
+			newFile(0, "")
+			err := preallocate(0, 4<<20, nil)
+			if errors.Is(err, unix.EOPNOTSUPP) {
+				Skip("this filesystem has no fallocate")
+			}
+			Expect(err).NotTo(HaveOccurred())
+			st := statOf(path)
+			Expect(st.Size).To(Equal(int64(0)))
+			Expect(st.Blocks * 512).To(BeNumerically(">=", 4<<20))
+		})
+
+		It("starts the range where the image ends and leaves its bytes alone", func() {
+			newFile(1<<20, "keep")
+			opts.fallocate = func(fd int, mode uint32, off, length int64) error {
+				calls = append(calls, fallocateCall{mode, off, length})
+				return nil
+			}
+			Expect(preallocate(1<<20, 3<<20, nil)).To(Succeed())
+			Expect(calls).To(Equal([]fallocateCall{{unix.FALLOC_FL_KEEP_SIZE, 1 << 20, 2 << 20}}))
+			Expect(os.ReadFile(path)).To(HavePrefix("keep"))
+		})
+
+		It("tries again after an interrupt", func() {
+			newFile(0, "")
+			opts.fallocate = func(fd int, mode uint32, off, length int64) error {
+				calls = append(calls, fallocateCall{mode, off, length})
+				if len(calls) < 3 {
+					return unix.EINTR
+				}
+				return nil
+			}
+			Expect(preallocate(0, 1<<20, nil)).To(Succeed())
+			Expect(calls).To(HaveLen(3))
+			Expect(chunks).To(BeEmpty())
+		})
+
+		It("does nothing for an empty range", func() {
+			newFile(1<<20, "")
+			opts.fallocate = func(int, uint32, int64, int64) error { Fail("fallocate was called"); return nil }
+			Expect(preallocate(1<<20, 1<<20, nil)).To(Succeed())
+			Expect(chunks).To(BeEmpty())
+		})
+
+		DescribeTable("fails on any other error and writes no zeros",
+			func(errno error, hint string) {
+				newFile(0, "")
+				opts.fallocate = func(fd int, mode uint32, off, length int64) error { return errno }
+				err := preallocate(0, 4<<20, nil)
+				Expect(errors.Is(err, errno)).To(BeTrue(), "%v", err)
+				Expect(err).To(MatchError("allocating 4194304 bytes at offset 0: " + errno.Error() + hint))
+				Expect(chunks).To(BeEmpty())
+				Expect(sizeOf()).To(BeZero())
+			},
+			Entry("ENOSPC", unix.ENOSPC, " (the volume's quota refused it)"),
+			Entry("EDQUOT", unix.EDQUOT, " (the volume's quota refused it)"),
+			Entry("EIO", unix.EIO, ""),
+			Entry("ENOSYS, which is not the NFS 4.1 answer", unix.ENOSYS, ""),
+			Entry("EINVAL", unix.EINVAL, ""),
+		)
+	})
+
+	Describe("when fallocate returns EOPNOTSUPP", func() {
+		BeforeEach(func() { opts.fallocate = unsupported })
+
+		It("writes zeros in 1 MiB chunks from the end, the last one short, and syncs once", func() {
+			newFile(0, "")
+			Expect(preallocate(0, 5<<19, nil)).To(Succeed()) // 2.5 MiB
+			Expect(calls).To(HaveLen(1), "fallocate is tried once, for the whole range")
+			Expect(chunks).To(Equal([]int64{1 << 20, 2 << 20, 5 << 19}))
+			Expect(syncs).To(Equal(1))
+			Expect(sizeOf()).To(Equal(int64(5 << 19)))
+			data, err := os.ReadFile(path)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(bytes.Count(data, []byte{0})).To(Equal(5 << 19))
+			Expect(statOf(path).Blocks*512).To(BeNumerically(">=", 5<<19), "zeros are written, not left sparse")
+		})
+
+		It("writes only past the current end and keeps the bytes before it", func() {
+			newFile(1<<20, "keep")
+			Expect(preallocate(1<<20, 3<<20, nil)).To(Succeed())
+			Expect(chunks).To(Equal([]int64{2 << 20, 3 << 20}))
+			data, err := os.ReadFile(path)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(data).To(HaveLen(3 << 20))
+			Expect(data[:4]).To(Equal([]byte("keep")))
+			Expect(bytes.Count(data[4:], []byte{0})).To(Equal(3<<20 - 4))
+		})
+
+		It("syncs every 256 MiB and once more at the end", func() {
+			newFile(0, "")
+			Expect(preallocate(0, 300<<20, nil)).To(Succeed())
+			Expect(syncs).To(Equal(2))
+			Expect(sizeOf()).To(Equal(int64(300 << 20)))
+		})
+
+		It("syncs just once when the range is exactly one sync interval", func() {
+			newFile(0, "")
+			Expect(preallocate(0, 256<<20, nil)).To(Succeed())
+			Expect(syncs).To(Equal(1))
+		})
+
+		It("stops at a signal after a last sync, and a later call continues where it stopped", func() {
+			newFile(0, "")
+			sigs := make(chan os.Signal, 1)
+			opts.afterZeroChunk = func(end int64) {
+				chunks = append(chunks, end)
+				if end == 2<<20 {
+					sigs <- syscall.SIGTERM
+				}
+			}
+			err := preallocate(0, 5<<20, sigs)
+			var sig *signalledError
+			Expect(errors.As(err, &sig)).To(BeTrue(), "%v", err)
+			Expect(sig.Sig).To(Equal(syscall.SIGTERM))
+			Expect(err).To(MatchError("received terminated while preallocating the volume image"))
+			Expect(stepExitCode(err)).To(Equal(128 + int(syscall.SIGTERM)))
+			Expect(chunks).To(Equal([]int64{1 << 20, 2 << 20}))
+			Expect(syncs).To(Equal(1), "a last sync after the signal")
+			Expect(sizeOf()).To(Equal(int64(2<<20)), "a multiple of 1 MiB past from")
+			Expect(statOf(path).Blocks * 512).To(BeNumerically(">=", 2<<20))
+
+			chunks, syncs = nil, 0
+			opts.afterZeroChunk = func(end int64) { chunks = append(chunks, end) }
+			Expect(preallocate(2<<20, 5<<20, nil)).To(Succeed())
+			Expect(chunks).To(Equal([]int64{3 << 20, 4 << 20, 5 << 20}))
+			Expect(sizeOf()).To(Equal(int64(5 << 20)))
+		})
+
+		It("checks for a signal before the first chunk", func() {
+			newFile(0, "")
+			sigs := make(chan os.Signal, 1)
+			sigs <- syscall.SIGINT
+			err := preallocate(0, 5<<20, sigs)
+			Expect(stepExitCode(err)).To(Equal(128 + int(syscall.SIGINT)))
+			Expect(chunks).To(BeEmpty())
+			Expect(sizeOf()).To(BeZero())
+		})
+
+		It("reports a write that fails and does not sync", func() {
+			newFile(0, "")
+			// A descriptor that cannot be written fails the first chunk.
+			ro, err := os.Open(path)
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { ro.Close() })
+			err = preallocateImage(int(ro.Fd()), path, 0, 2<<20, opts, nil)
+			Expect(errors.Is(err, unix.EBADF)).To(BeTrue(), "%v", err)
+			Expect(err).To(MatchError("writing zeros at offset 0: bad file descriptor"))
+			Expect(chunks).To(BeEmpty())
+			Expect(syncs).To(BeZero())
+		})
+
+		It("fails when a sync fails, in the loop and at the end", func() {
+			newFile(0, "")
+			opts.syncFile = func(int) error { return unix.EDQUOT }
+			err := preallocate(0, 2<<20, nil)
+			Expect(err).To(MatchError("syncing the zeros written so far: disk quota exceeded (the volume's quota refused it)"))
+			Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue())
+
+			err = preallocate(2<<20, 300<<20, nil)
+			Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
+			Expect(sizeOf()).To(Equal(int64(2<<20+256<<20)), "the loop stopped at the first sync")
+		})
+
+		It("fails a sync after a signal rather than hide it", func() {
+			newFile(0, "")
+			opts.syncFile = func(int) error { return unix.EIO }
+			sigs := make(chan os.Signal, 1)
+			sigs <- syscall.SIGTERM
+			err := preallocate(0, 2<<20, sigs)
+			Expect(err).To(MatchError("syncing the zeros written so far: input/output error"))
+			Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+		})
+	})
+
+	It("refuses an image that is not as long as the range starts, and touches nothing", func() {
+		newFile(1<<20, "keep")
+		opts.fallocate = func(int, uint32, int64, int64) error { Fail("fallocate was called"); return nil }
+		err := preallocate(512, 3<<20, nil)
+		Expect(err).To(MatchError("preallocating volume image " + path + ": the image is 1048576 bytes, not the 512 the range starts at; vm-launch writes zeros only past the current end"))
+		Expect(sizeOf()).To(Equal(int64(1 << 20)))
+		Expect(os.ReadFile(path)).To(HavePrefix("keep"))
+	})
+
+	DescribeTable("refuses a range that is not valid",
+		func(from, to int64) {
+			newFile(0, "")
+			err := preallocate(from, to, nil)
+			Expect(err).To(MatchError(fmt.Sprintf("preallocating volume image %s: the range %d to %d is not valid", path, from, to)))
+		},
+		Entry("a negative start", int64(-1), int64(512)),
+		Entry("an end before the start", int64(1024), int64(512)),
+		Entry("an end past 2^62", int64(0), int64(1<<62+1)),
+	)
+
+	It("reports an image it cannot stat", func() {
+		newFile(0, "")
+		Expect(preallocateImage(-1, path, 0, 512, opts, nil)).To(MatchError(ContainSubstring("fstat: bad file descriptor")))
+	})
+})
+
+// fallocateCall is one call the preallocation specs saw.
+type fallocateCall struct {
+	mode        uint32
+	off, length int64
+}
+
+var _ = Describe("creating an image with preallocation", func() {
+	var (
+		dir  string
+		vol  *guestVolume
+		img  string
+		opts imageOptions
+	)
+
+	BeforeEach(func() {
+		requireOpenat2()
+		dir = GinkgoT().TempDir()
+		vol = &guestVolume{ContainerDir: dir, ImageName: "rvm-disk-0.img"}
+		img = filepath.Join(dir, "rvm-disk-0.img")
+		opts = imageOptions{Size: 4 << 20, LockWait: 200 * time.Millisecond, LockPoll: 20 * time.Millisecond,
+			IsMountRoot: alwaysMountRoot, Preallocate: true}
+	})
+
+	It("leaves preallocation off for the default options, as JuiceFS needs", func() {
+		Expect(defaultImageOptions.Preallocate).To(BeFalse())
+	})
+
+	It("allocates the range, sets the length, and publishes an image of exactly its size", func() {
+		var calls []fallocateCall
+		opts.fallocate = func(fd int, mode uint32, off, length int64) error {
+			calls = append(calls, fallocateCall{mode, off, length})
+			return unix.Fallocate(fd, mode, off, length)
+		}
+		f, err := openVolumeImage(vol, opts, nil)
+		if err != nil && errors.Is(err, unix.EOPNOTSUPP) {
+			Skip("this filesystem has no fallocate")
+		}
+		Expect(err).NotTo(HaveOccurred())
+		defer f.Close()
+		Expect(calls).To(Equal([]fallocateCall{{unix.FALLOC_FL_KEEP_SIZE, 0, 4 << 20}}))
+		st := statOf(img)
+		Expect(st.Size).To(Equal(int64(4 << 20)))
+		Expect(st.Blocks * 512).To(BeNumerically(">=", 4<<20))
+		Expect(st.Mode & 0o7777).To(Equal(uint32(0o600)))
+		Expect(tempFiles(dir)).To(BeEmpty())
+		Expect(lockedElsewhere(img)).To(BeTrue())
+	})
+
+	It("writes the zeros itself when the filesystem has no ALLOCATE, and publishes the same image", func() {
+		var chunks []int64
+		opts.fallocate = func(int, uint32, int64, int64) error { return unix.EOPNOTSUPP }
+		opts.afterZeroChunk = func(end int64) { chunks = append(chunks, end) }
+		f, err := openVolumeImage(vol, opts, nil)
+		Expect(err).NotTo(HaveOccurred())
+		defer f.Close()
+		Expect(chunks).To(Equal([]int64{1 << 20, 2 << 20, 3 << 20, 4 << 20}))
+		st := statOf(img)
+		Expect(st.Size).To(Equal(int64(4 << 20)))
+		Expect(st.Blocks * 512).To(BeNumerically(">=", 4<<20))
+		Expect(tempFiles(dir)).To(BeEmpty())
+	})
+
+	It("does not preallocate when the option is off", func() {
+		opts.Preallocate = false
+		opts.fallocate = func(int, uint32, int64, int64) error { Fail("fallocate was called"); return nil }
+		f, err := openVolumeImage(vol, opts, nil)
+		Expect(err).NotTo(HaveOccurred())
+		defer f.Close()
+		Expect(statOf(img).Blocks * 512).To(BeNumerically("<", 1<<20))
+	})
+
+	It("stops at a signal while it writes zeros, exits 128 plus the signal, and leaves no image or temp file", func() {
+		opts.fallocate = func(int, uint32, int64, int64) error { return unix.EOPNOTSUPP }
+		sigs := make(chan os.Signal, 1)
+		opts.afterZeroChunk = func(end int64) {
+			if end == 2<<20 {
+				sigs <- syscall.SIGTERM
+			}
+		}
+		_, err := openVolumeImage(vol, opts, sigs)
+		Expect(stepExitCode(err)).To(Equal(128 + int(syscall.SIGTERM)))
+		Expect(err).To(MatchError("received terminated while preallocating the volume image"))
+		Expect(os.ReadDir(dir)).To(BeEmpty())
+	})
+
+	It("exits 125 with the quota's words and leaves nothing behind when the allocation is refused", func() {
+		opts.fallocate = func(int, uint32, int64, int64) error { return unix.ENOSPC }
+		_, err := openVolumeImage(vol, opts, nil)
+		Expect(errors.Is(err, unix.ENOSPC)).To(BeTrue(), "%v", err)
+		Expect(err).To(MatchError("creating volume image " + img + ": allocating 4194304 bytes at offset 0: no space left on device (the volume's quota refused it)"))
+		Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+		Expect(os.ReadDir(dir)).To(BeEmpty())
+	})
+
+	It("leaves the temp file and image name clear when a zero write fails part way", func() {
+		opts.fallocate = func(int, uint32, int64, int64) error { return unix.EOPNOTSUPP }
+		opts.syncFile = func(int) error { return unix.EDQUOT }
+		_, err := openVolumeImage(vol, opts, nil)
+		Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
+		Expect(err.Error()).To(HavePrefix("creating volume image " + img + ": syncing the zeros written so far"))
+		Expect(os.ReadDir(dir)).To(BeEmpty())
+	})
+
+	It("keeps an existing image as it is and does not preallocate it", func() {
+		writeImage(img, 4<<20, []byte("keep"))
+		opts.fallocate = func(int, uint32, int64, int64) error { Fail("fallocate was called"); return nil }
+		f, err := openVolumeImage(vol, opts, nil)
+		Expect(err).NotTo(HaveOccurred())
+		defer f.Close()
+		Expect(os.ReadFile(img)).To(HavePrefix("keep"))
 	})
 })

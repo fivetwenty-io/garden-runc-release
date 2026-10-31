@@ -197,13 +197,13 @@ var _ = Describe("run with a volume", func() {
 	})
 
 	It("exits 125 before it creates anything when the volume is not a JuiceFS mount", func() {
-		for _, fstype := range []string{"nfs4", "fuse.mapfs", "ext4"} {
+		for _, fstype := range []string{"cifs", "ext4"} {
 			setMountInfo(volDir, fstype)
 			logBuf.Reset()
 			argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
 			Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError), fstype)
 			Expect(logBuf.String()).To(ContainSubstring(strconv.Quote(fstype)))
-			Expect(logBuf.String()).To(ContainSubstring("VM backends support only JuiceFS volumes today"))
+			Expect(logBuf.String()).To(ContainSubstring("VM backends support only JuiceFS and NFS volumes today"))
 			Expect(logBuf.String()).NotTo(ContainSubstring(secretSentinel))
 			Expect(os.ReadDir(tmp)).To(BeEmpty())
 			Expect(os.ReadDir(volDir)).To(BeEmpty())

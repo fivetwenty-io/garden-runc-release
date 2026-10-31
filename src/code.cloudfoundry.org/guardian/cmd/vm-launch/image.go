@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -51,6 +52,14 @@ const (
 	// openRetries bounds retries of an openat2 that the kernel interrupted or
 	// asked to repeat because of a concurrent rename.
 	openRetries = 8
+
+	// zeroChunk is the size of one write when preallocation has to write
+	// zeros, and syncInterval is how many bytes it writes between fsyncs. A
+	// launch stopped part way therefore leaves an image whose length is a
+	// multiple of zeroChunk from where it began, with every byte of it
+	// allocated.
+	zeroChunk    = 1 << 20
+	syncInterval = 256 << 20
 )
 
 // imageOptions are the parameters of openVolumeImage. Tests shorten the
@@ -60,6 +69,24 @@ type imageOptions struct {
 	LockWait    time.Duration
 	LockPoll    time.Duration
 	IsMountRoot func(dirfd int) (bool, error)
+
+	// Preallocate makes a new image allocate its whole range before it is
+	// sized, for a volume whose quota counts allocated blocks, as an NFS
+	// server's does. A sparse image there would pass its creation and meet
+	// the quota later, inside the guest, as an I/O error. A volume whose
+	// quota counts file length, as JuiceFS's does, leaves it off.
+	Preallocate bool
+
+	// fallocate, when set, replaces fallocate(2) as the step that allocates a
+	// range. Tests use it to answer as an NFS 4.1 mount does.
+	fallocate func(fd int, mode uint32, off, length int64) error
+
+	// syncFile, when set, replaces fsync(2) between zero writes.
+	syncFile func(fd int) error
+
+	// afterZeroChunk, when set, runs after each chunk of zeros is written,
+	// with the image's length so far. Tests use it to send a signal part way.
+	afterZeroChunk func(end int64)
 
 	// afterTempCreate, when set, runs once a new image is sized and before it
 	// is published. Tests use it to act as a co-bound app would.
@@ -140,7 +167,8 @@ func (e *signalledError) Error() string {
 //
 // A missing image is created under a unique temporary name in the same
 // directory, sized to Size (sparse, but a quota that counts file length
-// charges all of it), synced, and only then published under its name with
+// charges all of it, and with Preallocate the whole range is allocated first),
+// synced, and only then published under its name with
 // renameat2(RENAME_NOREPLACE), so the published name never refers to an
 // unsized file, whatever happens to this launch. See createImage.
 func openVolumeImage(v *guestVolume, o imageOptions, sigs <-chan os.Signal) (*os.File, error) {
@@ -185,7 +213,7 @@ func openVolumeImage(v *guestVolume, o imageOptions, sigs <-chan os.Signal) (*os
 	// hypervisor reopens it read-write through /proc/self/fd, which checks
 	// them, and a new image without them would fail every later launch.
 	oldMask := unix.Umask(0o077)
-	fd, err := openImageFile(dirfd, v.ImageName, path, o)
+	fd, err := openImageFile(dirfd, v.ImageName, path, o, sigs)
 	unix.Umask(oldMask)
 	if err != nil {
 		return nil, err
@@ -233,8 +261,8 @@ func checkOpenImage(fd int, path string, want int64) error {
 // none, creates the image with createImage. A name that appears between the
 // failed open and the publish is opened instead, and a name that vanishes
 // between the publish race and that open is created again, within
-// openRetries.
-func openImageFile(dirfd int, name, path string, o imageOptions) (int, error) {
+// openRetries. A signal on sigs stops the creation while it preallocates.
+func openImageFile(dirfd int, name, path string, o imageOptions, sigs <-chan os.Signal) (int, error) {
 	var err error
 	for i := 0; i < openRetries; i++ {
 		var fd int
@@ -245,7 +273,7 @@ func openImageFile(dirfd int, name, path string, o imageOptions) (int, error) {
 		if !errors.Is(err, unix.ENOENT) {
 			return -1, fmt.Errorf("opening volume image %s: %w%s", path, err, symlinkHint(err))
 		}
-		fd, err = createImage(dirfd, name, path, o)
+		fd, err = createImage(dirfd, name, path, o, sigs)
 		if err == nil {
 			return fd, nil
 		}
@@ -277,7 +305,8 @@ var errImageAppeared = errors.New("volume image appeared while this launch creat
 // createImage makes a new image and publishes it under name. It creates a
 // file with a name nothing else uses, `.rvm-disk-<random>.tmp`, in the same
 // directory with O_CREAT|O_EXCL and mode 0600, sizes it to o.Size with
-// ftruncate, syncs it, and moves it to name with renameat2(RENAME_NOREPLACE).
+// ftruncate (after allocating the range, when o.Preallocate asks for it),
+// syncs it, and moves it to name with renameat2(RENAME_NOREPLACE).
 // It returns the open file, which is still the one now at name. The published
 // name therefore never refers to an unsized file, and a launch killed at any
 // point leaves at worst a temp file. Nothing opens, trusts, or reuses a temp
@@ -292,8 +321,9 @@ var errImageAppeared = errors.New("volume image appeared while this launch creat
 //
 // Only this launch's own temp file is ever removed, and only while its name
 // still refers to the file this launch created (removeOwnTemp). The
-// published name is never removed.
-func createImage(dirfd int, name, path string, o imageOptions) (int, error) {
+// published name is never removed. A signal on sigs during preallocation
+// removes the temp file and returns the signal's error.
+func createImage(dirfd int, name, path string, o imageOptions, sigs <-chan os.Signal) (int, error) {
 	tempName, fd, err := createTempImage(dirfd)
 	if err != nil {
 		return -1, fmt.Errorf("creating volume image %s: %w%s", path, err, symlinkHint(err))
@@ -306,7 +336,7 @@ func createImage(dirfd int, name, path string, o imageOptions) (int, error) {
 		discard()
 		return -1, err
 	}
-	if err := sizeNewImage(fd, path, o.Size); err != nil {
+	if err := sizeNewImage(fd, path, o, sigs); err != nil {
 		return fail(err)
 	}
 	if err := unix.Fsync(fd); err != nil {
@@ -396,24 +426,159 @@ func removeOwnTemp(dirfd, fd int, tempName string) {
 	_ = unix.Unlinkat(dirfd, tempName, 0)
 }
 
-// sizeNewImage truncates a file this launch created to size, which leaves it
-// sparse, and confirms that the filesystem kept the size. On a volume whose
-// quota counts file length, the truncate charges the whole size, so a quota
-// error here is an ordinary failure to create the image. The file checked is
-// still the temp file, so a failed check is reported by newImageCheckError.
-func sizeNewImage(fd int, path string, size int64) error {
-	if err := unix.Ftruncate(fd, size); err != nil {
+// sizeNewImage sizes a file this launch created to o.Size and confirms that
+// the filesystem kept the size. With o.Preallocate it first allocates the
+// whole range (preallocateImage), so that a quota that counts allocated blocks
+// refuses the image now; the truncate that follows then only sets the length.
+// Without it the truncate leaves the file sparse, which on a volume whose quota
+// counts file length still charges the whole size, so a quota error here is an
+// ordinary failure to create the image. The file checked is still the temp
+// file, so a failed check is reported by newImageCheckError. A signal during
+// preallocation returns its *signalledError unwrapped.
+func sizeNewImage(fd int, path string, o imageOptions, sigs <-chan os.Signal) error {
+	if o.Preallocate {
+		if err := preallocateImage(fd, path, 0, o.Size, o, sigs); err != nil {
+			var sig *signalledError
+			if errors.As(err, &sig) {
+				return err
+			}
+			return fmt.Errorf("creating volume image %s: %w", path, err)
+		}
+	}
+	if err := unix.Ftruncate(fd, o.Size); err != nil {
 		return fmt.Errorf("creating volume image %s: %w", path, err)
 	}
 	got, err := checkImage(fd, path)
 	if err != nil {
 		return newImageCheckError(path, err)
 	}
-	if got != size {
+	if got != o.Size {
 		return &volumeError{kind: errImageSize,
-			msg: fmt.Sprintf("creating volume image %s: size is %d after sizing it to %d", path, got, size)}
+			msg: fmt.Sprintf("creating volume image %s: size is %d after sizing it to %d", path, got, o.Size)}
 	}
 	return nil
+}
+
+// preallocateImage allocates the range [from, to) of the open image fd, which
+// must be exactly from bytes long, and leaves the image to bytes long when it
+// returns without an error. It never reads the image and writes only zeros at
+// or past its current end, so it cannot touch bytes the guest wrote.
+//
+// It first calls fallocate with FALLOC_FL_KEEP_SIZE on the range, which on a
+// server that allocates reserves the space without changing the length. NFS
+// 4.1 has no ALLOCATE, so when fallocate fails with EOPNOTSUPP it writes
+// sequential zeroChunk chunks from from, which extend the image as they go,
+// and fsyncs every syncInterval bytes and once at the end. glibc's
+// posix_fallocate is not used, because its emulation is far slower. A signal
+// on sigs, checked before each chunk, stops the writes after a last fsync and
+// returns a *signalledError; the image then keeps the length it reached, a
+// multiple of zeroChunk past from, fully allocated, and a later launch
+// continues from it. A write the quota refuses ends with that error and the
+// same length.
+func preallocateImage(fd int, path string, from, to int64, o imageOptions, sigs <-chan os.Signal) error {
+	if from < 0 || to < from || to > 1<<62 {
+		return fmt.Errorf("preallocating volume image %s: the range %d to %d is not valid", path, from, to)
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return fmt.Errorf("preallocating volume image %s: fstat: %w", path, err)
+	}
+	if st.Size != from {
+		return fmt.Errorf("preallocating volume image %s: the image is %d bytes, not the %d the range starts at; vm-launch writes zeros only past the current end", path, st.Size, from)
+	}
+	if to == from {
+		return nil
+	}
+
+	call := o.fallocate
+	if call == nil {
+		call = func(fd int, mode uint32, off, length int64) error { return unix.Fallocate(fd, mode, off, length) }
+	}
+	var err error
+	for {
+		err = call(fd, unix.FALLOC_FL_KEEP_SIZE, from, to-from)
+		if !errors.Is(err, unix.EINTR) {
+			break
+		}
+	}
+	switch {
+	case err == nil:
+		return nil
+	case !errors.Is(err, unix.EOPNOTSUPP):
+		return fmt.Errorf("allocating %d bytes at offset %d: %w%s", to-from, from, err, quotaHint(err))
+	}
+	return writeZeros(fd, path, from, to, o, sigs)
+}
+
+// writeZeros extends the image fd from from to to with sequential writes of
+// zeroChunk zero bytes, the last one shorter when the range is not a multiple
+// of it. It writes at explicit offsets, so a retry never depends on the file
+// position, and it syncs every syncInterval bytes.
+func writeZeros(fd int, path string, from, to int64, o imageOptions, sigs <-chan os.Signal) error {
+	syncFile := o.syncFile
+	if syncFile == nil {
+		syncFile = unix.Fsync
+	}
+	zeros := make([]byte, zeroChunk)
+	end, synced := from, from
+	for end < to {
+		select {
+		case sig := <-sigs:
+			if err := syncFile(fd); err != nil {
+				return fmt.Errorf("syncing the zeros written so far: %w", err)
+			}
+			return &signalledError{Sig: syscall.Signal(signalNumber(sig)), during: "preallocating the volume image"}
+		default:
+		}
+		n := min(int64(len(zeros)), to-end)
+		if err := pwriteFull(fd, zeros[:n], end); err != nil {
+			return fmt.Errorf("writing zeros at offset %d: %w%s", end, err, quotaHint(err))
+		}
+		end += n
+		if o.afterZeroChunk != nil {
+			o.afterZeroChunk(end)
+		}
+		if end-synced >= syncInterval {
+			if err := syncFile(fd); err != nil {
+				return fmt.Errorf("syncing the zeros written so far: %w%s", err, quotaHint(err))
+			}
+			synced = end
+		}
+	}
+	if synced != end {
+		if err := syncFile(fd); err != nil {
+			return fmt.Errorf("syncing the zeros written so far: %w%s", err, quotaHint(err))
+		}
+	}
+	return nil
+}
+
+// pwriteFull writes all of b at off, repeating after a short write or an
+// interrupt. A write that makes no progress is an error.
+func pwriteFull(fd int, b []byte, off int64) error {
+	for len(b) > 0 {
+		n, err := unix.Pwrite(fd, b, off)
+		switch {
+		case errors.Is(err, unix.EINTR):
+			continue
+		case err != nil:
+			return err
+		case n <= 0:
+			return io.ErrShortWrite
+		}
+		b, off = b[n:], off+int64(n)
+	}
+	return nil
+}
+
+// quotaHint says that a volume's quota is the cause of an out-of-space or
+// over-quota errno, which is the likeliest reason a grow or an allocation
+// fails on a shared volume.
+func quotaHint(err error) string {
+	if errors.Is(err, unix.EDQUOT) || errors.Is(err, unix.ENOSPC) {
+		return " (the volume's quota refused it)"
+	}
+	return ""
 }
 
 // newImageCheckError reports a check that failed on the new temp file. The

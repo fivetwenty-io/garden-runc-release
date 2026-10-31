@@ -119,7 +119,10 @@ type attachment struct {
 	Release func() error
 }
 
-// diskProvider is one volume service's side of the interface.
+// diskProvider is one volume service's side of the interface. A provider that
+// opens an image must go through openVolumeImage, with the mount ID of its
+// mountRecord in the guestVolume, so that the mount ID is rechecked against
+// the directory it opens.
 type diskProvider interface {
 	// Name is how log lines name the provider, such as "JuiceFS".
 	Name() string

@@ -78,14 +78,14 @@ func providerNamesOf(r *providerRegistry) []string {
 var _ = Describe("the volume provider registry", func() {
 	record := func(fstype string) mountRecord { return mountRecord{ContainerDir: "/data", FSType: fstype} }
 
-	It("holds JuiceFS and only JuiceFS", func() {
-		Expect(providerNamesOf(diskProviders)).To(Equal([]string{"JuiceFS"}))
+	It("holds JuiceFS and NFS", func() {
+		Expect(providerNamesOf(diskProviders)).To(Equal([]string{"JuiceFS", "NFS"}))
 		p, err := diskProviders.selectProvider(record("fuse.juicefs"))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(p.Name()).To(Equal("JuiceFS"))
-		for _, other := range []string{"", "nfs", "nfs4", "fuse.mapfs", "ext4", "fuse", "juicefs", "fuse.juicefs2", "FUSE.JUICEFS"} {
+		for _, other := range []string{"", "cifs", "ext4", "fuse", "juicefs", "fuse.juicefs2", "FUSE.JUICEFS"} {
 			_, err := diskProviders.selectProvider(record(other))
-			Expect(err).To(MatchError(`volume path "/data" is a `+strconv.Quote(other)+` mount; VM backends support only JuiceFS volumes today`), other)
+			Expect(err).To(MatchError(`volume path "/data" is a `+strconv.Quote(other)+` mount; VM backends support only JuiceFS and NFS volumes today`), other)
 		}
 	})
 
@@ -191,7 +191,7 @@ var _ = Describe("the volume provider registry", func() {
 	It("keeps the cause of a mount table that cannot be read", func() {
 		_, _, err := findIn(filepath.Join(GinkgoT().TempDir(), "absent"), "/data")
 		Expect(errors.Is(err, syscall.ENOENT)).To(BeTrue())
-		Expect(err).To(MatchError(HaveSuffix(`to find the filesystem of volume path "/data": no such file or directory; VM backends support only JuiceFS volumes today`)))
+		Expect(err).To(MatchError(HaveSuffix(`to find the filesystem of volume path "/data": no such file or directory; VM backends support only JuiceFS and NFS volumes today`)))
 	})
 })
 
