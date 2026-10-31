@@ -448,6 +448,9 @@ var _ = Describe("guest volume initramfs", func() {
 			GinkgoHelper()
 			at := filepath.Join(sys, filepath.Base(dev))
 			Expect(os.MkdirAll(at, 0o755)).To(Succeed())
+			// The file is read-only, as in sysfs, so a spec that resizes the
+			// device replaces it, which a user other than root must do.
+			Expect(os.RemoveAll(filepath.Join(at, "size"))).To(Succeed())
 			Expect(os.WriteFile(filepath.Join(at, "size"), []byte(sectors), 0o444)).To(Succeed())
 		}
 
