@@ -412,15 +412,6 @@ var _ = Describe("findVolumeProvider", func() {
 		Expect(findVolumeProviderErr(info, "/a\x00b")).To(MatchError(ContainSubstring("no mount")))
 	})
 
-	It("uses the last entry when a later mount shadows the same path", func() {
-		both := func(first, second string) string {
-			return infoFile(mountinfoLine(40, "/data", first), mountinfoLine(50, "/proc", "proc"), mountinfoLine(60, "/data", second))
-		}
-		Expect(findVolumeProviderErr(both("nfs4", "fuse.juicefs"), "/data")).To(Succeed())
-		err := findVolumeProviderErr(both("fuse.juicefs", "ext4"), "/data")
-		Expect(err).To(MatchError(ContainSubstring(`"ext4"`)))
-	})
-
 	It("never repeats VCAP_SERVICES", func() {
 		err := findVolumeProviderErr(infoFile(mountinfoLine(40, "/data", "nfs4")), "/data")
 		Expect(err.Error()).NotTo(ContainSubstring(secretSentinel))

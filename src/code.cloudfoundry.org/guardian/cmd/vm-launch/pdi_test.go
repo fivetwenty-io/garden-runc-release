@@ -17,12 +17,14 @@ import (
 	"code.cloudfoundry.org/guardian/backend"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"golang.org/x/sys/unix"
 )
 
-// findVolumeProviderErr is the error findVolumeProvider returns, which is
-// all the specs of the registry's refusals look at.
+// findVolumeProviderErr is the error findVolumeProvider returns for the mount
+// at dir in the table at mountinfo, which is all the specs of the registry's
+// refusals look at.
 func findVolumeProviderErr(mountinfo, dir string) error {
-	_, _, err := findVolumeProvider(mountinfo, dir)
+	_, _, err := findIn(mountinfo, dir)
 	return err
 }
 
@@ -110,7 +112,7 @@ var _ = Describe("the volume provider registry", func() {
 			Expect(err).To(MatchError(HaveSuffix("; VM backends support only "+c.names+" volumes today")), c.names)
 			empty := writeTempFile("mountinfo", "")
 			err = findVolumeProviderErr(empty, "/data")
-			Expect(err).To(MatchError(`volume path "/data" has no mount entry in `+empty+"; VM backends support only "+c.names+" volumes today"), c.names)
+			Expect(err).To(MatchError(`volume path "/data" has no mount entry for its mount ID `+strconv.FormatUint(noSuchMountID, 10)+` in `+empty+"; VM backends support only "+c.names+" volumes today"), c.names)
 		}
 		withProviders(fake("A", "fuse.a", strongMatch), fake("B", "fuse.b", strongMatch))
 		Expect(findVolumeProviderErr(writeTempFile("mountinfo", mountinfoLine(40, "/data", "fuse.b")), "/data")).To(Succeed())
@@ -178,14 +180,16 @@ var _ = Describe("the volume provider registry", func() {
 
 	It("hands the provider the mount it found", func() {
 		info := writeTempFile("mountinfo", mountinfoLine(40, "/data", "nfs4")+mountinfoLine(41, "/data", "fuse.juicefs"))
-		p, m, err := findVolumeProvider(info, "/data")
+		p, m, err := findIn(info, "/data")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(p.Name()).To(Equal("JuiceFS"))
-		Expect(m).To(Equal(mountRecord{ContainerDir: "/data", FSType: "fuse.juicefs"}))
+		Expect(m).To(Equal(mountRecord{ContainerDir: "/data", MountID: 41, ParentID: 29, Minor: 41, Root: "/", MountPoint: "/data",
+			MountOptions: []string{"rw", "relatime"}, OptionalFields: []string{"shared:41"}, FSType: "fuse.juicefs",
+			Source: "src", SuperOptions: []string{"rw"}}))
 	})
 
 	It("keeps the cause of a mount table that cannot be read", func() {
-		_, _, err := findVolumeProvider(filepath.Join(GinkgoT().TempDir(), "absent"), "/data")
+		_, _, err := findIn(filepath.Join(GinkgoT().TempDir(), "absent"), "/data")
 		Expect(errors.Is(err, syscall.ENOENT)).To(BeTrue())
 		Expect(err).To(MatchError(HaveSuffix(`to find the filesystem of volume path "/data": no such file or directory; VM backends support only JuiceFS volumes today`)))
 	})
@@ -393,6 +397,33 @@ p=; for a in "$@"; do [ "$p" = --config-file ] && { cp "$a" `+shellQuote(filepat
 		Expect(argvFile).NotTo(BeAnExistingFile())
 	})
 
+	It("exits 125 before it creates anything when the kernel does not report the mount ID", func() {
+		volumeMountID = statxMountID
+		statxCall = func(_ int, _ string, _ int, _ int, st *unix.Statx_t) error {
+			st.Mask = unix.STATX_TYPE
+			return nil
+		}
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(Equal("the kernel did not report a mount ID through statx for volume " + strconv.Quote(volDir) +
+			" (STATX_MNT_ID needs Linux 5.8 or later), so vm-launch cannot tell which mount holds it\n"))
+		Expect(os.ReadDir(tmp)).To(BeEmpty())
+		Expect(os.ReadDir(volDir)).To(BeEmpty())
+		Expect(argvFile).NotTo(BeAnExistingFile())
+	})
+
+	It("selects the volume's mount by the kernel's mount ID when a later mount shares its mount point", func() {
+		volumeMountID = func(string) (uint64, error) { return 40, nil }
+		mountInfoPath = writeTempFile("mountinfo", mountinfoLine(40, volDir, "fuse.juicefs")+mountinfoLine(41, volDir, "ext4"))
+		writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
+
+		volumeMountID = func(string) (uint64, error) { return 41, nil }
+		logBuf.Reset()
+		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(ContainSubstring(`is a "ext4" mount`))
+	})
+
 	It("passes the provider the mount, the image name, file-image mode, and the signals, and exits as its error says", func() {
 		var got prepareRequest
 		p := fake("Fake", "fuse.juicefs", strongMatch)
@@ -404,7 +435,9 @@ p=; for a in "$@"; do [ "$p" = --config-file ] && { cp "$a" `+shellQuote(filepat
 		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
 		Expect(runVM(backend.VMQemu)).To(Equal(128 + int(syscall.SIGTERM)))
 		Expect(logBuf.String()).To(HaveSuffix("received terminated while waiting for the fake disk\n"))
-		Expect(got.Mount).To(Equal(mountRecord{ContainerDir: volDir, FSType: "fuse.juicefs"}))
+		Expect(got.Mount).To(Equal(mountRecord{ContainerDir: volDir, MountID: 40, ParentID: 29, Minor: 40, Root: "/", MountPoint: volDir,
+			MountOptions: []string{"rw", "relatime"}, OptionalFields: []string{"shared:40"}, FSType: "fuse.juicefs",
+			Source: "src", SuperOptions: []string{"rw"}}))
 		Expect(got.ImageName).To(Equal("rvm-disk-" + testAppID + "-web-2.img"))
 		Expect(got.Mode).To(Equal(attachFileImage))
 		Expect(got.Signals).NotTo(BeNil())

@@ -18,14 +18,39 @@ import (
 // hypervisor and guest code see, so neither learns which volume service is
 // underneath. Each provider registers itself from its own init.
 
-// mountRecord is what vm-launch learns about the mount behind a volume.
+// mountRecord is what vm-launch learns about the mount behind a volume: the
+// volume's path from the environment, and the volume's line in
+// /proc/self/mountinfo, field for field. Providers decide from it.
 type mountRecord struct {
 	// ContainerDir is the volume's path from VCAP_SERVICES, which the guest
-	// mounts at the same path.
+	// mounts at the same path. The mount it names is the one that holds this
+	// directory, whose own mount point (MountPoint) may be a parent.
 	ContainerDir string
-	// FSType is the filesystem type the mount table shows for the mount at
-	// ContainerDir, such as "fuse.juicefs".
+
+	// MountID and ParentID are the mount's ID and its parent's ID.
+	MountID  uint64
+	ParentID uint64
+	// Major and Minor are the device numbers of the filesystem.
+	Major uint32
+	Minor uint32
+	// Root is the path within the filesystem that the mount shows, with its
+	// escapes decoded. It is "/" for a mount of a whole filesystem.
+	Root string
+	// MountPoint is where the mount is, with its escapes decoded.
+	MountPoint string
+	// MountOptions are the per-mount options, such as "rw" and "nodev".
+	MountOptions []string
+	// OptionalFields are the tagged fields between the mount options and the
+	// separator, such as "shared:5". There may be none.
+	OptionalFields []string
+	// FSType is the filesystem type, such as "fuse.juicefs".
 	FSType string
+	// Source is the mount source with its escapes decoded: a device, a
+	// remote path, or a name the filesystem chose.
+	Source string
+	// SuperOptions are the superblock options, such as "rw" and
+	// "local_lock=none".
+	SuperOptions []string
 }
 
 // matchStrength is how sure a provider is that it owns a mount.

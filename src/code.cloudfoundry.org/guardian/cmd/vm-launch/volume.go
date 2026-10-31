@@ -3,11 +3,9 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -233,19 +231,21 @@ func quoteForLog(s string) string {
 	return strconv.Quote(s)
 }
 
-// mountInfoPath is the mount table findVolumeProvider reads. Tests point it
-// at a file.
-var mountInfoPath = "/proc/self/mountinfo"
-
 // findVolumeProvider returns the provider in diskProviders that owns the
 // volume at dir, and what vm-launch learned about its mount, so that a volume
-// no provider supports is refused before anything boots. It finds the mount
-// at exactly dir in the mount table at mountinfo and lets the registry select
-// a provider by its filesystem type. A path with no mount entry is refused
-// too. Every refusal ends by naming the registered providers. Errors never
-// repeat VCAP_SERVICES.
+// no provider supports is refused before anything boots. It asks the kernel
+// for the ID of the mount that holds dir (volumeMountID), finds the line with
+// that ID in the mount table at mountinfo, and lets the registry select a
+// provider from the whole record. A kernel that does not report the ID is a
+// refusal, since matching by path could be wrong. A mount ID with no line is
+// refused too. Every refusal that follows a lookup in the mount table ends by
+// naming the registered providers. Errors never repeat VCAP_SERVICES.
 func findVolumeProvider(mountinfo, dir string) (diskProvider, mountRecord, error) {
-	m, err := volumeMount(mountinfo, dir)
+	id, err := volumeMountID(dir)
+	if err != nil {
+		return nil, mountRecord{}, err
+	}
+	m, err := volumeMount(mountinfo, dir, id)
 	if err != nil {
 		return nil, mountRecord{}, fmt.Errorf("%w; %s", err, diskProviders.supportedLine())
 	}
@@ -255,80 +255,3 @@ func findVolumeProvider(mountinfo, dir string) (diskProvider, mountRecord, error
 	}
 	return p, m, nil
 }
-
-// volumeMount returns the mount record of the mount at exactly dir in the
-// mount table at mountinfo. When mounts shadow one another at dir, the last
-// entry in the table is the one the process sees.
-func volumeMount(mountinfo, dir string) (mountRecord, error) {
-	f, err := os.Open(mountinfo)
-	if err != nil {
-		var pathErr *os.PathError
-		if errors.As(err, &pathErr) {
-			err = pathErr.Err
-		}
-		return mountRecord{}, fmt.Errorf("reading %s to find the filesystem of volume path %s: %w", mountinfo, quoteForLog(dir), err)
-	}
-	defer f.Close()
-
-	var fstype string
-	found := false
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for sc.Scan() {
-		point, typ, ok := parseMountInfoLine(sc.Text())
-		if ok && point == dir {
-			fstype, found = typ, true
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return mountRecord{}, fmt.Errorf("reading %s to find the filesystem of volume path %s: %w", mountinfo, quoteForLog(dir), err)
-	}
-	if !found {
-		return mountRecord{}, fmt.Errorf("volume path %s has no mount entry in %s", quoteForLog(dir), mountinfo)
-	}
-	return mountRecord{ContainerDir: dir, FSType: fstype}, nil
-}
-
-// parseMountInfoLine returns the mount point and filesystem type of one
-// mountinfo line, which reads
-//
-//	ID PARENT MAJ:MIN ROOT MOUNTPOINT OPTIONS [OPTIONAL...] - FSTYPE SOURCE SUPEROPTIONS
-//
-// The optional fields end at the lone "-". ok is false for a line that does
-// not have that shape.
-func parseMountInfoLine(line string) (point, fstype string, ok bool) {
-	fields := strings.Fields(line)
-	if len(fields) < 5 {
-		return "", "", false
-	}
-	for i := 6; i < len(fields); i++ {
-		if fields[i] == "-" {
-			if i+1 >= len(fields) {
-				return "", "", false
-			}
-			return unescapeMountInfo(fields[4]), fields[i+1], true
-		}
-	}
-	return "", "", false
-}
-
-// unescapeMountInfo decodes the three-digit octal escapes the kernel writes
-// for a space, tab, newline, and backslash in a mountinfo path. Any other
-// backslash stays as it is.
-func unescapeMountInfo(s string) string {
-	if !strings.Contains(s, `\`) {
-		return s
-	}
-	var b strings.Builder
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\\' && i+3 < len(s) && isOctal(s[i+1]) && s[i+1] <= '3' && isOctal(s[i+2]) && isOctal(s[i+3]) {
-			b.WriteByte((s[i+1]-'0')<<6 | (s[i+2]-'0')<<3 | (s[i+3] - '0'))
-			i += 3
-			continue
-		}
-		b.WriteByte(s[i])
-	}
-	return b.String()
-}
-
-func isOctal(c byte) bool { return c >= '0' && c <= '7' }
