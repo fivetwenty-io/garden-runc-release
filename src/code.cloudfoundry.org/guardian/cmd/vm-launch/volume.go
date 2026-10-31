@@ -29,8 +29,9 @@ const (
 	volumeModeReadOnly = "r"
 	volumeModeRW       = "rw"
 
-	// maxVolumes is the most volume mounts a VM app may have. Each one is a
-	// drive of its own, vol0 to vol3, ahead of the guest root's drive.
+	// maxVolumes is the most volume mounts a VM app may have. Each one has a
+	// number, vol0 to vol3. An image or disk volume has a drive of its own
+	// ahead of the guest root's drive, and a share has none.
 	maxVolumes = 4
 
 	// maxVolumePathLen bounds container_dir. The guest shell and the kernel

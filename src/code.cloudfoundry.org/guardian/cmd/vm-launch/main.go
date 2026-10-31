@@ -113,9 +113,11 @@
 // volume, for another instance to release it, checks after the wait that the name still refers to the
 // locked file, and passes the image to the hypervisor as file descriptor 3.
 // With more than one volume, the volumes are taken in the byte order of
-// their paths, and each one's image gets the next file descriptor and the
-// next drive, vol0 to vol3, so that the order never depends on the order of
-// VCAP_SERVICES. vm-launch prepares them in that order and, when one fails,
+// their paths and numbered from 0 in that order, shares included. Each image
+// or disk gets the next file descriptor and the next drive, and its drive
+// carries its volume's number, vol0 to vol3, so that the order never depends
+// on the order of VCAP_SERVICES. A share takes a number but has no file
+// descriptor or drive. vm-launch prepares them in that order and, when one fails,
 // releases every one it prepared before it. Two volumes that show one
 // directory of one filesystem, so that their images would be one file, fail
 // the launch, as does a volume whose image is the file another volume already
@@ -166,11 +168,8 @@
 // Shares: a volume that VM_VOLUMES sets to "mode": "share", on vm-qemu with
 // --allow-volume-shares, is granted a share and gets no image. A granted
 // share without --virtiofsd-path, or with a path that is not an executable
-// file, fails the launch with exit 125. So does every other granted share
-// for now, before anything boots, because the hypervisor's virtiofs device
-// and the guest's mount of the share are not built yet, and the app would
-// write to the guest's own disk. What is built is the server side. vm-launch
-// is to serve the volume's own directory to the guest over virtiofs, with
+// file, fails the launch with exit 125. Otherwise vm-launch serves the
+// volume's own directory to the guest over virtiofs, with
 // one virtiofsd for each share, run from the executable that
 // --virtiofsd-path names (on a cell,
 // /opt/garden-vm/artifacts/virtiofsd/virtiofsd-wrapper). Each virtiofsd
@@ -181,7 +180,14 @@
 // front. A virtiofsd that ends before the guest has reported its status
 // stops the guest, and vm-launch exits 125 with a line that names the
 // share. Once the hypervisor has exited, every virtiofsd that still runs
-// gets half a second to end and then SIGKILL.
+// gets half a second to end and then SIGKILL. QEMU gives the guest one
+// virtiofs device for each share, with the tag rvm-vol and the share's volume
+// number, such as rvm-vol1, on guest memory that virtiofsd can map. The guest
+// mounts the share at the volume's path with mount -t virtiofs, and a share
+// that does not mount fails the boot. After the command ends, the guest
+// flushes and unmounts the share along with the other volumes. Firecracker
+// has no virtiofs device, so a share on vm-firecracker fails the launch with
+// exit 125.
 //
 // Environment: the guest command sees the container's environment after the
 // changes the CF launcher would have made to it. vm-launch reads its
@@ -340,12 +346,11 @@
 //	       directory, a read-only mount, a bad volume path,
 //	       CF_INSTANCE_INDEX, application_id, or process_type, a task with
 //	       a volume, an image that fails a check or cannot be created,
-//	       volume images of different sizes, a VM_VOLUMES value that is not
+//	       a VM_VOLUMES value that is not
 //	       a JSON object of volume paths, names a path no volume mounts, or
 //	       sets a mode or size it does not allow, or asks for a share that
 //	       the backend, the volume, or the operator does not allow, a
-//	       granted share without a usable --virtiofsd-path, any other
-//	       granted share while share mode is not served yet, a share whose
+//	       granted share without a usable --virtiofsd-path, a share whose
 //	       mount changed, or whose virtiofsd could not start, ended, or was
 //	       not ready within 5 seconds, a share whose virtiofsd ended before
 //	       the guest reported a status, or
@@ -624,14 +629,11 @@ func run(argv []string, logger *log.Logger) int {
 	}
 	// A share is granted or refused here, with the providers known and
 	// still before CredHub, the ports, and the work directory, and so is a
-	// grant that this vm-launch has no virtiofsd to serve, and any grant
-	// while share mode is not served yet (see refuseUnservedShares).
+	// grant that this vm-launch has no virtiofsd to serve.
 	var shares []shareGrant
 	if err == nil {
 		if shares, err = grantShares(cfg.backend, cfg.allowVolumeShares, selected); err == nil {
-			if err = checkVirtiofsd(cfg.virtiofsd, shares); err == nil {
-				err = refuseUnservedShares(shares)
-			}
+			err = checkVirtiofsd(cfg.virtiofsd, shares)
 		}
 	}
 	// A guest with an image or block volume formats, checks, and grows it

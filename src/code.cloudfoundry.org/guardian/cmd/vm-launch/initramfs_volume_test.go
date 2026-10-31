@@ -356,7 +356,14 @@ var _ = Describe("guest volume initramfs", func() {
 		Expect(block).To(ContainSubstring(`mount -t ext4 -o noatime,errors=remount-ro "$rvm_vdev" "$rvm_vpath" || rvm_fail`))
 		Expect(block).NotTo(ContainSubstring("sync"))
 		Expect(block).NotTo(ContainSubstring("image"))
-		Expect(share).NotTo(ContainSubstring("mount"))
+		// The share arm mounts by tag, as virtiofs, with no device and no
+		// options, and never touches a filesystem tool or a sync option.
+		Expect(share).To(ContainSubstring(`mount -t virtiofs rvm-vol"$rvm_vi" "$rvm_vpath" || rvm_fail`))
+		Expect(strings.Count(share, "mount -t")).To(Equal(1))
+		Expect(share).NotTo(ContainSubstring("ext4"))
+		Expect(share).NotTo(ContainSubstring(" -o "))
+		Expect(share).NotTo(ContainSubstring("sync"))
+		Expect(share).NotTo(ContainSubstring("$rvm_vdev\" \"$rvm_vpath"))
 		// The kinds come from the drive kinds, so a renamed kind cannot leave
 		// an arm behind.
 		Expect(string(driveImage)).To(Equal("image"))
@@ -875,10 +882,15 @@ exit "${MOUNT_RC:-0}"`)
 			shellEntries(""),
 		)
 
-		DescribeTable("leaves a share, which has no drive, to the code that serves it, and refuses a device for it",
+		// shareCall is the stub's argv line for a share's mount.
+		shareCall := func(index int, mnt string) string {
+			return "mount -t virtiofs rvm-vol" + strconv.Itoa(index) + " " + mnt + "\n"
+		}
+
+		DescribeTable("mounts a share by its volume index's tag beside the other volumes, and refuses a device for it",
 			func(shellOf func() guestShell) {
 				shell := shellOf()
-				mounts := []string{filepath.Join(dir, "data"), filepath.Join(dir, "shared"), filepath.Join(dir, "logs")}
+				mounts := []string{filepath.Join(dir, "data"), filepath.Join(dir, "shared dir"), filepath.Join(dir, "logs")}
 				devices := []string{filepath.Join(dir, "vda"), "", filepath.Join(dir, "vdb")}
 				zeroDevice(devices[0])
 				zeroDevice(devices[2])
@@ -888,13 +900,55 @@ exit "${MOUNT_RC:-0}"`)
 					"RVM_VOL2_KIND=block\nRVM_VOL2_PATH="+shellQuote(mounts[2])+"\n"), 0o644)).To(Succeed())
 				r := runIn(shell, devices, "DD_MODE=data")
 				Expect(r.out).To(Equal("rvm-volume: clean, 11/65536 files, 4127/262144 blocks\nREACHED_START\n"), "%s", shell.name)
-				Expect(r.calls).To(Equal(ddCall(devices[0])+fsckCall(devices[0])+mountCall(devices[0], mounts[0])+blockMountCall(devices[2], mounts[2])), "%s", shell.name)
-				Expect(mounts[1]).NotTo(BeAnExistingFile())
+				Expect(r.calls).To(Equal(ddCall(devices[0])+fsckCall(devices[0])+mountCall(devices[0], mounts[0])+shareCall(1, mounts[1])+blockMountCall(devices[2], mounts[2])), "%s", shell.name)
+				Expect(mounts[1]).To(BeADirectory())
 
 				Expect(os.Remove(callLog)).To(Succeed())
 				devices[1] = devices[2]
 				r = runIn(shell, devices, "DD_MODE=data")
 				Expect(r.out).To(Equal("rvm-volume: clean, 11/65536 files, 4127/262144 blocks\nvm-launch guest setup: stage 1 passed the device "+devices[2]+" for the share at "+mounts[1]+", which has no drive\nREBOOT\n"), "%s", shell.name)
+			},
+			shellEntries(""),
+		)
+
+		DescribeTable("mounts a guest that holds only a share, at the tag of its own index, with no tool and no drive",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				shared := filepath.Join(dir, "a b", "it's")
+				Expect(os.WriteFile(filepath.Join(dir, "mounts"), []byte("RVM_VOLUMES=1\nRVM_SYNC_MOUNTS=true\nRVM_VOL0_KIND=share\nRVM_VOL0_PATH="+shellQuote(shared)+"\n"), 0o644)).To(Succeed())
+				r := runIn(shell, []string{""})
+				Expect(r.out).To(Equal("REACHED_START\n"), "%s", shell.name)
+				Expect(r.calls).To(Equal(shareCall(0, shared)), "%s", shell.name)
+				Expect(shared).To(BeADirectory())
+			},
+			shellEntries(""),
+		)
+
+		DescribeTable("fails the boot with a line that names the path when a share does not mount, and goes no further",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				mounts := []string{filepath.Join(dir, "shared"), filepath.Join(dir, "later")}
+				Expect(os.WriteFile(filepath.Join(dir, "mounts"), []byte("RVM_VOLUMES=2\nRVM_SYNC_MOUNTS=true\n"+
+					"RVM_VOL0_KIND=share\nRVM_VOL0_PATH="+shellQuote(mounts[0])+"\n"+
+					"RVM_VOL1_KIND=share\nRVM_VOL1_PATH="+shellQuote(mounts[1])+"\n"), 0o644)).To(Succeed())
+				r := runIn(shell, []string{"", ""}, "MOUNT_RC=32")
+				Expect(r.out).To(Equal("vm-launch guest setup: mounting the share rvm-vol0 at "+mounts[0]+" failed; the hypervisor must give the guest a virtiofs device with that tag\nREBOOT\n"), "%s", shell.name)
+				Expect(r.calls).To(Equal(shareCall(0, mounts[0])), "%s", shell.name)
+				Expect(mounts[1]).NotTo(BeAnExistingFile())
+			},
+			shellEntries(""),
+		)
+
+		DescribeTable("fails the boot with a line that names the path when the mount point of a share cannot be made",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				blocker := filepath.Join(dir, "file")
+				Expect(os.WriteFile(blocker, nil, 0o600)).To(Succeed())
+				shared := filepath.Join(blocker, "shared")
+				Expect(os.WriteFile(filepath.Join(dir, "mounts"), []byte("RVM_VOLUMES=1\nRVM_SYNC_MOUNTS=true\nRVM_VOL0_KIND=share\nRVM_VOL0_PATH="+shellQuote(shared)+"\n"), 0o644)).To(Succeed())
+				r := runIn(shell, []string{""})
+				Expect(r.out).To(HaveSuffix("vm-launch guest setup: creating "+shared+" failed\nREBOOT\n"), "%s", shell.name)
+				Expect(r.calls).To(BeEmpty(), "%s", shell.name)
 			},
 			shellEntries(""),
 		)
@@ -945,7 +999,7 @@ exit "${MOUNT_RC:-0}"`)
 					"sync -f " + mounts[0] + "\numount " + mounts[0] + "\n"))
 			})
 
-			It("syncs and unmounts a block volume as it does an image, and leaves a share, which stage 2 never mounted", func() {
+			It("syncs and unmounts a block volume and a share as it does an image, last first", func() {
 				mounts := []string{filepath.Join(dir, "data"), filepath.Join(dir, "shared"), filepath.Join(dir, "disk")}
 				Expect(os.WriteFile(filepath.Join(dir, "mounts"), []byte("RVM_VOLUMES=3\n"+
 					"RVM_VOL0_KIND=image\nRVM_VOL0_PATH="+shellQuote(mounts[0])+"\nRVM_VOL0_IMAGE=a.img\n"+
@@ -954,7 +1008,20 @@ exit "${MOUNT_RC:-0}"`)
 				r := teardown("5")
 				Expect(r.out).To(Equal("status=5\n"))
 				Expect(r.calls).To(Equal("sync -f " + mounts[2] + "\numount " + mounts[2] + "\n" +
+					"sync -f " + mounts[1] + "\numount " + mounts[1] + "\n" +
 					"sync -f " + mounts[0] + "\numount " + mounts[0] + "\n"))
+			})
+
+			It("flushes a share before it unmounts it, and reports a share that will not unmount", func() {
+				shared := filepath.Join(dir, "shared")
+				Expect(os.WriteFile(filepath.Join(dir, "mounts"), []byte("RVM_VOLUMES=1\nRVM_VOL0_KIND=share\nRVM_VOL0_PATH="+shellQuote(shared)+"\n"), 0o644)).To(Succeed())
+				r := teardown("4")
+				Expect(r.out).To(Equal("status=4\n"))
+				Expect(r.calls).To(Equal("sync -f " + shared + "\numount " + shared + "\n"))
+
+				Expect(os.Remove(callLog)).To(Succeed())
+				r = teardown("4", "UMOUNT_RC=1")
+				Expect(r.out).To(Equal("vm-launch guest: unmounting " + shared + " failed; data was already synced\nstatus=4\n"))
 			})
 
 			It("reports a failed unmount and still keeps the command's status", func() {

@@ -25,7 +25,7 @@ import (
 
 // helperShareRun marks a helper process that calls run with its own
 // arguments, the mount table at helperShareMountInfo, the kernel's answers
-// about volumes taken from that table, and share mode served, for a spec
+// about volumes taken from that table, for a spec
 // that signals or kills vm-launch while it serves a share, or holds its
 // stdout. helperShareDisconnectGrace, when set, is the disconnect grace.
 const (
@@ -39,7 +39,6 @@ func shareRun(args []string) int {
 	mountInfoPath = os.Getenv(helperShareMountInfo)
 	volumeProbe = mountIDByPath(func() string { return mountInfoPath })
 	dirProbe = probeByPath
-	shareModeServed = true
 	if v := os.Getenv(helperShareDisconnectGrace); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
@@ -58,13 +57,6 @@ func shareRun(args []string) int {
 // The helper keeps any other GORACE option the suite runs with.
 func quickRaceExit() string {
 	return "GORACE=" + strings.TrimSpace(os.Getenv("GORACE")+" atexit_sleep_ms=0")
-}
-
-// serveShares runs share mode, which run refuses until it is served, for
-// the rest of the spec.
-func serveShares() {
-	DeferCleanup(func(saved bool) { shareModeServed = saved }, shareModeServed)
-	shareModeServed = true
 }
 
 // virtiofsdReady is the line a fake virtiofsd writes when it is ready, as
@@ -1085,7 +1077,6 @@ var _ = Describe("run with a granted share", func() {
 
 	BeforeEach(func() {
 		shortVirtiofsdTimes()
-		serveShares()
 		art = makeArtifacts()
 		hv = filepath.Join(art, artQEMULoader)
 		shareDir = GinkgoT().TempDir()
@@ -1118,25 +1109,24 @@ var _ = Describe("run with a granted share", func() {
 		return run(argv, log.New(logBuf, "", 0))
 	}
 
-	It("refuses the share before anything starts while share mode is not served", func() {
-		shareModeServed = false
+	It("refuses a share on Firecracker before anything starts, though a virtiofsd is given", func() {
 		vfs, rec := fakeVirtiofsd(vfsServe, gone)
 		argvFile := writeShareHypervisor(hv, "", "", gone)
-		Expect(runWith(vfs)).To(Equal(exitLaunchError))
-		Expect(logBuf.String()).To(Equal(`VM_VOLUMES "` + shareDir + `" is granted a share, but this vm-launch does not serve share mode yet, because the hypervisor's virtiofs device and the guest's mount of the share come in a later release; the app would otherwise write to the guest's own disk` + "\n"))
+		argv := []string{"--backend", "vm-firecracker", "--allow-volume-shares", "--artifacts", art, "--virtiofsd-path", vfs,
+			"--", "/tmp/lifecycle/launcher", "app", "true", ""}
+		Expect(run(argv, log.New(logBuf, "", 0))).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(Equal(`VM_VOLUMES ` + quoteForLog(shareDir) + ` mode "share" is not available on vm-firecracker, which has no virtiofs device; shares need the vm-qemu backend` + "\n"))
 		Expect(argvFile).NotTo(BeAnExistingFile())
 		Expect(os.ReadDir(rec)).To(BeEmpty())
 		Expect(workDirsIn(tmp)).To(BeEmpty())
-		Expect(os.ReadDir(shareDir)).To(BeEmpty())
 	})
 
-	It("keeps the missing virtiofsd's own line while share mode is not served", func() {
-		shareModeServed = false
+	It("keeps the missing virtiofsd's own line", func() {
 		Expect(runWith("")).To(Equal(exitLaunchError))
 		Expect(logBuf.String()).To(Equal(`VM_VOLUMES "` + shareDir + `" is granted a share, but vm-launch was not given --virtiofsd-path, so nothing can serve it; the operator must install virtiofsd and pass its path` + "\n"))
 	})
 
-	It("with share mode served, serves the share with virtiofsd, gives the volume no image, and leaves nothing behind", func() {
+	It("boots a granted share, serves it with virtiofsd, gives the volume no image, and leaves nothing behind", func() {
 		// The fake ends within moments of seeing QEMU go. A grace that a
 		// loaded machine cannot spend keeps its clean end from being a kill.
 		virtiofsdStopGrace = 5 * time.Second
@@ -1157,6 +1147,7 @@ var _ = Describe("run with a granted share", func() {
 		hvArgv, err := os.ReadFile(argvFile)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(string(hvArgv)).NotTo(ContainSubstring("virtio-blk-device"))
+		Expect(string(hvArgv)).To(ContainSubstring("vhost-user-fs-device,chardev=fs0,tag=rvm-vol0\n"))
 		Expect(logBuf.String()).To(ContainSubstring(`virtiofsd for "` + shareDir + `": ` + virtiofsdReady + "\n"))
 		Expect(logBuf.String()).To(ContainSubstring("Client disconnected, shutting down\n"))
 		Expect(logBuf.String()).NotTo(ContainSubstring("killing"))
