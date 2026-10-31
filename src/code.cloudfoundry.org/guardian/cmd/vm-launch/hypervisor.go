@@ -300,13 +300,22 @@ type volumeDrive struct {
 	index int
 }
 
-// The hypervisor's inherited files. The hypervisor gets the volume images,
-// one for each volume, the initramfs, a QEMU monitor socket, when there is
-// one, and the guest root image, when there is one, as extra files, and opens
-// each through /proc/self/fd. For a volume image that reopens exactly the
-// inode vm-launch checked, so the container path of the volume never reaches
-// a QEMU option string or the Firecracker configuration. The root image has
-// no path at all, because vm-launch unlinks it when it creates it. The volume
+// The hypervisor's inherited files. The hypervisor gets the volume disks,
+// one for each volume that has a drive, the initramfs, a QEMU monitor
+// socket, when there is one, and the guest root image, when there is one, as
+// extra files, and opens each through /proc/self/fd, so the container path
+// of a volume never reaches a QEMU option string or the Firecracker
+// configuration. For a volume image, a regular file, that open reaches
+// exactly the inode vm-launch checked. A block volume's file is a device
+// node, and an open of a device node finds its disk by the node's device
+// number at the moment of the open, so the hypervisor reaches whichever disk
+// has that number then, and its open does not ask for O_EXCL. vm-launch
+// checked the disk behind its own O_EXCL descriptor, which it keeps open
+// while the hypervisor runs, so no other exclusive opener can take the disk
+// meanwhile. A disk that is detached between that check and the
+// hypervisor's open, or while the guest runs, frees its number, and a disk
+// attached after it can be given the same number. The root image has no
+// path at all, because vm-launch unlinks it when it creates it. The volume
 // images take file descriptors from firstVolumeFD on, in volume order, so
 // that the first one keeps 3, and the initramfs takes the next one: 3
 // without a volume, 4 with one, and 7 with four. The monitor takes the one
@@ -341,8 +350,11 @@ func volumeDrivePath(i int) string {
 // exec.Cmd.ExtraFiles, with the paths the hypervisor opens them by. vols are
 // the volumes' attachments in volume order, after newGuestDrives has given
 // each its identity, and drives holds the path, the identity, and the mode of
-// each, in the same order, or nothing without a volume. A nil attachment
-// gives a drive with no path, which hypervisorArgv refuses. initrd is the
+// each, in the same order, or nothing without a volume. An attachment
+// without a file, or a nil one, gives a drive with no path, which
+// hypervisorArgv refuses. That drive keeps the attachment's volume index, so
+// the refusal names the volume, and a nil attachment, which has none, gives
+// the index -1, so the refusal names the drive's position instead. initrd is the
 // initramfs from newInitramfs. monitor is QEMU's end of the QMP socket or nil, and
 // monitorFD is its file descriptor in the hypervisor, or 0 without one. root
 // is the guest root image from createRootImage or nil, and rootPath is empty
@@ -350,8 +362,12 @@ func volumeDrivePath(i int) string {
 func hypervisorFiles(vols []*attachment, initrd, monitor, root *os.File) (files []*os.File, drives []volumeDrive, initrdPath string, monitorFD int, rootPath string) {
 	for _, att := range vols {
 		if att == nil || att.File == nil {
+			index := -1
+			if att != nil {
+				index = att.Index
+			}
 			files = append(files, nil)
-			drives = append(drives, volumeDrive{})
+			drives = append(drives, volumeDrive{index: index})
 			continue
 		}
 		files = append(files, att.File)
@@ -499,7 +515,9 @@ func firecrackerArgv(root, configPath string) []string {
 // the floor and the ceiling. nw is the guest network, which run always
 // builds, and drives are the volume drives from hypervisorFiles, in volume
 // order, or none without a volume. More than maxVolumes of them is an error,
-// and so is a drive without a path, a drive in neither file-image nor block
+// and so is a drive without a path, which the error names by its volume
+// index, or by its place among drives when hypervisorFiles had no
+// attachment to take an index from, a drive in neither file-image nor block
 // mode, and, on QEMU, a drive whose identity the guest could not read back,
 // because QEMU passes it as the serial. rootPath is the path of the guest
 // root image, or empty when the guest root stays in RAM; that drive comes
@@ -513,8 +531,10 @@ func hypervisorArgv(kind backend.Kind, root, workDir, initrd string, memMiB int,
 	}
 	for i, d := range drives {
 		switch {
+		case d.path == "" && d.index < 0:
+			return nil, fmt.Errorf("the volume drive at place %d among the drives has no path and no volume index", i)
 		case d.path == "":
-			return nil, fmt.Errorf("volume drive %s has no path", volumeDriveID(i))
+			return nil, fmt.Errorf("volume drive %s has no path", volumeDriveID(d.index))
 		case d.mode != attachFileImage && d.mode != attachBlock:
 			return nil, fmt.Errorf("volume drive %s is in %s, which VM backends do not attach as a drive", volumeDriveID(d.index), d.mode)
 		case kind == backend.VMQemu && !validDriveID(d.id):

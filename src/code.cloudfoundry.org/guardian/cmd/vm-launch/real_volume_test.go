@@ -341,10 +341,16 @@ var _ = Describe("volume images against a real QEMU", func() {
 	)
 
 	// refusedImage boots a guest on img and expects stage 2 to fail the boot
-	// because e2fsck -p exits with status before the command starts.
+	// because e2fsck -p exits with status before the command starts: with
+	// the line for errors it left, from 4 to 7, or with the line for a check
+	// that could not run, from 8 on.
 	refusedImage := func(img *os.File, status int) string {
 		out := bootData(img, "echo command-ran")
-		Expect(out).To(MatchRegexp(`(?m)^vm-launch guest setup: the volume image volume\.img has errors that e2fsck -p can't repair; inspect it on the volume \(e2fsck -p exited `+strconv.Itoa(status)+` for `+dataDir+`, and vm-launch never formats an image that is not blank\)\r?$`), out)
+		line := "the volume image volume.img has errors that e2fsck -p can't repair; inspect it on the volume (e2fsck -p exited " + strconv.Itoa(status) + " for " + dataDir + ", and vm-launch never formats an image that is not blank)"
+		if status >= 8 {
+			line = "e2fsck -p for the volume image volume.img at " + dataDir + " exited " + strconv.Itoa(status) + ", which means it could not check the image, not that the image has errors it can't repair (the check adds 8 for an operational error, 16 for a usage error, 32 for a cancelled check, 128 for a library error, and 4 for errors it left); inspect it on the volume, and vm-launch never formats an image that is not blank"
+		}
+		Expect(out).To(MatchRegexp(`(?m)^`+regexp.QuoteMeta("vm-launch guest setup: "+line)+`\r?$`), out)
 		Expect(out).NotTo(ContainSubstring(startTag(testNonce)), out)
 		Expect(out).NotTo(ContainSubstring("command-ran"), out)
 		Expect(out).NotTo(ContainSubstring("vm-launch guest setup: mounting"), out)
@@ -541,11 +547,57 @@ var _ = Describe("volume images against a real QEMU", func() {
 		before := imageDigest(img)
 
 		out := bootData(img, "echo command-ran")
-		Expect(out).To(MatchRegexp(`(?m)^vm-launch guest setup: the volume image volume\.img for `+dataDir+` reads as zero in its first 64 KiB but holds the magic of an ext2, ext3, or ext4 superblock at byte 134217728, where a backup superblock is kept, so it looks like a damaged filesystem, and vm-launch never formats it; repair it by hand on the volume with e2fsck -b from a backup superblock \(e2fsck -b 32768 -B 4096 for 4096-byte blocks\)\r?$`), out)
+		Expect(out).To(MatchRegexp(`(?m)^vm-launch guest setup: the volume image volume\.img for `+dataDir+` reads as zero in its first 64 KiB but holds the magic of an ext2, ext3, or ext4 superblock at byte 134217728, where a backup superblock is kept, so it looks like a damaged filesystem, and vm-launch never formats it; if the volume never held data, an interrupted first format can cause this, and deleting volume\.img on the volume lets the next start create it fresh; otherwise repair it by hand on the volume with e2fsck -b from a backup superblock \(e2fsck -b 32768 -B 4096 for 4096-byte blocks\)\r?$`), out)
 		Expect(out).NotTo(ContainSubstring(startTag(testNonce)), out)
 		Expect(out).NotTo(ContainSubstring("command-ran"), out)
 		Expect(imageDigest(img)).To(Equal(before), "the guest wrote to the image")
 		Expect(imageHolds(img, "kept-behind-a-zeroed-head")).To(BeTrue())
+	})
+
+	It("fails the boot on an image too small for a backup superblock whose first 64 KiB are zero but whose filesystem is still there, and never formats it", func() {
+		const small = 64 << 20
+		img := openSizedFile(small)
+		markData(img, "kept-in-a-small-image")
+		fs := readExtImage(img)
+		Expect(fs.blockSize()).To(Equal(int64(4096)))
+		_, err := img.WriteAt(make([]byte, 64<<10), 0)
+		Expect(err).NotTo(HaveOccurred())
+		before := imageDigest(img)
+
+		out := bootData(img, "echo command-ran")
+		Expect(out).To(MatchRegexp(`(?m)^`+regexp.QuoteMeta("vm-launch guest setup: the volume image volume.img for "+dataDir+" reads as zero in its first 64 KiB but not in all of its "+strconv.Itoa(small)+" bytes, and an image this small that vm-launch formatted has no backup superblock that would tell a damaged filesystem from a new image, so it looks like a damaged filesystem, and vm-launch never formats it; if the volume never held data, an interrupted first format can cause this, and deleting volume.img on the volume lets the next start create it fresh; otherwise repair it by hand on the volume, where e2fsck -b needs a backup superblock that a filesystem this small may not have")+`\r?$`), out)
+		Expect(out).NotTo(ContainSubstring(startTag(testNonce)), out)
+		Expect(out).NotTo(ContainSubstring("command-ran"), out)
+		Expect(imageDigest(img)).To(Equal(before), "the guest wrote to the image")
+		Expect(imageHolds(img, "kept-in-a-small-image")).To(BeTrue())
+	})
+
+	It("stops a process the command left behind that ignores SIGTERM before it flushes and unmounts the volume, and keeps what both wrote", func() {
+		img := openSizedFile(defaultImageSize)
+		// The writer ignores SIGTERM and keeps its file open on the volume,
+		// so only the teardown's SIGKILL lets the volume unmount.
+		command := "( trap '' TERM; exec 3>>" + dataDir + "/left; while :; do echo left-behind-writer >&3; sleep 0.1; done ) &\n" +
+			"sleep 0.5\necho kept-past-the-teardown >" + dataDir + "/mark\n"
+		out := bootData(img, command)
+		Expect(out).NotTo(ContainSubstring("vm-launch guest setup"), out)
+		Expect(out).To(MatchRegexp(`(?m)^vm-launch guest: processes the command left were still running 2 seconds after SIGTERM, so the guest sends them SIGKILL before it flushes the volumes\r?$`), out)
+		Expect(out).NotTo(ContainSubstring("second after SIGKILL"), out)
+		Expect(out).NotTo(ContainSubstring("unmounting"), out)
+		Expect(out).NotTo(ContainSubstring("flushing"), out)
+		Expect(out).To(ContainSubstring(exitTag(testNonce)+"0"), out)
+		Expect(imageHolds(img, "kept-past-the-teardown")).To(BeTrue())
+		Expect(imageHolds(img, "left-behind-writer")).To(BeTrue())
+		fs := readExtImage(img)
+		Expect(fs.clean()).To(BeTrue(), "the image was not unmounted cleanly")
+	})
+
+	It("finds no process left in a guest whose command left none, so the teardown neither waits nor reports one", func() {
+		img := openSizedFile(defaultImageSize)
+		out := bootData(img, "echo kept-without-a-wait >"+dataDir+"/mark")
+		Expect(out).NotTo(ContainSubstring("SIGTERM"), out)
+		Expect(out).NotTo(ContainSubstring("SIGKILL"), out)
+		Expect(out).To(ContainSubstring(exitTag(testNonce)+"0"), out)
+		Expect(imageHolds(img, "kept-without-a-wait")).To(BeTrue())
 	})
 
 	It("drops sync and dirsync only from the images with a journal when the operator turns sync mounts off", func() {
