@@ -277,9 +277,9 @@ func objectMembers(text string) ([]member, error) {
 }
 
 // applyVolumeSettings reads VM_VOLUMES and records on each of vols what the
-// app chose for it. An app that asks for a share is refused for now, because
-// this vm-launch has no way to attach one, and a private disk in its place
-// would lose the data the app expects to share.
+// app chose for it, share mode included. Whether a share is granted depends
+// on the volume's provider, the backend, and the operator, which are known
+// only after the providers are found, so grantShares decides it.
 func applyVolumeSettings(lookup func(string) (string, bool), vols []guestVolume) error {
 	raw, _ := lookup(volumeSettingsEnv)
 	dirs := make([]string, len(vols))
@@ -294,9 +294,6 @@ func applyVolumeSettings(lookup func(string) (string, bool), vols []guestVolume)
 		s, ok := settings[vols[i].ContainerDir]
 		if !ok {
 			continue
-		}
-		if s.Mode == volumeShare {
-			return fmt.Errorf("%s %s mode %q is not supported by this vm-launch yet; shares need a later release", volumeSettingsEnv, quoteForLog(vols[i].ContainerDir), modeNameShare)
 		}
 		vols[i].Settings = s
 	}

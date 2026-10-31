@@ -7,7 +7,7 @@
 //
 // Usage:
 //
-//	vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--artifacts DIR] -- PATH [ARGS...]
+//	vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--artifacts DIR] -- PATH [ARGS...]
 //
 // When PATH is the CF launcher ("launcher APP-DIR START-COMMAND ..."), the
 // guest runs START-COMMAND. Otherwise it runs PATH and ARGS, shell-quoted.
@@ -275,7 +275,8 @@
 //	       a volume, an image that fails a check or cannot be created,
 //	       volume images of different sizes, a VM_VOLUMES value that is not
 //	       a JSON object of volume paths, names a path no volume mounts, or
-//	       sets a mode or size it does not allow, or
+//	       sets a mode or size it does not allow, or asks for a share that
+//	       the backend, the volume, or the operator does not allow, or
 //	       an image another instance still holds after 30 seconds, a
 //	       guest environment that is too large, with one entry over
 //	       131071 bytes or more than 1 MiB in all, or a value that holds a
@@ -361,7 +362,7 @@ const transparentProxyFlag = "transparent-proxy"
 // line, for every guest size vm-launch allows.
 const stopDeadline = 8 * time.Second
 
-const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--artifacts DIR] -- PATH [ARGS...]\n"
+const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--artifacts DIR] -- PATH [ARGS...]\n"
 
 type config struct {
 	backend   backend.Kind
@@ -371,6 +372,9 @@ type config struct {
 	// transparent makes the Firecracker port proxy dial the guest from its
 	// clients' addresses (see transparentSource).
 	transparent bool
+	// allowVolumeShares is the operator's switch for share mode. Without it
+	// an app that asks for a share in VM_VOLUMES is refused (see grantShares).
+	allowVolumeShares bool
 }
 
 // init holds the main goroutine, and with it run, to the thread-group
@@ -523,6 +527,15 @@ func run(argv []string, logger *log.Logger) int {
 	var selected []selectedVolume
 	if err == nil && len(vols) > 0 {
 		selected, err = findVolumeProviders(mountInfoPath, vols)
+	}
+	// A share is granted or refused here, with the providers known and
+	// still before CredHub, the ports, and the work directory. A grant is
+	// not served yet, so it ends the launch too (see refuseUnservedShares).
+	if err == nil {
+		var shares []shareGrant
+		if shares, err = grantShares(cfg.backend, cfg.allowVolumeShares, selected); err == nil {
+			err = refuseUnservedShares(shares)
+		}
 	}
 	if err != nil {
 		logger.Print(err)
@@ -810,11 +823,12 @@ func parseArgs(argv []string) (config, error) {
 	kind := fs.String("backend", "", "VM backend: vm-qemu or vm-firecracker")
 	artifacts := fs.String("artifacts", defaultArtifactsDir, "directory holding the kernel, hypervisor, and busybox")
 	transparent := fs.Bool(transparentProxyFlag, false, "dial the Firecracker guest from each client's address, which takes CAP_NET_RAW")
+	allowShares := fs.Bool(allowVolumeSharesFlag, false, "allow an app to ask for a volume as a share in VM_VOLUMES, which only QEMU can serve")
 	if err := fs.Parse(argv); err != nil {
 		return config{}, err
 	}
 
-	cfg := config{backend: backend.Kind(*kind), transparent: *transparent}
+	cfg := config{backend: backend.Kind(*kind), transparent: *transparent, allowVolumeShares: *allowShares}
 	if _, err := requiredArtifacts(cfg.backend); err != nil {
 		return config{}, err
 	}
