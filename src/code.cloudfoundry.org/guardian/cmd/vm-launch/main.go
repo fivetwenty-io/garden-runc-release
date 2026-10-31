@@ -7,7 +7,7 @@
 //
 // Usage:
 //
-//	vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--artifacts DIR] -- PATH [ARGS...]
+//	vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--volume-sync-mounts=false] [--artifacts DIR] -- PATH [ARGS...]
 //
 // When PATH is the CF launcher ("launcher APP-DIR START-COMMAND ..."), the
 // guest runs START-COMMAND. Otherwise it runs PATH and ARGS, shell-quoted.
@@ -113,10 +113,17 @@
 // directory of one filesystem, so that their images would be one file, fail
 // the launch, as does a volume whose image is the file another volume already
 // holds, which vm-launch refuses before it waits for the lock. The guest finds
-// each image's drive by the identity vm-launch gives the drive, checks its
-// size, formats it as ext2 when its first 64 KiB are all zero, and mounts it
-// synchronously at its own path; a non-blank image that does not mount is
-// never formatted.
+// each image's drive by the identity vm-launch gives the drive and checks its
+// size. When the image's first 64 KiB are all zero, the guest formats it as
+// a journalled ext4 with the shipped mke2fs, without zeroing its inode
+// tables or its journal. Every other image is checked with e2fsck -p before
+// it mounts, and an image that e2fsck -p cannot repair fails the boot and is
+// never formatted, nor is a non-blank image that does not mount. The guest
+// mounts each image at its own path with sync, dirsync, noatime,
+// noinit_itable, and errors=remount-ro. With --volume-sync-mounts=false, an
+// image whose filesystem has a journal mounts without sync and dirsync,
+// while an image without one, such as an ext2 image from an earlier
+// release, keeps them.
 //
 // A BOSH disk volume is a whole block device rather than an image. Its
 // volume path is a read-only tmpfs from pdi:bosh-disk that holds a
@@ -285,7 +292,7 @@
 //
 //	0-255  the guest command's exit status
 //	123    the hypervisor exited cleanly, but the guest never reported a status,
-//	       as when the guest cannot find, format, or mount the volume image
+//	       as when the guest cannot find, format, check, or mount a volume image
 //	       or the guest root image
 //	124    the hypervisor failed: it exited non-zero before the guest reported a
 //	       status, as QEMU does when it cannot open the volume image
@@ -393,7 +400,17 @@ const transparentProxyFlag = "transparent-proxy"
 // line, for every guest size vm-launch allows.
 const stopDeadline = 8 * time.Second
 
-const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--artifacts DIR] -- PATH [ARGS...]\n"
+// volumeSyncMountsFlag names the vm-launch flag with which the operator
+// keeps or drops sync and dirsync on the mounts of volume images. It is true
+// by default, and with --volume-sync-mounts=false, which Garden renders from
+// a job property, an image whose filesystem has a journal mounts without
+// them. vm-launch records the setting in /rvm/mounts, and the guest decides
+// for each image, because only the guest sees whether its filesystem has a
+// journal (see guestVolumeSetup). An image without a journal and a block
+// volume are never changed by it.
+const volumeSyncMountsFlag = "volume-sync-mounts"
+
+const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--volume-sync-mounts=false] [--artifacts DIR] -- PATH [ARGS...]\n"
 
 type config struct {
 	backend   backend.Kind
@@ -406,6 +423,10 @@ type config struct {
 	// allowVolumeShares is the operator's switch for share mode. Without it
 	// an app that asks for a share in VM_VOLUMES is refused (see grantShares).
 	allowVolumeShares bool
+	// volumeSyncMounts keeps sync and dirsync on every image mount. When it
+	// is false, an image with a journal mounts without them (see
+	// volumeSyncMountsFlag).
+	volumeSyncMounts bool
 }
 
 // init holds the main goroutine, and with it run, to the thread-group
@@ -730,6 +751,7 @@ func run(argv []string, logger *log.Logger) int {
 		rootBytes:      rootSize,
 		rootInodeRatio: rootInodeRatio,
 		tools:          tools,
+		noVolumeSync:   !cfg.volumeSyncMounts,
 	})
 	// The archive holds the tools' bytes now, so the files close here. The
 	// deferred call covers the returns before this point.
@@ -859,11 +881,12 @@ func parseArgs(argv []string) (config, error) {
 	artifacts := fs.String("artifacts", defaultArtifactsDir, "directory holding the kernel, hypervisor, and busybox")
 	transparent := fs.Bool(transparentProxyFlag, false, "dial the Firecracker guest from each client's address, which takes CAP_NET_RAW")
 	allowShares := fs.Bool(allowVolumeSharesFlag, false, "allow an app to ask for a volume as a share in VM_VOLUMES, which only QEMU can serve")
+	syncMounts := fs.Bool(volumeSyncMountsFlag, true, "mount every volume image with sync and dirsync; with =false, an image whose filesystem has a journal mounts without them")
 	if err := fs.Parse(argv); err != nil {
 		return config{}, err
 	}
 
-	cfg := config{backend: backend.Kind(*kind), transparent: *transparent, allowVolumeShares: *allowShares}
+	cfg := config{backend: backend.Kind(*kind), transparent: *transparent, allowVolumeShares: *allowShares, volumeSyncMounts: *syncMounts}
 	if _, err := requiredArtifacts(cfg.backend); err != nil {
 		return config{}, err
 	}

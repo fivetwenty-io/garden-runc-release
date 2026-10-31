@@ -396,9 +396,7 @@ var _ = Describe("the initramfs memfd against a real QEMU", func() {
 			g.vols = append(g.vols, guestVolume{ContainerDir: "/vol" + strconv.Itoa(i), ImageName: "volume.img"})
 		}
 		g.rootBytes, g.rootInodeRatio = 8<<20, inodeRatioFor(8<<20)
-		f, err := newInitramfs(guestBusybox(), g)
-		Expect(err).NotTo(HaveOccurred())
-		DeferCleanup(f.Close)
+		f := newRealInitramfs(g)
 		files, drivePaths, initrdPath, _, rootPath := hypervisorFiles(prepared.files(), withUserspaceMark(f), nil, root)
 		argv := markedArgv(tcgArgv(qemu, withRealRootDrive(qemuArgv(art, initrdPath, minGuestMemoryMiB, taskNetwork(), drivePaths, 0), rootPath)))
 		code, stdout, stderr := bootRealQEMU(argv, files)

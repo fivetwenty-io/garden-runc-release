@@ -672,7 +672,7 @@ var _ = Describe("parseArgs", func() {
 	It("accepts the form garden wraps the CF launcher in", func() {
 		cfg, err := parseArgs([]string{"--backend", "vm-qemu", "--", "/tmp/lifecycle/launcher", "app", "echo hi && exit 3", ""})
 		Expect(err).NotTo(HaveOccurred())
-		Expect(cfg).To(Equal(config{backend: backend.VMQemu, artifacts: defaultArtifactsDir, command: "echo hi && exit 3", credhub: credhubRetry{attempts: 3, delay: time.Second}}))
+		Expect(cfg).To(Equal(config{backend: backend.VMQemu, artifacts: defaultArtifactsDir, command: "echo hi && exit 3", credhub: credhubRetry{attempts: 3, delay: time.Second}, volumeSyncMounts: true}))
 	})
 
 	It("takes --artifacts and makes it absolute", func() {
@@ -716,6 +716,24 @@ var _ = Describe("parseArgs", func() {
 		cfg, err = parseArgs([]string{"--backend", "vm-firecracker", "--", "true"})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(cfg.transparent).To(BeFalse())
+	})
+
+	It("keeps volume image mounts synchronous by default and takes --volume-sync-mounts=false on either backend", func() {
+		Expect(volumeSyncMountsFlag).To(Equal("volume-sync-mounts"))
+		Expect(usage).To(ContainSubstring("[--volume-sync-mounts=false]"))
+		for _, kind := range []backend.Kind{backend.VMQemu, backend.VMFirecracker} {
+			for flags, want := range map[string]bool{"": true, "--volume-sync-mounts": true, "--volume-sync-mounts=true": true, "--volume-sync-mounts=false": false, "--volume-sync-mounts=0": false} {
+				argv := []string{"--backend", string(kind)}
+				if flags != "" {
+					argv = append(argv, flags)
+				}
+				cfg, err := parseArgs(append(argv, "--", "true"))
+				Expect(err).NotTo(HaveOccurred(), "%s %q", kind, flags)
+				Expect(cfg.volumeSyncMounts).To(Equal(want), "%s %q", kind, flags)
+			}
+		}
+		_, err := parseArgs([]string{"--backend", "vm-qemu", "--volume-sync-mounts=maybe", "--", "true"})
+		Expect(err).To(MatchError(ContainSubstring("invalid boolean value")))
 	})
 
 	It("names the flag Garden's process builder passes", func() {

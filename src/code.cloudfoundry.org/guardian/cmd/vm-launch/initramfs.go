@@ -386,14 +386,16 @@ fi
 // busybox calls sync(2) first, which writes every dirty page of the guest
 // root to the root image, data that is discarded at once and that could keep
 // the hypervisor up past its grace period. Each volume has its own flush
-// (see guestVolumeTeardown), and an image volume's mount is synchronous.
+// (see guestVolumeTeardown), and an image volume's mount is synchronous
+// unless the operator turned that off for images with a journal.
 //
 // First, stage 2 defines rvm_fail, which every setup step uses, and turns
 // off console echo. It then mounts /dev/shm, brings up lo and eth0 from
 // /rvm/net (in every guest, a task's included), prepares the open-files
 // limit from /rvm/limits, and checks that /rvm/env sources. A guest with
 // volumes then mounts each one by its kind, formatting only a blank volume
-// image and never a block volume (see guestVolumeSetup). When a setup step
+// image, preening every other image with e2fsck -p, and never formatting or
+// checking a block volume (see guestVolumeSetup). When a setup step
 // fails, stage 2 reboots before the start tag, so vm-launch reports a guest
 // that never started its command and shows the console output, which ends
 // with the failed step. Last before the start tag, stage 2 starts the stop
@@ -777,29 +779,57 @@ const (
 // that stage 1 found by the drive's identity and passed as stage 2's argument
 // in the same place (see guestRootInit), at the path and as the kind that
 // /rvm/mounts gives it (see mountsFile). A count of arguments other than the
-// volume count in /rvm/mounts, a volume without a path, and a kind stage 2
-// does not know are setup failures. The kind decides everything else, and
-// only the image arm can format.
+// volume count in /rvm/mounts, a sync mount setting other than true or false,
+// a volume without a path, and a kind stage 2 does not know are setup
+// failures. The kind decides everything else, and only the image arm can
+// format or check a filesystem.
 //
-// An image volume must have a block device. Stage 2 formats only an image
-// whose first 64 KiB it reads itself as all zero, which is a new image or
-// one whose creator died before the first boot; the host never tells it an
-// image is new. A read error is a setup failure, never a blank image. An
-// image that is not blank and does not mount is never formatted: that is a
-// setup failure for an operator to look at. busybox mke2fs makes ext2, which
-// the kernel's ext4 driver mounts. The sync and dirsync options put every
-// completed write on the image before the syscall returns, because the
-// hypervisors stop at once on SIGTERM, without a guest shutdown, so a
-// failure that reboots after some volumes are mounted loses nothing on them.
+// An image volume must have a block device, and the guest must have the
+// guest filesystem tools that vm-launch puts below guestToolsDir. Stage 2
+// runs them by their full paths and never falls back to busybox's mke2fs,
+// so a missing tool fails the boot before stage 2 reads the device. Stage 2
+// formats only an image whose first 64 KiB it reads itself as all zero,
+// which is a new image or one whose creator died before the first boot; the
+// host never tells it an image is new. A read error is a setup failure,
+// never a blank image. A blank image gets a journalled ext4 from the shipped
+// mke2fs with the pinned mke2fs.conf (see guestVolumeMke2fsArgs). The format
+// skips zeroing the inode tables and the journal, so it never writes the
+// image's whole size, which is safe because vm-launch makes every image with
+// fallocate or zero writes, so every block of a blank image reads as zero.
+//
+// Every image that is not blank is preened with e2fsck -p before it mounts,
+// at every boot. e2fsck(8) gives its exit status as the sum of 1 for errors
+// it corrected, 2 for a corrected system that should reboot, 4 for errors
+// it left, 8 for an operational error, 16 for a usage error, 32 for a
+// cancelled check, and 128 for a library error. A status below 4 lets the
+// boot go on: the reboot that 2 asks for matters only for a mounted
+// filesystem, and the image is not mounted yet, so stage 2 says so and goes
+// on. A status of 4 or more fails the boot with a line that names the image
+// and asks an operator to inspect it, and the image is never formatted.
+// Stage 2 never runs e2fsck -y. An image that is not blank and does not
+// mount after its preen is never formatted either.
+//
+// An image mounts with sync and dirsync, which put every completed write on
+// the image before the syscall returns, because the hypervisors stop at once
+// on SIGTERM, without a guest shutdown, so a failure that reboots after some
+// volumes are mounted loses nothing on them. noinit_itable keeps the kernel
+// from zeroing inode tables, which mke2fs left unwritten and which already
+// read as zero. When the operator turned sync mounts off (see
+// volumeSyncMountsFlag), an image whose filesystem has a journal, as tune2fs
+// -l reports it, mounts without sync and dirsync, because the journal keeps
+// the filesystem consistent through a sudden stop. An image without a
+// journal, such as an rvm.6 ext2 image or a new image too small for one,
+// keeps sync and dirsync, and so does an image whose features tune2fs cannot
+// read, with a line that says so.
 //
 // A block volume is a whole disk that holds the app's data, and stage 2
-// never reads its start, formats it, or checks it. It must have a block
-// device, which stage 2 mounts as ext4 with noatime and errors=remount-ro
-// and without sync or dirsync, so the disk keeps the speed of a local disk;
-// the teardown's sync -f flushes it after the command. A disk that does not
-// mount, a blank one included, fails the boot with a line that names the
-// volume's disk, never an image file, and says vm-launch never formats a
-// block volume.
+// never reads its start, formats it, or checks it, because the volume driver
+// checks it before it hands it over. It must have a block device, which stage
+// 2 mounts as ext4 with noatime and errors=remount-ro and without sync or
+// dirsync, so the disk keeps the speed of a local disk; the teardown's sync
+// -f flushes it after the command. A disk that does not mount, a blank one
+// included, fails the boot with a line that names the volume's disk, never
+// an image file, and says vm-launch never formats a block volume.
 //
 // A share has no drive, so stage 1 passes it an empty argument, and any
 // other argument is a setup failure. Stage 2 does not mount shares; the code
@@ -814,6 +844,10 @@ case "${RVM_VOLUMES:-}" in
 *) rvm_fail "the volume count in /rvm/mounts is not a number from 1 to ` + maxVolumesText + `" ;;
 esac
 [ "$#" -eq "$RVM_VOLUMES" ] || rvm_fail "stage 1 passed $# volume devices for the $RVM_VOLUMES volumes in /rvm/mounts"
+case "${RVM_SYNC_MOUNTS:-}" in
+true | false) ;;
+*) rvm_fail "the sync mount setting in /rvm/mounts is not true or false" ;;
+esac
 rvm_vi=0
 for rvm_vdev in "$@"; do
 	eval "rvm_vkind=\${RVM_VOL${rvm_vi}_KIND:-} rvm_vpath=\${RVM_VOL${rvm_vi}_PATH:-} rvm_vimage=\${RVM_VOL${rvm_vi}_IMAGE:-}"
@@ -821,6 +855,10 @@ for rvm_vdev in "$@"; do
 	case "$rvm_vkind" in
 	` + string(driveImage) + `)
 		[ -b "$rvm_vdev" ] || rvm_fail "no block device for the volume image $rvm_vimage at $rvm_vpath"
+		for rvm_vtool in ` + guestMke2fs + ` ` + guestE2fsck + ` ` + guestTune2fs + `; do
+			[ -f "$rvm_vtool" ] && [ -x "$rvm_vtool" ] || rvm_fail "the guest has no $rvm_vtool for the volume image $rvm_vimage at $rvm_vpath, and it never formats or checks a volume image with another tool"
+		done
+		[ -f ` + guestMke2fsConfig + ` ] && [ -r ` + guestMke2fsConfig + ` ] || rvm_fail "the guest has no ` + guestMke2fsConfig + ` for the volume image $rvm_vimage at $rvm_vpath"
 		mkdir -p "$rvm_vpath" || rvm_fail "creating $rvm_vpath failed"
 		dd if="$rvm_vdev" of=` + guestVolumeHead + ` bs=4096 count=16 || rvm_fail "reading the start of $rvm_vdev failed"
 		tr -d '\000' <` + guestVolumeHead + ` >` + guestVolumeUsed + ` || rvm_fail "checking whether $rvm_vdev is blank failed"
@@ -828,10 +866,27 @@ for rvm_vdev in "$@"; do
 		[ -s ` + guestVolumeHead + ` ] && [ ! -s ` + guestVolumeUsed + ` ] && rvm_blank=1
 		rm -f ` + guestVolumeHead + ` ` + guestVolumeUsed + `
 		if [ -n "$rvm_blank" ]; then
-			mke2fs -F -m 0 -L rvm-volume "$rvm_vdev" || rvm_fail "formatting the blank volume image $rvm_vimage for $rvm_vpath failed"
-			mount -t ext4 -o sync,dirsync,noatime,errors=remount-ro "$rvm_vdev" "$rvm_vpath" || rvm_fail "mounting the newly formatted volume image $rvm_vimage at $rvm_vpath failed"
+			MKE2FS_CONFIG=` + guestMke2fsConfig + ` ` + guestMke2fs + ` ` + guestVolumeMke2fsArgs + ` "$rvm_vdev" || rvm_fail "formatting the blank volume image $rvm_vimage for $rvm_vpath failed"
 		else
-			mount -t ext4 -o sync,dirsync,noatime,errors=remount-ro "$rvm_vdev" "$rvm_vpath" || rvm_fail "mounting the volume image $rvm_vimage at $rvm_vpath failed; it is not blank, so vm-launch will not format it; inspect or delete $rvm_vimage on the volume"
+			rvm_vrc=0
+			` + guestE2fsck + ` -p "$rvm_vdev" || rvm_vrc=$?
+			[ "$rvm_vrc" -lt 4 ] || rvm_fail "the volume image $rvm_vimage has errors that e2fsck -p can't repair; inspect it on the volume (e2fsck -p exited $rvm_vrc for $rvm_vpath, and vm-launch never formats an image that is not blank)"
+			[ $((rvm_vrc & 2)) -eq 0 ] || echo "vm-launch guest: e2fsck -p repaired the volume image $rvm_vimage and asked for a reboot, which only a mounted filesystem needs; the image is not mounted yet, so the guest goes on"
+		fi
+		rvm_vopts=` + guestImageSyncOptions + `,` + guestImageMountOptions + `
+		if [ "$RVM_SYNC_MOUNTS" = false ]; then
+			if rvm_vfeat=$(` + guestTune2fs + ` -l "$rvm_vdev" 2>/dev/null) && rvm_vfeat=$(printf '%s\n' "$rvm_vfeat" | sed -n 's/^Filesystem features:[[:space:]]*//p') && [ -n "$rvm_vfeat" ]; then
+				case " $rvm_vfeat " in
+				*" has_journal "*) rvm_vopts=` + guestImageMountOptions + ` ;;
+				esac
+			else
+				echo "vm-launch guest: reading the filesystem features of the volume image $rvm_vimage failed, so it mounts with sync and dirsync"
+			fi
+		fi
+		if [ -n "$rvm_blank" ]; then
+			mount -t ext4 -o "$rvm_vopts" "$rvm_vdev" "$rvm_vpath" || rvm_fail "mounting the newly formatted volume image $rvm_vimage at $rvm_vpath failed"
+		else
+			mount -t ext4 -o "$rvm_vopts" "$rvm_vdev" "$rvm_vpath" || rvm_fail "mounting the volume image $rvm_vimage at $rvm_vpath failed; it is not blank, so vm-launch will not format it; inspect or delete $rvm_vimage on the volume"
 		fi
 		;;
 	` + string(driveBlock) + `)
@@ -848,6 +903,24 @@ for rvm_vdev in "$@"; do
 	rvm_vi=$((rvm_vi + 1))
 done
 `
+
+// guestVolumeMke2fsArgs are the arguments with which stage 2 formats a blank
+// volume image, before the device. The filesystem is ext4 with the features
+// of the pinned mke2fs.conf, 4096-byte blocks, no reserved blocks, and the
+// label rvm-volume. lazy_itable_init and lazy_journal_init leave the inode
+// tables and the journal unwritten, and assume_storage_prezeroed, from
+// e2fsprogs 1.47.0, marks the inode tables as zeroed, so the format writes
+// only metadata and never the image's whole size. nodiscard keeps mke2fs
+// from discarding the whole device first. All of it relies on every block of
+// a blank image reading as zero.
+const guestVolumeMke2fsArgs = "-t ext4 -F -b 4096 -m 0 -L rvm-volume -E lazy_itable_init=1,lazy_journal_init=1,nodiscard,assume_storage_prezeroed=1"
+
+// guestImageSyncOptions are the mount options that make an image's mount
+// synchronous, and guestImageMountOptions the ones every image mounts with.
+const (
+	guestImageSyncOptions  = "sync,dirsync"
+	guestImageMountOptions = "noatime,noinit_itable,errors=remount-ro"
+)
 
 // guestVolumeTeardown follows the command, once its status is kept in
 // rvm_status: it flushes and unmounts every volume that stage 2 mounted, last
@@ -868,9 +941,13 @@ done
 `
 
 // mountsFile returns the guest /rvm/mounts, which stage 2 sources before it
-// mounts the volumes: their number as RVM_VOLUMES and, for each volume in
-// volume order, its kind as RVM_VOLn_KIND and its quoted path as
+// mounts the volumes: their number as RVM_VOLUMES, the operator's sync mount
+// setting as RVM_SYNC_MOUNTS, true unless g.noVolumeSync, and, for each
+// volume in volume order, its kind as RVM_VOLn_KIND and its quoted path as
 // RVM_VOLn_PATH, and for an image volume its image name as RVM_VOLn_IMAGE.
+// Stage 2 decides from the setting and from the filesystem whether an image
+// mounts with sync and dirsync, because only the guest sees whether an
+// image's filesystem has a journal (see guestVolumeSetup).
 // The kind is the one disksFile gives the volume's drive in /rvm/disks, taken
 // from the same entry of g.drives, so the two stages never disagree on which
 // volume is an image that stage 2 may format. Volume drives that do not match
@@ -882,7 +959,7 @@ func mountsFile(g guestContents) (string, error) {
 		return "", fmt.Errorf("%d volume drives for %d guest volumes", len(d), len(g.vols))
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "RVM_VOLUMES=%d\n", len(g.vols))
+	fmt.Fprintf(&b, "RVM_VOLUMES=%d\nRVM_SYNC_MOUNTS=%t\n", len(g.vols), !g.noVolumeSync)
 	for i, v := range g.vols {
 		switch d[i].kind {
 		case driveImage:
@@ -1021,6 +1098,11 @@ type guestContents struct {
 	// 2 needs for an image or block volume, or nil for a guest that has
 	// neither. The caller closes them after the initramfs is written.
 	tools *guestTools
+	// noVolumeSync is set when the operator turned sync mounts off (see
+	// volumeSyncMountsFlag), so that stage 2 mounts an image whose
+	// filesystem has a journal without sync and dirsync. The zero value
+	// keeps every image's mount synchronous.
+	noVolumeSync bool
 }
 
 // The guest filesystem tools. A guest with an image or block volume gets

@@ -395,8 +395,9 @@ stat -L -c %d%r%i /proc/self/fd/3 /proc/self/fd/5 >`+shellQuote(filepath.Join(ou
 	// identities stand in as @ROOTID and @VOLID. With the lookup by identity,
 	// /rvm/disks lost RVM_VOLUME_SECTORS, and /rvm/mounts names each volume
 	// by its index, with the kind that tells stage 2 whether it may format.
+	// /rvm/mounts later gained the operator's sync mount setting.
 	const (
-		goldenPDIMounts = "RVM_VOLUMES=1\nRVM_VOL0_KIND=image\nRVM_VOL0_PATH='@VOL'\nRVM_VOL0_IMAGE='rvm-disk-" + testAppID + "-web-2.img'\n"
+		goldenPDIMounts = "RVM_VOLUMES=1\nRVM_SYNC_MOUNTS=true\nRVM_VOL0_KIND=image\nRVM_VOL0_PATH='@VOL'\nRVM_VOL0_IMAGE='rvm-disk-" + testAppID + "-web-2.img'\n"
 		goldenPDIDisks  = "RVM_ROOT_ID=@ROOTID\nRVM_ROOT_SECTORS=65536\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUMES=1\n" +
 			"RVM_VOL0_KIND=image\nRVM_VOL0_ID=@VOLID\nRVM_VOL0_SECTORS=2097152\n"
 		goldenPDIFC = `{"boot-source":{"kernel_image_path":"@ART/kernel/vmlinux","initrd_path":"/proc/self/fd/4","boot_args":"console=ttyS0 reboot=k panic=1 rdinit=/init quiet"},` +

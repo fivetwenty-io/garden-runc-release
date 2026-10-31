@@ -57,9 +57,7 @@ func bootRealGuestEdited(g guestContents, vols []*os.File, root *os.File, edit f
 	art := realArtifacts()
 	qemu := realQEMU()
 	requireMicrovm(qemu)
-	f, err := newInitramfs(guestBusybox(), g)
-	Expect(err).NotTo(HaveOccurred())
-	DeferCleanup(f.Close)
+	f := newRealInitramfs(g)
 	files, drivePaths, initrdPath, _, rootPath := hypervisorFiles(imageAttachments(vols...), withUserspaceMark(f), nil, root)
 	argv := withRealRootDrive(qemuArgv(art, initrdPath, minGuestMemoryMiB, g.nw, drivePaths, 0), rootPath)
 	if edit != nil {
@@ -68,6 +66,27 @@ func bootRealGuestEdited(g guestContents, vols []*os.File, root *os.File, edit f
 	code, stdout, stderr := bootRealQEMU(markedArgv(tcgArgv(qemu, argv)), files)
 	Expect(code).To(Equal(0), "QEMU failed: %s\n%s", stderr, stdout)
 	return stdout
+}
+
+// newRealInitramfs builds the initramfs of g with the guest's busybox, as
+// vm-launch builds it, and closes it when the spec ends. A guest with a
+// volume also gets the guest filesystem tools, which vm-launch gives every
+// guest with an image or block volume and without which stage 2 never
+// formats or checks an image, unless g already holds them. They come from
+// the artifacts directory realArtifacts names, where a cell keeps them, and
+// a directory without them fails the spec rather than skipping it, because a
+// release check that sets the directory must run the volume specs.
+func newRealInitramfs(g guestContents) *os.File {
+	if len(g.vols) > 0 && g.tools == nil {
+		tools, err := openGuestTools(realArtifacts())
+		Expect(err).NotTo(HaveOccurred(), "%s must hold the guest filesystem tools beside the kernel", realArtifactsEnv)
+		defer tools.Close()
+		g.tools = tools
+	}
+	f, err := newInitramfs(guestBusybox(), g)
+	Expect(err).NotTo(HaveOccurred())
+	DeferCleanup(f.Close)
+	return f
 }
 
 // withDriveSerials returns argv with the serial of each virtio-blk device
