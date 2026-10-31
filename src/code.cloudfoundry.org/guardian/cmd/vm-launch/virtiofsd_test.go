@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -23,12 +24,14 @@ import (
 )
 
 // helperShareRun marks a helper process that calls run with its own
-// arguments, the mount table at helperShareMountInfo, and the kernel's
-// answers about volumes taken from that table, for a spec that signals or
-// kills vm-launch while it serves a share.
+// arguments, the mount table at helperShareMountInfo, the kernel's answers
+// about volumes taken from that table, and share mode served, for a spec
+// that signals or kills vm-launch while it serves a share, or holds its
+// stdout. helperShareDisconnectGrace, when set, is the disconnect grace.
 const (
-	helperShareRun       = "VM_LAUNCH_TEST_SHARE_RUN"
-	helperShareMountInfo = "VM_LAUNCH_TEST_SHARE_MOUNTINFO"
+	helperShareRun             = "VM_LAUNCH_TEST_SHARE_RUN"
+	helperShareMountInfo       = "VM_LAUNCH_TEST_SHARE_MOUNTINFO"
+	helperShareDisconnectGrace = "VM_LAUNCH_TEST_SHARE_DISCONNECT_GRACE"
 )
 
 // shareRun is the helper process that helperShareRun marks. TestMain runs it.
@@ -36,7 +39,32 @@ func shareRun(args []string) int {
 	mountInfoPath = os.Getenv(helperShareMountInfo)
 	volumeProbe = mountIDByPath(func() string { return mountInfoPath })
 	dirProbe = probeByPath
+	shareModeServed = true
+	if v := os.Getenv(helperShareDisconnectGrace); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", helperShareDisconnectGrace, err)
+			return 99
+		}
+		virtiofsdDisconnectGrace = d
+	}
 	return run(args, log.New(os.Stderr, "vm-launch: ", 0))
+}
+
+// quickRaceExit returns the GORACE setting for a helper process whose exit a
+// spec times. Under -race, the race detector sleeps for atexit_sleep_ms,
+// which is 1000 ms by default, before the process exits, and a spec that
+// bounds how long vm-launch takes to stop would otherwise count that second.
+// The helper keeps any other GORACE option the suite runs with.
+func quickRaceExit() string {
+	return "GORACE=" + strings.TrimSpace(os.Getenv("GORACE")+" atexit_sleep_ms=0")
+}
+
+// serveShares runs share mode, which run refuses until it is served, for
+// the rest of the spec.
+func serveShares() {
+	DeferCleanup(func(saved bool) { shareModeServed = saved }, shareModeServed)
+	shareModeServed = true
 }
 
 // virtiofsdReady is the line a fake virtiofsd writes when it is ready, as
@@ -50,7 +78,8 @@ const (
 	// hypervisor creates as it exits, and then ends as virtiofsd does when
 	// its client disconnects.
 	vfsServe = `ready; while [ ! -e "$GONE" ]; do sleep 0.01; done; echo '[2026-10-31T00:45:16Z INFO  virtiofsd] Client disconnected, shutting down' >&2; exit 0`
-	// vfsHang becomes ready, ignores SIGTERM, and never ends on its own.
+	// vfsHang becomes ready, ignores SIGTERM, and never ends on its own. A
+	// spec sends it SIGTERM to show that only SIGKILL ends it.
 	vfsHang = `ready; trap '' TERM; while :; do sleep 0.02; done`
 	// vfsNeverReady never writes the ready line.
 	vfsNeverReady = `echo '[2026-10-31T00:44:07Z WARN  virtiofsd::limits] Failure when trying to set the limit to 1000000' >&2; while :; do sleep 0.02; done`
@@ -79,7 +108,7 @@ d="$rec/$n.tmp"
 mkdir "$d"
 echo $$ >"$d/pid"
 printf '%s\n' "$@" >"$d/argv"
-grep -E '^(Uid|Gid|Cap[A-Za-z]+):' /proc/$$/status >"$d/status"
+grep -E '^(Uid|Gid|Cap[A-Za-z]+|NoNewPrivs):' /proc/$$/status >"$d/status"
 tr '\0' '\n' </proc/$$/environ >"$d/env"
 readlink /proc/$$/fd/3 >"$d/fd3" 2>&1
 grep '^flags' /proc/$$/fdinfo/3 >"$d/fd3flags" 2>&1
@@ -114,9 +143,17 @@ func recordedPid(rec string, n int) int {
 	return pid
 }
 
-// processGone reports whether pid has ended: it no longer exists, or it is a
-// zombie that nothing has reaped yet.
+// processGone reports whether pid has ended and been reaped, which means the
+// kernel has no process with that pid. A zombie is not gone, because a launch that
+// leaves one has not reaped what it started.
 func processGone(pid int) bool {
+	_, err := os.Stat("/proc/" + strconv.Itoa(pid))
+	return errors.Is(err, os.ErrNotExist)
+}
+
+// processEnded reports whether pid has ended, reaped or not. It is for a
+// process whose parent was killed, which whatever adopted it may never reap.
+func processEnded(pid int) bool {
 	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
 	if err != nil {
 		return true
@@ -161,9 +198,11 @@ var _ = Describe("the --virtiofsd flag", func() {
 	})
 
 	It("becomes an absolute path", func() {
-		cfg, err := parseArgs([]string{"--backend", "vm-qemu", "--virtiofsd-path", "/var/vcap/data/vm-runtime/artifacts/virtiofsd/virtiofsd-wrapper", "--", "true"})
+		// The path a cell passes is the one inside the container, where
+		// Garden binds the host's artifacts directory.
+		cfg, err := parseArgs([]string{"--backend", "vm-qemu", "--virtiofsd-path", "/opt/garden-vm/artifacts/virtiofsd/virtiofsd-wrapper", "--", "true"})
 		Expect(err).NotTo(HaveOccurred())
-		Expect(cfg.virtiofsd).To(Equal("/var/vcap/data/vm-runtime/artifacts/virtiofsd/virtiofsd-wrapper"))
+		Expect(cfg.virtiofsd).To(Equal("/opt/garden-vm/artifacts/virtiofsd/virtiofsd-wrapper"))
 		cfg, err = parseArgs([]string{"--backend", "vm-qemu", "--virtiofsd-path=rel/vfs", "--", "true"})
 		Expect(err).NotTo(HaveOccurred())
 		wd, err := os.Getwd()
@@ -216,7 +255,7 @@ var _ = Describe("checkVirtiofsd", func() {
 
 var _ = Describe("virtiofsdArgv", func() {
 	It("runs virtiofsd with the flags the lab proved", func() {
-		w := "/var/vcap/data/vm-runtime/artifacts/virtiofsd/virtiofsd-wrapper"
+		w := "/opt/garden-vm/artifacts/virtiofsd/virtiofsd-wrapper"
 		Expect(virtiofsdArgv(w, "/home/vcap/data")).To(Equal([]string{
 			w, "--fd=3", "--sandbox=none", "--seccomp=kill", "--cache=auto", "--inode-file-handles=never",
 			"--shared-dir=/home/vcap/data",
@@ -463,32 +502,120 @@ var _ = Describe("virtiofsd's log", func() {
 		Expect(lines[1]).To(Equal(`virtiofsd for "/data": next`))
 	})
 
-	It("passes on a bounded number of lines and keeps reading the rest", func() {
+	It("passes on a bounded number of lines, keeps reading the rest, and passes on the last ones at the end", func() {
+		const total = 5000
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			for i := 0; i < 5000; i++ {
-				fmt.Fprintf(w, "line %d\n", i)
+			for i := 0; i < total-1; i++ {
+				fmt.Fprintf(w, "[x WARN  virtiofsd] line %d\n", i)
 			}
+			// The line that says why virtiofsd ended is its last.
+			fmt.Fprintln(w, "[x ERROR virtiofsd] the store went away")
 			w.Close()
 		}()
 		Eventually(done, 10*time.Second).Should(BeClosed())
 		Eventually(srv.logDone).Should(BeClosed())
 		lines := strings.Split(strings.TrimSuffix(logBuf.String(), "\n"), "\n")
-		Expect(lines).To(HaveLen(maxVirtiofsdLogLines + 1))
-		Expect(lines[maxVirtiofsdLogLines-1]).To(Equal(fmt.Sprintf(`virtiofsd for "/data": line %d`, maxVirtiofsdLogLines-1)))
-		Expect(lines[maxVirtiofsdLogLines]).To(Equal(fmt.Sprintf(`virtiofsd for "/data" wrote more than %d lines; vm-launch passes on no more of them`, maxVirtiofsdLogLines)))
+		Expect(lines).To(HaveLen(maxVirtiofsdLogLines + 1 + 1 + maxVirtiofsdTailLines))
+		Expect(lines[maxVirtiofsdLogLines-1]).To(Equal(fmt.Sprintf(`virtiofsd for "/data": [x WARN  virtiofsd] line %d`, maxVirtiofsdLogLines-1)))
+		Expect(lines[maxVirtiofsdLogLines]).To(Equal(fmt.Sprintf(`virtiofsd for "/data" wrote more than %d lines; vm-launch holds back the rest and passes on the last %d when the log ends`, maxVirtiofsdLogLines, maxVirtiofsdTailLines)))
+		Expect(lines[maxVirtiofsdLogLines+1]).To(Equal(fmt.Sprintf(`virtiofsd for "/data": %d lines were held back; the last %d follow`, total-maxVirtiofsdLogLines, maxVirtiofsdTailLines)))
+		tail := lines[maxVirtiofsdLogLines+2:]
+		for i, line := range tail[:maxVirtiofsdTailLines-1] {
+			Expect(line).To(Equal(fmt.Sprintf(`virtiofsd for "/data": [x WARN  virtiofsd] line %d`, total-maxVirtiofsdTailLines+i)))
+		}
+		Expect(tail[maxVirtiofsdTailLines-1]).To(Equal(`virtiofsd for "/data": [x ERROR virtiofsd] the store went away`))
+	})
+
+	It("passes on every held-back line when fewer than the tail were held back", func() {
+		for i := 0; i < maxVirtiofsdLogLines+3; i++ {
+			fmt.Fprintf(w, "line %d\n", i)
+		}
+		w.Close()
+		Eventually(srv.logDone).Should(BeClosed())
+		lines := strings.Split(strings.TrimSuffix(logBuf.String(), "\n"), "\n")
+		Expect(lines).To(HaveLen(maxVirtiofsdLogLines + 2 + 3))
+		Expect(lines[maxVirtiofsdLogLines+1]).To(Equal(`virtiofsd for "/data": 3 lines were held back; the last 3 follow`))
+		Expect(lines[maxVirtiofsdLogLines+2:]).To(Equal([]string{
+			fmt.Sprintf(`virtiofsd for "/data": line %d`, maxVirtiofsdLogLines),
+			fmt.Sprintf(`virtiofsd for "/data": line %d`, maxVirtiofsdLogLines+1),
+			fmt.Sprintf(`virtiofsd for "/data": line %d`, maxVirtiofsdLogLines+2),
+		}))
+	})
+
+	It("escapes control bytes, so a line cannot drive a terminal, and keeps tabs", func() {
+		fmt.Fprint(w, "a\x1b[2Jb\tc\x7fd\re\x00f\n")
+		w.Close()
+		Eventually(srv.logDone).Should(BeClosed())
+		Expect(logBuf.String()).To(Equal(`virtiofsd for "/data": a\x1b[2Jb` + "\t" + `c\x7fd\x0de\x00f` + "\n"))
+	})
+
+	It("sees the ready line past the line limit", func() {
+		for i := 0; i < maxVirtiofsdLogLines+5; i++ {
+			fmt.Fprintf(w, "line %d\n", i)
+		}
+		fmt.Fprintln(w, virtiofsdReady)
+		Eventually(srv.ready).Should(BeClosed())
+		w.Close()
+		Eventually(srv.logDone).Should(BeClosed())
+		Expect(logBuf.String()).To(HaveSuffix(`virtiofsd for "/data": ` + virtiofsdReady + "\n"))
+	})
+})
+
+var _ = Describe("lineRing", func() {
+	It("keeps the latest lines in order and counts every line", func() {
+		r := newLineRing(3)
+		Expect(r.lines()).To(BeEmpty())
+		r.add("a")
+		r.add("b")
+		Expect(r.lines()).To(Equal([]string{"a", "b"}))
+		for _, l := range []string{"c", "d", "e", "f", "g"} {
+			r.add(l)
+		}
+		Expect(r.lines()).To(Equal([]string{"e", "f", "g"}))
+		Expect(r.total).To(Equal(7))
 	})
 })
 
 var _ = Describe("confining virtiofsd", func() {
+	// onDiscardedThread runs f on an OS thread that ends with it, so a flag
+	// f sets on the thread never reaches another goroutine.
+	onDiscardedThread := func(f func()) {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			defer GinkgoRecover()
+			runtime.LockOSThread()
+			f()
+		}()
+		<-done
+	}
+
 	It("names virtiofsd in its lines", func() {
-		f := &fakeCaps{}
-		f.hasFileCaps = true
-		Expect(confineProcess(f, "/opt/vfs/virtiofsd-wrapper", "virtiofsd", "virtiofsd")).To(MatchError("/opt/vfs/virtiofsd-wrapper has file capabilities, which could give virtiofsd capabilities"))
+		f := &fakeCaps{root: true, boundingBits: 0x1, ignoreDrop: true}
+		Expect(confineThread(f, "virtiofsd")).To(MatchError("vm-launch runs as root without CAP_SETPCAP, so its bounding set keeps capabilities (0x1), which a root virtiofsd gets"))
 		cmd := exec.Command("/bin/true")
 		_, err := startConfinedAs(cmd, func() error { return unix.EPERM }, "virtiofsd")
 		Expect(err).To(MatchError("confining virtiofsd's capabilities: operation not permitted"))
+	})
+
+	It("sets no_new_privs on its thread, and asks about no file's capabilities", func() {
+		onDiscardedThread(func() {
+			f := &fakeCaps{hasFileCaps: true}
+			Expect(confineVirtiofsd(f)).To(Succeed())
+			nnp, err := unix.PrctlRetInt(unix.PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(nnp).To(Equal(1))
+			Expect(f.calls).NotTo(ContainElement(HavePrefix("fileCaps")))
+		})
+	})
+
+	It("stops at the first failure to drop a capability", func() {
+		onDiscardedThread(func() {
+			f := &fakeCaps{errs: map[string]error{"clearAmbient": unix.EPERM}}
+			Expect(confineVirtiofsd(f)).To(MatchError("clearing the ambient capabilities: operation not permitted"))
+		})
 	})
 })
 
@@ -593,6 +720,8 @@ var _ = Describe("the virtiofsd of each share", func() {
 			Expect(caps["CapBnd"]).To(BeZero())
 		}
 		Expect(status).To(MatchRegexp(`(?m)^Uid:\s+%d\s`, os.Getuid()))
+		// vm-launch sets no_new_privs itself, whatever it was started with.
+		Expect(status).To(MatchRegexp(`(?m)^NoNewPrivs:\s+1$`))
 
 		// Descriptor 3 is the listening socket at the share's path, in
 		// blocking mode.
@@ -624,9 +753,18 @@ var _ = Describe("the virtiofsd of each share", func() {
 		s, rec := servers(vfsHang, 2)
 		Expect(s.start(nil)).To(Succeed())
 		pids := []int{recordedPid(rec, 0), recordedPid(rec, 1)}
+		g, done, _ := guest()
+		s.guestStarted(g.Process)
+		Expect(g.Process.Kill()).To(Succeed())
+		<-done
+		// A SIGTERM changes nothing, because vm-launch stops virtiofsd with SIGKILL.
+		for _, pid := range pids {
+			Expect(syscall.Kill(pid, syscall.SIGTERM)).To(Succeed())
+		}
+		Consistently(func() bool { return processEnded(pids[0]) || processEnded(pids[1]) }, 100*time.Millisecond).Should(BeFalse())
 		began := time.Now()
 		s.guestEnded()
-		Expect(time.Since(began)).To(BeNumerically("<", virtiofsdStopGrace+virtiofsdKillWait+time.Second))
+		Expect(time.Since(began)).To(BeNumerically("<", virtiofsdStopGrace+virtiofsdKillWait))
 		Expect(time.Since(began)).To(BeNumerically(">=", virtiofsdStopGrace))
 		for _, pid := range pids {
 			Expect(processGone(pid)).To(BeTrue())
@@ -640,7 +778,67 @@ var _ = Describe("the virtiofsd of each share", func() {
 		Expect(logBuf.String()).NotTo(ContainSubstring("did not end"))
 	})
 
+	It("stops at once a virtiofsd whose QEMU never started, since nothing will connect to it", func() {
+		s, rec := servers(vfsHang, 1)
+		Expect(s.start(nil)).To(Succeed())
+		pid := recordedPid(rec, 0)
+		began := time.Now()
+		s.guestEnded()
+		Expect(time.Since(began)).To(BeNumerically("<", virtiofsdStopGrace))
+		Expect(processGone(pid)).To(BeTrue())
+		Expect(s.servers[0].exited).To(BeClosed())
+	})
+
+	It("bounds the stop by the grace and the kill wait together, even when a log never ends", func() {
+		// Each fake leaves a child behind that holds its log open, so the
+		// log reaches its end only when the child does.
+		s, rec := servers(`sleep 30 >&2 & echo $! >"$d/child.tmp"; mv "$d/child.tmp" "$d/child"; ready; while :; do sleep 0.02; done`, 2)
+		Expect(s.start(nil)).To(Succeed())
+		for n := 0; n < 2; n++ {
+			child, err := strconv.Atoi(strings.TrimSpace(readRecord(rec, n, "child")))
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { _ = syscall.Kill(child, syscall.SIGKILL) })
+		}
+		g, done, _ := guest()
+		s.guestStarted(g.Process)
+		Expect(g.Process.Kill()).To(Succeed())
+		<-done
+		began := time.Now()
+		s.guestEnded()
+		took := time.Since(began)
+		Expect(took).To(BeNumerically(">=", virtiofsdStopGrace+virtiofsdKillWait))
+		Expect(took).To(BeNumerically("<", virtiofsdStopGrace+virtiofsdKillWait+250*time.Millisecond))
+		for _, srv := range s.servers {
+			Expect(srv.exited).To(BeClosed())
+			Expect(srv.logDone).NotTo(BeClosed())
+		}
+		Expect(logBuf.String()).NotTo(ContainSubstring("did not end"))
+	})
+
+	It("spends one kill wait on the exits and the logs together when SIGKILL does not end a virtiofsd", func() {
+		// Each server stands for a virtiofsd that SIGKILL cannot end yet,
+		// as when it waits in uninterruptible I/O on the share's store, so
+		// neither its exit nor its log's end ever comes.
+		s, err := newShareServers("/nonexistent/virtiofsd", workDir, grants(2), logger)
+		Expect(err).NotTo(HaveOccurred())
+		for _, srv := range s.servers {
+			cmd := exec.Command("sleep", "30")
+			Expect(cmd.Start()).To(Succeed())
+			DeferCleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+			srv.cmd = cmd
+		}
+		began := time.Now()
+		s.stop(0)
+		took := time.Since(began)
+		Expect(took).To(BeNumerically(">=", virtiofsdKillWait))
+		Expect(took).To(BeNumerically("<", virtiofsdKillWait+250*time.Millisecond))
+		Expect(strings.Count(logBuf.String(), "did not end within "+virtiofsdKillWait.String()+" of SIGKILL")).To(Equal(2))
+	})
+
 	It("lets a virtiofsd that sees QEMU go end on its own", func() {
+		// The fake ends within moments of seeing QEMU go. A grace that a
+		// loaded machine cannot spend keeps its clean end from being a kill.
+		virtiofsdStopGrace = 5 * time.Second
 		s, rec := servers(vfsServe, 1)
 		Expect(s.start(nil)).To(Succeed())
 		g, done, _ := guest()
@@ -651,6 +849,7 @@ var _ = Describe("the virtiofsd of each share", func() {
 		Expect(os.WriteFile(gone, nil, 0o600)).To(Succeed())
 		s.guestEnded()
 		Expect(processGone(pid)).To(BeTrue())
+		Expect(s.servers[0].exited).To(BeClosed())
 		Expect(s.servers[0].state.Success()).To(BeTrue())
 		Expect(s.failureReason()).To(BeEmpty())
 		Expect(logBuf.String()).To(HaveSuffix("Client disconnected, shutting down\n"))
@@ -685,15 +884,40 @@ var _ = Describe("the virtiofsd of each share", func() {
 
 	It("does not fail a share whose virtiofsd exits 0 as QEMU exits", func() {
 		s, _ := servers(vfsQuit, 1)
+		// A grace far longer than the spec needs, so QEMU's reap always
+		// comes within it.
+		s.disconnectGrace = time.Minute
 		Expect(s.start(nil)).To(Succeed())
 		g, done, _ := guest()
 		s.guestStarted(g.Process)
 		Eventually(s.servers[0].exited, 5*time.Second).Should(BeClosed())
-		// QEMU exits within the grace.
 		Expect(g.Process.Kill()).To(Succeed())
 		<-done
+		s.hypervisorReaped()
 		s.guestEnded()
-		Consistently(s.failureReason, 2*virtiofsdDisconnectGrace).Should(BeEmpty())
+		Expect(s.failureReason()).To(BeEmpty())
+		Expect(logBuf.String()).NotTo(ContainSubstring("killing the hypervisor"))
+	})
+
+	It("takes QEMU's reap as the guest's end at once, however long run takes to return after it", func() {
+		s, rec := servers(vfsServe, 1)
+		Expect(s.start(nil)).To(Succeed())
+		g, done, _ := guest()
+		s.guestStarted(g.Process)
+		pid := recordedPid(rec, 0)
+		Expect(g.Process.Kill()).To(Succeed())
+		<-done
+		s.hypervisorReaped()
+		// virtiofsd sees the disconnect and exits 0, and run is still
+		// flushing the guest's output for longer than the disconnect grace.
+		Expect(os.WriteFile(gone, nil, 0o600)).To(Succeed())
+		Eventually(s.servers[0].exited, 5*time.Second).Should(BeClosed())
+		Consistently(s.failureReason, 2*s.disconnectGrace).Should(BeEmpty())
+		Expect(processGone(pid)).To(BeTrue())
+		// The stop began at the reap, so guestEnded only waits for it.
+		Expect(s.stopped).To(BeClosed())
+		s.guestEnded()
+		Expect(s.stopDone).To(BeClosed())
 		Expect(logBuf.String()).NotTo(ContainSubstring("killing the hypervisor"))
 	})
 
@@ -837,6 +1061,7 @@ var _ = Describe("run with a granted share", func() {
 
 	BeforeEach(func() {
 		shortVirtiofsdTimes()
+		serveShares()
 		art = makeArtifacts()
 		hv = filepath.Join(art, artQEMULoader)
 		shareDir = GinkgoT().TempDir()
@@ -869,7 +1094,28 @@ var _ = Describe("run with a granted share", func() {
 		return run(argv, log.New(logBuf, "", 0))
 	}
 
-	It("serves the share with virtiofsd, gives the volume no image, and leaves nothing behind", func() {
+	It("refuses the share before anything starts while share mode is not served", func() {
+		shareModeServed = false
+		vfs, rec := fakeVirtiofsd(vfsServe, gone)
+		argvFile := writeShareHypervisor(hv, "", "", gone)
+		Expect(runWith(vfs)).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(Equal(`VM_VOLUMES "` + shareDir + `" is granted a share, but this vm-launch does not serve share mode yet, because the hypervisor's virtiofs device and the guest's mount of the share come in a later release; the app would otherwise write to the guest's own disk` + "\n"))
+		Expect(argvFile).NotTo(BeAnExistingFile())
+		Expect(os.ReadDir(rec)).To(BeEmpty())
+		Expect(workDirsIn(tmp)).To(BeEmpty())
+		Expect(os.ReadDir(shareDir)).To(BeEmpty())
+	})
+
+	It("keeps the missing virtiofsd's own line while share mode is not served", func() {
+		shareModeServed = false
+		Expect(runWith("")).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(Equal(`VM_VOLUMES "` + shareDir + `" is granted a share, but vm-launch was not given --virtiofsd-path, so nothing can serve it; the operator must install virtiofsd and pass its path` + "\n"))
+	})
+
+	It("with share mode served, serves the share with virtiofsd, gives the volume no image, and leaves nothing behind", func() {
+		// The fake ends within moments of seeing QEMU go. A grace that a
+		// loaded machine cannot spend keeps its clean end from being a kill.
+		virtiofsdStopGrace = 5 * time.Second
 		vfs, rec := fakeVirtiofsd(vfsServe, gone)
 		writeShareHypervisor(hv, "", "", gone)
 		Expect(runWith(vfs)).To(Equal(0), logBuf.String())
@@ -1013,7 +1259,7 @@ var _ = Describe("a vm-launch process serving a share", func() {
 		cmd.Stderr = stderr
 		cmd.Env = []string{
 			helperShareRun + "=1", helperShareMountInfo + "=" + info,
-			"TMPDIR=" + GinkgoT().TempDir(), "PATH=" + os.Getenv("PATH"),
+			"TMPDIR=" + GinkgoT().TempDir(), "PATH=" + os.Getenv("PATH"), quickRaceExit(),
 			"CF_INSTANCE_INDEX=2", "VCAP_APPLICATION=" + vcapApp, "MEMORY_LIMIT=512m",
 			`VCAP_SERVICES={"juicefs":[{"name":"b","volume_mounts":[` + mountJSON(shareDir, "rw") + `]}]}`,
 			`VM_VOLUMES={"` + shareDir + `":{"mode":"share"}}`,
@@ -1053,6 +1299,14 @@ echo "RVM_EXIT_$nonce=0"
 		Expect(os.WriteFile(hv, []byte(script), 0o755)).To(Succeed())
 	}
 
+	// sinceGone returns how long ago the fake QEMU exited, from the time it
+	// touched gone.
+	sinceGone := func() time.Duration {
+		info, err := os.Stat(gone)
+		Expect(err).NotTo(HaveOccurred())
+		return time.Since(info.ModTime())
+	}
+
 	It("drains at SIGTERM with virtiofsd serving, and then stops it, within the stop budget", func(ctx SpecContext) {
 		vfs, rec := fakeVirtiofsd(vfsServe, gone)
 		drainingGuest()
@@ -1063,7 +1317,10 @@ echo "RVM_EXIT_$nonce=0"
 		Expect(cmd.Process.Signal(syscall.SIGTERM)).To(Succeed())
 		err := cmd.Wait()
 		Expect(err).NotTo(HaveOccurred(), stderr.String())
-		Expect(time.Since(began)).To(BeNumerically("<", stopDeadline))
+		// The guest drains in 0.3 s, and from QEMU's exit on, vm-launch
+		// takes no more than the stop grace and the kill wait.
+		Expect(sinceGone()).To(BeNumerically("<", virtiofsdStopGrace+virtiofsdKillWait))
+		Expect(time.Since(began)).To(BeNumerically("<", 300*time.Millisecond+virtiofsdStopGrace+virtiofsdKillWait+time.Second))
 		Expect(processGone(vpid)).To(BeTrue())
 		Expect(processGone(qemuPid())).To(BeTrue())
 		Expect(stderr.String()).To(ContainSubstring("asking the guest command to stop"))
@@ -1076,12 +1333,65 @@ echo "RVM_EXIT_$nonce=0"
 		cmd, stderr := launch(vfs)
 		waitForFile(started)
 		vpid := recordedPid(rec, 0)
-		began := time.Now()
+		// A stop that signals every process of the container reaches
+		// virtiofsd too, which ignores it and keeps serving the drain.
+		Expect(syscall.Kill(vpid, syscall.SIGTERM)).To(Succeed())
 		Expect(cmd.Process.Signal(syscall.SIGTERM)).To(Succeed())
+		Consistently(func() bool { return processEnded(vpid) }, 200*time.Millisecond).Should(BeFalse())
 		Expect(cmd.Wait()).To(Succeed(), stderr.String())
-		Expect(time.Since(began)).To(BeNumerically("<", stopDeadline))
+		// From QEMU's exit on, vm-launch waits the stop grace, sends
+		// SIGKILL, and is done within the kill wait.
+		Expect(sinceGone()).To(BeNumerically(">=", virtiofsdStopGrace))
+		Expect(sinceGone()).To(BeNumerically("<", virtiofsdStopGrace+virtiofsdKillWait))
 		Expect(processGone(vpid)).To(BeTrue())
 		Expect(stderr.String()).NotTo(ContainSubstring("did not end"))
+		Expect(stderr.String()).NotTo(ContainSubstring("killing the hypervisor"))
+	}, SpecTimeout(time.Minute))
+
+	It("does not take a virtiofsd that exits 0 as QEMU exits for a failure while stdout holds the guest's last output", func(ctx SpecContext) {
+		// The guest writes more than a pipe holds and then reports status
+		// 0. Nothing reads vm-launch's stdout, so the flush of that output
+		// takes the whole flush timeout, longer than the disconnect grace.
+		Expect(os.Remove(hv)).To(Succeed())
+		script := `#!/bin/bash
+echo $$ > ` + shellQuote(hv+".pid") + `
+trap 'touch ` + shellQuote(gone) + `' EXIT
+for a in "$@"; do
+	case "$prev" in -initrd) initrd=$a ;; esac
+	prev=$a
+done
+nonce=$(gzip -dc "$initrd" | grep -a -o 'RVM_START_[0-9a-f]*' | head -n 1 | cut -d_ -f3)
+echo "RVM_START_$nonce"
+head -c 300000 /dev/zero | tr '\0' x
+echo
+echo "RVM_EXIT_$nonce=0"
+`
+		Expect(os.WriteFile(hv, []byte(script), 0o755)).To(Succeed())
+		vfs, _ := fakeVirtiofsd(vfsServe, gone)
+		stdoutR, stdoutW, err := os.Pipe()
+		Expect(err).NotTo(HaveOccurred())
+		defer stdoutR.Close()
+		self, err := os.Executable()
+		Expect(err).NotTo(HaveOccurred())
+		cmd := exec.Command(self, "--backend", "vm-qemu", "--allow-volume-shares", "--virtiofsd-path", vfs, "--artifacts", art, "--", "/tmp/lifecycle/launcher", "app", "true", "")
+		stderr := &safeBuffer{}
+		cmd.Stdout, cmd.Stderr = stdoutW, stderr
+		cmd.Env = []string{
+			helperShareRun + "=1", helperShareMountInfo + "=" + info, helperShareDisconnectGrace + "=100ms",
+			"TMPDIR=" + GinkgoT().TempDir(), "PATH=" + os.Getenv("PATH"), quickRaceExit(),
+			"CF_INSTANCE_INDEX=2", "VCAP_APPLICATION=" + vcapApp, "MEMORY_LIMIT=512m",
+			`VCAP_SERVICES={"juicefs":[{"name":"b","volume_mounts":[` + mountJSON(shareDir, "rw") + `]}]}`,
+			`VM_VOLUMES={"` + shareDir + `":{"mode":"share"}}`,
+		}
+		Expect(cmd.Start()).To(Succeed())
+		Expect(stdoutW.Close()).To(Succeed())
+		DeferCleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+		Expect(cmd.Wait()).To(Succeed(), stderr.String())
+		Expect(stderr.String()).To(ContainSubstring("stdout did not take the guest's last output within " + outputFlushTimeout.String()))
+		Expect(stderr.String()).To(ContainSubstring("Client disconnected, shutting down"))
+		Expect(stderr.String()).NotTo(ContainSubstring("still ran"))
+		Expect(stderr.String()).NotTo(ContainSubstring("killing the hypervisor"))
+		Expect(stderr.String()).NotTo(ContainSubstring("stopped being served"))
 	}, SpecTimeout(time.Minute))
 
 	It("takes QEMU and virtiofsd with it when vm-launch is killed", func(ctx SpecContext) {
@@ -1092,6 +1402,8 @@ echo "RVM_EXIT_$nonce=0"
 		vpid, qemu := recordedPid(rec, 0), qemuPid()
 		Expect(cmd.Process.Kill()).To(Succeed())
 		_ = cmd.Wait()
-		Eventually(func() bool { return processGone(vpid) && processGone(qemu) }, 5*time.Second, 20*time.Millisecond).Should(BeTrue())
+		// Whatever adopts them once vm-launch is gone may never reap them,
+		// so an ended process counts here, a zombie included.
+		Eventually(func() bool { return processEnded(vpid) && processEnded(qemu) }, 5*time.Second, 20*time.Millisecond).Should(BeTrue())
 	}, SpecTimeout(time.Minute))
 })

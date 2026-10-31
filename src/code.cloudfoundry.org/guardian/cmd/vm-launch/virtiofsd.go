@@ -20,13 +20,19 @@ import (
 
 // A share (see pdi_share.go) is served by one virtiofsd per shared volume.
 // vm-launch starts each virtiofsd as a sibling of QEMU inside the app's
-// container, so it runs as the app's user, inherits NoNewPrivileges, sees
-// exactly the bind mount the app would see, and is charged to the app's
-// cgroup. It starts from an OS thread that has dropped every capability, as
-// Firecracker does (see confineProcess and startConfinedAs), so virtiofsd
-// holds none, and it runs with --sandbox=none, because the namespace sandbox
-// needs a user namespace and the chroot sandbox needs root: the container is
-// the sandbox.
+// container, so it runs as the app's user, sees exactly the bind mount the
+// app would see, and is charged to the app's cgroup. It starts from an OS
+// thread that has set no_new_privs and dropped every capability (see
+// confineVirtiofsd and startConfinedAs), so virtiofsd holds no capability,
+// and no exec on the way to it can grant one. It runs with --sandbox=none,
+// because the namespace sandbox needs a user namespace and the chroot
+// sandbox needs root, so the container is the sandbox.
+//
+// Until QEMU gets a vhost-user-fs device for each share's socket and the
+// guest mounts each share by its tag, a granted share is refused before
+// anything starts (see refuseUnservedShares and shareModeServed). The rest
+// of this file is the lifecycle that the refusal gives way to, and specs
+// run it through run by setting shareModeServed.
 //
 // vm-launch binds a listening Unix socket for each share in its private work
 // directory and hands it to virtiofsd as file descriptor 3 with --fd=3, so
@@ -53,10 +59,14 @@ import (
 //     reported its command's status, which comes after the guest has flushed
 //     and unmounted its volumes, vm-launch then exits 125 with a line that
 //     names the share, so Diego starts the instance again.
-//   - Once QEMU has been reaped, each virtiofsd gets virtiofsdStopGrace to
-//     see the disconnect and exit, and then SIGKILL. virtiofsd holds no data
-//     of its own: every write the guest made has already reached the host
-//     file through a system call, so SIGKILL loses nothing.
+//   - The supervisor tells the share servers the moment it reaps QEMU (see
+//     hypervisorReaped), before it flushes the guest's last output, so a
+//     virtiofsd that exits 0 at the disconnect is never taken for a failure
+//     while that flush runs. From then on, each virtiofsd gets
+//     virtiofsdStopGrace to see the disconnect and exit, and then SIGKILL.
+//     virtiofsd holds no data of its own, because every write the guest made
+//     has already reached the host file through a system call, so SIGKILL
+//     loses nothing.
 //   - A launch that fails before QEMU starts, as when a second virtiofsd
 //     cannot start or does not become ready in time, kills every virtiofsd
 //     it started, at once.
@@ -64,17 +74,25 @@ import (
 //     vm-launch never reaps, because vm-launch itself was killed, dies too.
 //
 // After the first SIGTERM the guest drains within the 8 second stop
-// deadline, during which virtiofsd keeps serving it, and stopping virtiofsd
-// afterwards takes at most virtiofsdStopGrace plus virtiofsdKillWait, which
-// fits in the 2 seconds left before Garden's stop timeout.
+// deadline, during which virtiofsd keeps serving it. Stopping every
+// virtiofsd then takes at most virtiofsdStopGrace plus virtiofsdKillWait,
+// one second for all of them together, the wait for their last log lines
+// included. That stop starts when QEMU is reaped and runs beside the flush
+// of the guest's last output, which outputFlushTimeout bounds to the same
+// second, so the two together take one of the 2 seconds that stopDeadline
+// leaves before Diego's SIGKILL.
 
 // virtiofsdFlag names the vm-launch flag that gives the path of the
 // executable that runs virtiofsd. Without it, a granted share fails the
-// launch. On a cell it is the wrapper the virtiofsd install puts at
-// /var/vcap/data/vm-runtime/artifacts/virtiofsd/virtiofsd-wrapper, which
-// runs virtiofsd 1.13 through its bundled loader, because the app's rootfs
-// may have an older C library. vm-launch passes the wrapper virtiofsd's own
-// arguments, and the wrapper must pass them, and descriptor 3, on unchanged.
+// launch. vm-launch runs inside the app's container, so the path is the one
+// the container sees. On a cell it is
+// /opt/garden-vm/artifacts/virtiofsd/virtiofsd-wrapper, the wrapper that the
+// virtiofsd install puts under the host's artifacts directory,
+// /var/vcap/data/vm-runtime/artifacts, which Garden binds read-only at
+// /opt/garden-vm/artifacts. The wrapper runs virtiofsd 1.13 through its
+// bundled loader, because the app's rootfs may have an older C library.
+// vm-launch passes the wrapper virtiofsd's own arguments, and the wrapper
+// must pass them, and descriptor 3, on unchanged.
 const virtiofsdFlag = "virtiofsd-path"
 
 // virtiofsdListenFD is the file descriptor virtiofsd gets its listening
@@ -86,7 +104,8 @@ const virtiofsdListenFD = 3
 // is about to accept its client on the socket.
 const virtiofsdReadyText = "Waiting for vhost-user socket connection"
 
-// Timing of the virtiofsd lifecycle. Specs shorten them.
+// Timing of the virtiofsd lifecycle. Specs shorten them. newShareServers
+// takes a copy, which the goroutines of the launch read.
 var (
 	// virtiofsdReadyTimeout bounds the wait for every virtiofsd of a launch
 	// to become ready, all of them together.
@@ -97,17 +116,21 @@ var (
 	// virtiofsdStopGrace is how long a virtiofsd may keep running after QEMU
 	// has been reaped before vm-launch sends it SIGKILL.
 	virtiofsdStopGrace = 500 * time.Millisecond
-	// virtiofsdKillWait is how long vm-launch waits for a virtiofsd to end,
-	// and for its last log lines, after SIGKILL. A virtiofsd stuck in I/O on
-	// a store that has gone away ends only when the I/O returns, and
-	// vm-launch does not wait for that.
+	// virtiofsdKillWait is how long vm-launch waits after SIGKILL for every
+	// virtiofsd to end and for their last log lines, all of it together. A
+	// virtiofsd stuck in I/O on a store that has gone away ends only when
+	// the I/O returns, and vm-launch does not wait for that.
 	virtiofsdKillWait = 500 * time.Millisecond
 )
 
-// Bounds on the virtiofsd log that vm-launch passes on.
+// Bounds on the virtiofsd log that vm-launch passes on. Past
+// maxVirtiofsdLogLines, vm-launch keeps only the latest
+// maxVirtiofsdTailLines lines and passes them on when the log ends, because
+// the line that says why virtiofsd ended is among its last.
 const (
 	maxVirtiofsdLineBytes = 4096
 	maxVirtiofsdLogLines  = 200
+	maxVirtiofsdTailLines = 20
 )
 
 // maxSocketPathBytes is the longest path a Unix socket address holds with
@@ -266,7 +289,8 @@ type shareServer struct {
 	// endedEarly is set, under shareServers.mu, when virtiofsd ended before
 	// start armed the servers, so that arming handles that end.
 	endedEarly bool
-	// logDone is closed once virtiofsd's log has reached its end.
+	// logDone is closed once virtiofsd's log has reached its end and its
+	// held-back last lines have been passed on.
 	logDone chan struct{}
 }
 
@@ -277,9 +301,12 @@ type shareServers struct {
 	path    string
 	logger  *log.Logger
 	servers []*shareServer
-	// disconnectGrace is virtiofsdDisconnectGrace as the launch began, which
-	// each virtiofsd's own goroutine reads when it ends.
+	// The lifecycle's timing as the launch began (see virtiofsdReadyTimeout
+	// and the rest), which the launch's goroutines read.
+	readyTimeout    time.Duration
 	disconnectGrace time.Duration
+	stopGrace       time.Duration
+	killWait        time.Duration
 
 	mu sync.Mutex
 	// armed is set once start has every virtiofsd ready. Before that, start
@@ -287,14 +314,16 @@ type shareServers struct {
 	armed bool
 	// guest is QEMU, once it has started.
 	guest *os.Process
-	// guestReaped is set once QEMU has been reaped, and guestDone is closed
-	// then.
+	// guestReaped is set once QEMU has been reaped, or once run is past the
+	// supervisor without a QEMU, and guestDone is closed then.
 	guestReaped bool
 	guestDone   chan struct{}
 	// stopping is set once vm-launch stops the virtiofsd processes itself,
-	// after which their ends are expected. stopped is closed then.
+	// after which their ends are expected. stopped is closed then, and
+	// stopDone once that stop has finished.
 	stopping bool
 	stopped  chan struct{}
+	stopDone chan struct{}
 	// failure is the first share whose virtiofsd ended while the guest
 	// needed it, as the reason for the exit line, or empty.
 	failure string
@@ -304,7 +333,12 @@ type shareServers struct {
 // process; start does. On an error every socket it bound is closed, and
 // workDir's removal removes their names.
 func newShareServers(path, workDir string, grants []shareGrant, logger *log.Logger) (*shareServers, error) {
-	s := &shareServers{path: path, logger: logger, disconnectGrace: virtiofsdDisconnectGrace, guestDone: make(chan struct{}), stopped: make(chan struct{})}
+	s := &shareServers{
+		path: path, logger: logger,
+		readyTimeout: virtiofsdReadyTimeout, disconnectGrace: virtiofsdDisconnectGrace,
+		stopGrace: virtiofsdStopGrace, killWait: virtiofsdKillWait,
+		guestDone: make(chan struct{}), stopped: make(chan struct{}), stopDone: make(chan struct{}),
+	}
 	for _, g := range grants {
 		path := filepath.Join(workDir, shareSocketName(g.Tag))
 		l, err := listenShareSocket(path)
@@ -346,7 +380,7 @@ func (srv *shareServer) closeListener(logger *log.Logger) {
 }
 
 // start checks each share's mount again, starts its virtiofsd, and waits
-// until it is ready, in volume order, all within virtiofsdReadyTimeout. A
+// until it is ready, in volume order, all within the ready timeout. A
 // SIGTERM or SIGINT on signals ends the wait. On any error, every virtiofsd
 // that start started is killed and reaped before start returns, so the
 // launch leaves none behind.
@@ -354,7 +388,7 @@ func (s *shareServers) start(signals <-chan os.Signal) error {
 	if len(s.servers) == 0 {
 		return nil
 	}
-	deadline := time.NewTimer(virtiofsdReadyTimeout)
+	deadline := time.NewTimer(s.readyTimeout)
 	defer deadline.Stop()
 	for _, srv := range s.servers {
 		if err := s.startOne(srv); err != nil {
@@ -370,7 +404,7 @@ func (s *shareServers) start(signals <-chan os.Signal) error {
 		case <-deadline.C:
 			s.stop(0)
 			return fmt.Errorf("virtiofsd for the share at %s did not report that it was ready within %v",
-				quoteForLog(srv.grant.Path), virtiofsdReadyTimeout)
+				quoteForLog(srv.grant.Path), s.readyTimeout)
 		case sig := <-signals:
 			s.stop(0)
 			ss, ok := sig.(syscall.Signal)
@@ -418,9 +452,7 @@ func (s *shareServers) startOne(srv *shareServer) error {
 	// ExtraFiles[0] is the child's descriptor 3, virtiofsdListenFD.
 	cmd.ExtraFiles = []*os.File{srv.listener}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
-	release, err := startConfinedAs(cmd, func() error {
-		return confineProcess(hypervisorCaps, cmd.Path, "virtiofsd", "virtiofsd")
-	}, "virtiofsd")
+	release, err := startConfinedAs(cmd, func() error { return confineVirtiofsd(hypervisorCaps) }, "virtiofsd")
 	if cerr := logW.Close(); cerr != nil {
 		s.logger.Printf("closing vm-launch's copy of the log pipe of virtiofsd for the share at %s: %v", quoteForLog(srv.grant.Path), cerr)
 	}
@@ -434,11 +466,47 @@ func (s *shareServers) startOne(srv *shareServer) error {
 	return nil
 }
 
+// confineVirtiofsd runs on the thread that starts virtiofsd. It sets
+// no_new_privs on the thread and then takes every capability from it, as
+// confineThread does for the hypervisor. The process the thread starts
+// inherits both. With no_new_privs, no exec can raise the permitted set
+// above the thread's, which is empty, or honour a set-user-ID bit, so no
+// file in the chain that runs virtiofsd gains anything from its file
+// capabilities. That chain is the wrapper, the wrapper's interpreter, the
+// bundled loader, and virtiofsd itself, plus anything those exec in turn. A
+// check of one named file, as the hypervisor gets, would cover less, so
+// virtiofsd gets none. The thread ends with virtiofsd (see
+// startConfinedAs), so no other part of vm-launch ever runs with the flag.
+func confineVirtiofsd(ops capOps) error {
+	if err := setNoNewPrivs(); err != nil {
+		return err
+	}
+	return confineThread(ops, "virtiofsd")
+}
+
+// setNoNewPrivs sets no_new_privs on the calling thread and reads it back.
+// Garden starts vm-launch with it already, which leaves nothing to change.
+func setNoNewPrivs() error {
+	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+		return fmt.Errorf("setting no_new_privs: %w", os.NewSyscallError("prctl PR_SET_NO_NEW_PRIVS", err))
+	}
+	set, err := unix.PrctlRetInt(unix.PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0)
+	if err != nil {
+		return fmt.Errorf("reading no_new_privs back: %w", os.NewSyscallError("prctl PR_GET_NO_NEW_PRIVS", err))
+	}
+	if set != 1 {
+		return fmt.Errorf("no_new_privs reads back as %d after vm-launch set it", set)
+	}
+	return nil
+}
+
 // readLog passes each line of virtiofsd's log to the logger with the share's
 // path in front, closes srv.ready at the first line that holds
 // virtiofsdReadyText, and closes srv.logDone at the end of the log. It keeps
-// reading to the end, so virtiofsd never blocks on its log, but passes on at
-// most maxVirtiofsdLogLines lines, each cut at maxVirtiofsdLineBytes.
+// reading to the end, so virtiofsd never blocks on its log. It passes on the
+// first maxVirtiofsdLogLines lines, each cut at maxVirtiofsdLineBytes and
+// with its control bytes escaped, holds back the lines after those but keeps
+// the latest maxVirtiofsdTailLines of them, and passes those on at the end.
 func (srv *shareServer) readLog(r *os.File, logger *log.Logger) {
 	defer close(srv.logDone)
 	defer r.Close()
@@ -446,6 +514,7 @@ func (srv *shareServer) readLog(r *os.File, logger *log.Logger) {
 	br := bufio.NewReaderSize(r, maxVirtiofsdLineBytes)
 	ready, inLongLine := false, false
 	lines := 0
+	tail := newLineRing(maxVirtiofsdTailLines)
 	for {
 		chunk, err := br.ReadSlice('\n')
 		if len(chunk) > 0 {
@@ -459,6 +528,7 @@ func (srv *shareServer) readLog(r *os.File, logger *log.Logger) {
 					ready = true
 					close(srv.ready)
 				}
+				text = escapeControlBytes(text)
 				if cut {
 					text += " [cut]"
 					inLongLine = true
@@ -467,15 +537,76 @@ func (srv *shareServer) readLog(r *os.File, logger *log.Logger) {
 				case lines < maxVirtiofsdLogLines:
 					logger.Printf("virtiofsd for %s: %s", path, text)
 				case lines == maxVirtiofsdLogLines:
-					logger.Printf("virtiofsd for %s wrote more than %d lines; vm-launch passes on no more of them", path, maxVirtiofsdLogLines)
+					logger.Printf("virtiofsd for %s wrote more than %d lines; vm-launch holds back the rest and passes on the last %d when the log ends", path, maxVirtiofsdLogLines, maxVirtiofsdTailLines)
+					tail.add(text)
+				default:
+					tail.add(text)
 				}
 				lines++
 			}
 		}
 		if err != nil && !errors.Is(err, bufio.ErrBufferFull) {
-			return
+			break
 		}
 	}
+	if held := tail.total; held > 0 {
+		kept := tail.lines()
+		logger.Printf("virtiofsd for %s: %d lines were held back; the last %d follow", path, held, len(kept))
+		for _, text := range kept {
+			logger.Printf("virtiofsd for %s: %s", path, text)
+		}
+	}
+}
+
+// lineRing keeps the latest lines added to it, up to its size, and counts
+// every line added.
+type lineRing struct {
+	buf   []string
+	next  int
+	total int
+}
+
+func newLineRing(size int) *lineRing { return &lineRing{buf: make([]string, 0, size)} }
+
+func (r *lineRing) add(line string) {
+	r.total++
+	if len(r.buf) < cap(r.buf) {
+		r.buf = append(r.buf, line)
+		return
+	}
+	r.buf[r.next] = line
+	r.next = (r.next + 1) % len(r.buf)
+}
+
+// lines returns the kept lines, oldest first.
+func (r *lineRing) lines() []string {
+	out := make([]string, 0, len(r.buf))
+	out = append(out, r.buf[r.next:]...)
+	return append(out, r.buf[:r.next]...)
+}
+
+// escapeControlBytes writes each ASCII control byte of s other than a tab,
+// and DEL, as \xNN, so a line that virtiofsd copied from a guest's request
+// cannot move a terminal's cursor or hide part of the log.
+func escapeControlBytes(s string) string {
+	isControl := func(c byte) bool { return (c < 0x20 && c != '\t') || c == 0x7f }
+	i := 0
+	for i < len(s) && !isControl(s[i]) {
+		i++
+	}
+	if i == len(s) {
+		return s
+	}
+	var b strings.Builder
+	b.WriteString(s[:i])
+	for ; i < len(s); i++ {
+		if c := s[i]; isControl(c) {
+			fmt.Fprintf(&b, `\x%02x`, c)
+		} else {
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 // wait reaps srv's virtiofsd, ends the thread that started it, and acts on
@@ -491,9 +622,8 @@ func (s *shareServers) wait(srv *shareServer, release func()) {
 // ended acts on the end of srv's virtiofsd. An end after QEMU was reaped, or
 // once vm-launch stops virtiofsd itself, is expected. An end before start
 // armed the servers is left to start. Any other end fails the share, except
-// an end with status 0 after which QEMU exits within
-// virtiofsdDisconnectGrace: that is virtiofsd seeing QEMU disconnect as QEMU
-// exits.
+// an end with status 0 after which QEMU is reaped within the disconnect
+// grace, since that is virtiofsd seeing QEMU disconnect as QEMU exits.
 func (s *shareServers) ended(srv *shareServer) {
 	s.mu.Lock()
 	expected := s.stopping || s.guestReaped
@@ -564,16 +694,43 @@ func (s *shareServers) guestStarted(p *os.Process) {
 	}
 }
 
-// guestEnded records that QEMU has been reaped and stops every virtiofsd that
-// still runs, after virtiofsdStopGrace.
-func (s *shareServers) guestEnded() {
+// markReaped records that QEMU has been reaped, or that run is past the
+// supervisor without one, and closes guestDone. It reports whether this
+// call was the one that did, and the grace each virtiofsd then gets, which
+// is the stop grace when QEMU ran, since virtiofsd sees it disconnect, and none
+// when QEMU never started, since nothing will ever connect.
+func (s *shareServers) markReaped() (grace time.Duration, first bool) {
 	s.mu.Lock()
-	if !s.guestReaped {
-		s.guestReaped = true
-		close(s.guestDone)
+	defer s.mu.Unlock()
+	if s.guestReaped {
+		return 0, false
 	}
-	s.mu.Unlock()
-	s.stop(virtiofsdStopGrace)
+	s.guestReaped = true
+	close(s.guestDone)
+	if s.guest != nil {
+		return s.stopGrace, true
+	}
+	return 0, true
+}
+
+// hypervisorReaped is the supervisor's reaped hook, which runs as soon as
+// QEMU has been reaped and before the supervisor flushes the guest's last
+// output. It records the reap, so that a virtiofsd that exits 0 at QEMU's
+// disconnect is expected however long the flush takes, and starts stopping
+// every virtiofsd in the background, beside the flush. It does not block.
+func (s *shareServers) hypervisorReaped() {
+	if grace, first := s.markReaped(); first {
+		go s.stop(grace)
+	}
+}
+
+// guestEnded runs once the supervisor has returned. It records the reap if
+// the supervisor never reported one, as when QEMU did not start, and stops
+// every virtiofsd that still runs, or waits for the stop that
+// hypervisorReaped began, so their last lines come before the exit line.
+func (s *shareServers) guestEnded() {
+	grace, _ := s.markReaped()
+	s.stop(grace)
 }
 
 // failureReason returns the exit line's reason when a share stopped being
@@ -584,20 +741,25 @@ func (s *shareServers) failureReason() string {
 	return s.failure
 }
 
-// stop ends every virtiofsd: it gives each grace to end on its own, sends
-// SIGKILL to each that still runs, and waits up to virtiofsdKillWait for
-// them and for their last log lines. It closes every socket vm-launch still
-// holds. Only the first call does anything, so run can defer it for every
-// way out and still call it at the point where the lines belong.
+// stop ends every virtiofsd. It closes every socket vm-launch still holds,
+// gives each virtiofsd grace to end on its own, sends SIGKILL to each that
+// still runs, and then waits for them to end and for their last log lines,
+// all within the one kill wait. So a stop takes at most grace plus the kill
+// wait, however many virtiofsd processes there are. Only the first call
+// stops anything. A later call waits until that stop has finished, so run
+// can defer stop for every way out and still have the lines where they
+// belong.
 func (s *shareServers) stop(grace time.Duration) {
 	s.mu.Lock()
 	if s.stopping {
 		s.mu.Unlock()
+		<-s.stopDone
 		return
 	}
 	s.stopping = true
 	close(s.stopped)
 	s.mu.Unlock()
+	defer close(s.stopDone)
 	s.closeListeners()
 
 	var running []*shareServer
@@ -609,20 +771,11 @@ func (s *shareServers) stop(grace time.Duration) {
 	if len(running) == 0 {
 		return
 	}
-	waitAll := func(d time.Duration, ch func(*shareServer) <-chan struct{}) {
-		t := time.NewTimer(d)
-		defer t.Stop()
-		for _, srv := range running {
-			select {
-			case <-ch(srv):
-			case <-t.C:
-				return
-			}
-		}
-	}
 	exited := func(srv *shareServer) <-chan struct{} { return srv.exited }
 	if grace > 0 {
-		waitAll(grace, exited)
+		t := time.NewTimer(grace)
+		waitEach(t.C, running, exited)
+		t.Stop()
 	}
 	for _, srv := range running {
 		if isClosed(srv.exited) {
@@ -632,20 +785,31 @@ func (s *shareServers) stop(grace time.Duration) {
 			s.logger.Printf("killing virtiofsd for the share at %s: %v", quoteForLog(srv.grant.Path), err)
 		}
 	}
-	waitAll(virtiofsdKillWait, exited)
+	deadline := time.NewTimer(s.killWait)
+	defer deadline.Stop()
+	allEnded := waitEach(deadline.C, running, exited)
 	for _, srv := range running {
 		if !isClosed(srv.exited) {
-			s.logger.Printf("virtiofsd for the share at %s did not end within %v of SIGKILL; it ends when its I/O returns", quoteForLog(srv.grant.Path), virtiofsdKillWait)
+			s.logger.Printf("virtiofsd for the share at %s did not end within %v of SIGKILL; it ends when its I/O returns", quoteForLog(srv.grant.Path), s.killWait)
 		}
 	}
-	waitAll(virtiofsdKillWait, func(srv *shareServer) <-chan struct{} {
-		if !isClosed(srv.exited) {
-			// A virtiofsd that has not ended still holds its log open.
-			return closedChan
-		}
-		return srv.logDone
-	})
+	if !allEnded {
+		// The kill wait is spent. A virtiofsd that has ended may still have
+		// lines on the way, and they come when they come.
+		return
+	}
+	waitEach(deadline.C, running, func(srv *shareServer) <-chan struct{} { return srv.logDone })
 }
 
-// closedChan is a channel that is always closed.
-var closedChan = func() chan struct{} { c := make(chan struct{}); close(c); return c }()
+// waitEach waits until ch(srv) is closed for each of servers in turn, and
+// reports whether all of them were before timeout fired.
+func waitEach(timeout <-chan time.Time, servers []*shareServer, ch func(*shareServer) <-chan struct{}) bool {
+	for _, srv := range servers {
+		select {
+		case <-ch(srv):
+		case <-timeout:
+			return false
+		}
+	}
+	return true
+}

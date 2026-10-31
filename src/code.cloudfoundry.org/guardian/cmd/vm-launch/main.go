@@ -126,19 +126,24 @@
 // mount entry fails the launch with exit 125 before anything boots.
 //
 // Shares: a volume that VM_VOLUMES sets to "mode": "share", on vm-qemu with
-// --allow-volume-shares, gets no image. vm-launch serves the volume's own
-// directory to the guest over virtiofs instead, with one virtiofsd for each
-// share, run from the executable that --virtiofsd-path names (on a cell, the
-// virtiofsd-wrapper the virtiofsd install provides), and a granted share
-// without --virtiofsd-path fails the launch with exit 125. Each virtiofsd
-// runs as vm-launch's user with no capabilities and an empty environment, gets a
-// listening Unix socket in the work directory, and must report that it is
-// ready within 5 seconds, all of them together, before the guest boots; its
-// log lines go to stderr with the share's path in front. A virtiofsd that
-// ends before the guest has reported its status stops the guest, and
-// vm-launch exits 125 with a line that names the share. Once the hypervisor
-// has exited, every virtiofsd that still runs gets half a second to end and
-// then SIGKILL.
+// --allow-volume-shares, is granted a share and gets no image. A granted
+// share without --virtiofsd-path, or with a path that is not an executable
+// file, fails the launch with exit 125. So does every other granted share
+// for now, before anything boots, because the hypervisor's virtiofs device
+// and the guest's mount of the share are not built yet, and the app would
+// write to the guest's own disk. What is built is the server side. vm-launch
+// is to serve the volume's own directory to the guest over virtiofs, with
+// one virtiofsd for each share, run from the executable that
+// --virtiofsd-path names (on a cell,
+// /opt/garden-vm/artifacts/virtiofsd/virtiofsd-wrapper). Each virtiofsd
+// runs as vm-launch's user with no capabilities, no_new_privs, and an empty
+// environment, gets a listening Unix socket in the work directory, and must
+// report that it is ready within 5 seconds, all of them together, before
+// the guest boots. Its log lines go to stderr with the share's path in
+// front. A virtiofsd that ends before the guest has reported its status
+// stops the guest, and vm-launch exits 125 with a line that names the
+// share. Once the hypervisor has exited, every virtiofsd that still runs
+// gets half a second to end and then SIGKILL.
 //
 // Environment: the guest command sees the container's environment after the
 // changes the CF launcher would have made to it. vm-launch reads its
@@ -292,10 +297,11 @@
 //	       a JSON object of volume paths, names a path no volume mounts, or
 //	       sets a mode or size it does not allow, or asks for a share that
 //	       the backend, the volume, or the operator does not allow, a
-//	       granted share without a usable --virtiofsd-path, whose mount changed,
-//	       or whose virtiofsd could not start, ended, or was not ready
-//	       within 5 seconds, a share whose virtiofsd ended before the guest
-//	       reported a status, or
+//	       granted share without a usable --virtiofsd-path, any other
+//	       granted share while share mode is not served yet, a share whose
+//	       mount changed, or whose virtiofsd could not start, ended, or was
+//	       not ready within 5 seconds, a share whose virtiofsd ended before
+//	       the guest reported a status, or
 //	       an image another instance still holds after 30 seconds, a
 //	       guest environment that is too large, with one entry over
 //	       131071 bytes or more than 1 MiB in all, or a value that holds a
@@ -552,11 +558,14 @@ func run(argv []string, logger *log.Logger) int {
 	}
 	// A share is granted or refused here, with the providers known and
 	// still before CredHub, the ports, and the work directory, and so is a
-	// grant that this vm-launch has no virtiofsd to serve.
+	// grant that this vm-launch has no virtiofsd to serve, and any grant
+	// while share mode is not served yet (see refuseUnservedShares).
 	var shares []shareGrant
 	if err == nil {
 		if shares, err = grantShares(cfg.backend, cfg.allowVolumeShares, selected); err == nil {
-			err = checkVirtiofsd(cfg.virtiofsd, shares)
+			if err = checkVirtiofsd(cfg.virtiofsd, shares); err == nil {
+				err = refuseUnservedShares(shares)
+			}
 		}
 	}
 	if err != nil {
@@ -778,11 +787,15 @@ func run(argv []string, logger *log.Logger) int {
 	sup := supervisor{stdout: os.Stdout, logger: logger, signals: sigs, grace: killGrace, deadline: stopDeadline, started: closeInherited}
 	if len(shares) > 0 {
 		// A virtiofsd that ends while QEMU runs kills it, which takes QEMU's
-		// process, known once it has started.
+		// process, known once it has started. QEMU's reap is reported at
+		// once, before the output flush, so a virtiofsd that exits 0 at the
+		// disconnect is expected, and the stop of every virtiofsd runs
+		// beside the flush.
 		sup.started = func() {
 			closeInherited()
 			shareSrv.guestStarted(cmd.Process)
 		}
+		sup.reaped = shareSrv.hypervisorReaped
 	}
 	// Firecracker starts without a capability whether or not vm-launch was
 	// given --transparent-proxy, so a grant that reaches vm-launch some other
@@ -820,8 +833,8 @@ func run(argv []string, logger *log.Logger) int {
 		sup.listen = gates.set
 	}
 	res, err := sup.run(cmd, nonce)
-	// QEMU has been reaped, or never started, so every virtiofsd stops now,
-	// and its last lines come before the exit line.
+	// QEMU has been reaped, or never started. Every virtiofsd has stopped,
+	// or stops now, and its last lines come before the exit line.
 	shareSrv.guestEnded()
 	if gates != nil {
 		// The gates' last lines about the ports come before the exit line.

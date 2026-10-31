@@ -188,14 +188,24 @@ type capOps interface {
 // change is read back, and any failure is an error, so the hypervisor never
 // starts holding a capability.
 func confineHypervisor(ops capOps, path string) error {
-	return confineProcess(ops, path, "the hypervisor", "hypervisor")
+	if err := confineThread(ops, "hypervisor"); err != nil {
+		return err
+	}
+	hasFileCaps, err := ops.fileCaps(path)
+	if err != nil {
+		return fmt.Errorf("reading the file capabilities of %s: %w", path, err)
+	}
+	if hasFileCaps {
+		return fmt.Errorf("%s has file capabilities, which could give the hypervisor capabilities", path)
+	}
+	return nil
 }
 
-// confineProcess is confineHypervisor for any process that vm-launch starts
-// without capabilities: the hypervisor, and virtiofsd for a share (see
-// virtiofsd.go). what names the process in a line, as "the hypervisor" or
-// "virtiofsd", and noun names it after "a root", as "hypervisor".
-func confineProcess(ops capOps, path, what, noun string) error {
+// confineThread is the part of confineHypervisor that takes every capability
+// away from the calling OS thread. virtiofsd for a share gets it too (see
+// confineVirtiofsd). noun names the process after "a root" in a line, as
+// "hypervisor" or "virtiofsd".
+func confineThread(ops capOps, noun string) error {
 	setpcap := capBit(unix.CAP_SETPCAP)
 
 	if err := ops.clearAmbient(); err != nil && !errors.Is(err, unix.EINVAL) {
@@ -263,14 +273,6 @@ func confineProcess(ops capOps, path, what, noun string) error {
 		if still != 0 {
 			return fmt.Errorf("vm-launch runs as root without CAP_SETPCAP, so its bounding set keeps capabilities (%#x), which a root %s gets", still, noun)
 		}
-	}
-
-	hasFileCaps, err := ops.fileCaps(path)
-	if err != nil {
-		return fmt.Errorf("reading the file capabilities of %s: %w", path, err)
-	}
-	if hasFileCaps {
-		return fmt.Errorf("%s has file capabilities, which could give %s capabilities", path, what)
 	}
 	return nil
 }

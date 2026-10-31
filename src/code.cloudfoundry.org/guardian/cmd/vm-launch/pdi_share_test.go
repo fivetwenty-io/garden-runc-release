@@ -24,6 +24,15 @@ func shareVol(path string, p diskProvider, mode volumeMode) selectedVolume {
 	}
 }
 
+// indexed gives each of vs its place in the list as its volume index, as
+// findVolumeProviders does when it selects every volume of a launch.
+func indexed(vs ...selectedVolume) []selectedVolume {
+	for i := range vs {
+		vs[i].Index = i
+	}
+	return vs
+}
+
 // privateProvider is a provider that declares private volumes only, as a
 // block provider would.
 func privateProvider(name string) *fakeDiskProvider {
@@ -86,14 +95,22 @@ var _ = Describe("grantShares", func() {
 		})
 
 		It("takes its index and tag from its place among all the volumes, and skips the private ones", func() {
-			grants, err := grantShares(backend.VMQemu, true, []selectedVolume{
+			grants, err := grantShares(backend.VMQemu, true, indexed(
 				juice("/a", volumePrivate), nfs("/b", volumeShare), juice("/c", volumePrivate), juice("/d", volumeShare),
-			})
+			))
 			Expect(err).NotTo(HaveOccurred())
 			Expect(grants).To(Equal([]shareGrant{
 				{Index: 1, Path: "/b", Mount: mountRecord{ContainerDir: "/b"}, Tag: "rvm-vol1", Provider: "NFS"},
 				{Index: 3, Path: "/d", Mount: mountRecord{ContainerDir: "/d"}, Tag: "rvm-vol3", Provider: "JuiceFS"},
 			}))
+		})
+
+		It("takes the volume index it was selected with, not its place in the list it is given", func() {
+			v := juice("/c", volumeShare)
+			v.Index = 2
+			grants, err := grantShares(backend.VMQemu, true, []selectedVolume{v})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(grants).To(Equal([]shareGrant{{Index: 2, Path: "/c", Mount: mountRecord{ContainerDir: "/c"}, Tag: "rvm-vol2", Provider: "JuiceFS"}}))
 		})
 
 		It("is any provider that declares its volumes shareable", func() {
@@ -184,7 +201,7 @@ var _ = Describe("grantShares", func() {
 	})
 
 	It("does not refuse a private volume of a provider that cannot share, beside a share", func() {
-		grants, err := grantShares(backend.VMQemu, true, []selectedVolume{shareVol("/disk", privateProvider("Block"), volumePrivate), juice("/shared", volumeShare)})
+		grants, err := grantShares(backend.VMQemu, true, indexed(shareVol("/disk", privateProvider("Block"), volumePrivate), juice("/shared", volumeShare)))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(grants).To(HaveLen(1))
 		Expect(grants[0].Index).To(Equal(1))
