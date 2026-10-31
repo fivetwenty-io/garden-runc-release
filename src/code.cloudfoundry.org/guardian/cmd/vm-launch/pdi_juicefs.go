@@ -15,9 +15,10 @@ func init() { registerDiskProvider(juicefsProvider{}) }
 
 // juicefsProvider is the JuiceFS volume service. Its disk is a sparse image
 // file in the volume root, 1 GiB unless the app asks for another size, which
-// openVolumeImage creates, checks, locks, and grows by truncate. A JuiceFS
-// flock holds across cells, and its quota counts file length, so an image is
-// charged its whole size as soon as it is sized or grown.
+// openVolumeImage creates, checks, locks, and grows by fallocate, or by
+// truncate where the volume has no fallocate. A JuiceFS flock holds across
+// cells, and its quota counts file length, so an image is charged its whole
+// size as soon as it is sized or grown.
 type juicefsProvider struct{}
 
 func (juicefsProvider) Name() string { return "JuiceFS" }

@@ -168,11 +168,18 @@ func isQuotaErrno(err error) bool {
 // space. It keeps cause in the chain, so errors.Is still finds EDQUOT or
 // ENOSPC. stays says what the volume holds afterwards. The free space is read
 // again, because the allocation and other writers have used some of it since
-// the check, and is left out when the volume reports none.
+// the check, and is left out when the volume reports none. The reason in the
+// line is the quota's errno, even when cause also holds another one, as a
+// zero write that failed with EIO before a sync that failed with EDQUOT does.
 func (o imageOptions) quotaRefusal(op spaceOp, cause error, stays string) error {
 	reason := cause.Error()
 	var errno unix.Errno
-	if errors.As(cause, &errno) {
+	switch {
+	case errors.Is(cause, unix.EDQUOT):
+		reason = unix.EDQUOT.Error()
+	case errors.Is(cause, unix.ENOSPC):
+		reason = unix.ENOSPC.Error()
+	case errors.As(cause, &errno):
 		reason = errno.Error()
 	}
 	msg := fmt.Sprintf("volume %s: %s needs %s, and the volume's quota refused it (%s)",

@@ -26,8 +26,9 @@ const (
 	// defaultImageSize is the size an image is brought up to when the app
 	// sets none in VM_VOLUMES. Every image an older vm-launch made has this
 	// size. vm-launch grows a smaller image and never shrinks a larger one.
-	// An image grown by truncate is sparse, but a quota that counts file
-	// length, as JuiceFS does, charges all of it as soon as the file is sized.
+	// An image grown on JuiceFS holds no data past what the guest wrote, but
+	// a quota that counts file length, as JuiceFS's does, charges all of it as
+	// soon as the file is sized.
 	defaultImageSize = 1 << 30
 
 	// maxImageSize is the largest image vm-launch accepts or grows to, which
@@ -64,9 +65,10 @@ const (
 	// it is sized and published, with tempRandomBytes random bytes written as
 	// hex between them. A launch killed in between leaves such a file behind.
 	// Nothing ever opens, trusts, or reuses a temp file as an image. On a
-	// volume whose quota counts file length it holds up to the image size of
-	// quota until an operator deletes it, except on a volume that publishes by
-	// link (publishLink), where the next launch removes it (sweepTempImages).
+	// volume whose quota counts file length it holds up to the creation step
+	// (imageCreationStep) of quota until an operator deletes it, except on a
+	// volume that publishes by link (publishLink), where the next launch
+	// removes it (sweepTempImages).
 	tempPrefix      = ".rvm-disk-"
 	tempSuffix      = ".tmp"
 	tempRandomBytes = 8
@@ -180,9 +182,17 @@ type imageOptions struct {
 	// progressInterval, when set, replaces growProgressInterval.
 	progressInterval time.Duration
 
-	// truncate, when set, replaces ftruncate(2) as the step that grows an
-	// image without preallocation. Tests use it to answer as a full quota does.
+	// truncate, when set, replaces ftruncate(2) as the step that sets the
+	// length of a published image: the grow without preallocation on a volume
+	// that has no fallocate, and the cut back to the length that last synced
+	// after a sync of zero writes failed. Tests use it to answer as a full
+	// quota does.
 	truncate func(fd int, size int64) error
+
+	// statSize, when set, replaces freshSize as the step that reads the
+	// length of an image fresh from the filesystem during a grow. Tests use it
+	// to answer with a length that has gone stale.
+	statSize func(fd int) (int64, error)
 
 	// fstatfs, when set, replaces fstatfs(2) as the step that reads the
 	// volume's free space for the quota check (checkSpace). Tests use it to
@@ -1104,8 +1114,10 @@ func newGrowTarget(dirfd int, path string) growTarget {
 // smaller one grows, with a line that says so unless this launch has just
 // created it at the creation step:
 //
-//   - Without o.Preallocate, as on JuiceFS, one ftruncate to o.Size, which
-//     only extends the file.
+//   - Without o.Preallocate, as on JuiceFS, fallocate with mode 0 on the
+//     range past the end, which only raises the length, or, when the volume
+//     answers EOPNOTSUPP, one ftruncate to o.Size once a fresh look at the
+//     length shows it is still below o.Size (extendImage).
 //   - With o.Preallocate, as on NFS, fallocate with mode 0 on the range past
 //     the end, which extends the file, or, when the volume answers
 //     EOPNOTSUPP, sequential zero writes from the end (allocateRange). The
@@ -1116,9 +1128,12 @@ func newGrowTarget(dirfd int, path string) growTarget {
 //
 // Before it writes anything, it asks the volume whether it has free the bytes
 // the grow adds (checkSpace). Then it syncs the image and checks that it is
-// o.Size bytes. A failed step exits 125 with a line that names the volume, and
-// the image keeps the length it reached. A step that the volume's quota
-// refuses with EDQUOT or ENOSPC is reported in the same words as the check
+// at least o.Size bytes; an image that a stale length or another writer made
+// longer is kept, with the line for a larger image. A failed step exits 125
+// with a line that names the volume and the length the image has afterwards,
+// read fresh from the filesystem, because a step that fails part way can
+// leave the image longer than it was. A step that the volume's quota refuses
+// with EDQUOT or ENOSPC is reported in the same words as the check
 // (quotaRefusal).
 func growImage(fd int, t growTarget, size int64, created bool, o imageOptions, sigs <-chan os.Signal) error {
 	want := o.Size
@@ -1126,8 +1141,7 @@ func growImage(fd int, t growTarget, size int64, created bool, o imageOptions, s
 	case size == want:
 		return nil
 	case size > want:
-		o.logf("volume %s: image %s is %s, larger than the %s asked for; vm-launch never shrinks an image, so it keeps %s",
-			t.volume, t.image, exactSize(size), exactSize(want), exactSize(size))
+		o.logKept(t, size, want)
 		return nil
 	}
 	op := growOp(t, size, want)
@@ -1137,14 +1151,15 @@ func growImage(fd int, t growTarget, size int64, created bool, o imageOptions, s
 	if !created {
 		o.logf("volume %s: growing image %s from %s to %s", t.volume, t.image, roughSize(size), exactSize(want))
 	}
-	// failed reports a step that failed with the image at stays bytes. A step
-	// that the volume's quota refused is reported in the quota line.
-	failed := func(err error, stays int64) error {
+	// failed reports a step that failed, with the length the image has now.
+	// A step that the volume's quota refused is reported in the quota line.
+	failed := func(err error) error {
+		stays := o.staysAt(fd)
 		if isQuotaErrno(err) {
-			return o.quotaRefusal(op, err, "the image stays at "+roughSize(stays))
+			return o.quotaRefusal(op, err, stays)
 		}
-		return fmt.Errorf("volume %s: growing image %s from %s to %s: %w; the image stays at %s",
-			t.volume, t.image, roughSize(size), exactSize(want), err, roughSize(stays))
+		return fmt.Errorf("volume %s: growing image %s from %s to %s: %w; %s",
+			t.volume, t.image, roughSize(size), exactSize(want), err, stays)
 	}
 	if o.Preallocate {
 		g := &growth{target: t, from: size, to: want, end: size, o: o}
@@ -1154,42 +1169,121 @@ func growImage(fd int, t growTarget, size int64, created bool, o imageOptions, s
 				return fmt.Errorf("volume %s: growing image %s to %s: %w; it is %s now, and the next start continues from there",
 					t.volume, t.image, exactSize(want), err, roughSize(g.end))
 			}
-			return failed(err, g.end)
+			return failed(err)
 		}
-	} else if err := truncateUp(fd, want, o); err != nil {
-		return failed(err, size)
+	} else if err := extendImage(fd, size, want, o); err != nil {
+		return failed(err)
 	}
 	if err := unix.Fsync(fd); err != nil {
-		return failed(fmt.Errorf("syncing it: %w", err), want)
+		return failed(fmt.Errorf("syncing it: %w", err))
 	}
 	got, err := checkImage(fd, t.path)
 	if err != nil {
 		return err
 	}
-	if got != want {
+	switch {
+	case got < want:
 		return &volumeError{kind: errImageSize,
 			msg: fmt.Sprintf("volume %s: image %s is %d bytes after growing it to %d", t.volume, t.image, got, want)}
+	case got > want:
+		o.logKept(t, got, want)
 	}
 	return nil
 }
 
-// truncateUp extends the image fd to size bytes with ftruncate, repeating
-// after an interrupt. The caller has checked, under the lock, that the image
-// is shorter, so the truncate only extends it.
-func truncateUp(fd int, size int64, o imageOptions) error {
+// logKept prints the line for an image of size bytes that is kept because it
+// is larger than the want bytes asked for.
+func (o imageOptions) logKept(t growTarget, size, want int64) {
+	o.logf("volume %s: image %s is %s, larger than the %s asked for; vm-launch never shrinks an image, so it keeps %s",
+		t.volume, t.image, exactSize(size), exactSize(want), exactSize(size))
+}
+
+// staysAt says how long the image fd is after a failed step of a grow, for
+// the end of the failure's line. It reads the length fresh, and says so when
+// that fails too.
+func (o imageOptions) staysAt(fd int) string {
+	n, err := o.lengthOf(fd)
+	if err != nil {
+		return fmt.Sprintf("its length could not be read after the failure (%v)", err)
+	}
+	return "the image stays at " + roughSize(n)
+}
+
+// lengthOf reads the length of the open image fd fresh from the filesystem,
+// through statSize when a test sets it, and otherwise with freshSize.
+func (o imageOptions) lengthOf(fd int) (int64, error) {
+	if o.statSize != nil {
+		return o.statSize(fd)
+	}
+	return freshSize(fd)
+}
+
+// extendImage grows the image fd, which growImage found size bytes long, to
+// want bytes without preallocating it, for a volume whose quota counts file
+// length, as JuiceFS's does.
+//
+// It first calls fallocate with mode 0 on [size, want). Mode 0 only ever
+// raises the length and leaves every byte below it as it was, so it cannot
+// cut the image even when the image is longer than size says. JuiceFS
+// answers it by setting the length and charging the quota, without writing
+// data. Only when the volume has no fallocate (EOPNOTSUPP) does extendImage
+// fall back to ftruncate, which sets the length to exactly want and so would
+// cut an image that is longer. size can be stale, because a client can answer
+// from a cache and a co-bound app that ignores the lock can grow the file, so
+// extendImage reads the length fresh just before the truncate and truncates
+// only when it is still below want. Otherwise it leaves the length as it is,
+// and growImage's check after the grow reports what it finds.
+func extendImage(fd int, size, want int64, o imageOptions) error {
+	err := o.fallocateRange(fd, size, want-size)
+	switch {
+	case err == nil:
+		return nil
+	case !errors.Is(err, unix.EOPNOTSUPP):
+		return fmt.Errorf("allocating %d bytes at offset %d: %w", want-size, size, err)
+	}
+	now, err := o.lengthOf(fd)
+	if err != nil {
+		return fmt.Errorf("reading its length before the truncate: %w", err)
+	}
+	if now >= want {
+		return nil
+	}
+	if err := setLength(fd, want, o); err != nil {
+		return fmt.Errorf("truncating it to %d bytes: %w", want, err)
+	}
+	return nil
+}
+
+// fallocateRange calls fallocate with mode 0 on the length bytes of the open
+// image fd from off, through o.fallocate when a test sets it, repeating after
+// an interrupt.
+func (o imageOptions) fallocateRange(fd int, off, length int64) error {
+	call := o.fallocate
+	if call == nil {
+		call = func(fd int, mode uint32, off, length int64) error { return unix.Fallocate(fd, mode, off, length) }
+	}
+	for {
+		err := call(fd, 0, off, length)
+		if !errors.Is(err, unix.EINTR) {
+			return err
+		}
+	}
+}
+
+// setLength sets the length of the image fd to size bytes with ftruncate,
+// through o.truncate when a test sets it, repeating after an interrupt. The
+// caller decides that size cuts nothing: the grow calls it only with a length
+// above a fresh look at the image's end, and the cut back after a failed sync
+// only removes zeros that the same grow wrote.
+func setLength(fd int, size int64, o imageOptions) error {
 	call := o.truncate
 	if call == nil {
 		call = unix.Ftruncate
 	}
 	for {
 		err := call(fd, size)
-		switch {
-		case err == nil:
-			return nil
-		case errors.Is(err, unix.EINTR):
-			continue
-		default:
-			return fmt.Errorf("truncating it to %d bytes: %w", size, err)
+		if !errors.Is(err, unix.EINTR) {
+			return err
 		}
 	}
 }
@@ -1254,7 +1348,7 @@ func allocateRange(fd int, path string, from, to int64, o imageOptions, sigs <-c
 	if from < 0 || to < from || to > maxImageSize {
 		return fmt.Errorf("preallocating volume image %s: the range %d to %d is not valid", path, from, to)
 	}
-	size, err := freshSize(fd)
+	size, err := o.lengthOf(fd)
 	if err != nil {
 		return fmt.Errorf("preallocating volume image %s: %w", path, err)
 	}
@@ -1265,16 +1359,7 @@ func allocateRange(fd int, path string, from, to int64, o imageOptions, sigs <-c
 		return nil
 	}
 
-	call := o.fallocate
-	if call == nil {
-		call = func(fd int, mode uint32, off, length int64) error { return unix.Fallocate(fd, mode, off, length) }
-	}
-	for {
-		err = call(fd, 0, from, to-from)
-		if !errors.Is(err, unix.EINTR) {
-			break
-		}
-	}
+	err = o.fallocateRange(fd, from, to-from)
 	switch {
 	case err == nil:
 		if g != nil {
@@ -1322,9 +1407,11 @@ func freshSize(fd int) (int64, error) {
 // For the grow of a published image (g set), a signal first syncs what was
 // written, so the next launch continues from a length the volume has kept, and
 // a failed write syncs what came before it, so the image keeps the length it
-// reached. A sync that fails then is reported with the signal's line or the
-// write's error. Either way the image is left shorter, fully allocated up to
-// its end, and only ever holds zeros past the length it had.
+// reached. A sync that fails, there or at a periodic or final sync, cuts the
+// image back to the length that last synced (cutBack), and is reported with
+// the signal's line or the write's error, keeping its errno for errors.Is.
+// Either way the image is left shorter, fully allocated up to its end, and
+// only ever holds zeros past the length it had.
 func writeZeros(fd int, from, to int64, o imageOptions, sigs <-chan os.Signal, g *growth) error {
 	syncFile := o.syncFile
 	if syncFile == nil {
@@ -1347,6 +1434,27 @@ func writeZeros(fd int, from, to int64, o imageOptions, sigs <-chan os.Signal, g
 		synced = end
 		return nil
 	}
+	// cutBack runs after the sync that failed with serr, for a grow, and cuts
+	// the image back to the length that last synced. On NFS a write lands in
+	// the client's cache, and EDQUOT, ENOSPC, or EIO from the server arrives at
+	// the sync. The client sends the writes concurrently and the server can
+	// apply them out of order, so a range past a refused one can land and move
+	// the server's length past a hole that the next launch would never fill.
+	// Every byte past synced is a zero this grow wrote under the lock, past
+	// the length allocateRange found, so the cut removes nothing else. It
+	// returns serr, with the cut's own failure added when there is one, and
+	// leaves a new temp file (g nil) as it is, because the caller discards it.
+	cutBack := func(serr error) error {
+		if g == nil {
+			return serr
+		}
+		if err := setLength(fd, synced, o); err != nil {
+			return fmt.Errorf("%w; cutting the image back to the %d bytes that synced also failed: %w", serr, synced, err)
+		}
+		end = synced
+		g.end = synced
+		return serr
+	}
 	for end < to {
 		select {
 		case sig := <-sigs:
@@ -1355,7 +1463,7 @@ func writeZeros(fd int, from, to int64, o imageOptions, sigs <-chan os.Signal, g
 			}
 			during := "writing zeros"
 			if err := syncWritten(); err != nil {
-				during = fmt.Sprintf("writing zeros, and syncing the zeros written so far failed: %v", err)
+				during = fmt.Sprintf("writing zeros, and syncing the zeros written so far failed: %v", cutBack(err))
 			}
 			return &signalledError{Sig: syscall.Signal(signalNumber(sig)), during: during}
 		default:
@@ -1365,7 +1473,7 @@ func writeZeros(fd int, from, to int64, o imageOptions, sigs <-chan os.Signal, g
 			werr := fmt.Errorf("writing zeros at offset %d: %w", end, err)
 			if g != nil {
 				if serr := syncWritten(); serr != nil {
-					werr = fmt.Errorf("%w; syncing the zeros written before it also failed: %v", werr, serr)
+					werr = fmt.Errorf("%w; syncing the zeros written before it also failed: %w", werr, cutBack(serr))
 				}
 			}
 			return werr
@@ -1379,14 +1487,14 @@ func writeZeros(fd int, from, to int64, o imageOptions, sigs <-chan os.Signal, g
 		}
 		if end-synced >= syncInterval {
 			if err := syncFile(fd); err != nil {
-				return fmt.Errorf("syncing the zeros written so far: %w", err)
+				return fmt.Errorf("syncing the zeros written so far: %w", cutBack(err))
 			}
 			synced = end
 		}
 	}
 	if synced != end {
 		if err := syncFile(fd); err != nil {
-			return fmt.Errorf("syncing the zeros written so far: %w", err)
+			return fmt.Errorf("syncing the zeros written so far: %w", cutBack(err))
 		}
 	}
 	return nil

@@ -144,6 +144,9 @@ var _ = Describe("the quota check of the image engine", func() {
 		lines   []string
 		truncs  []int64
 		fallocs []int64
+		// noFallocate is set when the test filesystem refused fallocate,
+		// so the grow without preallocation fell back to a truncate.
+		noFallocate bool
 	)
 
 	const (
@@ -161,7 +164,21 @@ var _ = Describe("the quota check of the image engine", func() {
 		}
 		opts.fallocate = func(fd int, mode uint32, off, length int64) error {
 			fallocs = append(fallocs, off, length)
-			return unix.Fallocate(fd, mode, off, length)
+			err := unix.Fallocate(fd, mode, off, length)
+			noFallocate = errors.Is(err, unix.EOPNOTSUPP)
+			return err
+		}
+	}
+	// grewBy checks that a grow without preallocation called fallocate mode
+	// 0 on the length bytes from off, and truncated only where the test
+	// filesystem had no fallocate.
+	grewBy := func(off, length int64) {
+		GinkgoHelper()
+		Expect(fallocs).To(Equal([]int64{off, length}))
+		if noFallocate {
+			Expect(truncs).To(Equal([]int64{off + length}))
+		} else {
+			Expect(truncs).To(BeEmpty())
 		}
 	}
 	open := func() (*os.File, error) { return openVolumeImage(vol, opts, nil) }
@@ -183,7 +200,7 @@ var _ = Describe("the quota check of the image engine", func() {
 		vol = &guestVolume{ContainerDir: dir, ImageName: "rvm-disk-0.img"}
 		img = filepath.Join(dir, "rvm-disk-0.img")
 		vq = quoteForLog(dir)
-		lines, truncs, fallocs = nil, nil, nil
+		lines, truncs, fallocs, noFallocate = nil, nil, nil, false
 		opts = imageOptions{Size: 8 << 20, LockWait: 200 * time.Millisecond, LockPoll: 20 * time.Millisecond,
 			IsMountRoot: alwaysMountRoot, creationStep: 1 << 20,
 			Logf: func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }}
@@ -267,7 +284,7 @@ var _ = Describe("the quota check of the image engine", func() {
 			trackAllocations()
 			openOK()
 			Expect(sizeOf()).To(Equal(8 * mib))
-			Expect(truncs).To(Equal([]int64{8 * mib}))
+			grewBy(7*mib, mib)
 		})
 
 		It("refuses a grow that needs one fragment more than the free space", func() {
@@ -315,7 +332,7 @@ var _ = Describe("the quota check of the image engine", func() {
 			trackAllocations()
 			openOK()
 			Expect(sizeOf()).To(Equal(8 * mib))
-			Expect(truncs).To(Equal([]int64{8 * mib}))
+			grewBy(2*mib, 6*mib)
 			Expect(lines).To(Equal([]string{`volume ` + vq + `: growing image "rvm-disk-0.img" from 2 MiB to 8 MiB`}))
 		})
 
@@ -386,7 +403,11 @@ var _ = Describe("the quota check of the image engine", func() {
 		}
 		allocators := func() []allocator {
 			return []allocator{
-				{"ftruncate, as on JuiceFS", func(errno error) {
+				{"fallocate, as on JuiceFS", func(errno error) {
+					opts.fallocate = func(int, uint32, int64, int64) error { return errno }
+				}, 2 * mib},
+				{"ftruncate, as on a JuiceFS volume without fallocate", func(errno error) {
+					opts.fallocate = func(int, uint32, int64, int64) error { return unix.EOPNOTSUPP }
 					opts.truncate = func(int, int64) error { return errno }
 				}, 2 * mib},
 				{"fallocate, as on NFS 4.2", func(errno error) {
@@ -442,7 +463,7 @@ var _ = Describe("the quota check of the image engine", func() {
 				}
 				return good(fd, st)
 			}
-			opts.truncate = func(int, int64) error { return unix.EDQUOT }
+			opts.fallocate = func(int, uint32, int64, int64) error { return unix.EDQUOT }
 			_, err := open()
 			Expect(err).To(MatchError("volume " + vq + `: growing image "rvm-disk-0.img" from 2 MiB to 8 MiB needs 6 MiB, and the volume's quota refused it (disk quota exceeded); ` + quotaAdvice + "; the image stays at 2 MiB"))
 		})
@@ -456,7 +477,8 @@ var _ = Describe("the quota check of the image engine", func() {
 			_, err := open()
 			Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
 			Expect(err.Error()).To(HavePrefix("volume " + vq + `: growing image "rvm-disk-0.img" from 2 MiB to 8 MiB needs 6 MiB, and the volume's quota refused it (disk quota exceeded)`))
-			Expect(err.Error()).To(HaveSuffix("; the image stays at 8 MiB"))
+			Expect(err.Error()).To(HaveSuffix("; the image stays at 2 MiB"), "the zeros that did not sync are cut")
+			Expect(sizeOf()).To(Equal(2 * mib))
 		})
 
 		It("reports a refused allocation of a new image in the same words, and leaves no image or temp file", func() {
@@ -484,6 +506,7 @@ var _ = Describe("the quota check of the image engine", func() {
 		It("gives another allocation failure its own words, without the quota's", func() {
 			writeImage(img, 2*mib, nil)
 			volume(gib, 10*gib)
+			opts.fallocate = func(int, uint32, int64, int64) error { return unix.EOPNOTSUPP }
 			opts.truncate = func(int, int64) error { return unix.EIO }
 			_, err := open()
 			Expect(err).To(MatchError("volume " + vq + `: growing image "rvm-disk-0.img" from 2 MiB to 8 MiB: truncating it to 8388608 bytes: input/output error; the image stays at 2 MiB`))

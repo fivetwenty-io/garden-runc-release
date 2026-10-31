@@ -98,11 +98,13 @@
 // name, and the next launch removes a temporary name that a killed launch
 // left. Once it holds the image's lock, vm-launch grows the image to the size
 // VM_VOLUMES asks for, 1 GiB by default, writing only zeros past its end: by
-// truncate on JuiceFS, and on NFS by fallocate or, where the volume has none,
-// by zero writes that log their progress every 10 seconds and that the next
-// start continues when this one is stopped. It never shrinks an image, and
-// it keeps a larger one with a line that says so. An image below 64 MiB was
-// not made by vm-launch and fails the launch. The volume path and the image
+// fallocate on JuiceFS, which only raises the length there, or by truncate
+// where the volume has no fallocate, and on NFS by fallocate or, where the
+// volume has none, by zero writes that log their progress every 10 seconds
+// and that the next start continues when this one is stopped. It never
+// shrinks an image, and it keeps a larger one with a line that says so. An
+// image below 64 MiB was not made by vm-launch and fails the launch. The
+// volume path and the image
 // are resolved without following
 // symbolic links, the volume path must be a mount point, and the image must
 // be a regular file owned by the app's uid, with one link and mode 0600.
