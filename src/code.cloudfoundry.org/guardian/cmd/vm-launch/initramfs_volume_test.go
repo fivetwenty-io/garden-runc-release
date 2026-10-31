@@ -3,6 +3,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -15,6 +17,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"golang.org/x/sys/unix"
 )
 
 // The /rvm/init script, stage 2 of the guest's boot, of a guest without a
@@ -1585,5 +1588,282 @@ exit 0`)
 		Expect(os.RemoveAll(filepath.Join(dir, "disk"))).To(Succeed())
 		Expect(os.WriteFile(filepath.Join(dir, "disk"), nil, 0o600)).To(Succeed())
 		failed(run(shell, bothDisks), "creating the guest root mount points failed", mke2fs)
+	})
+})
+
+// goldenMke2fsConfSHA256 is the sha256 of the pinned mke2fs.conf. Changing
+// the file changes the features and the inode layout of every new image, so
+// a change has to change this digest on purpose.
+const goldenMke2fsConfSHA256 = "14c13f4289408325fed71bb93daecea347debae7fab0fd062288c9bd4867cd7e"
+
+// openFDCount returns the number of descriptors this process holds.
+func openFDCount() int {
+	entries, err := os.ReadDir("/proc/self/fd")
+	Expect(err).NotTo(HaveOccurred())
+	return len(entries)
+}
+
+var _ = Describe("the guest filesystem tools", func() {
+	// toolsDir returns an artifacts directory that holds the four tools,
+	// each with bytes of its own, and returns the bytes by name.
+	toolsDir := func() (string, map[string]string) {
+		dir := GinkgoT().TempDir()
+		want := map[string]string{}
+		for _, name := range guestToolNames {
+			want[name] = "static " + name + strings.Repeat("\x00\xff", 40)
+			Expect(os.WriteFile(filepath.Join(dir, name), []byte(want[name]), 0o755)).To(Succeed())
+		}
+		return dir, want
+	}
+
+	volumeGuest := func() guestContents {
+		g := taskGuest("true")
+		g.vols = []guestVolume{{ContainerDir: "/data", ImageName: "rvm-disk-3.img"}}
+		g.drives.volumes = qemuImageDrives(defaultImageSize)
+		return g
+	}
+
+	archive := func(g guestContents) (names []string, byName map[string]cpioEntry) {
+		bb := filepath.Join(GinkgoT().TempDir(), "busybox")
+		Expect(os.WriteFile(bb, []byte("busybox"), 0o755)).To(Succeed())
+		f, err := newInitramfs(bb, g)
+		Expect(err).NotTo(HaveOccurred())
+		defer f.Close()
+		return archiveEntries(fileBytes(f))
+	}
+
+	It("names the tools at fixed guest paths below /rvm/tools, away from the applets that stage 1 installs in /bin", func() {
+		Expect([]string{guestMke2fs, guestE2fsck, guestTune2fs, guestExt4grow, guestMke2fsConfig}).To(Equal([]string{
+			"/rvm/tools/mke2fs", "/rvm/tools/e2fsck", "/rvm/tools/tune2fs", "/rvm/tools/ext4grow", "/rvm/tools/mke2fs.conf"}))
+		Expect(guestToolNames).To(Equal([]string{"mke2fs", "e2fsck", "tune2fs", "ext4grow"}))
+		for _, p := range []string{guestMke2fs, guestE2fsck, guestTune2fs, guestExt4grow, guestMke2fsConfig} {
+			Expect(p).NotTo(HavePrefix("/bin/"))
+		}
+	})
+
+	It("pins the mke2fs.conf the guest's mke2fs reads", func() {
+		sum := sha256.Sum256([]byte(guestMke2fsConfText))
+		Expect(hex.EncodeToString(sum[:])).To(Equal(goldenMke2fsConfSHA256))
+		Expect(guestMke2fsConfText).To(HaveSuffix("\n"))
+		Expect(guestMke2fsConfText).To(ContainSubstring("base_features = sparse_super,large_file,filetype,resize_inode,dir_index,ext_attr\n"))
+		Expect(guestMke2fsConfText).To(MatchRegexp(`ext4 = \{\n\t\tfeatures = has_journal,extent,[a-z_,]*64bit[a-z_,]*\n\t\}`))
+	})
+
+	It("puts the four tools and mke2fs.conf in the initramfs of a guest with a volume, with the modes the guest runs them with", func() {
+		dir, want := toolsDir()
+		tools, err := openGuestTools(dir)
+		Expect(err).NotTo(HaveOccurred())
+		defer tools.Close()
+		g := volumeGuest()
+		g.tools = tools
+
+		names, byName := archive(g)
+		Expect(byName).To(HaveKey("rvm/tools"))
+		Expect(byName["rvm/tools"].mode).To(Equal(uint32(0o040755)))
+		for _, name := range guestToolNames {
+			e, ok := byName["rvm/tools/"+name]
+			Expect(ok).To(BeTrue(), name)
+			Expect(e.mode).To(Equal(uint32(0o100755)), name)
+			Expect(string(e.data)).To(Equal(want[name]), name)
+		}
+		conf := byName["rvm/tools/mke2fs.conf"]
+		Expect(conf.mode).To(Equal(uint32(0o100644)))
+		Expect(string(conf.data)).To(Equal(guestMke2fsConfText))
+		Expect(slices.Index(names, "rvm/tools")).To(BeNumerically("<", slices.Index(names, "rvm/tools/mke2fs")), "a directory comes before what it holds")
+		Expect(byName).To(HaveKey("rvm/mounts"))
+	})
+
+	It("adds nothing to a guest without the tools, so it boots exactly as before", func() {
+		dir, _ := toolsDir()
+		tools, err := openGuestTools(dir)
+		Expect(err).NotTo(HaveOccurred())
+		defer tools.Close()
+
+		without := taskGuest("true")
+		names, byName := archive(without)
+		for _, n := range names {
+			Expect(n).NotTo(HavePrefix("rvm/tools"))
+		}
+		Expect(string(byName["rvm/init"].data)).To(Equal(goldenInitNet))
+
+		with := without
+		with.tools = tools
+		moreNames, moreByName := archive(with)
+		var added []string
+		for _, n := range moreNames {
+			if !slices.Contains(names, n) {
+				added = append(added, n)
+				continue
+			}
+			Expect(moreByName[n]).To(Equal(byName[n]), n)
+		}
+		Expect(added).To(Equal([]string{"rvm/tools", "rvm/tools/mke2fs", "rvm/tools/e2fsck", "rvm/tools/tune2fs", "rvm/tools/ext4grow", "rvm/tools/mke2fs.conf"}))
+		Expect(moreNames).To(HaveLen(len(names) + len(added)))
+	})
+
+	It("writes the bytes of the file it checked, not those of a file put in its place afterwards", func() {
+		dir, want := toolsDir()
+		tools, err := openGuestTools(dir)
+		Expect(err).NotTo(HaveOccurred())
+		defer tools.Close()
+		for _, name := range guestToolNames {
+			swap := filepath.Join(dir, name+".new")
+			Expect(os.WriteFile(swap, []byte("swapped "+name), 0o755)).To(Succeed())
+			Expect(os.Rename(swap, filepath.Join(dir, name))).To(Succeed())
+		}
+		g := volumeGuest()
+		g.tools = tools
+		_, byName := archive(g)
+		for _, name := range guestToolNames {
+			Expect(string(byName["rvm/tools/"+name].data)).To(Equal(want[name]), name)
+		}
+		// A second archive from the same tools has the same bytes.
+		_, again := archive(g)
+		Expect(string(again["rvm/tools/ext4grow"].data)).To(Equal(want["ext4grow"]))
+	})
+
+	DescribeTable("needs the tools for any volume that is not a share",
+		func(volumes, shares int, want bool) { Expect(needsGuestTools(volumes, shares)).To(Equal(want)) },
+		Entry("no volume", 0, 0, false),
+		Entry("one volume", 1, 0, true),
+		Entry("four volumes", 4, 0, true),
+		Entry("one share", 1, 1, false),
+		Entry("a share and an image", 2, 1, true),
+	)
+
+	Describe("openGuestTools", func() {
+		hint := "the cell needs the guest e2fsprogs artifact"
+
+		DescribeTable("refuses a tool that is missing, naming it and what the cell needs",
+			func(missing string) {
+				dir, _ := toolsDir()
+				Expect(os.Remove(filepath.Join(dir, missing))).To(Succeed())
+				before := openFDCount()
+				tools, err := openGuestTools(dir)
+				Expect(tools).To(BeNil())
+				Expect(err).To(MatchError(ContainSubstring("guest tool " + missing + " is missing")))
+				Expect(err).To(MatchError(ContainSubstring(hint)))
+				Expect(err).To(MatchError(ContainSubstring(filepath.Join(dir, missing))))
+				Expect(openFDCount()).To(Equal(before), "a refusal closes the tools it had opened")
+			},
+			Entry("mke2fs", "mke2fs"),
+			Entry("e2fsck", "e2fsck"),
+			Entry("tune2fs", "tune2fs"),
+			Entry("ext4grow", "ext4grow"),
+		)
+
+		It("refuses a directory with none of them", func() {
+			_, err := openGuestTools(GinkgoT().TempDir())
+			Expect(err).To(MatchError(ContainSubstring("guest tool mke2fs is missing")))
+			Expect(err).To(MatchError(ContainSubstring(hint)))
+		})
+
+		It("refuses an artifacts directory that does not exist", func() {
+			_, err := openGuestTools(filepath.Join(GinkgoT().TempDir(), "nope"))
+			Expect(err).To(MatchError(ContainSubstring("the artifacts directory")))
+			Expect(err).To(MatchError(ContainSubstring(hint)))
+		})
+
+		DescribeTable("refuses a tool that is not a regular executable file",
+			func(name string, prepare func(path string), reason string) {
+				dir, _ := toolsDir()
+				path := filepath.Join(dir, name)
+				Expect(os.Remove(path)).To(Succeed())
+				prepare(path)
+				before := openFDCount()
+				tools, err := openGuestTools(dir)
+				Expect(tools).To(BeNil())
+				Expect(err).To(MatchError(ContainSubstring("guest tool " + name + " at " + path + " " + reason)))
+				Expect(err).To(MatchError(ContainSubstring(hint)))
+				Expect(openFDCount()).To(Equal(before))
+			},
+			Entry("a directory", "e2fsck", func(p string) { Expect(os.Mkdir(p, 0o755)).To(Succeed()) }, "is not a regular file"),
+			Entry("a FIFO, which must not hang the launch", "tune2fs", func(p string) { Expect(unix.Mkfifo(p, 0o755)).To(Succeed()) }, "is not a regular file"),
+			Entry("a file without an execute bit", "mke2fs", func(p string) { Expect(os.WriteFile(p, []byte("x"), 0o644)).To(Succeed()) }, "is not executable"),
+			Entry("a file that only another class may execute", "ext4grow", func(p string) { Expect(os.WriteFile(p, []byte("x"), 0o640)).To(Succeed()) }, "is not executable"),
+			Entry("an empty file", "ext4grow", func(p string) { Expect(os.WriteFile(p, nil, 0o755)).To(Succeed()) }, "is empty"),
+		)
+
+		It("accepts a tool that is a symbolic link to a file inside the artifacts directory", func() {
+			dir, want := toolsDir()
+			Expect(os.Mkdir(filepath.Join(dir, "versions"), 0o755)).To(Succeed())
+			Expect(os.Rename(filepath.Join(dir, "mke2fs"), filepath.Join(dir, "versions", "mke2fs-1.47.4"))).To(Succeed())
+			Expect(os.Symlink("versions/mke2fs-1.47.4", filepath.Join(dir, "mke2fs"))).To(Succeed())
+			// An artifacts directory reached through a link is the same directory.
+			via := filepath.Join(GinkgoT().TempDir(), "art")
+			Expect(os.Symlink(dir, via)).To(Succeed())
+
+			for _, root := range []string{dir, via} {
+				tools, err := openGuestTools(root)
+				Expect(err).NotTo(HaveOccurred(), root)
+				g := volumeGuest()
+				g.tools = tools
+				_, byName := archive(g)
+				tools.Close()
+				Expect(string(byName["rvm/tools/mke2fs"].data)).To(Equal(want["mke2fs"]), root)
+			}
+		})
+
+		DescribeTable("refuses a symbolic link that leaves the artifacts directory",
+			func(target func(dir, outside string) string) {
+				dir, _ := toolsDir()
+				outside := GinkgoT().TempDir()
+				Expect(os.WriteFile(filepath.Join(outside, "mke2fs"), []byte("elsewhere"), 0o755)).To(Succeed())
+				Expect(os.Remove(filepath.Join(dir, "tune2fs"))).To(Succeed())
+				Expect(os.Symlink(target(dir, outside), filepath.Join(dir, "tune2fs"))).To(Succeed())
+				before := openFDCount()
+				tools, err := openGuestTools(dir)
+				Expect(tools).To(BeNil())
+				Expect(err).To(MatchError(ContainSubstring("guest tool tune2fs at " + filepath.Join(dir, "tune2fs") + " resolves to ")))
+				Expect(err).To(MatchError(ContainSubstring("not a file inside the artifacts directory")))
+				Expect(err).To(MatchError(ContainSubstring(hint)))
+				Expect(openFDCount()).To(Equal(before))
+			},
+			Entry("an absolute path", func(_, outside string) string { return filepath.Join(outside, "mke2fs") }),
+			Entry("a relative path up out of the directory", func(dir, outside string) string {
+				rel, err := filepath.Rel(dir, filepath.Join(outside, "mke2fs"))
+				Expect(err).NotTo(HaveOccurred())
+				return rel
+			}),
+		)
+
+		It("refuses a link that leads out through another link, and a link to the artifacts directory itself", func() {
+			dir, _ := toolsDir()
+			outside := GinkgoT().TempDir()
+			Expect(os.WriteFile(filepath.Join(outside, "real"), []byte("elsewhere"), 0o755)).To(Succeed())
+			Expect(os.Symlink(filepath.Join(outside, "real"), filepath.Join(dir, "hop"))).To(Succeed())
+			Expect(os.Remove(filepath.Join(dir, "e2fsck"))).To(Succeed())
+			Expect(os.Symlink("hop", filepath.Join(dir, "e2fsck"))).To(Succeed())
+			_, err := openGuestTools(dir)
+			Expect(err).To(MatchError(ContainSubstring("guest tool e2fsck")))
+			Expect(err).To(MatchError(ContainSubstring("not a file inside the artifacts directory")))
+
+			Expect(os.Remove(filepath.Join(dir, "e2fsck"))).To(Succeed())
+			Expect(os.Symlink(".", filepath.Join(dir, "e2fsck"))).To(Succeed())
+			_, err = openGuestTools(dir)
+			Expect(err).To(MatchError(ContainSubstring("guest tool e2fsck")))
+		})
+
+		It("refuses a dangling symbolic link as missing", func() {
+			dir, _ := toolsDir()
+			Expect(os.Remove(filepath.Join(dir, "ext4grow"))).To(Succeed())
+			Expect(os.Symlink("gone", filepath.Join(dir, "ext4grow"))).To(Succeed())
+			_, err := openGuestTools(dir)
+			Expect(err).To(MatchError(ContainSubstring("guest tool ext4grow is missing")))
+			Expect(err).To(MatchError(ContainSubstring(hint)))
+		})
+
+		It("closes its tools once, and tolerates nil", func() {
+			dir, _ := toolsDir()
+			before := openFDCount()
+			tools, err := openGuestTools(dir)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(openFDCount()).To(Equal(before + len(guestToolNames)))
+			tools.Close()
+			tools.Close()
+			Expect(openFDCount()).To(Equal(before))
+			var none *guestTools
+			none.Close()
+		})
 	})
 })

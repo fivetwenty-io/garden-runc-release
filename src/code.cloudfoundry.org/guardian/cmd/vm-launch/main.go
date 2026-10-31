@@ -250,6 +250,14 @@
 // it starts the command, and vm-launch exits 123 with the console output,
 // which ends with the step that failed.
 //
+// A guest with an image or block volume also gets the guest filesystem tools
+// mke2fs, e2fsck, tune2fs, and ext4grow, and a pinned mke2fs.conf, below
+// /rvm/tools in its initramfs. vm-launch reads the four tools from the
+// artifacts directory beside busybox, and it exits 125 before it prepares
+// any volume when one is missing, is not a regular executable file, or is a
+// symbolic link that leaves the artifacts directory. A guest without such a
+// volume gets none of them.
+//
 // The initramfs that holds the guest's /init, busybox, command, and
 // environment is built in a sealed memfd and never written to disk. The
 // hypervisor gets it as the file descriptor after the volume images', 3
@@ -284,8 +292,9 @@
 //	125    vm-launch could not start the guest: core dumps it could not
 //	       disable, a dumpable flag it could not clear, an open files
 //	       limit it could not read, bad arguments, a guest command over
-//	       131071 bytes, a missing artifact, a work
-//	       file, initramfs, guest root image, or QMP socket it could not
+//	       131071 bytes, a missing artifact, a guest filesystem tool that
+//	       a guest with an image or block volume needs and the cell lacks,
+//	       a work file, initramfs, guest root image, or QMP socket it could not
 //	       create, a disk quota too small for the guest root image or
 //	       that it could not read, a
 //	       hypervisor it could not run, PORT already in use in the
@@ -553,16 +562,25 @@ func run(argv []string, logger *log.Logger) int {
 	// A share is granted or refused here, with the providers known and
 	// still before CredHub, the ports, and the work directory. A grant is
 	// not served yet, so it ends the launch too (see refuseUnservedShares).
+	var shares []shareGrant
 	if err == nil {
-		var shares []shareGrant
 		if shares, err = grantShares(cfg.backend, cfg.allowVolumeShares, selected); err == nil {
 			err = refuseUnservedShares(shares)
 		}
+	}
+	// A guest with an image or block volume formats, checks, and grows it
+	// with the guest filesystem tools, so a cell without them refuses the
+	// launch here, before anything is prepared. The tools stay open until
+	// the initramfs is written. A guest without such a volume gets none.
+	var tools *guestTools
+	if err == nil && needsGuestTools(len(selected), len(shares)) {
+		tools, err = openGuestTools(cfg.artifacts)
 	}
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError
 	}
+	defer tools.Close()
 	memMiB := guestMemory(lookupEnv, logger)
 	// The launcher derives DATABASE_URL from the resolved VCAP_SERVICES, so
 	// the references are resolved before buildGuestEnv.
@@ -711,7 +729,11 @@ func run(argv []string, logger *log.Logger) int {
 		nofile:         nofile,
 		rootBytes:      rootSize,
 		rootInodeRatio: rootInodeRatio,
+		tools:          tools,
 	})
+	// The archive holds the tools' bytes now, so the files close here. The
+	// deferred call covers the returns before this point.
+	tools.Close()
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError

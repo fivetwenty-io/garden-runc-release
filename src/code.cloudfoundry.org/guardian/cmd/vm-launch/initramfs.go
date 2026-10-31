@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -1015,6 +1017,198 @@ type guestContents struct {
 	// per inode of its filesystem, or 0 without one; both go in /rvm/disks.
 	rootBytes      int64
 	rootInodeRatio int64
+	// tools are the guest filesystem tools (see openGuestTools), which stage
+	// 2 needs for an image or block volume, or nil for a guest that has
+	// neither. The caller closes them after the initramfs is written.
+	tools *guestTools
+}
+
+// The guest filesystem tools. A guest with an image or block volume gets
+// four static binaries and a pinned mke2fs.conf, all below guestToolsDir.
+// They are not in /bin, where stage 1 installs busybox's applets and
+// formats the guest root with busybox's own mke2fs, so a stage that wants
+// the e2fsprogs tools names them by these paths.
+const (
+	guestToolsDir     = "/rvm/tools"
+	guestMke2fs       = guestToolsDir + "/mke2fs"
+	guestE2fsck       = guestToolsDir + "/e2fsck"
+	guestTune2fs      = guestToolsDir + "/tune2fs"
+	guestExt4grow     = guestToolsDir + "/ext4grow"
+	guestMke2fsConfig = guestToolsDir + "/mke2fs.conf"
+)
+
+// guestToolNames are the tools' file names, which are the same in the
+// artifacts directory, where the cell's runtime config installs them side by
+// side with busybox, and below guestToolsDir in the guest.
+var guestToolNames = []string{"mke2fs", "e2fsck", "tune2fs", "ext4grow"}
+
+// guestMke2fsConfText is the mke2fs.conf the guest's mke2fs reads through
+// MKE2FS_CONFIG. It is the profile that the e2fsprogs 1.47.4 build of the
+// guest tools carries inside mke2fs, written out here so that the filesystem
+// features of a new image are the ones we measured and do not move with the
+// tools. An ext4 image gets a journal, extents, flex_bg, 64bit,
+// resize_inode, which reserves the descriptor room that online growth uses,
+// and metadata checksums.
+const guestMke2fsConfText = `[defaults]
+	base_features = sparse_super,large_file,filetype,resize_inode,dir_index,ext_attr
+	default_mntopts = acl,user_xattr
+	enable_periodic_fsck = 0
+	blocksize = 4096
+	inode_size = 256
+	inode_ratio = 16384
+
+[fs_types]
+	ext3 = {
+		features = has_journal
+	}
+	ext4 = {
+		features = has_journal,extent,huge_file,flex_bg,metadata_csum,metadata_csum_seed,64bit,dir_nlink,extra_isize,orphan_file
+	}
+	small = {
+		blocksize = 1024
+		inode_ratio = 4096
+	}
+	floppy = {
+		blocksize = 1024
+		inode_ratio = 8192
+	}
+	big = {
+		inode_ratio = 32768
+	}
+	huge = {
+		inode_ratio = 65536
+	}
+	news = {
+		inode_ratio = 4096
+	}
+	largefile = {
+		inode_ratio = 1048576
+		blocksize = -1
+	}
+	largefile4 = {
+		inode_ratio = 4194304
+		blocksize = -1
+	}
+	hurd = {
+		blocksize = 4096
+		inode_size = 128
+		warn_y2038_dates = 0
+	}
+`
+
+// noGuestToolsHint ends every refusal about a guest tool, so that the line
+// tells an operator what the cell lacks.
+const noGuestToolsHint = "; the cell needs the guest e2fsprogs artifact (mke2fs, e2fsck, tune2fs, and ext4grow in the artifacts directory) for a guest with an image or block volume"
+
+// guestTool is one tool, opened and checked.
+type guestTool struct {
+	name string
+	file *os.File
+	size int64
+}
+
+// guestTools are the guest filesystem tools of one launch, each held open
+// from the moment openGuestTools checked it, so that the bytes that go into
+// the initramfs are those of the file that passed the check.
+type guestTools struct {
+	tools []guestTool
+}
+
+// needsGuestTools reports whether a guest with volumes volumes, of which
+// shares are served as shares, has an image or block volume. Only an image
+// or a block volume is formatted, checked, or grown by the guest.
+func needsGuestTools(volumes, shares int) bool { return volumes > shares }
+
+// openGuestTools opens each of guestToolNames in the artifacts directory
+// root. A tool must be a regular, executable, non-empty file that is
+// root's own or reached through symbolic links that stay inside root. A
+// link out of root is refused, because in the container the artifacts
+// directory is the only part of the cell's disk that is there, and a link
+// to anywhere else would put a file into the guest that the operator did
+// not install. The error names the first tool that fails and says that the
+// cell needs the guest e2fsprogs artifact. The caller closes the result.
+func openGuestTools(root string) (*guestTools, error) {
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return nil, fmt.Errorf("guest tool: the artifacts directory %s cannot be resolved: %w%s", root, err, noGuestToolsHint)
+	}
+	t := &guestTools{}
+	for _, name := range guestToolNames {
+		tool, err := openGuestTool(root, realRoot, name)
+		if err != nil {
+			t.Close()
+			return nil, err
+		}
+		t.tools = append(t.tools, tool)
+	}
+	return t, nil
+}
+
+// openGuestTool opens and checks the tool name in root, whose resolved path
+// is realRoot.
+func openGuestTool(root, realRoot, name string) (guestTool, error) {
+	fail := func(format string, args ...any) (guestTool, error) {
+		return guestTool{}, fmt.Errorf("guest tool %s "+format+"%s", append(append([]any{name}, args...), noGuestToolsHint)...)
+	}
+	p := filepath.Join(root, name)
+	target, err := filepath.EvalSymlinks(p)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return fail("is missing: %s does not exist", p)
+	case err != nil:
+		return fail("cannot be resolved: %v", err)
+	case !strings.HasPrefix(target, realRoot+string(filepath.Separator)):
+		return fail("at %s resolves to %s, which is not a file inside the artifacts directory", p, target)
+	}
+	// The resolved path is opened without following a link, so a link
+	// that appears after the check cannot take the open elsewhere, and
+	// without blocking, so that a FIFO in its place fails the type check
+	// instead of hanging the launch.
+	f, err := os.OpenFile(target, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return fail("cannot be opened: %v", err)
+	}
+	info, err := f.Stat()
+	switch {
+	case err != nil:
+		err = fmt.Errorf("guest tool %s cannot be examined: %w%s", name, err, noGuestToolsHint)
+	case !info.Mode().IsRegular():
+		_, err = fail("at %s is not a regular file", p)
+	case info.Mode().Perm()&0o111 == 0:
+		_, err = fail("at %s is not executable", p)
+	case info.Size() == 0:
+		_, err = fail("at %s is empty", p)
+	}
+	if err != nil {
+		f.Close()
+		return guestTool{}, err
+	}
+	return guestTool{name: name, file: f, size: info.Size()}, nil
+}
+
+// Close closes every tool. It is safe on nil and to call twice.
+func (t *guestTools) Close() {
+	if t == nil {
+		return
+	}
+	for _, tool := range t.tools {
+		tool.file.Close()
+	}
+	t.tools = nil
+}
+
+// archiveSteps returns the archive steps that add the tools directory, the
+// tools, and mke2fs.conf.
+func (t *guestTools) archiveSteps(cw *cpioWriter) []func() error {
+	steps := []func() error{func() error { return cw.Dir(strings.TrimPrefix(guestToolsDir, "/"), 0o755) }}
+	for _, tool := range t.tools {
+		steps = append(steps, func() error {
+			return cw.File(strings.TrimPrefix(guestToolsDir+"/"+tool.name, "/"), 0o755, tool.size, io.NewSectionReader(tool.file, 0, tool.size))
+		})
+	}
+	return append(steps, func() error {
+		return cw.File(strings.TrimPrefix(guestMke2fsConfig, "/"), 0o644, int64(len(guestMke2fsConfText)), strings.NewReader(guestMke2fsConfText))
+	})
 }
 
 // newInitramfs builds the guest initramfs (see writeInitramfs) in a sealed
@@ -1123,6 +1317,9 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, g 
 	}
 	if g.nw != nil && len(g.nw.ports) > 0 {
 		steps = append(steps, func() error { return cw.FIFO(strings.TrimPrefix(guestListenTick, "/"), 0o600) })
+	}
+	if g.tools != nil {
+		steps = append(steps, g.tools.archiveSteps(cw)...)
 	}
 	if len(g.vols) > 0 {
 		mounts, err := mountsFile(g)
