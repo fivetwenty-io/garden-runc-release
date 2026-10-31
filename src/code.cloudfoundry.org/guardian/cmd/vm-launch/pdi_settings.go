@@ -83,13 +83,26 @@ func (s volumeSettings) RequestedBytes() int64 {
 	return s.SizeBytes
 }
 
-// sizeUnits maps an upper-cased unit to its binary multiplier. A size is one
-// to nine decimal digits, the first not a zero, directly followed by a unit
-// in any case.
+// sizeUnits maps an ASCII upper-cased unit to its binary multiplier. A size
+// is one to nine decimal digits, the first not a zero, directly followed by a
+// unit in any case.
 var sizeUnits = map[string]int64{
 	"M": 1 << 20, "MB": 1 << 20, "MIB": 1 << 20,
 	"G": 1 << 30, "GB": 1 << 30, "GIB": 1 << 30,
 	"T": 1 << 40, "TB": 1 << 40, "TIB": 1 << 40,
+}
+
+// asciiUpper upper-cases the ASCII letters of s and leaves every other byte
+// alone. strings.ToUpper folds Unicode, so it turns the dotless i of "64Mıb"
+// into an I and accepts a spelling the unit list does not allow.
+func asciiUpper(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if c >= 'a' && c <= 'z' {
+			b[i] = c - 'a' + 'A'
+		}
+	}
+	return string(b)
 }
 
 // parseVolumeSize turns the text of a size into bytes. ok is false when text
@@ -108,7 +121,7 @@ func parseVolumeSize(text string) (n, unit int64, ok bool) {
 	if err != nil || count < 1 || count > maxSizeNumber {
 		return 0, 0, false
 	}
-	unit, found := sizeUnits[strings.ToUpper(text[i:])]
+	unit, found := sizeUnits[asciiUpper(text[i:])]
 	if !found {
 		return 0, 0, false
 	}
@@ -178,21 +191,20 @@ func parseOneVolume(dir string, value []byte) (volumeSettings, error) {
 			case isString && name == modeNameShare:
 				modeIsShare = true
 			default:
-				return volumeSettings{}, fmt.Errorf("%s %s mode %s is not private or share", volumeSettingsEnv, quoteForLog(dir), quoteForLog(settingText(m.value, name, isString)))
+				return volumeSettings{}, fmt.Errorf("%s %s mode %s is not private or share", volumeSettingsEnv, quoteForLog(dir), settingForLog(m.value, name, isString))
 			}
 		case settingSize:
 			haveSize = true
 			text, isString := jsonString(m.value)
-			shown := settingText(m.value, text, isString)
 			count, unit, ok := parseVolumeSize(text)
 			if !isString || !ok {
-				return volumeSettings{}, fmt.Errorf("%s %s size %s is not a whole number followed by M, G, or T", volumeSettingsEnv, quoteForLog(dir), quoteForLog(shown))
+				return volumeSettings{}, fmt.Errorf("%s %s size %s is not a whole number followed by M, G, or T", volumeSettingsEnv, quoteForLog(dir), settingForLog(m.value, text, isString))
 			}
 			if count > maxVolumeSize/unit {
-				return volumeSettings{}, fmt.Errorf("%s %s size %s is over the 4 EiB limit", volumeSettingsEnv, quoteForLog(dir), text)
+				return volumeSettings{}, fmt.Errorf("%s %s size %s is over the 4 EiB limit", volumeSettingsEnv, quoteForLog(dir), quoteForLog(text))
 			}
 			if count*unit < minVolumeSize {
-				return volumeSettings{}, fmt.Errorf("%s %s size %s is below the 64M minimum", volumeSettingsEnv, quoteForLog(dir), text)
+				return volumeSettings{}, fmt.Errorf("%s %s size %s is below the 64M minimum", volumeSettingsEnv, quoteForLog(dir), quoteForLog(text))
 			}
 			s.SizeBytes = count * unit
 		default:
@@ -221,13 +233,39 @@ func jsonString(value []byte) (string, bool) {
 	return s, true
 }
 
-// settingText is what an error line shows for a setting's value: the string
-// itself, or the JSON text of a value that is not a string.
-func settingText(value []byte, str string, isString bool) string {
+// settingForLog is what an error line shows for a setting's value. A string
+// is quoted, so it reads as the text the app wrote. Any other value is shown
+// as its JSON text with the insignificant whitespace removed and no added
+// quotes, so that the number 1 and the string "1" differ in the log. The text
+// is cut to maxLoggedValueLen bytes, and a byte outside printable ASCII is
+// written as \xNN, so a value cannot add a line or a control character to the
+// log.
+func settingForLog(value []byte, str string, isString bool) string {
 	if isString {
-		return str
+		return quoteForLog(str)
 	}
-	return string(bytes.TrimSpace(value))
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, value); err != nil {
+		compact.Reset()
+		compact.Write(bytes.TrimSpace(value))
+	}
+	text := compact.Bytes()
+	cut := len(text) > maxLoggedValueLen
+	if cut {
+		text = text[:maxLoggedValueLen]
+	}
+	var out strings.Builder
+	for _, c := range text {
+		if c < 0x20 || c > 0x7e {
+			fmt.Fprintf(&out, `\x%02x`, c)
+			continue
+		}
+		out.WriteByte(c)
+	}
+	if cut {
+		out.WriteString("...")
+	}
+	return out.String()
 }
 
 // member is one key and value of a JSON object, in the order written.

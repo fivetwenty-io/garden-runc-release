@@ -5,8 +5,10 @@ package main
 import (
 	"bytes"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -70,6 +72,11 @@ var _ = Describe("parseVolumeSize", func() {
 		Entry("a unit before the number", "G20"),
 		Entry("a unicode digit", "２０G"),
 		Entry("a unicode unit", "20Ｇ"),
+		Entry("a dotless i that Unicode upper-cases to I", "64M\u0131b"),
+		Entry("a dotless i in GiB", "1G\u0131b"),
+		Entry("a dotless i in TiB, in lower case", "2t\u0131b"),
+		Entry("a long s that Unicode upper-cases to S", "20\u017f"),
+		Entry("a Kelvin sign", "20\u212a"),
 		Entry("hex", "0x20G"),
 		Entry("a trailing word", "20G please"),
 	)
@@ -222,50 +229,93 @@ var _ = Describe("parseVolumeSettings", func() {
 			refused(`{"/data":{"mode":" share"}}`, `VM_VOLUMES "/data" mode " share" is not private or share`)
 			refused(`{"/data":{"mode":""}}`, `VM_VOLUMES "/data" mode "" is not private or share`)
 			refused(`{"/data":{"mode":"rw"}}`, `VM_VOLUMES "/data" mode "rw" is not private or share`)
-			refused(`{"/data":{"mode":null}}`, `VM_VOLUMES "/data" mode "null" is not private or share`)
-			refused(`{"/data":{"mode":true}}`, `VM_VOLUMES "/data" mode "true" is not private or share`)
-			refused(`{"/data":{"mode":1}}`, `VM_VOLUMES "/data" mode "1" is not private or share`)
-			refused(`{"/data":{"mode":["share"]}}`, `VM_VOLUMES "/data" mode "[\"share\"]" is not private or share`)
+			refused(`{"/data":{"mode":null}}`, `VM_VOLUMES "/data" mode null is not private or share`)
+			refused(`{"/data":{"mode":true}}`, `VM_VOLUMES "/data" mode true is not private or share`)
+			refused(`{"/data":{"mode":1}}`, `VM_VOLUMES "/data" mode 1 is not private or share`)
+			refused(`{"/data":{"mode":"1"}}`, `VM_VOLUMES "/data" mode "1" is not private or share`)
+			refused(`{"/data":{"mode":["share"]}}`, `VM_VOLUMES "/data" mode ["share"] is not private or share`)
+			refused(`{"/data":{"mode": [ "share" , 1 ] }}`, `VM_VOLUMES "/data" mode ["share",1] is not private or share`)
 		})
 
 		It("refuses a size that is not a whole number followed by M, G, or T", func() {
+			// shown is what the line holds for the size: a string in quotes,
+			// and any other value as its JSON text.
 			for _, c := range []struct{ json, shown string }{
-				{`"20 G"`, `20 G`},
-				{`""`, ``},
-				{`"20"`, `20`},
-				{`"G"`, `G`},
-				{`"1.5G"`, `1.5G`},
-				{`"-1G"`, `-1G`},
-				{`"0G"`, `0G`},
-				{`"020G"`, `020G`},
-				{`"1000000000M"`, `1000000000M`},
-				{`"10K"`, `10K`},
-				{`"1P"`, `1P`},
-				{`"20Gi"`, `20Gi`},
-				{`"20G\n"`, `20G` + "\n"},
-				{`"unlimited"`, `unlimited`},
+				{`"20 G"`, `"20 G"`},
+				{`""`, `""`},
+				{`"20"`, `"20"`},
+				{`"G"`, `"G"`},
+				{`"1.5G"`, `"1.5G"`},
+				{`"-1G"`, `"-1G"`},
+				{`"0G"`, `"0G"`},
+				{`"020G"`, `"020G"`},
+				{`"1000000000M"`, `"1000000000M"`},
+				{`"10K"`, `"10K"`},
+				{`"1P"`, `"1P"`},
+				{`"20Gi"`, `"20Gi"`},
+				{`"20G\n"`, `"20G\n"`},
+				{`"unlimited"`, `"unlimited"`},
+				{`"64M\u0131b"`, "\"64M\u0131b\""},
+				{`"1G\u0131b"`, "\"1G\u0131b\""},
+				{`"32m\u0131b"`, "\"32m\u0131b\""},
 				{`20`, `20`},
 				{`20.5`, `20.5`},
 				{`null`, `null`},
 				{`true`, `true`},
 				{`["20G"]`, `["20G"]`},
+				{"[ \"20G\" ,\n 1 ]", `["20G",1]`},
 				{`{"a":1}`, `{"a":1}`},
+				{`{ "a" : "b\u00e9" }`, `{"a":"b\u00e9"}`},
 			} {
-				want := `VM_VOLUMES "/data" size ` + quoteForLog(c.shown) + ` is not a whole number followed by M, G, or T`
+				want := `VM_VOLUMES "/data" size ` + c.shown + ` is not a whole number followed by M, G, or T`
 				refused(`{"/data":{"size":`+c.json+`}}`, want)
 			}
 		})
 
+		It("shows a number and the string of the same digits differently", func() {
+			_, numberErr := parseVolumeSettings(`{"/data":{"size":1}}`, dirs)
+			_, stringErr := parseVolumeSettings(`{"/data":{"size":"1"}}`, dirs)
+			Expect(numberErr).To(MatchError(`VM_VOLUMES "/data" size 1 is not a whole number followed by M, G, or T`))
+			Expect(stringErr).To(MatchError(`VM_VOLUMES "/data" size "1" is not a whole number followed by M, G, or T`))
+			_, numberErr = parseVolumeSettings(`{"/data":{"mode":1}}`, dirs)
+			_, stringErr = parseVolumeSettings(`{"/data":{"mode":"1"}}`, dirs)
+			Expect(numberErr).To(MatchError(`VM_VOLUMES "/data" mode 1 is not private or share`))
+			Expect(stringErr).To(MatchError(`VM_VOLUMES "/data" mode "1" is not private or share`))
+		})
+
+		It("keeps a value that is not a string to one line, bounded, in printable ASCII", func() {
+			long := strings.Repeat("a", 500)
+			for _, setting := range []string{"mode", "size"} {
+				_, err := parseVolumeSettings(`{"/data":{"`+setting+`":["`+long+`"]}}`, dirs)
+				Expect(err).To(HaveOccurred(), setting)
+				Expect(len(err.Error())).To(BeNumerically("<", 250), setting)
+				Expect(err.Error()).To(ContainSubstring(`...`), setting)
+				Expect(err.Error()).NotTo(ContainSubstring("\n"), setting)
+			}
+			_, err := parseVolumeSettings("{\"/data\":{\"size\":[\"\xff\u00e9\\u0001\"]}}", dirs)
+			Expect(err).To(MatchError(`VM_VOLUMES "/data" size ["\xff\xc3\xa9\u0001"] is not a whole number followed by M, G, or T`))
+		})
+
+		It("accepts only ASCII letters in the unit, and quotes the size in every line that shows it", func() {
+			refused(`{"/data":{"size":"64M\u0131b"}}`, "VM_VOLUMES \"/data\" size \"64M\u0131b\" is not a whole number followed by M, G, or T")
+			refused(`{"/data":{"size":"1G\u0131B"}}`, "VM_VOLUMES \"/data\" size \"1G\u0131B\" is not a whole number followed by M, G, or T")
+			refused(`{"/data":{"size":"32M"}}`, `VM_VOLUMES "/data" size "32M" is below the 64M minimum`)
+			refused(`{"/data":{"size":"4194305TIB"}}`, `VM_VOLUMES "/data" size "4194305TIB" is over the 4 EiB limit`)
+			got, err := parseVolumeSettings(`{"/data":{"size":"64mIb"}}`, dirs)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(got["/data"].SizeBytes).To(Equal(int64(64 << 20)))
+		})
+
 		It("refuses a size below the 64M minimum, in the writer's own spelling", func() {
-			refused(`{"/data":{"size":"32M"}}`, `VM_VOLUMES "/data" size 32M is below the 64M minimum`)
-			refused(`{"/data":{"size":"1MiB"}}`, `VM_VOLUMES "/data" size 1MiB is below the 64M minimum`)
-			refused(`{"/data":{"size":"63mb"}}`, `VM_VOLUMES "/data" size 63mb is below the 64M minimum`)
+			refused(`{"/data":{"size":"32M"}}`, `VM_VOLUMES "/data" size "32M" is below the 64M minimum`)
+			refused(`{"/data":{"size":"1MiB"}}`, `VM_VOLUMES "/data" size "1MiB" is below the 64M minimum`)
+			refused(`{"/data":{"size":"63mb"}}`, `VM_VOLUMES "/data" size "63mb" is below the 64M minimum`)
 			refused(`{"/data":{"size":"1"}}`, `VM_VOLUMES "/data" size "1" is not a whole number followed by M, G, or T`)
 		})
 
 		It("refuses a size over the 2^62-byte limit", func() {
-			refused(`{"/data":{"size":"4194305TiB"}}`, `VM_VOLUMES "/data" size 4194305TiB is over the 4 EiB limit`)
-			refused(`{"/data":{"size":"999999999T"}}`, `VM_VOLUMES "/data" size 999999999T is over the 4 EiB limit`)
+			refused(`{"/data":{"size":"4194305TiB"}}`, `VM_VOLUMES "/data" size "4194305TiB" is over the 4 EiB limit`)
+			refused(`{"/data":{"size":"999999999T"}}`, `VM_VOLUMES "/data" size "999999999T" is over the 4 EiB limit`)
 			refused(`{"/data":{"size":"4294967297G"}}`, `VM_VOLUMES "/data" size "4294967297G" is not a whole number followed by M, G, or T`)
 		})
 
@@ -278,14 +328,14 @@ var _ = Describe("parseVolumeSettings", func() {
 
 		It("reports a bad setting before the size-on-a-share conflict", func() {
 			refused(`{"/shared":{"mode":"share","size":"20 G"}}`, `VM_VOLUMES "/shared" size "20 G" is not a whole number followed by M, G, or T`)
-			refused(`{"/shared":{"mode":"share","size":"1M"}}`, `VM_VOLUMES "/shared" size 1M is below the 64M minimum`)
+			refused(`{"/shared":{"mode":"share","size":"1M"}}`, `VM_VOLUMES "/shared" size "1M" is below the 64M minimum`)
 			refused(`{"/shared":{"mode":"share","size":"2G","extra":1}}`, `VM_VOLUMES "/shared" has an unknown setting "extra"; the settings are mode and size`)
 		})
 
 		It("reports the first bad entry in the order written", func() {
 			refused(`{"/x":{"size":"1M"},"/data":{"sizes":"1G"}}`, `VM_VOLUMES names "/x", which no volume binding of this app mounts`)
 			refused(`{"/shared":{"mode":"bad"},"/data":{"size":"1M"}}`, `VM_VOLUMES "/shared" mode "bad" is not private or share`)
-			refused(`{"/data":{"size":"1M"},"/shared":{"mode":"bad"}}`, `VM_VOLUMES "/data" size 1M is below the 64M minimum`)
+			refused(`{"/data":{"size":"1M"},"/shared":{"mode":"bad"}}`, `VM_VOLUMES "/data" size "1M" is below the 64M minimum`)
 		})
 
 		It("bounds the text of a long rejected value", func() {
@@ -410,17 +460,43 @@ var _ = Describe("run with VM_VOLUMES", func() {
 		for _, c := range []struct{ value, line string }{
 			{`not json`, `VM_VOLUMES is not a JSON object of volume paths`},
 			{`[]`, `VM_VOLUMES is not a JSON object of volume paths`},
+			{`{"` + volDir + `":5}`, `VM_VOLUMES is not a JSON object of volume paths`},
 			{`{"/data":5}`, `VM_VOLUMES names "/data", which no volume binding of this app mounts`},
 			{`{"/x":{}}`, `VM_VOLUMES names "/x", which no volume binding of this app mounts`},
 			{`{"` + volDir + `":{},"` + volDir + `":{}}`, `VM_VOLUMES names ` + quoteForLog(volDir) + ` more than once`},
 			{`{"` + volDir + `":{"sizes":"1G"}}`, `VM_VOLUMES ` + quoteForLog(volDir) + ` has an unknown setting "sizes"; the settings are mode and size`},
 			{`{"` + volDir + `":{"mode":"shared"}}`, `VM_VOLUMES ` + quoteForLog(volDir) + ` mode "shared" is not private or share`},
 			{`{"` + volDir + `":{"size":"20 G"}}`, `VM_VOLUMES ` + quoteForLog(volDir) + ` size "20 G" is not a whole number followed by M, G, or T`},
-			{`{"` + volDir + `":{"size":"32M"}}`, `VM_VOLUMES ` + quoteForLog(volDir) + ` size 32M is below the 64M minimum`},
+			{`{"` + volDir + `":{"size":"32M"}}`, `VM_VOLUMES ` + quoteForLog(volDir) + ` size "32M" is below the 64M minimum`},
 			{`{"` + volDir + `":{"mode":"share","size":"1G"}}`, `VM_VOLUMES ` + quoteForLog(volDir) + ` sets a size, but a share has no image; its space is the volume's own quota`},
 			{`{"` + volDir + `":{"mode":"share"}}`, `VM_VOLUMES ` + quoteForLog(volDir) + ` mode "share" is not supported by this vm-launch yet; shares need a later release`},
 		} {
 			refusedBeforeAnything(c.value, c.line)
+		}
+	})
+
+	It("exits 125 before it reserves PORT, which another listener holds", func() {
+		held, err := net.Listen("tcp", "0.0.0.0:0")
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(held.Close)
+		port := held.Addr().(*net.TCPAddr).Port
+		GinkgoT().Setenv("PORT", strconv.Itoa(port))
+
+		// The same start without a VM_VOLUMES refusal does reserve PORT and
+		// stops on the held one, so a refusal that logs none of it came first.
+		GinkgoT().Setenv("VM_VOLUMES", `{}`)
+		writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+		Expect(runVM()).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(ContainSubstring("reserving port " + strconv.Itoa(port)))
+
+		for _, c := range []struct{ value, line string }{
+			{`not json`, `VM_VOLUMES is not a JSON object of volume paths`},
+			{`{"/x":{}}`, `VM_VOLUMES names "/x", which no volume binding of this app mounts`},
+			{`{"` + volDir + `":{"size":"32M"}}`, `VM_VOLUMES ` + quoteForLog(volDir) + ` size "32M" is below the 64M minimum`},
+			{`{"` + volDir + `":{"mode":"share"}}`, `VM_VOLUMES ` + quoteForLog(volDir) + ` mode "share" is not supported by this vm-launch yet; shares need a later release`},
+		} {
+			refusedBeforeAnything(c.value, c.line)
+			Expect(logBuf.String()).NotTo(ContainSubstring("reserving port"), c.value)
 		}
 	})
 
