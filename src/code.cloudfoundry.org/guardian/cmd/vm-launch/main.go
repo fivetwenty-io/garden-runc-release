@@ -85,8 +85,10 @@
 // PROCESSTYPE is its process_type, 1 to 63 lowercase letters, digits,
 // underscores, or hyphens, and INDEX is CF_INSTANCE_INDEX. Two apps bound to
 // one service instance, and the process types of one app, get separate
-// images. A task has neither CF_INSTANCE_INDEX nor process_type, and a task
-// that has a volume fails to start. vm-launch creates a missing image under
+// images. A task has neither CF_INSTANCE_INDEX nor process_type, so it has
+// no instance image of its own, and a task that has a private volume fails
+// to start. A task can have a volume as a share (see Shares below), which
+// needs no image. vm-launch creates a missing image under
 // a temporary name, as a sparse 64 MiB file with mode 0600, and publishes it
 // with renameat2(RENAME_NOREPLACE) once it is sized, so the image name never
 // refers to an unsized file. A launch that is killed leaves at worst a
@@ -172,20 +174,30 @@
 // volume's own directory to the guest over virtiofs, with
 // one virtiofsd for each share, run from the executable that
 // --virtiofsd-path names (on a cell,
-// /opt/garden-vm/artifacts/virtiofsd/virtiofsd-wrapper). Each virtiofsd
+// /opt/garden-vm/artifacts/virtiofsd/virtiofsd-wrapper). When that path is
+// the wrapper or the virtiofsd of the virtiofsd bundle, vm-launch runs the
+// bundle's virtiofsd through the bundle's own loader and libraries, as the
+// wrapper does, so it needs no shell from the app's rootfs. Each virtiofsd
 // runs as vm-launch's user with no capabilities, no_new_privs, and an empty
 // environment, gets a listening Unix socket in the work directory, and must
-// report that it is ready within 5 seconds, all of them together, before
-// the guest boots. Its log lines go to stderr with the share's path in
-// front. A virtiofsd that ends before the guest has reported its status
-// stops the guest, and vm-launch exits 125 with a line that names the
-// share. Once the hypervisor has exited, every virtiofsd that still runs
-// gets half a second to end and then SIGKILL. QEMU gives the guest one
-// virtiofs device for each share, with the tag rvm-vol and the share's volume
-// number, such as rvm-vol1, on guest memory that virtiofsd can map. The guest
-// mounts the share at the volume's path with mount -t virtiofs, and a share
-// that does not mount fails the boot. After the command ends, the guest
-// flushes and unmounts the share along with the other volumes. Firecracker
+// report that it is ready within 5 seconds, all of them together and with
+// vm-launch's last check of each share's mount, before the guest boots. Its
+// log lines go to stderr with the share's path in front. A virtiofsd that
+// ends before the guest has reported its status stops the guest, and
+// vm-launch exits 125 with a line that names the share, unless the
+// hypervisor exited on its own first, which keeps the hypervisor's status. A
+// virtiofsd that exits 0 as the hypervisor exits is not a failure, and a
+// hypervisor that is still exiting a second later gets one more second, and
+// one more for each 4 GiB of guest memory, before vm-launch says so. Once
+// the hypervisor has exited, every virtiofsd that still runs gets half a
+// second to end and then SIGKILL. QEMU gives the guest one virtiofs device
+// for each share, with the tag rvm-vol and the share's volume number, such as
+// rvm-vol1, on guest memory that virtiofsd can map. The guest mounts the
+// share at the volume's path with mount -t virtiofs, and a share that does
+// not mount fails the boot. After the command ends, the guest flushes and
+// unmounts the share along with the other volumes before it reports the
+// command's status. When the command exited 0 but a flush or unmount failed,
+// the guest reports 125 in its place, and vm-launch exits 125. Firecracker
 // has no virtiofs device, so a share on vm-firecracker fails the launch with
 // exit 125.
 //
@@ -325,13 +337,18 @@
 //
 // Exit status:
 //
-//	0-255  the guest command's exit status
+//	0-255  the status the guest reported: the guest command's exit status,
+//	       or 125 for a command that exited 0 when the guest then could not
+//	       flush or unmount a volume, a share included
 //	123    the hypervisor exited cleanly, but the guest never reported a status,
 //	       as when the guest cannot find, format, check, or mount a volume image
-//	       or the guest root image
+//	       or the guest root image; a volume the guest could not flush or
+//	       unmount after the command is not this, since the guest reports 125
 //	124    the hypervisor failed: it exited non-zero before the guest reported a
 //	       status, as QEMU does when it cannot open the volume image
-//	125    vm-launch could not start the guest: core dumps it could not
+//	125    the guest reported it, for a command that exited 0 and a volume,
+//	       a share included, that the guest then could not flush or unmount,
+//	       or vm-launch could not start the guest: core dumps it could not
 //	       disable, a dumpable flag it could not clear, an open files
 //	       limit it could not read, bad arguments, a guest command over
 //	       131071 bytes, a missing artifact, a guest filesystem tool that
@@ -345,15 +362,16 @@
 //	       mounts, two volume mounts on one path, two volumes that share a
 //	       directory, a read-only mount, a bad volume path,
 //	       CF_INSTANCE_INDEX, application_id, or process_type, a task with
-//	       a volume, an image that fails a check or cannot be created,
+//	       a private volume, an image that fails a check or cannot be created,
 //	       a VM_VOLUMES value that is not
 //	       a JSON object of volume paths, names a path no volume mounts, or
 //	       sets a mode or size it does not allow, or asks for a share that
 //	       the backend, the volume, or the operator does not allow, a
 //	       granted share without a usable --virtiofsd-path, a share whose
-//	       mount changed, or whose virtiofsd could not start, ended, or was
-//	       not ready within 5 seconds, a share whose virtiofsd ended before
-//	       the guest reported a status, or
+//	       mount changed or could not be checked within 5 seconds, or whose
+//	       virtiofsd could not start, ended, or was not ready within 5
+//	       seconds, a share whose virtiofsd ended before the guest reported
+//	       a status and whose kill ended the hypervisor, or
 //	       an image another instance still holds after 30 seconds, a
 //	       guest environment that is too large, with one entry over
 //	       131071 bytes or more than 1 MiB in all, or a value that holds a
@@ -436,7 +454,10 @@ const transparentProxyFlag = "transparent-proxy"
 // SIGTERM or SIGINT, which is all the time a guest command gets to stop. Diego
 // sends SIGKILL 10 seconds after its SIGTERM, and the 2 seconds left cover
 // the kernel freeing the guest's memory and vm-launch's own cleanup and exit
-// line, for every guest size vm-launch allows.
+// line, for every guest size vm-launch allows. With a share, a virtiofsd that
+// outlives a killed QEMU holds the last reference to the guest's memory, and
+// the kernel frees it in virtiofsd's exit, which vm-launch does not wait for
+// past its kill wait (see virtiofsdKillWait).
 const stopDeadline = 8 * time.Second
 
 // volumeSyncMountsFlag names the vm-launch flag with which the operator
@@ -837,6 +858,7 @@ func run(argv []string, logger *log.Logger) int {
 		return exitLaunchError
 	}
 	defer shareSrv.stop(0)
+	shareSrv.setGuestMemory(memMiB)
 	files, drivePaths, initrdPath, monitorFD, rootPath := hypervisorFiles(prepared.files(), initrd, qemuMonitor, rootImg)
 	hvArgv, err := hypervisorArgv(cfg.backend, cfg.artifacts, workDir, initrdPath, memMiB, nw, drivePaths, rootPath, monitorFD, shareSrv.sockets()...)
 	if err != nil {
@@ -928,10 +950,13 @@ func run(argv []string, logger *log.Logger) int {
 	}
 	code, reason := exitCode(res)
 	// A share that stopped being served while the guest still needed it is
-	// the cause, whatever QEMU's own end looked like. Once the guest has
-	// reported its status, it has flushed and unmounted its volumes, so the
-	// status stays the command's.
-	if shareReason := shareSrv.failureReason(); shareReason != "" && !res.markerFound {
+	// the cause when vm-launch's kill for it is what ended QEMU. A QEMU that
+	// ended on its own keeps its own status. A guest that reported its status
+	// keeps that, because it reports it only once it has flushed and
+	// unmounted its volumes. For a command that exited 0, the guest reports
+	// 125 when it could not flush or unmount a volume, a share included, and
+	// vm-launch passes that 125 on (see shareEndedGuest).
+	if shareReason := shareSrv.failureReason(); shareReason != "" && shareEndedGuest(res) {
 		code, reason = exitLaunchError, shareReason
 	}
 	if reason != "" {

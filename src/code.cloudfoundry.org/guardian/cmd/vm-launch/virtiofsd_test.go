@@ -14,6 +14,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -112,6 +114,33 @@ ready() { echo ` + shellQuote(virtiofsdReady) + ` >&2; }
 	path := filepath.Join(dir, "virtiofsd-wrapper")
 	Expect(os.WriteFile(path, []byte(script), 0o755)).To(Succeed())
 	return path, rec
+}
+
+// fakeVirtiofsdBundle lays out a virtiofsd bundle as the virtiofsd install
+// does, with the fake of fakeVirtiofsd as its virtiofsd, and returns the
+// path of its wrapper, the fake's record directory, and the file in which
+// the bundle's fake loader records its arguments. The fake loader takes
+// --library-path DIR and runs the program after it, as the real loader does.
+// The wrapper names an interpreter that does not exist, so a launch that ran
+// the wrapper would fail.
+func fakeVirtiofsdBundle(behaviour, gone string) (wrapper, rec, loaderArgv string) {
+	vfs, rec := fakeVirtiofsd(behaviour, gone)
+	dir := filepath.Dir(vfs)
+	Expect(os.Rename(vfs, filepath.Join(dir, virtiofsdBinaryName))).To(Succeed())
+	loaderArgv = filepath.Join(GinkgoT().TempDir(), "loader-argv")
+	loader := `#!/bin/sh
+printf '%s\n' "$@" >` + shellQuote(loaderArgv) + `
+[ "$1" = --library-path ] || exit 97
+shift 2
+# The real loader passes on the environment it gets, which is empty, so the
+# fake drops the variables its own shell set.
+exec env -i "$@"
+`
+	Expect(os.WriteFile(filepath.Join(dir, virtiofsdLoaderName), []byte(loader), 0o755)).To(Succeed())
+	Expect(os.Mkdir(filepath.Join(dir, virtiofsdLibDirName), 0o755)).To(Succeed())
+	wrapper = filepath.Join(dir, virtiofsdWrapperName)
+	Expect(os.WriteFile(wrapper, []byte("#!/nonexistent/sh\nexit 98\n"), 0o755)).To(Succeed())
+	return wrapper, rec, loaderArgv
 }
 
 // recordOf returns the file name of the record of the n-th fake virtiofsd,
@@ -243,19 +272,187 @@ var _ = Describe("checkVirtiofsd", func() {
 		Expect(os.Symlink(path, link)).To(Succeed())
 		Expect(checkVirtiofsd(link, grant)).To(Succeed())
 	})
+
+	It("accepts a bundle whose wrapper's shell the container lacks, because the wrapper is not run", func() {
+		wrapper, _, _ := fakeVirtiofsdBundle(vfsHang, "")
+		Expect(checkVirtiofsd(wrapper, grant)).To(Succeed())
+		Expect(checkVirtiofsd(filepath.Join(filepath.Dir(wrapper), virtiofsdBinaryName), grant)).To(Succeed())
+	})
+
+	It("refuses a bundle whose loader or virtiofsd cannot run, or whose library directory is missing", func() {
+		wrapper, _, _ := fakeVirtiofsdBundle(vfsHang, "")
+		dir := filepath.Dir(wrapper)
+		loader := filepath.Join(dir, virtiofsdLoaderName)
+		vfs := filepath.Join(dir, virtiofsdBinaryName)
+		lib := filepath.Join(dir, virtiofsdLibDirName)
+
+		Expect(os.Chmod(loader, 0o644)).To(Succeed())
+		Expect(checkVirtiofsd(wrapper, grant)).To(MatchError("virtiofsd for shares: the bundle at " + quoteForLog(dir) + ": " + quoteForLog(loader) + " is not executable"))
+		Expect(os.Chmod(loader, 0o755)).To(Succeed())
+
+		Expect(os.Remove(vfs)).To(Succeed())
+		Expect(checkVirtiofsd(wrapper, grant)).To(MatchError("virtiofsd for shares: the bundle at " + quoteForLog(dir) + ": stat " + vfs + ": no such file or directory"))
+		Expect(os.WriteFile(vfs, nil, 0o755)).To(Succeed())
+
+		Expect(os.Remove(lib)).To(Succeed())
+		Expect(checkVirtiofsd(wrapper, grant)).To(MatchError("virtiofsd for shares: the bundle at " + quoteForLog(dir) + ": stat " + lib + ": no such file or directory"))
+		Expect(os.WriteFile(lib, nil, 0o644)).To(Succeed())
+		Expect(checkVirtiofsd(wrapper, grant)).To(MatchError("virtiofsd for shares: the bundle at " + quoteForLog(dir) + ": " + quoteForLog(lib) + " is not a directory"))
+	})
+
+	It("refuses a script outside a bundle whose interpreter the container lacks, naming both", func() {
+		path := filepath.Join(GinkgoT().TempDir(), "my-virtiofsd")
+		Expect(os.WriteFile(path, []byte("#! /nonexistent/sh -e\nexec virtiofsd \"$@\"\n"), 0o755)).To(Succeed())
+		Expect(checkVirtiofsd(path, grant)).To(MatchError("virtiofsd for shares: " + quoteForLog(path) + ` is a script for "/nonexistent/sh", which the app's container cannot run: stat /nonexistent/sh: no such file or directory`))
+
+		Expect(os.WriteFile(path, []byte("#!\n"), 0o755)).To(Succeed())
+		Expect(checkVirtiofsd(path, grant)).To(MatchError("virtiofsd for shares: " + quoteForLog(path) + " is a script whose #! line names no interpreter"))
+
+		dir := GinkgoT().TempDir()
+		Expect(os.WriteFile(path, []byte("#!"+dir+"\n"), 0o755)).To(Succeed())
+		Expect(checkVirtiofsd(path, grant)).To(MatchError("virtiofsd for shares: " + quoteForLog(path) + " is a script for " + quoteForLog(dir) + ", which the app's container cannot run: " + quoteForLog(dir) + " is not a regular file"))
+	})
+
+	It("accepts a file outside a bundle that is not a script, or that it may run but not read", func() {
+		path := filepath.Join(GinkgoT().TempDir(), "virtiofsd")
+		Expect(os.WriteFile(path, []byte("\x7fELF"), 0o755)).To(Succeed())
+		Expect(checkVirtiofsd(path, grant)).To(Succeed())
+		Expect(os.WriteFile(path, nil, 0o755)).To(Succeed())
+		Expect(checkVirtiofsd(path, grant)).To(Succeed())
+		if os.Geteuid() != 0 {
+			Expect(os.WriteFile(path, []byte("#!/nonexistent/sh\n"), 0o711)).To(Succeed())
+			Expect(os.Chmod(path, 0o111)).To(Succeed())
+			Expect(checkVirtiofsd(path, grant)).To(Succeed())
+		}
+	})
+})
+
+var _ = Describe("virtiofsdLauncher", func() {
+	It("runs a bundle's virtiofsd through the bundle's loader, for the wrapper or for virtiofsd itself", func() {
+		wrapper, _, _ := fakeVirtiofsdBundle(vfsHang, "")
+		dir := filepath.Dir(wrapper)
+		want := []string{filepath.Join(dir, virtiofsdLoaderName), "--library-path", filepath.Join(dir, virtiofsdLibDirName), filepath.Join(dir, virtiofsdBinaryName)}
+		Expect(virtiofsdLauncher(wrapper)).To(Equal(want))
+		Expect(virtiofsdLauncher(filepath.Join(dir, virtiofsdBinaryName))).To(Equal(want))
+	})
+
+	It("runs any other path as it is", func() {
+		wrapper, _, _ := fakeVirtiofsdBundle(vfsHang, "")
+		other := filepath.Join(filepath.Dir(wrapper), "my-wrapper")
+		Expect(virtiofsdLauncher(other)).To(Equal([]string{other}))
+		lone, _ := fakeVirtiofsd(vfsHang, "")
+		Expect(virtiofsdLauncher(lone)).To(Equal([]string{lone}))
+		Expect(virtiofsdLauncher("/opt/garden-vm/artifacts/virtiofsd/virtiofsd-wrapper")).To(Equal([]string{"/opt/garden-vm/artifacts/virtiofsd/virtiofsd-wrapper"}))
+	})
+
+	It("takes the bundle from the path as given, as the wrapper takes it from its $0", func() {
+		wrapper, _, _ := fakeVirtiofsdBundle(vfsHang, "")
+		link := filepath.Join(GinkgoT().TempDir(), virtiofsdWrapperName)
+		Expect(os.Symlink(wrapper, link)).To(Succeed())
+		Expect(virtiofsdLauncher(link)).To(Equal([]string{link}))
+	})
+})
+
+var _ = Describe("a process's stat", func() {
+	It("reads the state and the flags after a command name that holds spaces and parentheses", func() {
+		st, err := parseProcStat([]byte("4242 (qemu (a) b) Z 1 4242 4242 0 -1 4194564 12 0 0 0 0 0 0 0 20 0 1 0\n"))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(st).To(Equal(procStat{State: 'Z', Flags: 4194564}))
+	})
+
+	It("refuses a stat it cannot read", func() {
+		for _, text := range []string{"", "4242 qemu S 1", "4242 (qemu) S 1 2 3", "4242 (qemu) SS 1 2 3 4 5 6", "4242 (qemu) S 1 2 3 4 5 x"} {
+			_, err := parseProcStat([]byte(text))
+			Expect(err).To(HaveOccurred(), text)
+		}
+	})
+
+	It("is exiting in its exit, as a zombie, or dead, and not otherwise", func() {
+		Expect(procStat{State: 'R', Flags: pfExiting}.exiting()).To(BeTrue())
+		Expect(procStat{State: 'D', Flags: pfExiting | 0x400000}.exiting()).To(BeTrue())
+		Expect(procStat{State: 'Z'}.exiting()).To(BeTrue())
+		Expect(procStat{State: 'X'}.exiting()).To(BeTrue())
+		Expect(procStat{State: 'S', Flags: 0x400100}.exiting()).To(BeFalse())
+		Expect(procStat{State: 'D'}.exiting()).To(BeFalse())
+	})
+
+	It("reads a live process and a zombie from /proc", func() {
+		cmd := exec.Command("sleep", "30")
+		Expect(cmd.Start()).To(Succeed())
+		DeferCleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+		st, err := readProcStat(cmd.Process.Pid)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(st.exiting()).To(BeFalse())
+		Expect(cmd.Process.Kill()).To(Succeed())
+		Eventually(func() byte { st, _ := readProcStat(cmd.Process.Pid); return st.State }, 5*time.Second).Should(Equal(byte('Z')))
+		Expect(cmd.Wait()).To(HaveOccurred())
+		_, err = readProcStat(cmd.Process.Pid)
+		Expect(processGoneErr(err)).To(BeTrue(), "%v", err)
+	})
+})
+
+var _ = Describe("hypervisorExitWait", func() {
+	It("is a second plus a second for every 4 GiB of guest memory", func() {
+		Expect(hypervisorExitWait(0)).To(Equal(time.Second))
+		Expect(hypervisorExitWait(minGuestMemoryMiB)).To(Equal(time.Second + 31250*time.Microsecond))
+		Expect(hypervisorExitWait(4096)).To(Equal(2 * time.Second))
+		Expect(hypervisorExitWait(maxGuestMemoryMiB)).To(Equal(5 * time.Second))
+		Expect(hypervisorExitWait(-1)).To(Equal(time.Second))
+	})
+})
+
+var _ = Describe("shareEndedGuest", func() {
+	ended := func(how string) *os.ProcessState {
+		cmd := exec.Command("sh", "-c", how)
+		_ = cmd.Run()
+		return cmd.ProcessState
+	}
+	killed := func(sig syscall.Signal) *os.ProcessState {
+		cmd := exec.Command("sleep", "30")
+		Expect(cmd.Start()).To(Succeed())
+		Expect(cmd.Process.Signal(sig)).To(Succeed())
+		_ = cmd.Wait()
+		return cmd.ProcessState
+	}
+
+	It("takes a QEMU that died from SIGKILL, or whose end is unknown, as ended by the share", func() {
+		Expect(shareEndedGuest(runResult{state: killed(syscall.SIGKILL)})).To(BeTrue())
+		Expect(shareEndedGuest(runResult{state: killed(syscall.SIGKILL), received: syscall.SIGTERM})).To(BeTrue())
+		Expect(shareEndedGuest(runResult{})).To(BeTrue())
+	})
+
+	It("keeps the status of a QEMU that ended on its own, and of a guest that reported one", func() {
+		Expect(shareEndedGuest(runResult{state: ended("exit 0")})).To(BeFalse())
+		Expect(shareEndedGuest(runResult{state: ended("exit 1")})).To(BeFalse())
+		Expect(shareEndedGuest(runResult{state: ended("exit 0"), received: syscall.SIGTERM})).To(BeFalse())
+		Expect(shareEndedGuest(runResult{state: killed(syscall.SIGTERM)})).To(BeFalse())
+		Expect(shareEndedGuest(runResult{state: killed(syscall.SIGKILL), markerFound: true})).To(BeFalse())
+		reported := runResult{state: killed(syscall.SIGKILL), markerFound: true, guestStatus: exitLaunchError}
+		Expect(shareEndedGuest(reported)).To(BeFalse())
+		Expect(exitCode(reported)).To(Equal(exitLaunchError))
+	})
 })
 
 var _ = Describe("virtiofsdArgv", func() {
 	It("runs virtiofsd with the flags the lab proved", func() {
 		w := "/opt/garden-vm/artifacts/virtiofsd/virtiofsd-wrapper"
-		Expect(virtiofsdArgv(w, "/home/vcap/data")).To(Equal([]string{
+		Expect(virtiofsdArgv([]string{w}, virtiofsdSeccomp, "/home/vcap/data")).To(Equal([]string{
 			w, "--fd=3", "--sandbox=none", "--seccomp=kill", "--cache=auto", "--inode-file-handles=never",
 			"--shared-dir=/home/vcap/data",
 		}))
 	})
 
+	It("puts virtiofsd's arguments after a bundle's loader command", func() {
+		launcher := []string{"/b/ld-linux-x86-64.so.2", "--library-path", "/b/lib", "/b/virtiofsd"}
+		argv := virtiofsdArgv(launcher, virtiofsdSeccomp, "/d")
+		Expect(argv).To(Equal(append(append([]string{}, launcher...),
+			"--fd=3", "--sandbox=none", "--seccomp=kill", "--cache=auto", "--inode-file-handles=never", "--shared-dir=/d")))
+		// The launcher is copied, never appended to in place.
+		Expect(launcher).To(HaveLen(4))
+	})
+
 	It("keeps a directory with an equals sign or a leading dash in one argument", func() {
-		argv := virtiofsdArgv("/v", "/-a=b c")
+		argv := virtiofsdArgv([]string{"/v"}, virtiofsdSeccomp, "/-a=b c")
 		Expect(argv[len(argv)-1]).To(Equal("--shared-dir=/-a=b c"))
 	})
 })
@@ -700,7 +897,7 @@ var _ = Describe("the virtiofsd of each share", func() {
 	It("starts virtiofsd confined, as vm-launch's user, with an empty environment and the listening socket on descriptor 3", func() {
 		s, rec := servers(vfsHang, 1)
 		Expect(s.start(nil)).To(Succeed())
-		Expect(strings.Split(strings.TrimSpace(readRecord(rec, 0, "argv")), "\n")).To(Equal(virtiofsdArgv(s.path, shares[0])[1:]))
+		Expect(strings.Split(strings.TrimSpace(readRecord(rec, 0, "argv")), "\n")).To(Equal(virtiofsdArgv(s.launcher, s.seccomp, shares[0])[1:]))
 		Expect(readRecord(rec, 0, "env")).To(BeEmpty())
 
 		status := readRecord(rec, 0, "status")
@@ -824,7 +1021,9 @@ var _ = Describe("the virtiofsd of each share", func() {
 		took := time.Since(began)
 		Expect(took).To(BeNumerically(">=", virtiofsdKillWait))
 		Expect(took).To(BeNumerically("<", virtiofsdKillWait+250*time.Millisecond))
-		Expect(strings.Count(logBuf.String(), "did not end within "+virtiofsdKillWait.String()+" of SIGKILL")).To(Equal(2))
+		// Each sleep has died from SIGKILL, and nothing reaps it, so its
+		// stat shows a process that is exiting.
+		Expect(strings.Count(logBuf.String(), "has not ended "+virtiofsdKillWait.String()+" after SIGKILL; it is still exiting, which can take this long when its exit frees a large guest's memory, and vm-launch does not wait for it")).To(Equal(2))
 	})
 
 	It("lets a virtiofsd that sees QEMU go end on its own", func() {
@@ -1020,6 +1219,235 @@ var _ = Describe("the virtiofsd of each share", func() {
 		Expect(openFDs()).To(BeNumerically("<", before))
 	})
 
+	It("starts a bundle's virtiofsd through the bundle's loader, confined, and never runs the wrapper", func() {
+		wrapper, rec, loaderArgv := fakeVirtiofsdBundle(vfsHang, gone)
+		s, err := newShareServers(wrapper, workDir, grants(1), logger)
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { s.stop(0) })
+		Expect(s.start(nil)).To(Succeed())
+		dir := filepath.Dir(wrapper)
+		args := virtiofsdArgv(nil, virtiofsdSeccomp, shares[0])
+		Expect(strings.Split(strings.TrimSpace(readRecord(rec, 0, "argv")), "\n")).To(Equal(args))
+		loaderRec, err := os.ReadFile(loaderArgv)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(strings.Split(strings.TrimSpace(string(loaderRec)), "\n")).To(Equal(append([]string{
+			"--library-path", filepath.Join(dir, virtiofsdLibDirName), filepath.Join(dir, virtiofsdBinaryName)}, args...)))
+		Expect(readRecord(rec, 0, "env")).To(BeEmpty())
+		caps := statusCaps(readRecord(rec, 0, "status"))
+		for _, set := range []string{"CapEff", "CapPrm", "CapInh", "CapAmb"} {
+			Expect(caps[set]).To(BeZero(), set)
+		}
+		Expect(readRecord(rec, 0, "status")).To(MatchRegexp(`(?m)^NoNewPrivs:\s+1$`))
+		Expect(strings.TrimSpace(readRecord(rec, 0, "fd3"))).To(MatchRegexp(`^socket:\[\d+\]$`))
+		pid := recordedPid(rec, 0)
+		s.guestEnded()
+		Expect(processGone(pid)).To(BeTrue())
+	})
+
+	Context("when the check of a share's mount does not return", func() {
+		// hangOn makes the mount check of the share at dir block until the
+		// spec ends, as a statx on a mount whose store has gone away does.
+		// The check that start gave up on then fails, and the spec waits for
+		// that before it puts the probe back, so the abandoned check reads
+		// no setting that the spec changes after it.
+		hangOn := func(dir string) chan struct{} {
+			entered, release, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			saved := dirProbe
+			DeferCleanup(func() {
+				close(release)
+				select {
+				case <-entered:
+					<-finished
+				default:
+				}
+				dirProbe = saved
+			})
+			var once sync.Once
+			dirProbe = func(fd int, name string) (mountProbe, error) {
+				if name != dir {
+					return saved(fd, name)
+				}
+				once.Do(func() { close(entered) })
+				<-release
+				defer close(finished)
+				return mountProbe{}, errors.New("released at the end of the spec")
+			}
+			return entered
+		}
+
+		It("gives up at the ready timeout with a line that names the share, and kills the virtiofsd before it", func() {
+			s, rec := servers(vfsHang, 2)
+			s.readyTimeout = 600 * time.Millisecond
+			hangOn(shares[1])
+			began := time.Now()
+			err := s.start(nil)
+			Expect(time.Since(began)).To(BeNumerically(">=", s.readyTimeout))
+			Expect(time.Since(began)).To(BeNumerically("<", s.readyTimeout+time.Second))
+			Expect(err).To(MatchError(fmt.Sprintf(`checking the mount of the share at "%s" did not finish within %v; the store behind it may not be answering`, shares[1], s.readyTimeout)))
+			Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+			Expect(processGone(recordedPid(rec, 0))).To(BeTrue())
+			Expect(filepath.Join(rec, "1")).NotTo(BeAnExistingFile())
+			for _, srv := range s.servers {
+				Expect(srv.listener).To(BeNil())
+			}
+		})
+
+		It("ends the wait at a signal and exits 128+N", func() {
+			s, rec := servers(vfsHang, 1)
+			entered := hangOn(shares[0])
+			sigs := make(chan os.Signal, 1)
+			go func() {
+				<-entered
+				sigs <- syscall.SIGTERM
+			}()
+			err := s.start(sigs)
+			Expect(err).To(MatchError(`received terminated while checking the mount of the share at "` + shares[0] + `"`))
+			Expect(stepExitCode(err)).To(Equal(143))
+			Expect(filepath.Join(rec, "0")).NotTo(BeAnExistingFile())
+			Expect(s.servers[0].listener).To(BeNil())
+		})
+	})
+
+	Context("when virtiofsd exits 0 and QEMU has not been reaped when the disconnect grace is spent", func() {
+		// fakeStat makes readProcStat answer for QEMU with stat and err once
+		// the spec has named QEMU's pid, and read every other pid's stat. It
+		// is put in place before the servers, so that their stop at the end
+		// of the spec, which waits for the action on each virtiofsd's end,
+		// comes before readProcStat is put back.
+		fakeStat := func(stat procStat, err error) *atomic.Int64 {
+			var qemu atomic.Int64
+			saved := readProcStat
+			DeferCleanup(func() { readProcStat = saved })
+			readProcStat = func(pid int) (procStat, error) {
+				if int64(pid) == qemu.Load() {
+					return stat, err
+				}
+				return saved(pid)
+			}
+			return &qemu
+		}
+		exiting := procStat{State: 'R', Flags: pfExiting}
+
+		It("waits for a QEMU that is exiting, and neither fails the share nor kills QEMU", func() {
+			qemu := fakeStat(exiting, nil)
+			s, _ := servers(vfsQuit, 1)
+			s.exitWait = 5 * time.Second
+			Expect(s.start(nil)).To(Succeed())
+			g, done, status := guest()
+			qemu.Store(int64(g.Process.Pid))
+			s.guestStarted(g.Process)
+			Eventually(s.servers[0].exited, 5*time.Second).Should(BeClosed())
+			Consistently(done, s.disconnectGrace+500*time.Millisecond).ShouldNot(BeClosed())
+			// QEMU's exit ends, and the supervisor reports the reap.
+			Expect(g.Process.Signal(syscall.SIGTERM)).To(Succeed())
+			Expect(status().Signal()).To(Equal(syscall.SIGTERM))
+			s.hypervisorReaped()
+			s.guestEnded()
+			Expect(s.servers[0].settled).To(BeClosed())
+			Expect(s.failureReason()).To(BeEmpty())
+			Expect(logBuf.String()).NotTo(ContainSubstring("still ran"))
+			Expect(logBuf.String()).NotTo(ContainSubstring("killing the hypervisor"))
+			Expect(logBuf.String()).NotTo(ContainSubstring("has still not ended"))
+		})
+
+		It("takes a QEMU whose pid is already gone as one whose reap is on its way", func() {
+			qemu := fakeStat(procStat{}, &os.PathError{Op: "open", Path: "/proc/stat", Err: syscall.ENOENT})
+			s, _ := servers(vfsQuit, 1)
+			s.exitWait = 5 * time.Second
+			Expect(s.start(nil)).To(Succeed())
+			g, done, _ := guest()
+			qemu.Store(int64(g.Process.Pid))
+			s.guestStarted(g.Process)
+			Eventually(s.servers[0].exited, 5*time.Second).Should(BeClosed())
+			Consistently(done, s.disconnectGrace+300*time.Millisecond).ShouldNot(BeClosed())
+			Expect(s.failureReason()).To(BeEmpty())
+		})
+
+		It("says once that an exiting QEMU outlasted the wait, and still neither fails the share nor kills QEMU", func() {
+			qemu := fakeStat(exiting, nil)
+			s, _ := servers(vfsQuit, 1)
+			s.exitWait = 200 * time.Millisecond
+			Expect(s.start(nil)).To(Succeed())
+			g, done, _ := guest()
+			qemu.Store(int64(g.Process.Pid))
+			s.guestStarted(g.Process)
+			line := fmt.Sprintf(`virtiofsd for the share at "%s" exited with status 0 as the hypervisor began to exit, and the hypervisor has still not ended %v later; vm-launch keeps waiting for it`,
+				shares[0], s.disconnectGrace+s.exitWait)
+			Eventually(logBuf.String, 5*time.Second).Should(ContainSubstring(line))
+			Consistently(done, 300*time.Millisecond).ShouldNot(BeClosed())
+			Expect(strings.Count(logBuf.String(), line)).To(Equal(1))
+			Expect(s.failureReason()).To(BeEmpty())
+			Expect(logBuf.String()).NotTo(ContainSubstring("killing the hypervisor"))
+		})
+
+		It("kills a QEMU whose state it cannot read, and says why", func() {
+			qemu := fakeStat(procStat{}, &os.PathError{Op: "open", Path: "/proc/stat", Err: syscall.EACCES})
+			s, _ := servers(vfsQuit, 1)
+			Expect(s.start(nil)).To(Succeed())
+			g, done, status := guest()
+			qemu.Store(int64(g.Process.Pid))
+			s.guestStarted(g.Process)
+			Eventually(done, 5*time.Second).Should(BeClosed())
+			Expect(status().Signal()).To(Equal(syscall.SIGKILL))
+			Eventually(s.servers[0].settled).Should(BeClosed())
+			Expect(logBuf.String()).To(ContainSubstring(fmt.Sprintf(`virtiofsd for the share at "%s" exited with status 0, but the hypervisor still ran %v later, and vm-launch could not tell whether it was exiting: open /proc/stat: permission denied; killing the hypervisor`, shares[0], s.disconnectGrace)))
+			Expect(s.failureReason()).NotTo(BeEmpty())
+		})
+
+		It("waits in its stop for a failure that is under way, so its line comes first", func() {
+			// The stat read stands for a slow step of the action on the
+			// end: the stop that begins meanwhile waits for that action.
+			entered, release := make(chan struct{}), make(chan struct{})
+			var qemu atomic.Int64
+			saved := readProcStat
+			DeferCleanup(func() { readProcStat = saved })
+			readProcStat = func(pid int) (procStat, error) {
+				if int64(pid) == qemu.Load() {
+					close(entered)
+					<-release
+				}
+				return saved(pid)
+			}
+			s, _ := servers(vfsQuit, 1)
+			s.killWait = 2 * time.Second
+			Expect(s.start(nil)).To(Succeed())
+			g, _, _ := guest()
+			qemu.Store(int64(g.Process.Pid))
+			s.guestStarted(g.Process)
+			Eventually(entered, 5*time.Second).Should(BeClosed())
+			stopped := make(chan struct{})
+			go func() { s.stop(0); close(stopped) }()
+			Consistently(stopped, 200*time.Millisecond).ShouldNot(BeClosed())
+			close(release)
+			Eventually(stopped, 5*time.Second).Should(BeClosed())
+			Expect(s.servers[0].settled).To(BeClosed())
+			// The stop had begun, so the end was expected by the time the
+			// action went on, and nothing was killed for it.
+			Expect(logBuf.String()).NotTo(ContainSubstring("killing the hypervisor"))
+		})
+	})
+
+	DescribeTable("says what a virtiofsd that outlives its SIGKILL is doing",
+		func(st procStat, statErr error, tail string) {
+			cmd := exec.Command("sleep", "30")
+			Expect(cmd.Start()).To(Succeed())
+			DeferCleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+			saved := readProcStat
+			DeferCleanup(func() { readProcStat = saved })
+			readProcStat = func(p int) (procStat, error) {
+				Expect(p).To(Equal(cmd.Process.Pid))
+				return st, statErr
+			}
+			srv := &shareServer{grant: shareGrant{Path: shares[0]}, cmd: cmd}
+			Expect(unendedLine(srv, 500*time.Millisecond)).To(Equal(`virtiofsd for the share at "` + shares[0] + `" has not ended 500ms after SIGKILL` + tail))
+		},
+		Entry("in its exit", procStat{State: 'D', Flags: pfExiting}, nil, "; it is still exiting, which can take this long when its exit frees a large guest's memory, and vm-launch does not wait for it"),
+		Entry("as a zombie", procStat{State: 'Z'}, nil, "; it is still exiting, which can take this long when its exit frees a large guest's memory, and vm-launch does not wait for it"),
+		Entry("in I/O outside its exit", procStat{State: 'D'}, nil, "; it is blocked in I/O on the share's store and ends when that I/O returns, and vm-launch does not wait for it"),
+		Entry("in another state", procStat{State: 'S'}, nil, "; vm-launch does not wait for it"),
+		Entry("with a stat it cannot read", procStat{}, errors.New("no stat"), "; vm-launch does not wait for it"),
+	)
+
 	It("does nothing without a share", func() {
 		s, err := newShareServers("", workDir, nil, logger)
 		Expect(err).NotTo(HaveOccurred())
@@ -1177,6 +1605,75 @@ var _ = Describe("run with a granted share", func() {
 		Expect(runWith(vfs)).To(Equal(0), logBuf.String())
 		Expect(logBuf.String()).To(ContainSubstring(`exited with status 3; killing the hypervisor`))
 		Expect(logBuf.String()).NotTo(ContainSubstring("exiting 125"))
+	})
+
+	It("passes on the 125 that a guest reports when it could not flush or unmount the share after a command that exited 0", func() {
+		vfs, _ := fakeVirtiofsd(`ready; while [ ! -e "$GONE.reported" ]; do sleep 0.01; done; exit 3`, gone)
+		writeShareHypervisor(hv, "", "touch "+shellQuote(gone+".reported")+"; "+quietSleep, gone)
+		script, err := os.ReadFile(hv)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(script)).To(ContainSubstring(`echo "RVM_EXIT_$nonce=0"`))
+		Expect(os.WriteFile(hv, []byte(strings.Replace(string(script), `echo "RVM_EXIT_$nonce=0"`, `echo "RVM_EXIT_$nonce=125"`, 1)), 0o755)).To(Succeed())
+		Expect(runWith(vfs)).To(Equal(exitLaunchError), logBuf.String())
+		Expect(logBuf.String()).To(ContainSubstring(`exited with status 3; killing the hypervisor`))
+		Expect(logBuf.String()).NotTo(ContainSubstring("stopped being served"))
+		Expect(logBuf.String()).NotTo(ContainSubstring("exiting 125"))
+	})
+
+	It("serves the share from the virtiofsd bundle without running the bundle's wrapper", func() {
+		virtiofsdStopGrace = 5 * time.Second
+		wrapper, rec, loaderArgv := fakeVirtiofsdBundle(vfsServe, gone)
+		writeShareHypervisor(hv, "", "", gone)
+		Expect(runWith(wrapper)).To(Equal(0), logBuf.String())
+		Expect(loaderArgv).To(BeAnExistingFile())
+		Expect(readRecord(rec, 0, "argv")).To(ContainSubstring("--shared-dir=" + shareDir + "\n"))
+		Expect(logBuf.String()).To(ContainSubstring("Client disconnected, shutting down\n"))
+		Expect(logBuf.String()).NotTo(ContainSubstring("killing"))
+	})
+
+	Context("when QEMU closes the share's socket and then takes longer than the disconnect grace to exit, with no status from the guest", func() {
+		// lingeringGuest is a fake QEMU whose guest never reports a status,
+		// as when a volume fails the boot. It closes its end of the share,
+		// which ends the fake virtiofsd with status 0, and exits 0 0.8 s
+		// later, past the disconnect grace.
+		lingeringGuest := func() {
+			Expect(os.Remove(hv)).To(Succeed())
+			script := `#!/bin/bash
+echo $$ > ` + shellQuote(hv+".pid.tmp") + `
+mv ` + shellQuote(hv+".pid.tmp") + ` ` + shellQuote(hv+".pid") + `
+touch ` + shellQuote(gone) + `
+sleep 0.8 </dev/null >/dev/null 2>&1
+exit 0
+`
+			Expect(os.WriteFile(hv, []byte(script), 0o755)).To(Succeed())
+		}
+
+		It("waits for a QEMU that is exiting and keeps the status of a guest that ended without one", func() {
+			vfs, rec := fakeVirtiofsd(vfsServe, gone)
+			lingeringGuest()
+			saved := readProcStat
+			DeferCleanup(func() { readProcStat = saved })
+			readProcStat = func(pid int) (procStat, error) {
+				if b, err := os.ReadFile(hv + ".pid"); err == nil && strings.TrimSpace(string(b)) == strconv.Itoa(pid) {
+					return procStat{State: 'R', Flags: pfExiting}, nil
+				}
+				return saved(pid)
+			}
+			Expect(runWith(vfs)).To(Equal(exitMissingMarker), logBuf.String())
+			Expect(readRecord(rec, 0, "pid")).NotTo(BeEmpty())
+			Expect(logBuf.String()).NotTo(ContainSubstring("still ran"))
+			Expect(logBuf.String()).NotTo(ContainSubstring("killing the hypervisor"))
+			Expect(logBuf.String()).NotTo(ContainSubstring("stopped being served"))
+			Expect(logBuf.String()).To(HaveSuffix("guest ended without reporting a status; exiting 123\n"))
+		})
+
+		It("kills a QEMU that still runs, and exits 125 with the share's line", func() {
+			vfs, _ := fakeVirtiofsd(vfsServe, gone)
+			lingeringGuest()
+			Expect(runWith(vfs)).To(Equal(exitLaunchError), logBuf.String())
+			Expect(logBuf.String()).To(ContainSubstring(fmt.Sprintf(`virtiofsd for the share at "%s" exited with status 0, but the hypervisor still ran %v later; killing the hypervisor`, shareDir, virtiofsdDisconnectGrace)))
+			Expect(logBuf.String()).To(HaveSuffix(`the share at "` + shareDir + `" stopped being served before the guest reported a status; exiting 125` + "\n"))
+		})
 	})
 
 	It("refuses before it boots when the virtiofsd path is missing", func() {

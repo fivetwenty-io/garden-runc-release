@@ -6,10 +6,12 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -27,6 +29,22 @@ import (
 // and no exec on the way to it can grant one. It runs with --sandbox=none,
 // because the namespace sandbox needs a user namespace and the chroot
 // sandbox needs root, so the container is the sandbox.
+//
+// With --sandbox=none, virtiofsd has no chroot and no mount namespace of its
+// own, so it resolves every guest request against the container's whole
+// filesystem, as the app's user. The share's boundary is then virtiofsd's
+// own path handling, which keeps every lookup below the shared directory. A
+// guest that gained control of its kernel and found a flaw in that handling
+// would reach what the app's user can reach in the container, such as the
+// instance identity under /etc/cf-instance-credentials, the droplet, and the
+// other volumes' mounts, which is what a runc app sees.
+//
+// A share also puts guest RAM in a memfd that QEMU and virtiofsd keep open,
+// so a process of the app's user that can open their descriptors under
+// /proc can map the guest's memory. On the VM path the app's own code runs
+// in the guest, and the only host processes of the app's user are
+// vm-launch, QEMU, and virtiofsd, plus a cf ssh session or a sidecar, which
+// are the app's own principal.
 //
 // QEMU gets a vhost-user-fs device for each share's socket, and the guest
 // mounts each share by its tag (see qemuArgv and guestVolumeSetup).
@@ -51,19 +69,34 @@ import (
 //   - A virtiofsd that ends before QEMU has been reaped stops the guest.
 //     virtiofsd exits with status 0 when its client disconnects, which QEMU
 //     does as it exits, so an end with status 0 gives QEMU
-//     virtiofsdDisconnectGrace to exit on its own before vm-launch kills it.
-//     Any other end kills QEMU at once. Unless the guest had already
-//     reported its command's status, which comes after the guest has flushed
-//     and unmounted its volumes, vm-launch then exits 125 with a line that
-//     names the share, so Diego starts the instance again.
+//     virtiofsdDisconnectGrace to exit on its own. A QEMU that is still
+//     there then, but already exiting, as a large guest's QEMU is while the
+//     kernel frees its memory, gets hypervisorExitWait more and is never
+//     killed. A QEMU that still runs is killed, and any other end kills QEMU
+//     at once. When vm-launch's kill is what ended QEMU and the guest had
+//     not reported its command's status, vm-launch exits 125 with a line
+//     that names the share, so Diego starts the instance again. A QEMU that
+//     ended on its own keeps its own status (see shareEndedGuest).
+//   - The guest reports its command's status only after it has flushed and
+//     unmounted every volume. When the command exited 0 but the guest could
+//     not flush or unmount a volume, a share included, the guest reports 125
+//     in its place, and a command that failed keeps its own status.
+//     vm-launch passes a reported status on as it is (see
+//     shareEndedGuest). For a share, the flush commits on the host the data
+//     of every file the guest has closed. Data of a file still
+//     open in the guest when it stops reaches the share's store when
+//     virtiofsd's descriptors close as it ends, which can come after the
+//     status line.
 //   - The supervisor tells the share servers the moment it reaps QEMU (see
 //     hypervisorReaped), before it flushes the guest's last output, so a
 //     virtiofsd that exits 0 at the disconnect is never taken for a failure
 //     while that flush runs. From then on, each virtiofsd gets
 //     virtiofsdStopGrace to see the disconnect and exit, and then SIGKILL.
-//     virtiofsd holds no data of its own, because every write the guest made
-//     has already reached the host file through a system call, so SIGKILL
-//     loses nothing.
+//     virtiofsd keeps no data of its own, because every write the guest made
+//     has already reached the host file through a system call. SIGKILL
+//     closes virtiofsd's descriptors, and the host's FUSE driver then sends
+//     the flush of each file still open, so a store such as JuiceFS still
+//     gets that data while its daemon runs.
 //   - A launch that fails before QEMU starts, as when a second virtiofsd
 //     cannot start or does not become ready in time, kills every virtiofsd
 //     it started, at once.
@@ -77,7 +110,11 @@ import (
 // included. That stop starts when QEMU is reaped and runs beside the flush
 // of the guest's last output, which outputFlushTimeout bounds to the same
 // second, so the two together take one of the 2 seconds that stopDeadline
-// leaves before Diego's SIGKILL.
+// leaves before Diego's SIGKILL. When QEMU ends before virtiofsd has let go
+// of guest RAM, as when QEMU is killed, virtiofsd holds the last reference
+// to that memory, and the kernel frees it in virtiofsd's exit instead of
+// QEMU's. A large guest's virtiofsd can then outlast the kill wait, and
+// vm-launch exits without waiting for it.
 
 // virtiofsdFlag names the vm-launch flag that gives the path of the
 // executable that runs virtiofsd. Without it, a granted share fails the
@@ -86,11 +123,28 @@ import (
 // /opt/garden-vm/artifacts/virtiofsd/virtiofsd-wrapper, the wrapper that the
 // virtiofsd install puts under the host's artifacts directory,
 // /var/vcap/data/vm-runtime/artifacts, which Garden binds read-only at
-// /opt/garden-vm/artifacts. The wrapper runs virtiofsd 1.13 through its
-// bundled loader, because the app's rootfs may have an older C library.
-// vm-launch passes the wrapper virtiofsd's own arguments, and the wrapper
-// must pass them, and descriptor 3, on unchanged.
+// /opt/garden-vm/artifacts, beside virtiofsd 1.13, its bundled loader, and
+// its libraries (see virtiofsdLauncher). The bundle has its own loader,
+// because the app's rootfs may have an older C library. vm-launch runs the
+// bundle's virtiofsd through that loader itself, as it runs QEMU, so the
+// launch needs no shell from the app's rootfs; the wrapper stays for an
+// operator who runs virtiofsd by hand. A path outside such a bundle is run
+// as it is, with virtiofsd's own arguments and descriptor 3, which it must
+// pass on unchanged when it is a wrapper of its own.
 const virtiofsdFlag = "virtiofsd-path"
+
+// The layout of the virtiofsd bundle that the virtiofsd install puts in one
+// directory: the wrapper, virtiofsd itself, the bundled loader, and the
+// directory of the libraries the loader takes virtiofsd's from.
+const (
+	virtiofsdWrapperName = "virtiofsd-wrapper"
+	virtiofsdBinaryName  = "virtiofsd"
+	virtiofsdLoaderName  = "ld-linux-x86-64.so.2"
+	virtiofsdLibDirName  = "lib"
+)
+
+// virtiofsdSeccomp is the --seccomp mode vm-launch runs virtiofsd with.
+const virtiofsdSeccomp = "kill"
 
 // virtiofsdListenFD is the file descriptor virtiofsd gets its listening
 // socket on: the first descriptor after stdin, stdout, and stderr.
@@ -108,17 +162,91 @@ var (
 	// to become ready, all of them together.
 	virtiofsdReadyTimeout = 5 * time.Second
 	// virtiofsdDisconnectGrace is how long QEMU may keep running after a
-	// virtiofsd ended with status 0 before vm-launch kills it.
+	// virtiofsd ended with status 0 before vm-launch looks at whether it is
+	// exiting, and kills it when it is not.
 	virtiofsdDisconnectGrace = time.Second
+	// virtiofsdExitBase and virtiofsdExitPer4GiB make up hypervisorExitWait.
+	virtiofsdExitBase    = time.Second
+	virtiofsdExitPer4GiB = time.Second
 	// virtiofsdStopGrace is how long a virtiofsd may keep running after QEMU
 	// has been reaped before vm-launch sends it SIGKILL.
 	virtiofsdStopGrace = 500 * time.Millisecond
 	// virtiofsdKillWait is how long vm-launch waits after SIGKILL for every
 	// virtiofsd to end and for their last log lines, all of it together. A
-	// virtiofsd stuck in I/O on a store that has gone away ends only when
-	// the I/O returns, and vm-launch does not wait for that.
+	// virtiofsd whose exit frees a large guest's memory, or that is stuck in
+	// I/O on a store that has gone away, ends later, and vm-launch does not
+	// wait for that.
 	virtiofsdKillWait = 500 * time.Millisecond
 )
+
+// hypervisorExitWait is how long vm-launch waits, past the disconnect grace,
+// for a QEMU that it found exiting after a virtiofsd ended with status 0:
+// virtiofsdExitBase, plus virtiofsdExitPer4GiB for every 4 GiB of guest
+// memory, in proportion. QEMU's exit frees the guest's memory before QEMU can
+// be reaped, which takes longer the larger the guest is: 5 seconds for the
+// largest guest, 16 GiB. The wait runs only while QEMU has not been reaped,
+// so it never adds to the stop budget, which starts at the reap.
+func hypervisorExitWait(memMiB int) time.Duration {
+	if memMiB < 0 {
+		memMiB = 0
+	}
+	return virtiofsdExitBase + time.Duration(memMiB)*virtiofsdExitPer4GiB/4096
+}
+
+// procStat is what vm-launch reads of a process's /proc/<pid>/stat: its state
+// and its kernel flags.
+type procStat struct {
+	State byte
+	Flags uint64
+}
+
+// pfExiting is the kernel's PF_EXITING flag, which a task carries from the
+// start of its exit on.
+const pfExiting = 0x4
+
+// exiting reports whether the process is on its way out: in its exit, a
+// zombie, or dead.
+func (p procStat) exiting() bool {
+	return p.State == 'Z' || p.State == 'X' || p.Flags&pfExiting != 0
+}
+
+// readProcStat reads the stat of the process pid. Specs replace it to report
+// a state that a fake process cannot have.
+var readProcStat = func(pid int) (procStat, error) {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return procStat{}, err
+	}
+	return parseProcStat(b)
+}
+
+// parseProcStat takes the state, the third field, and the flags, the ninth,
+// from the text of a /proc/<pid>/stat. The second field is the command name
+// in parentheses, which may hold spaces and parentheses itself, so the
+// fields after it are counted from its last closing parenthesis.
+func parseProcStat(b []byte) (procStat, error) {
+	s := string(b)
+	i := strings.LastIndexByte(s, ')')
+	if i < 0 {
+		return procStat{}, fmt.Errorf("a process stat with no command name: %q", s)
+	}
+	fields := strings.Fields(s[i+1:])
+	// fields[0] is the state and fields[6] the flags.
+	if len(fields) < 7 || len(fields[0]) != 1 {
+		return procStat{}, fmt.Errorf("a process stat with too few fields after its command name: %q", s)
+	}
+	flags, err := strconv.ParseUint(fields[6], 10, 64)
+	if err != nil {
+		return procStat{}, fmt.Errorf("the flags of a process stat: %w", err)
+	}
+	return procStat{State: fields[0][0], Flags: flags}, nil
+}
+
+// processGoneErr reports whether err from readProcStat means that the
+// process no longer exists, because it has been reaped.
+func processGoneErr(err error) bool {
+	return errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH)
+}
 
 // Bounds on the virtiofsd log that vm-launch passes on. Past
 // maxVirtiofsdLogLines, vm-launch keeps only the latest
@@ -146,8 +274,12 @@ type shareSocket struct {
 
 // checkVirtiofsd makes sure, before anything else of the launch happens, that
 // vm-launch can serve the grants it holds: that it was given --virtiofsd-path
-// and that the path is an executable regular file. Without a grant, neither
-// the flag nor the file is needed.
+// and that the path is an executable regular file. When the path is in a
+// virtiofsd bundle (see virtiofsdLauncher), the bundle's virtiofsd and loader
+// must be executable regular files too, and its library directory a
+// directory. Otherwise, a path that is a script must name an interpreter
+// that the container has, because the kernel looks for it in the app's
+// rootfs. Without a grant, neither the flag nor the file is needed.
 func checkVirtiofsd(path string, grants []shareGrant) error {
 	if len(grants) == 0 {
 		return nil
@@ -156,35 +288,125 @@ func checkVirtiofsd(path string, grants []shareGrant) error {
 		return fmt.Errorf("%s %s is granted a share, but vm-launch was not given --%s, so nothing can serve it; the operator must install virtiofsd and pass its path",
 			volumeSettingsEnv, quoteForLog(grants[0].Path), virtiofsdFlag)
 	}
+	if err := checkExecutable(path); err != nil {
+		return fmt.Errorf("virtiofsd for shares: %w", err)
+	}
+	if launcher := virtiofsdLauncher(path); len(launcher) > 1 {
+		dir := filepath.Dir(path)
+		for _, part := range []string{virtiofsdLoaderName, virtiofsdBinaryName} {
+			if err := checkExecutable(filepath.Join(dir, part)); err != nil {
+				return fmt.Errorf("virtiofsd for shares: the bundle at %s: %w", quoteForLog(dir), err)
+			}
+		}
+		lib := filepath.Join(dir, virtiofsdLibDirName)
+		info, err := os.Stat(lib)
+		switch {
+		case err != nil:
+			return fmt.Errorf("virtiofsd for shares: the bundle at %s: %w", quoteForLog(dir), err)
+		case !info.IsDir():
+			return fmt.Errorf("virtiofsd for shares: the bundle at %s: %s is not a directory", quoteForLog(dir), quoteForLog(lib))
+		}
+		return nil
+	}
+	return checkInterpreter(path)
+}
+
+// checkExecutable refuses a path that is not an executable regular file,
+// after following symbolic links.
+func checkExecutable(path string) error {
 	info, err := os.Stat(path)
 	switch {
 	case err != nil:
-		return fmt.Errorf("virtiofsd for shares: %w", err)
+		return err
 	case !info.Mode().IsRegular():
-		return fmt.Errorf("virtiofsd for shares: %s is not a regular file", quoteForLog(path))
+		return fmt.Errorf("%s is not a regular file", quoteForLog(path))
 	case info.Mode().Perm()&0o111 == 0:
-		return fmt.Errorf("virtiofsd for shares: %s is not executable", quoteForLog(path))
+		return fmt.Errorf("%s is not executable", quoteForLog(path))
 	}
 	return nil
 }
 
-// virtiofsdArgv returns the command line of the virtiofsd at path that serves
-// sharedDir on virtiofsdListenFD. --cache=auto lets a change that another
-// instance makes show up within a second. --inode-file-handles=never keeps
-// virtiofsd from file handles, which need CAP_DAC_READ_SEARCH.
-// --seccomp=kill stacks virtiofsd's own filter on Garden's. --sandbox=none
-// keeps virtiofsd from namespaces, which an unprivileged virtiofsd cannot
-// create.
-func virtiofsdArgv(path, sharedDir string) []string {
-	return []string{
-		path,
+// maxShebangBytes is how much of a script the kernel reads for its #! line.
+const maxShebangBytes = 256
+
+// checkInterpreter refuses a script at path whose #! line names an
+// interpreter that is not an executable regular file in vm-launch's mount
+// namespace, which is the app's container, where the kernel looks for it when
+// virtiofsd starts. A file that is not a script passes. A file that
+// vm-launch may execute but not read passes too, because an interpreter
+// started as vm-launch's user could not read that script either, and so the
+// exec or the interpreter names the error.
+func checkInterpreter(path string) error {
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrPermission) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("virtiofsd for shares: %w", err)
+	}
+	defer f.Close()
+	head := make([]byte, maxShebangBytes)
+	n, err := io.ReadFull(f, head)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("virtiofsd for shares: reading %s: %w", quoteForLog(path), err)
+	}
+	line, ok := strings.CutPrefix(string(head[:n]), "#!")
+	if !ok {
+		return nil
+	}
+	if nl := strings.IndexByte(line, '\n'); nl >= 0 {
+		line = line[:nl]
+	}
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return fmt.Errorf("virtiofsd for shares: %s is a script whose #! line names no interpreter", quoteForLog(path))
+	}
+	if err := checkExecutable(fields[0]); err != nil {
+		return fmt.Errorf("virtiofsd for shares: %s is a script for %s, which the app's container cannot run: %w", quoteForLog(path), quoteForLog(fields[0]), err)
+	}
+	return nil
+}
+
+// virtiofsdLauncher returns the start of the command line that runs the
+// virtiofsd that --virtiofsd-path names, before virtiofsd's own arguments.
+// When the path is the wrapper or the virtiofsd of a virtiofsd bundle, which
+// keeps its bundled loader beside them, the command is the bundle's loader
+// with the bundle's library directory and the bundle's virtiofsd, as the
+// wrapper's own exec line has it. That runs virtiofsd as the wrapper would,
+// with the same loader, libraries, and arguments, and without the shell the
+// wrapper needs from the app's rootfs. The bundle's directory is the
+// directory of the path as given, as the wrapper takes it from its $0. Any
+// other path is the command by itself. checkVirtiofsd checks the files.
+func virtiofsdLauncher(path string) []string {
+	dir, base := filepath.Dir(path), filepath.Base(path)
+	if base != virtiofsdWrapperName && base != virtiofsdBinaryName {
+		return []string{path}
+	}
+	loader := filepath.Join(dir, virtiofsdLoaderName)
+	if _, err := os.Lstat(loader); err != nil {
+		return []string{path}
+	}
+	return []string{loader, "--library-path", filepath.Join(dir, virtiofsdLibDirName), filepath.Join(dir, virtiofsdBinaryName)}
+}
+
+// virtiofsdArgv returns the command line that runs virtiofsd, from launcher
+// (see virtiofsdLauncher), to serve sharedDir on virtiofsdListenFD with the
+// seccomp mode, which is virtiofsdSeccomp for a launch. --cache=auto lets a
+// change that another instance makes show up within a second.
+// --inode-file-handles=never keeps virtiofsd from file handles, which need
+// CAP_DAC_READ_SEARCH. --seccomp=kill stacks virtiofsd's own filter on
+// Garden's. --sandbox=none keeps virtiofsd from namespaces, which an
+// unprivileged virtiofsd cannot create.
+func virtiofsdArgv(launcher []string, seccomp, sharedDir string) []string {
+	argv := append([]string{}, launcher...)
+	return append(argv,
 		fmt.Sprintf("--fd=%d", virtiofsdListenFD),
 		"--sandbox=none",
-		"--seccomp=kill",
+		"--seccomp="+seccomp,
 		"--cache=auto",
 		"--inode-file-handles=never",
-		"--shared-dir=" + sharedDir,
-	}
+		"--shared-dir="+sharedDir,
+	)
 }
 
 // shareSocketName is the name of the socket of the share with tag in the work
@@ -289,19 +511,32 @@ type shareServer struct {
 	// logDone is closed once virtiofsd's log has reached its end and its
 	// held-back last lines have been passed on.
 	logDone chan struct{}
+	// settled is closed once wait has acted on virtiofsd's end (see ended),
+	// so that a stop can wait until no line or kill for it is still on the
+	// way.
+	settled chan struct{}
 }
 
 // shareServers are the virtiofsd processes of one launch, one for each share
 // in volume order, and the policy that ties their lives to QEMU's.
 type shareServers struct {
-	// path is the executable that --virtiofsd-path names.
-	path    string
+	// path is the executable that --virtiofsd-path names, and launcher the
+	// start of the command line that runs virtiofsd for it (see
+	// virtiofsdLauncher).
+	path     string
+	launcher []string
+	// seccomp is the --seccomp mode virtiofsd runs with, virtiofsdSeccomp.
+	// Specs that run the real virtiofsd where its filter cannot load change
+	// it.
+	seccomp string
 	logger  *log.Logger
 	servers []*shareServer
 	// The lifecycle's timing as the launch began (see virtiofsdReadyTimeout
-	// and the rest), which the launch's goroutines read.
+	// and the rest), which the launch's goroutines read. exitWait is
+	// hypervisorExitWait for the guest's memory (see setGuestMemory).
 	readyTimeout    time.Duration
 	disconnectGrace time.Duration
+	exitWait        time.Duration
 	stopGrace       time.Duration
 	killWait        time.Duration
 
@@ -328,11 +563,13 @@ type shareServers struct {
 
 // newShareServers binds the socket of each grant in workDir. It starts no
 // process; start does. On an error every socket it bound is closed, and
-// workDir's removal removes their names.
+// workDir's removal removes their names. Until setGuestMemory says
+// otherwise, the wait for an exiting QEMU is the one for the largest guest.
 func newShareServers(path, workDir string, grants []shareGrant, logger *log.Logger) (*shareServers, error) {
 	s := &shareServers{
-		path: path, logger: logger,
+		path: path, launcher: virtiofsdLauncher(path), seccomp: virtiofsdSeccomp, logger: logger,
 		readyTimeout: virtiofsdReadyTimeout, disconnectGrace: virtiofsdDisconnectGrace,
+		exitWait:  hypervisorExitWait(maxGuestMemoryMiB),
 		stopGrace: virtiofsdStopGrace, killWait: virtiofsdKillWait,
 		guestDone: make(chan struct{}), stopped: make(chan struct{}), stopDone: make(chan struct{}),
 	}
@@ -344,9 +581,15 @@ func newShareServers(path, workDir string, grants []shareGrant, logger *log.Logg
 			return nil, err
 		}
 		s.servers = append(s.servers, &shareServer{grant: g, socketPath: path, listener: l,
-			ready: make(chan struct{}), exited: make(chan struct{}), logDone: make(chan struct{})})
+			ready: make(chan struct{}), exited: make(chan struct{}), logDone: make(chan struct{}), settled: make(chan struct{})})
 	}
 	return s, nil
+}
+
+// setGuestMemory sizes the wait for an exiting QEMU to a guest of memMiB
+// (see hypervisorExitWait). run calls it before start.
+func (s *shareServers) setGuestMemory(memMiB int) {
+	s.exitWait = hypervisorExitWait(memMiB)
 }
 
 // sockets returns the socket of each share, in volume order, for QEMU's
@@ -377,17 +620,47 @@ func (srv *shareServer) closeListener(logger *log.Logger) {
 }
 
 // start checks each share's mount again, starts its virtiofsd, and waits
-// until it is ready, in volume order, all within the ready timeout. A
-// SIGTERM or SIGINT on signals ends the wait. On any error, every virtiofsd
-// that start started is killed and reaped before start returns, so the
-// launch leaves none behind.
+// until it is ready, in volume order, all within the ready timeout. The
+// mount checks count against that timeout too, and a SIGTERM or SIGINT on
+// signals ends the wait at any point, a mount check that hangs on a store
+// that has gone away included. On any error, every virtiofsd that start
+// started is killed and reaped before start returns, so the launch leaves
+// none behind. A mount check that start gave up on keeps running in its own
+// goroutine until the kernel answers it, and its answer is dropped.
 func (s *shareServers) start(signals <-chan os.Signal) error {
 	if len(s.servers) == 0 {
 		return nil
 	}
 	deadline := time.NewTimer(s.readyTimeout)
 	defer deadline.Stop()
+	signalled := func(sig os.Signal, during string) error {
+		s.stop(0)
+		ss, ok := sig.(syscall.Signal)
+		if !ok {
+			ss = syscall.SIGTERM
+		}
+		return &signalledError{Sig: ss, during: during}
+	}
 	for _, srv := range s.servers {
+		path := quoteForLog(srv.grant.Path)
+		// The check opens and inspects the share's directory, which can
+		// block in the kernel when the store behind the mount has gone away,
+		// so it runs where start can stop waiting for it.
+		checked := make(chan error, 1)
+		go func(g shareGrant) { checked <- checkShareMount(g) }(srv.grant)
+		select {
+		case err := <-checked:
+			if err != nil {
+				s.stop(0)
+				return err
+			}
+		case <-deadline.C:
+			s.stop(0)
+			return fmt.Errorf("checking the mount of the share at %s did not finish within %v; the store behind it may not be answering",
+				path, s.readyTimeout)
+		case sig := <-signals:
+			return signalled(sig, "checking the mount of the share at "+path)
+		}
 		if err := s.startOne(srv); err != nil {
 			s.stop(0)
 			return err
@@ -397,18 +670,13 @@ func (s *shareServers) start(signals <-chan os.Signal) error {
 		case <-srv.exited:
 			s.stop(0)
 			return fmt.Errorf("virtiofsd for the share at %s %s before it was ready to serve the guest",
-				quoteForLog(srv.grant.Path), describeEnd(srv.state, srv.waitErr))
+				path, describeEnd(srv.state, srv.waitErr))
 		case <-deadline.C:
 			s.stop(0)
 			return fmt.Errorf("virtiofsd for the share at %s did not report that it was ready within %v",
-				quoteForLog(srv.grant.Path), s.readyTimeout)
+				path, s.readyTimeout)
 		case sig := <-signals:
-			s.stop(0)
-			ss, ok := sig.(syscall.Signal)
-			if !ok {
-				ss = syscall.SIGTERM
-			}
-			return &signalledError{Sig: ss, during: "starting virtiofsd for the share at " + quoteForLog(srv.grant.Path)}
+			return signalled(sig, "starting virtiofsd for the share at "+path)
 		}
 	}
 	// A virtiofsd that ended after it was ready, while start went on to the
@@ -428,20 +696,17 @@ func (s *shareServers) start(signals <-chan os.Signal) error {
 	return nil
 }
 
-// startOne checks srv's mount and starts its virtiofsd from a confined
-// thread, with an empty environment, its stdout and stderr on a pipe that
-// readLog reads, and the socket as its virtiofsdListenFD. vm-launch's copy
-// of the socket is closed whether or not the start works.
+// startOne starts srv's virtiofsd, once start has checked its mount, from a
+// confined thread, with an empty environment, its stdout and stderr on a
+// pipe that readLog reads, and the socket as its virtiofsdListenFD.
+// vm-launch's copy of the socket is closed whether or not the start works.
 func (s *shareServers) startOne(srv *shareServer) error {
 	defer srv.closeListener(s.logger)
-	if err := checkShareMount(srv.grant); err != nil {
-		return err
-	}
 	logR, logW, err := os.Pipe()
 	if err != nil {
 		return fmt.Errorf("creating the log pipe of virtiofsd for the share at %s: %w", quoteForLog(srv.grant.Path), err)
 	}
-	argv := virtiofsdArgv(s.path, srv.grant.Path)
+	argv := virtiofsdArgv(s.launcher, s.seccomp, srv.grant.Path)
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = []string{}
 	cmd.Dir = "/"
@@ -469,8 +734,8 @@ func (s *shareServers) startOne(srv *shareServer) error {
 // inherits both. With no_new_privs, no exec can raise the permitted set
 // above the thread's, which is empty, or honour a set-user-ID bit, so no
 // file in the chain that runs virtiofsd gains anything from its file
-// capabilities. That chain is the wrapper, the wrapper's interpreter, the
-// bundled loader, and virtiofsd itself, plus anything those exec in turn. A
+// capabilities. That chain is the bundled loader for a bundle, or the named
+// file and, for a script, its interpreter, plus anything those exec in turn. A
 // check of one named file, as the hypervisor gets, would cover less, so
 // virtiofsd gets none. The thread ends with virtiofsd (see
 // startConfinedAs), so no other part of vm-launch ever runs with the flag.
@@ -613,6 +878,7 @@ func (s *shareServers) wait(srv *shareServer, release func()) {
 	srv.state, srv.waitErr = srv.cmd.ProcessState, err
 	release()
 	close(srv.exited)
+	defer close(srv.settled)
 	s.ended(srv)
 }
 
@@ -620,7 +886,10 @@ func (s *shareServers) wait(srv *shareServer, release func()) {
 // once vm-launch stops virtiofsd itself, is expected. An end before start
 // armed the servers is left to start. Any other end fails the share, except
 // an end with status 0 after which QEMU is reaped within the disconnect
-// grace, since that is virtiofsd seeing QEMU disconnect as QEMU exits.
+// grace, since that is virtiofsd seeing QEMU disconnect as QEMU exits, and an
+// end with status 0 after which QEMU is found exiting once the grace is
+// spent, since that is the same disconnect from a QEMU whose exit takes
+// longer.
 func (s *shareServers) ended(srv *shareServer) {
 	s.mu.Lock()
 	expected := s.stopping || s.guestReaped
@@ -628,14 +897,14 @@ func (s *shareServers) ended(srv *shareServer) {
 		srv.endedEarly = true
 		expected = true
 	}
-	started := s.guest != nil
+	guest := s.guest
 	s.mu.Unlock()
 	if expected {
 		return
 	}
 	how := describeEnd(srv.state, srv.waitErr)
 	clean := srv.state != nil && srv.state.Success()
-	if !clean || !started {
+	if !clean || guest == nil {
 		s.fail(srv, how)
 		return
 	}
@@ -643,9 +912,43 @@ func (s *shareServers) ended(srv *shareServer) {
 	defer grace.Stop()
 	select {
 	case <-s.guestDone:
+		return
 	case <-s.stopped:
+		return
 	case <-grace.C:
+	}
+	// QEMU closes its vhost-user connections near the end of its cleanup, and
+	// its exit then frees the guest's memory before QEMU can be reaped. For a
+	// large guest that takes longer than the grace, and a QEMU in that state
+	// is on its way out by itself, so it is waited for rather than killed.
+	// The pid is still QEMU's, because the supervisor has not reported the
+	// reap yet; a pid that is gone means the reap is being reported now.
+	st, err := readProcStat(guest.Pid)
+	switch {
+	case err == nil && st.exiting(), err != nil && processGoneErr(err):
+		s.awaitExit(srv, how)
+	case err != nil:
+		s.fail(srv, fmt.Sprintf("%s, but the hypervisor still ran %v later, and vm-launch could not tell whether it was exiting: %v", how, s.disconnectGrace, err))
+	default:
 		s.fail(srv, fmt.Sprintf("%s, but the hypervisor still ran %v later", how, s.disconnectGrace))
+	}
+}
+
+// awaitExit waits up to the exit wait for the reap of a QEMU that was
+// found exiting after srv's virtiofsd ended with status 0. QEMU's end is its
+// own, so vm-launch records no failure and sends no signal: a process in its
+// exit takes no signal, and its status is already set. When the reap does
+// not come within the wait, one line says so, and the supervisor goes on
+// waiting for the reap as it would without a share.
+func (s *shareServers) awaitExit(srv *shareServer, how string) {
+	wait := time.NewTimer(s.exitWait)
+	defer wait.Stop()
+	select {
+	case <-s.guestDone:
+	case <-s.stopped:
+	case <-wait.C:
+		s.logger.Printf("virtiofsd for the share at %s %s as the hypervisor began to exit, and the hypervisor has still not ended %v later; vm-launch keeps waiting for it",
+			quoteForLog(srv.grant.Path), how, s.disconnectGrace+s.exitWait)
 	}
 }
 
@@ -742,11 +1045,37 @@ func (s *shareServers) failureReason() string {
 	return s.failure
 }
 
+// shareEndedGuest reports whether a share's failure, which vm-launch acts on
+// by killing QEMU with SIGKILL, is what ended the guest of r, so that the
+// share's reason becomes the exit line's. A guest that reported its status
+// keeps it, because it reports it only after its volumes are flushed and
+// unmounted, and it reports 125 for a command that exited 0 when it could
+// not flush or unmount one of them, a share included. A QEMU that ended on
+// its own, with an exit status, keeps the status that exitCode gives it,
+// because the kernel ignores a SIGKILL that comes once a process has begun
+// to exit, so its status shows a race that QEMU won. A QEMU that died from SIGKILL, or whose end vm-launch could not
+// read, ended by the share's kill.
+func shareEndedGuest(r runResult) bool {
+	if r.markerFound {
+		return false
+	}
+	if r.state == nil {
+		return true
+	}
+	ws, ok := r.state.Sys().(syscall.WaitStatus)
+	return ok && ws.Signaled() && ws.Signal() == syscall.SIGKILL
+}
+
 // stop ends every virtiofsd. It closes every socket vm-launch still holds,
 // gives each virtiofsd grace to end on its own, sends SIGKILL to each that
-// still runs, and then waits for them to end and for their last log lines,
+// still runs, and then waits for them to end, for the action on each end to
+// finish, and for their last log lines,
 // all within the one kill wait. So a stop takes at most grace plus the kill
-// wait, however many virtiofsd processes there are. Only the first call
+// wait, however many virtiofsd processes there are. A virtiofsd that has not
+// ended by then gets one line that says what it is doing, as far as its
+// /proc stat tells: still exiting, which for a virtiofsd that held the last
+// reference to a large guest's memory is the kernel freeing it, or blocked
+// in I/O on the share's store. Only the first call
 // stops anything. A later call waits until that stop has finished, so run
 // can defer stop for every way out and still have the lines where they
 // belong.
@@ -791,7 +1120,7 @@ func (s *shareServers) stop(grace time.Duration) {
 	allEnded := waitEach(deadline.C, running, exited)
 	for _, srv := range running {
 		if !isClosed(srv.exited) {
-			s.logger.Printf("virtiofsd for the share at %s did not end within %v of SIGKILL; it ends when its I/O returns", quoteForLog(srv.grant.Path), s.killWait)
+			s.logger.Print(unendedLine(srv, s.killWait))
 		}
 	}
 	if !allEnded {
@@ -799,7 +1128,34 @@ func (s *shareServers) stop(grace time.Duration) {
 		// lines on the way, and they come when they come.
 		return
 	}
+	// Once stopping is set, the action on each end returns at once, so this
+	// waits only for one that was already under way, such as a line about
+	// a failure, which then comes before the exit line.
+	if !waitEach(deadline.C, running, func(srv *shareServer) <-chan struct{} { return srv.settled }) {
+		return
+	}
 	waitEach(deadline.C, running, func(srv *shareServer) <-chan struct{} { return srv.logDone })
+}
+
+// unendedLine is the line for srv's virtiofsd when it has not ended within
+// killWait of its SIGKILL. A process in its exit is still exiting, whatever
+// it waits on. One that is not in its exit and is in uninterruptible sleep,
+// state D, is blocked in I/O, which SIGKILL ends only when the I/O returns.
+// For any other state, or a stat vm-launch cannot read, the line says only
+// that virtiofsd has not ended.
+func unendedLine(srv *shareServer, killWait time.Duration) string {
+	head := fmt.Sprintf("virtiofsd for the share at %s has not ended %v after SIGKILL", quoteForLog(srv.grant.Path), killWait)
+	st, err := readProcStat(srv.cmd.Process.Pid)
+	switch {
+	case err != nil:
+		return head + "; vm-launch does not wait for it"
+	case st.exiting():
+		return head + "; it is still exiting, which can take this long when its exit frees a large guest's memory, and vm-launch does not wait for it"
+	case st.State == 'D':
+		return head + "; it is blocked in I/O on the share's store and ends when that I/O returns, and vm-launch does not wait for it"
+	default:
+		return head + "; vm-launch does not wait for it"
+	}
 }
 
 // waitEach waits until ch(srv) is closed for each of servers in turn, and
