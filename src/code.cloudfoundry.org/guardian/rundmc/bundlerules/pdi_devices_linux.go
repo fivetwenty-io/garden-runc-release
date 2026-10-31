@@ -4,27 +4,34 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
+	"strings"
+	"unsafe"
 
 	"code.cloudfoundry.org/lager/v3"
 	"golang.org/x/sys/unix"
 )
 
 // NewPDIDevices returns the block volume step for the host, with the default
-// node, claim, sysfs, and mount table paths.
-func NewPDIDevices(logger lager.Logger, kvmGid uint32) (*PDIDevices, error) {
+// node, claim, sysfs, and mount table paths. tag is the Garden's --tag value,
+// or empty, and it marks the claims that this Garden may release.
+func NewPDIDevices(logger lager.Logger, kvmGid uint32, tag string) (*PDIDevices, error) {
 	if kvmGid == 0 {
 		return nil, errors.New("block volumes need the kvm gid, which is not configured")
 	}
+	if strings.Contains(tag, "\n") {
+		return nil, errors.New("block volumes cannot record a tag that holds a newline")
+	}
 	return &PDIDevices{
-		KVMGid:          kvmGid,
-		NodeDir:         DefaultPDINodeDir,
-		ClaimDir:        DefaultPDIClaimDir,
-		SysfsDir:        "/sys",
-		MountInfoPath:   "/proc/self/mountinfo",
-		DescriptorOwner: 0,
-		Host:            LinuxPDIHost{},
-		Logger:          logger,
+		KVMGid:        kvmGid,
+		Tag:           tag,
+		NodeDir:       DefaultPDINodeDir,
+		ClaimDir:      DefaultPDIClaimDir,
+		SysfsDir:      "/sys",
+		MountInfoPath: "/proc/self/mountinfo",
+		Host:          LinuxPDIHost{},
+		Logger:        logger,
 	}, nil
 }
 
@@ -73,11 +80,11 @@ func (s *linuxPDISource) ReadDescriptor() (PDIDescriptorFile, error) {
 		return PDIDescriptorFile{}, fmt.Errorf("fstat %s: %w", PDIDescriptorName, err)
 	}
 	file := PDIDescriptorFile{
-		Mode: unixFileMode(st.Mode),
-		UID:  st.Uid,
-		Size: st.Size,
+		Regular: st.Mode&unix.S_IFMT == unix.S_IFREG,
+		UID:     st.Uid,
+		Size:    st.Size,
 	}
-	if !file.Mode.IsRegular() {
+	if !file.Regular {
 		return file, nil
 	}
 
@@ -132,8 +139,10 @@ func (LinuxPDIHost) Mknod(path string, major, minor, gid uint32) error {
 
 // Probe opens the node read-write with O_EXCL, as vm-launch will. Linux fails
 // that open with EBUSY while the device is mounted anywhere or claimed by
-// another exclusive opener, which includes an app that holds it.
-func (LinuxPDIHost) Probe(path string, major, minor uint32) error {
+// another exclusive opener, which includes an app that holds it. It then
+// reads the device size from that descriptor, so the size belongs to the very
+// device that Garden opened.
+func (LinuxPDIHost) Probe(path string, major, minor uint32, size int64) error {
 	fd, err := unix.Open(path, unix.O_RDWR|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return fmt.Errorf("exclusive open: %w", err)
@@ -147,6 +156,14 @@ func (LinuxPDIHost) Probe(path string, major, minor uint32) error {
 	if st.Mode&unix.S_IFMT != unix.S_IFBLK || st.Rdev != unix.Mkdev(major, minor) {
 		return fmt.Errorf("the node is not block device %d:%d", major, minor)
 	}
+
+	var bytes uint64
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), unix.BLKGETSIZE64, uintptr(unsafe.Pointer(&bytes))); errno != 0 {
+		return fmt.Errorf("BLKGETSIZE64: %w", errno)
+	}
+	if bytes > math.MaxInt64 || int64(bytes) != size {
+		return fmt.Errorf("the device is %d bytes, and the descriptor says %d", bytes, size)
+	}
 	return nil
 }
 
@@ -159,33 +176,10 @@ func (LinuxPDIHost) RemoveNode(path string, major, minor uint32) error {
 		return err
 	}
 	if st.Mode&unix.S_IFMT != unix.S_IFBLK || st.Rdev != unix.Mkdev(major, minor) {
-		return fmt.Errorf("it is not block device %d:%d, so Garden leaves it in place", major, minor)
+		return fmt.Errorf("%w: it is not block device %d:%d, so Garden leaves it in place", ErrPDIForeignNode, major, minor)
 	}
 	if err := unix.Unlink(path); err != nil && !errors.Is(err, unix.ENOENT) {
 		return err
 	}
 	return nil
-}
-
-// unixFileMode converts the type bits of st_mode to an os.FileMode.
-func unixFileMode(mode uint32) os.FileMode {
-	perm := os.FileMode(mode & 0o777)
-	switch mode & unix.S_IFMT {
-	case unix.S_IFREG:
-		return perm
-	case unix.S_IFDIR:
-		return perm | os.ModeDir
-	case unix.S_IFLNK:
-		return perm | os.ModeSymlink
-	case unix.S_IFBLK:
-		return perm | os.ModeDevice
-	case unix.S_IFCHR:
-		return perm | os.ModeDevice | os.ModeCharDevice
-	case unix.S_IFIFO:
-		return perm | os.ModeNamedPipe
-	case unix.S_IFSOCK:
-		return perm | os.ModeSocket
-	default:
-		return perm | os.ModeIrregular
-	}
 }

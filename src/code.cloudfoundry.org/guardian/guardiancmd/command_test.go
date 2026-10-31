@@ -544,6 +544,7 @@ var _ = Describe("execution backend flags", func() {
 
 			It("wires the step for the host paths and the kvm gid, and releases devices on destroy, when the flag is on", func() {
 				cmd.ExecutionBackends.VMBlockVolumes = true
+				cmd.Server.Tag = "ab"
 
 				backends, err := cmd.wireExecutionBackends(log)
 				if runtime.GOOS != "linux" {
@@ -557,7 +558,7 @@ var _ = Describe("execution backend flags", func() {
 				Expect(backends.blockVolumes.ClaimDir).To(Equal("/run/garden-pdi-claims"))
 				Expect(backends.blockVolumes.SysfsDir).To(Equal("/sys"))
 				Expect(backends.blockVolumes.MountInfoPath).To(Equal("/proc/self/mountinfo"))
-				Expect(backends.blockVolumes.DescriptorOwner).To(BeZero())
+				Expect(backends.blockVolumes.Tag).To(Equal("ab"))
 				Expect(backends.containerizerOptions(new(rundmcfakes.FakeOCIRuntime))).To(HaveLen(2))
 			})
 
@@ -608,8 +609,8 @@ var _ = Describe("execution backend flags", func() {
 				nodeDir = filepath.Join(root, "nodes")
 				Expect(os.Mkdir(claimDir, 0o700)).To(Succeed())
 				Expect(os.Mkdir(nodeDir, 0o755)).To(Succeed())
-				Expect(os.WriteFile(filepath.Join(claimDir, "8-16"), []byte("gone"), 0o600)).To(Succeed())
-				Expect(os.WriteFile(filepath.Join(claimDir, "8-32"), []byte("running"), 0o600)).To(Succeed())
+				Expect(os.WriteFile(filepath.Join(claimDir, "8-16"), []byte("\ngone"), 0o600)).To(Succeed())
+				Expect(os.WriteFile(filepath.Join(claimDir, "8-32"), []byte("\nrunning"), 0o600)).To(Succeed())
 
 				handles, listErr = []string{"running"}, nil
 				sweeper = blockVolumeSweeper{
@@ -628,6 +629,14 @@ var _ = Describe("execution backend flags", func() {
 				Expect(sweeper.Start()).To(Succeed())
 				Expect(filepath.Join(claimDir, "8-16")).NotTo(BeAnExistingFile())
 				Expect(filepath.Join(claimDir, "8-32")).To(BeARegularFile())
+			})
+
+			It("keeps the devices that a Garden with another tag claimed", func() {
+				Expect(os.WriteFile(filepath.Join(claimDir, "8-48"), []byte("zz\nunknown-to-us"), 0o600)).To(Succeed())
+
+				Expect(sweeper.Start()).To(Succeed())
+				Expect(filepath.Join(claimDir, "8-16")).NotTo(BeAnExistingFile())
+				Expect(filepath.Join(claimDir, "8-48")).To(BeARegularFile())
 			})
 
 			It("fails the start when the containers cannot be listed", func() {

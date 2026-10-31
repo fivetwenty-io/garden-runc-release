@@ -67,7 +67,7 @@ var _ = Describe("LinuxPDIHost", func() {
 
 			file, err := readDescriptor(dir)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(file.Mode.IsRegular()).To(BeTrue())
+			Expect(file.Regular).To(BeTrue())
 			Expect(file.UID).To(BeEquivalentTo(os.Getuid()))
 			Expect(file.Size).To(BeEquivalentTo(10))
 			Expect(file.Data).To(Equal([]byte("version=1\n")))
@@ -95,7 +95,7 @@ var _ = Describe("LinuxPDIHost", func() {
 
 			file, err := readDescriptor(dir)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(file.Mode & os.ModeNamedPipe).NotTo(BeZero())
+			Expect(file.Regular).To(BeFalse())
 			Expect(file.Data).To(BeEmpty())
 		})
 
@@ -122,16 +122,18 @@ var _ = Describe("LinuxPDIHost", func() {
 
 		It("probes and refuses a node that is not a block device", func() {
 			Expect(os.WriteFile(node, nil, 0o600)).To(Succeed())
-			Expect(host.Probe(node, 7, 250)).To(MatchError(ContainSubstring("not block device 7:250")))
+			Expect(host.Probe(node, 7, 250, 4096)).To(MatchError(ContainSubstring("not block device 7:250")))
 		})
 
 		It("fails the probe for a missing node", func() {
-			Expect(host.Probe(node, 7, 250)).To(MatchError(ContainSubstring("exclusive open")))
+			Expect(host.Probe(node, 7, 250, 4096)).To(MatchError(ContainSubstring("exclusive open")))
 		})
 
 		It("does not remove something that is not the named block device", func() {
 			Expect(os.WriteFile(node, nil, 0o600)).To(Succeed())
-			Expect(host.RemoveNode(node, 7, 250)).To(MatchError(ContainSubstring("not block device 7:250")))
+			err := host.RemoveNode(node, 7, 250)
+			Expect(err).To(MatchError(ContainSubstring("not block device 7:250")))
+			Expect(errors.Is(err, bundlerules.ErrPDIForeignNode)).To(BeTrue())
 			Expect(node).To(BeARegularFile())
 		})
 
@@ -162,7 +164,7 @@ var _ = Describe("LinuxPDIHost", func() {
 
 				Expect(errors.Is(host.Mknod(node, 7, 250, 991), os.ErrExist)).To(BeTrue())
 
-				Expect(host.RemoveNode(node, 7, 251)).To(MatchError(ContainSubstring("not block device 7:251")))
+				Expect(errors.Is(host.RemoveNode(node, 7, 251), bundlerules.ErrPDIForeignNode)).To(BeTrue())
 				Expect(unix.Lstat(node, &st)).To(Succeed())
 
 				Expect(host.RemoveNode(node, 7, 250)).To(Succeed())
@@ -170,9 +172,89 @@ var _ = Describe("LinuxPDIHost", func() {
 				Expect(host.RemoveNode(node, 7, 250)).To(Succeed())
 			})
 
-			It("leaves no node behind when it cannot finish one", func() {
+			It("creates no node in a directory that is missing", func() {
 				Expect(host.Mknod(filepath.Join(dir, "missing", "7-250"), 7, 250, 991)).To(MatchError(ContainSubstring("mknod")))
+			})
+
+			It("removes the node it made when it cannot finish it", func() {
+				// A gid of all ones tells chown to change nothing, so the node keeps its
+				// own group, the final check fails, and mknod has already made the node.
+				err := host.Mknod(node, 7, 250, 0xFFFFFFFF)
+				Expect(err).To(MatchError(ContainSubstring("the node is mode")))
+
+				var st unix.Stat_t
+				Expect(unix.Lstat(node, &st)).To(MatchError(unix.ENOENT))
 			})
 		})
 	})
+
+	Describe("Probe against a loop device", func() {
+		const size = 8 << 20
+
+		var node string
+
+		BeforeEach(func() {
+			if os.Getuid() != 0 {
+				Skip("a loop device needs root")
+			}
+			ctl, err := unix.Open("/dev/loop-control", unix.O_RDWR|unix.O_CLOEXEC, 0)
+			if err != nil {
+				Skip("no /dev/loop-control: " + err.Error())
+			}
+			defer unix.Close(ctl)
+			n, err := unix.IoctlRetInt(ctl, unix.LOOP_CTL_GET_FREE)
+			Expect(err).NotTo(HaveOccurred())
+
+			backing := filepath.Join(dir, "disk.img")
+			Expect(os.WriteFile(backing, nil, 0o600)).To(Succeed())
+			Expect(os.Truncate(backing, size)).To(Succeed())
+			backingFd, err := unix.Open(backing, unix.O_RDWR|unix.O_CLOEXEC, 0)
+			Expect(err).NotTo(HaveOccurred())
+			defer unix.Close(backingFd)
+
+			node = filepath.Join(dir, "loop-node")
+			Expect(host.Mknod(node, 7, uint32(n), 0)).To(Succeed())
+			loopFd, err := unix.Open(node, unix.O_RDWR|unix.O_CLOEXEC, 0)
+			Expect(err).NotTo(HaveOccurred())
+			if err := unix.IoctlSetInt(loopFd, unix.LOOP_SET_FD, backingFd); err != nil {
+				unix.Close(loopFd)
+				Skip("cannot attach a loop device: " + err.Error())
+			}
+			DeferCleanup(func() {
+				Expect(unix.IoctlSetInt(loopFd, unix.LOOP_CLR_FD, 0)).To(Succeed())
+				Expect(unix.Close(loopFd)).To(Succeed())
+			})
+		})
+
+		It("accepts the device at the descriptor's size", func() {
+			Expect(host.Probe(node, 7, uint32(loopMinor(node)), size)).To(Succeed())
+		})
+
+		It("refuses a device whose size differs from the descriptor's", func() {
+			err := host.Probe(node, 7, uint32(loopMinor(node)), size-512)
+			Expect(err).To(MatchError(ContainSubstring("the device is 8388608 bytes, and the descriptor says 8388096")))
+		})
+
+		It("refuses the device while another exclusive opener holds it, and accepts it again afterwards", func() {
+			held, err := unix.Open(node, unix.O_RDWR|unix.O_EXCL|unix.O_CLOEXEC, 0)
+			Expect(err).NotTo(HaveOccurred())
+
+			err = host.Probe(node, 7, uint32(loopMinor(node)), size)
+			Expect(errors.Is(err, unix.EBUSY)).To(BeTrue(), "got %v", err)
+
+			Expect(unix.Close(held)).To(Succeed())
+			Expect(host.Probe(node, 7, uint32(loopMinor(node)), size)).To(Succeed())
+		})
+
+		It("refuses the node when it is a different device number", func() {
+			Expect(host.Probe(node, 7, uint32(loopMinor(node))+1, size)).To(MatchError(ContainSubstring("is not block device")))
+		})
+	})
 })
+
+// loopMinor returns the minor number of the block node at path.
+func loopMinor(path string) uint32 {
+	var st unix.Stat_t
+	Expect(unix.Lstat(path, &st)).To(Succeed())
+	return unix.Minor(st.Rdev)
+}

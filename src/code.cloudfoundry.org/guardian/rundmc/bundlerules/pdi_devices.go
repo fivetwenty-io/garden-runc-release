@@ -7,9 +7,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 
+	"code.cloudfoundry.org/garden"
 	spec "code.cloudfoundry.org/guardian/gardener/container-spec"
 	"code.cloudfoundry.org/lager/v3"
 )
@@ -41,22 +43,30 @@ const (
 	DefaultPDIClaimDir = "/run/garden-pdi-claims"
 
 	pdiNodeMode os.FileMode = 0660
+
+	// pdiDescriptorOwner is the uid that must own a descriptor file, which is
+	// root on a cell.
+	pdiDescriptorOwner uint32 = 0
 )
 
 // ErrBlockVolumeRefused is wrapped by every error that refuses a container
 // because of a block volume.
 var ErrBlockVolumeRefused = errors.New("block volume refused")
 
+// ErrPDIForeignNode is wrapped by the error that RemoveNode returns for a path
+// that is not the block device it was asked to remove.
+var ErrPDIForeignNode = errors.New("the path is not the block node Garden made")
+
 // PDIDescriptorFile is what PDIHost read from a descriptor file.
 type PDIDescriptorFile struct {
-	// Mode is the file's type and permission bits.
-	Mode os.FileMode
+	// Regular reports whether the file is a regular file.
+	Regular bool
 	// UID is the file's owner.
 	UID uint32
 	// Size is the file's length from fstat.
 	Size int64
-	// Data is the file's content. It is empty unless Mode is a regular file,
-	// and it holds at most PDIDescriptorSizeLimit+1 bytes.
+	// Data is the file's content. It is empty unless Regular is true, and it
+	// holds at most PDIDescriptorSizeLimit+1 bytes.
 	Data []byte
 }
 
@@ -81,10 +91,12 @@ type PDIHost interface {
 	// already exists, and it leaves no node behind when it fails otherwise.
 	Mknod(path string, major, minor, gid uint32) error
 	// Probe opens the node at path with O_EXCL, checks that it is the block
-	// device major:minor, and closes it again.
-	Probe(path string, major, minor uint32) error
+	// device major:minor and that the device is size bytes long, and closes it
+	// again.
+	Probe(path string, major, minor uint32, size int64) error
 	// RemoveNode removes the node at path when it is the block device
-	// major:minor. A missing node is not an error.
+	// major:minor. A missing node is not an error, and a path that is anything
+	// else returns an error wrapping ErrPDIForeignNode.
 	RemoveNode(path string, major, minor uint32) error
 }
 
@@ -93,15 +105,22 @@ type PDIHost interface {
 // checks that the named device is unused on the host, creates its node, and
 // records which container has it. Release removes the node and the record
 // when the container is destroyed.
+//
+// The node and claim directories are shared by every Garden on the host. Each
+// claim records the Garden's Tag, and a Garden releases only claims with its
+// own tag, while it refuses a device that any Garden has claimed.
 type PDIDevices struct {
 	// KVMGid owns the block nodes. Only the wrapped vm-launch holds it.
 	KVMGid uint32
 
+	// Tag is the Garden's --tag value, or empty. It is written into each claim.
+	Tag string
+
 	// NodeDir holds the block nodes, named MAJOR-MINOR.
 	NodeDir string
 
-	// ClaimDir holds the claim files, named MAJOR-MINOR, each holding the
-	// handle of the container that has the device.
+	// ClaimDir holds the claim files, named MAJOR-MINOR, each holding the tag of
+	// the Garden and the handle of the container that has the device.
 	ClaimDir string
 
 	// SysfsDir is where sysfs is mounted.
@@ -110,12 +129,12 @@ type PDIDevices struct {
 	// MountInfoPath is the mount table of Garden's mount namespace.
 	MountInfoPath string
 
-	// DescriptorOwner is the uid that must own a descriptor file. It is root
-	// on a cell.
-	DescriptorOwner uint32
-
 	Host   PDIHost
 	Logger lager.Logger
+
+	// mu serialises Claim's claiming, Release, and ReleaseUnknown, which would
+	// otherwise read an owner and then remove a node that a new owner has taken.
+	mu sync.Mutex
 }
 
 // pdiDevice is one block device that a container's descriptor names.
@@ -169,6 +188,9 @@ func (p *PDIDevices) Claim(desired spec.DesiredContainerSpec) ([]deviceNode, err
 		if !ok {
 			continue
 		}
+		if bm.Mode == garden.BindMountModeRO {
+			return nil, refuse("bind mount %s is a device descriptor and is read-only, and block mode needs it read-write", bm.SrcPath)
+		}
 		dev := pdiDevice{source: bm.SrcPath, desc: desc}
 		if other, dup := seen[dev.numbers()]; dup {
 			return nil, refuse("bind mounts %s and %s both name device %s", other, bm.SrcPath, dev.numbers())
@@ -195,6 +217,9 @@ func (p *PDIDevices) Claim(desired spec.DesiredContainerSpec) ([]deviceNode, err
 	if err := ensurePDIDir(p.ClaimDir, 0700); err != nil {
 		return nil, refuse("preparing %s: %s", p.ClaimDir, err)
 	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
 	var claimed []pdiDevice
 	nodes := make([]deviceNode, 0, len(devices))
@@ -260,11 +285,11 @@ func (p *PDIDevices) descriptorAt(source string, mounts []pdiMountEntry) (pdiDes
 	if err != nil {
 		return pdiDescriptor{}, false, refuse("reading the descriptor in %s: %s", source, err)
 	}
-	if !file.Mode.IsRegular() {
-		return pdiDescriptor{}, false, refuse("the descriptor in %s is not a regular file (%s)", source, file.Mode.Type())
+	if !file.Regular {
+		return pdiDescriptor{}, false, refuse("the descriptor in %s is not a regular file", source)
 	}
-	if file.UID != p.DescriptorOwner {
-		return pdiDescriptor{}, false, refuse("the descriptor in %s is owned by uid %d, not %d", source, file.UID, p.DescriptorOwner)
+	if file.UID != pdiDescriptorOwner {
+		return pdiDescriptor{}, false, refuse("the descriptor in %s is owned by uid %d, not %d", source, file.UID, pdiDescriptorOwner)
 	}
 	if file.Size >= PDIDescriptorSizeLimit || len(file.Data) >= PDIDescriptorSizeLimit {
 		return pdiDescriptor{}, false, refuse("the descriptor in %s is %d bytes, and it must be shorter than %d", source, max(file.Size, int64(len(file.Data))), PDIDescriptorSizeLimit)
@@ -280,10 +305,10 @@ func (p *PDIDevices) descriptorAt(source string, mounts []pdiMountEntry) (pdiDes
 }
 
 // checkDevice refuses a device whose size differs from the descriptor's, or
-// that is mounted or has holders on the host, either itself, through any of
-// its partitions, or, for a partition, through its whole disk. The exclusive
-// open in claim is the check that also sees an app's O_EXCL hold and mounts in
-// other mount namespaces, which neither holders nor this mount table show.
+// that is mounted on the host, either itself, through any of its partitions,
+// or, for a partition, through its whole disk. The exclusive open in claim is
+// the check that also sees an app's O_EXCL hold, swap, device-mapper claims,
+// and mounts in other mount namespaces, which this mount table does not show.
 func (p *PDIDevices) checkDevice(dev pdiDevice, mounts []pdiMountEntry) error {
 	devDir := filepath.Join(p.SysfsDir, "dev", "block", dev.numbers())
 	info, err := os.Stat(devDir)
@@ -310,21 +335,11 @@ func (p *PDIDevices) checkDevice(dev pdiDevice, mounts []pdiMountEntry) error {
 		return refuse("listing the partitions of device %s: %s", dev.numbers(), err)
 	}
 
-	for _, rel := range append([]sysfsBlockDevice{{dir: devDir, numbers: dev.numbers()}}, related...) {
+	for _, numbers := range append([]string{dev.numbers()}, related...) {
 		for _, m := range mounts {
-			if m.devNumbers == rel.numbers {
-				return refuse("device %s (from %s) is mounted on the host at %s", rel.numbers, dev.source, m.mountPoint)
+			if m.devNumbers == numbers {
+				return refuse("device %s (from %s) is mounted on the host at %s", numbers, dev.source, m.mountPoint)
 			}
-		}
-		if rel.dir == "" {
-			continue
-		}
-		holders, err := os.ReadDir(filepath.Join(rel.dir, "holders"))
-		if err != nil {
-			return refuse("reading the holders of device %s: %s", rel.numbers, unwrapPathError(err))
-		}
-		if len(holders) > 0 {
-			return refuse("device %s (from %s) is held by %s", rel.numbers, dev.source, holders[0].Name())
 		}
 	}
 	return nil
@@ -332,8 +347,9 @@ func (p *PDIDevices) checkDevice(dev pdiDevice, mounts []pdiMountEntry) error {
 
 // claim records the container as the device's owner, creates the node, and
 // probes it with O_EXCL. The claim file is created exclusively, so a second
-// container naming the same device is refused, and a node that Garden did not
-// create is never adopted or removed.
+// container naming the same device is refused, whichever Garden it is in, and
+// a node that Garden did not create is never adopted or removed. The caller
+// holds p.mu.
 func (p *PDIDevices) claim(handle string, dev pdiDevice) error {
 	major, minor := dev.desc.Major, dev.desc.Minor
 	claimPath := p.claimPath(major, minor)
@@ -341,14 +357,11 @@ func (p *PDIDevices) claim(handle string, dev pdiDevice) error {
 	f, err := os.OpenFile(claimPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) {
-			if owner, readErr := os.ReadFile(claimPath); readErr == nil {
-				return refuse("device %s named by %s is already given to container %q", dev.numbers(), dev.source, string(owner))
-			}
-			return refuse("device %s named by %s is already given to another container", dev.numbers(), dev.source)
+			return p.refuseClaimed(dev, claimPath)
 		}
 		return refuse("claiming device %s: %s", dev.numbers(), unwrapPathError(err))
 	}
-	_, writeErr := f.Write([]byte(handle))
+	_, writeErr := f.Write(encodePDIClaim(pdiClaim{tag: p.Tag, handle: handle}))
 	closeErr := f.Close()
 	if err := errors.Join(writeErr, closeErr); err != nil {
 		_ = os.Remove(claimPath)
@@ -364,29 +377,53 @@ func (p *PDIDevices) claim(handle string, dev pdiDevice) error {
 		return refuse("creating %s: %s", nodePath, err)
 	}
 
-	if err := p.Host.Probe(nodePath, major, minor); err != nil {
-		if rmErr := p.release(major, minor); rmErr != nil {
+	if err := p.Host.Probe(nodePath, major, minor, dev.desc.Size); err != nil {
+		if rmErr := p.release(p.Logger, major, minor); rmErr != nil {
 			p.Logger.Error("pdi-device-probe-cleanup-failed", rmErr, lager.Data{"device": dev.numbers()})
 		}
-		return refuse("device %s named by %s is mounted, held, or busy on the host: %s", dev.numbers(), dev.source, err)
+		return refuse("device %s named by %s failed the exclusive probe, so it may be mounted, held, busy, or the wrong size on the host: %s", dev.numbers(), dev.source, err)
 	}
 	return nil
 }
 
-// rollback releases the devices that one Claim call had already claimed.
+// refuseClaimed refuses a device whose claim file already exists.
+func (p *PDIDevices) refuseClaimed(dev pdiDevice, claimPath string) error {
+	data, err := os.ReadFile(claimPath)
+	if err != nil {
+		return refuse("device %s named by %s is already given to another container", dev.numbers(), dev.source)
+	}
+	c, ok := parsePDIClaim(data)
+	switch {
+	case !ok:
+		return refuse("device %s named by %s has a claim that Garden cannot read, so it is already given to another container", dev.numbers(), dev.source)
+	case c.tag != p.Tag:
+		return refuse("device %s named by %s is already given to container %q of the Garden tagged %q", dev.numbers(), dev.source, c.handle, c.tag)
+	default:
+		return refuse("device %s named by %s is already given to container %q", dev.numbers(), dev.source, c.handle)
+	}
+}
+
+// rollback releases the devices that one Claim call had already claimed. The
+// caller holds p.mu.
 func (p *PDIDevices) rollback(claimed []pdiDevice) {
 	for _, dev := range claimed {
-		if err := p.release(dev.desc.Major, dev.desc.Minor); err != nil {
+		if err := p.release(p.Logger, dev.desc.Major, dev.desc.Minor); err != nil {
 			p.Logger.Error("pdi-device-rollback-failed", err, lager.Data{"device": dev.numbers()})
 		}
 	}
 }
 
 // release removes a device's node, then its claim. A claim without a node,
-// which a crash between the two steps leaves, is released the same way.
-func (p *PDIDevices) release(major, minor uint32) error {
+// which a crash between the two steps leaves, is released the same way. A path
+// that is not the block node is logged and left in place, and the claim goes
+// anyway, because a later claim of the device still refuses the existing path.
+// The caller holds p.mu and has checked that the claim is its own.
+func (p *PDIDevices) release(log lager.Logger, major, minor uint32) error {
 	if err := p.Host.RemoveNode(p.nodePath(major, minor), major, minor); err != nil {
-		return fmt.Errorf("removing %s: %w", p.nodePath(major, minor), err)
+		if !errors.Is(err, ErrPDIForeignNode) {
+			return fmt.Errorf("removing %s: %w", p.nodePath(major, minor), err)
+		}
+		log.Error("pdi-node-left-in-place", err, lager.Data{"node": p.nodePath(major, minor)})
 	}
 	if err := os.Remove(p.claimPath(major, minor)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("removing %s: %w", p.claimPath(major, minor), err)
@@ -394,15 +431,19 @@ func (p *PDIDevices) release(major, minor uint32) error {
 	return nil
 }
 
-// Release removes the node and claim of every device given to the container.
-// It is safe to call for a container that has none, and more than once.
+// Release removes the node and claim of every device that this Garden gave to
+// the container. It is safe to call for a container that has none, and more
+// than once. It returns an error only for a claim that the container owns, so
+// an unreadable or foreign entry in the shared claim directory, which is
+// logged and left alone, never fails another container's destroy.
 func (p *PDIDevices) Release(log lager.Logger, handle string) error {
 	return p.releaseWhere(log, func(owner string) bool { return owner == handle })
 }
 
-// ReleaseUnknown removes the node and claim of every device whose container is
-// not among known. Garden calls it at start-up, before it serves requests, to
-// release devices that a crash left claimed by a container it never created.
+// ReleaseUnknown removes the node and claim of every device that this Garden
+// gave to a container not among known. Garden calls it at start-up, before it
+// serves requests, to release devices that a crash left claimed by a container
+// it never created. Claims of other Gardens are not touched.
 func (p *PDIDevices) ReleaseUnknown(log lager.Logger, known []string) error {
 	knownSet := make(map[string]struct{}, len(known))
 	for _, h := range known {
@@ -414,13 +455,20 @@ func (p *PDIDevices) ReleaseUnknown(log lager.Logger, known []string) error {
 	})
 }
 
-func (p *PDIDevices) releaseWhere(log lager.Logger, match func(owner string) bool) error {
+// releaseWhere releases the claims with this Garden's tag whose handle match
+// picks. It holds p.mu while it reads each owner and while it removes the
+// node and claim, so a claim that another call has released and a new owner has
+// taken is never removed on the strength of a stale read.
+func (p *PDIDevices) releaseWhere(log lager.Logger, match func(handle string) bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	entries, err := os.ReadDir(p.ClaimDir)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Error("pdi-claim-dir-unreadable", err, lager.Data{"dir": p.ClaimDir})
 		}
-		return fmt.Errorf("listing %s: %w", p.ClaimDir, err)
+		return nil
 	}
 
 	var errs []error
@@ -430,24 +478,49 @@ func (p *PDIDevices) releaseWhere(log lager.Logger, match func(owner string) boo
 			log.Info("pdi-claim-dir-unexpected-entry", lager.Data{"name": entry.Name()})
 			continue
 		}
-		owner, err := os.ReadFile(filepath.Join(p.ClaimDir, entry.Name()))
+		data, err := os.ReadFile(filepath.Join(p.ClaimDir, entry.Name()))
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				continue
+			if !errors.Is(err, os.ErrNotExist) {
+				log.Error("pdi-claim-unreadable", err, lager.Data{"name": entry.Name()})
 			}
-			errs = append(errs, fmt.Errorf("reading claim %s: %w", entry.Name(), err))
 			continue
 		}
-		if !match(string(owner)) {
+		c, ok := parsePDIClaim(data)
+		if !ok {
+			log.Info("pdi-claim-malformed", lager.Data{"name": entry.Name()})
 			continue
 		}
-		if err := p.release(major, minor); err != nil {
+		if c.tag != p.Tag || !match(c.handle) {
+			continue
+		}
+		if err := p.release(log, major, minor); err != nil {
 			errs = append(errs, err)
 			continue
 		}
-		log.Info("pdi-device-released", lager.Data{"handle": string(owner), "device": fmt.Sprintf("%d:%d", major, minor)})
+		log.Info("pdi-device-released", lager.Data{"handle": c.handle, "device": fmt.Sprintf("%d:%d", major, minor)})
 	}
 	return errors.Join(errs...)
+}
+
+// pdiClaim is the content of a claim file, which is the Garden's tag, a
+// newline, and the container's handle.
+type pdiClaim struct {
+	tag    string
+	handle string
+}
+
+func encodePDIClaim(c pdiClaim) []byte {
+	return []byte(c.tag + "\n" + c.handle)
+}
+
+// parsePDIClaim reports whether data is a claim in the form encodePDIClaim
+// writes.
+func parsePDIClaim(data []byte) (pdiClaim, bool) {
+	tag, handle, ok := strings.Cut(string(data), "\n")
+	if !ok || handle == "" {
+		return pdiClaim{}, false
+	}
+	return pdiClaim{tag: tag, handle: handle}, true
 }
 
 // parsePDIName parses a MAJOR-MINOR node or claim name in its one spelling.
@@ -483,17 +556,11 @@ func ensurePDIDir(dir string, perm os.FileMode) error {
 	return nil
 }
 
-// sysfsBlockDevice is a block device related to the one a descriptor names.
-// dir is empty when sysfs has no directory to read its holders from.
-type sysfsBlockDevice struct {
-	dir     string
-	numbers string
-}
-
-// relatedBlockDevices returns the partitions of the device in devDir and, when
-// the device is itself a partition, its whole disk.
-func relatedBlockDevices(devDir string) ([]sysfsBlockDevice, error) {
-	var related []sysfsBlockDevice
+// relatedBlockDevices returns the MAJOR:MINOR numbers of the partitions of the
+// device in devDir and, when the device is itself a partition, of its whole
+// disk.
+func relatedBlockDevices(devDir string) ([]string, error) {
+	var related []string
 
 	entries, err := os.ReadDir(devDir)
 	if err != nil {
@@ -514,7 +581,7 @@ func relatedBlockDevices(devDir string) ([]sysfsBlockDevice, error) {
 		if err != nil {
 			return nil, err
 		}
-		related = append(related, sysfsBlockDevice{dir: dir, numbers: numbers})
+		related = append(related, numbers)
 	}
 
 	if _, err := os.Lstat(filepath.Join(devDir, "partition")); err == nil {
@@ -522,12 +589,11 @@ func relatedBlockDevices(devDir string) ([]sysfsBlockDevice, error) {
 		if err != nil {
 			return nil, err
 		}
-		parent := filepath.Dir(real)
-		numbers, err := readSysfsDev(filepath.Join(parent, "dev"))
+		numbers, err := readSysfsDev(filepath.Join(filepath.Dir(real), "dev"))
 		if err != nil {
 			return nil, err
 		}
-		related = append(related, sysfsBlockDevice{dir: parent, numbers: numbers})
+		related = append(related, numbers)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, unwrapPathError(err)
 	}
@@ -571,15 +637,19 @@ type pdiMountEntry struct {
 	id         uint64
 	devNumbers string
 	mountPoint string
-	options    string
 	fsType     string
 	source     string
+	superOpts  string
 }
 
-// readOnly reports whether the per-mount options include ro, which is what the
-// bosh-disk driver checks after it remounts the descriptor tmpfs.
+// readOnly reports whether the filesystem's own options include ro. A read-only
+// superblock blocks writes through every mount of the tmpfs. The per-mount
+// flags are not enough. A mount that propagated into Garden's mount namespace
+// before the driver's remount keeps read-write per-mount flags, and a
+// per-mount ro flag leaves a read-write filesystem writable through any other
+// mount of it.
 func (e pdiMountEntry) readOnly() bool {
-	for _, opt := range strings.Split(e.options, ",") {
+	for _, opt := range strings.Split(e.superOpts, ",") {
 		if opt == "ro" {
 			return true
 		}
@@ -622,7 +692,7 @@ func readPDIMountInfo(path string) ([]pdiMountEntry, error) {
 				break
 			}
 		}
-		if len(fields) < 6 || sep < 0 || sep+2 >= len(fields) {
+		if len(fields) < 6 || sep < 0 || sep+3 >= len(fields) {
 			return nil, fmt.Errorf("line %d is not a mountinfo line", n+1)
 		}
 		id, err := strconv.ParseUint(fields[0], 10, 64)
@@ -633,9 +703,9 @@ func readPDIMountInfo(path string) ([]pdiMountEntry, error) {
 			id:         id,
 			devNumbers: fields[2],
 			mountPoint: unescapeMountInfo(fields[4]),
-			options:    fields[5],
 			fsType:     fields[sep+1],
 			source:     unescapeMountInfo(fields[sep+2]),
+			superOpts:  fields[sep+3],
 		})
 	}
 	return entries, nil

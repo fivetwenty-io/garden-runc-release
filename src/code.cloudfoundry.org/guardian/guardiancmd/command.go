@@ -973,7 +973,7 @@ func (cmd *CommonCommand) wireExecutionBackends(log lager.Logger) (*executionBac
 		if kvmGid == 0 {
 			cmd.logUnusedBlockVolumes(log)
 		} else {
-			blockVolumes, err = bundlerules.NewPDIDevices(log.Session("block-volumes"), kvmGid)
+			blockVolumes, err = bundlerules.NewPDIDevices(log.Session("block-volumes"), kvmGid, cmd.Server.Tag)
 			if err != nil {
 				return nil, fmt.Errorf("--vm-block-volumes: %w", err)
 			}
@@ -994,8 +994,9 @@ func (cmd *CommonCommand) logUnusedBlockVolumes(log lager.Logger) {
 }
 
 // blockVolumeSweeper releases, at start-up and before Garden serves requests,
-// the block devices that a crash left claimed by containers Garden no longer
-// knows. Every container it does know releases its own on destroy.
+// the block devices that a crash left claimed by containers this Garden no
+// longer knows. Claims of other Gardens on the host are left alone. Every
+// container it does know releases its own on destroy.
 type blockVolumeSweeper struct {
 	log     lager.Logger
 	volumes *bundlerules.PDIDevices
