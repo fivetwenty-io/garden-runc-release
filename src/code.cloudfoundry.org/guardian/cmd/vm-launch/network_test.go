@@ -474,9 +474,9 @@ var _ = Describe("guest network", func() {
 		nw := &network{ports: []int{8080}}
 
 		It("adds a user-mode NIC with no forward, and for PORT a QMP monitor on the inherited socket", func() {
-			argv, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/proc/self/fd/3", 128, nw, "", "", 4)
+			argv, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/proc/self/fd/3", 128, nw, nil, "", 4)
 			Expect(err).NotTo(HaveOccurred())
-			task, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/proc/self/fd/3", 128, &network{}, "", "", 0)
+			task, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/proc/self/fd/3", 128, &network{}, nil, "", 0)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(argv[:len(argv)-4]).To(Equal(task))
 			Expect(argv[len(argv)-4:]).To(Equal([]string{
@@ -491,14 +491,14 @@ var _ = Describe("guest network", func() {
 		})
 
 		It("refuses a QMP monitor for Firecracker", func() {
-			_, err := hypervisorArgv(backend.VMFirecracker, art, GinkgoT().TempDir(), "/proc/self/fd/3", 128, nw, "", "", 4)
+			_, err := hypervisorArgv(backend.VMFirecracker, art, GinkgoT().TempDir(), "/proc/self/fd/3", 128, nw, nil, "", 4)
 			Expect(err).To(MatchError("firecracker has no QMP monitor"))
 		})
 
 		It("attaches the Firecracker guest of an LRP and of a task to garden's tap device", func() {
 			for _, n := range []*network{nw, {}} {
 				work := GinkgoT().TempDir()
-				argv, err := hypervisorArgv(backend.VMFirecracker, art, work, "/proc/self/fd/3", 128, n, "", "", 0)
+				argv, err := hypervisorArgv(backend.VMFirecracker, art, work, "/proc/self/fd/3", 128, n, nil, "", 0)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(argv).To(Equal([]string{art + "/firecracker/firecracker", "--no-api", "--config-file", work + "/fc.json"}))
 

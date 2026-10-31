@@ -78,7 +78,8 @@
 // Volumes: when VCAP_SERVICES names a volume mount, as it does for an app
 // bound to a volume service, the guest gets that volume at the same path the
 // container sees, backed by a raw image file
-// rvm-disk-APPID-PROCESSTYPE-INDEX.img in the root of the volume. APPID is the
+// rvm-disk-APPID-PROCESSTYPE-INDEX.img in the root of the volume. An app may
+// have up to four read-write volume mounts, each on a path of its own. APPID is the
 // application_id in VCAP_APPLICATION, which must be a lowercase UUID,
 // PROCESSTYPE is its process_type, 1 to 63 lowercase letters, digits,
 // underscores, or hyphens, and INDEX is CF_INSTANCE_INDEX. Two apps bound to
@@ -103,16 +104,24 @@
 // for as long as the VM runs, waiting up to 30 seconds for another instance
 // to release it, checks after the wait that the name still refers to the
 // locked file, and passes the image to the hypervisor as file descriptor 3.
-// The guest finds the image by its size, which no guest root image shares,
-// formats it as ext2 when its first 64 KiB are all zero, and mounts it
-// synchronously; a non-blank image that does not mount is never formatted. A
-// VM app supports one read-write volume mount, and it must be a JuiceFS
-// mount. Cloud Controller strips the driver name from volume_mounts,
-// so vm-launch reads the filesystem type of the mount at the volume path from
-// /proc/self/mountinfo and lets the registry of volume providers (see pdi.go)
-// pick the provider that owns it. JuiceFS, which owns fuse.juicefs, is the
-// only provider, so any other type, or a path with no mount entry, fails the
-// launch with exit 125 before anything boots.
+// With more than one volume, the volumes are taken in the byte order of
+// their paths, and each one's image gets the next file descriptor and the
+// next drive, vol0 to vol3, so that the order never depends on the order of
+// VCAP_SERVICES. vm-launch prepares them in that order and, when one fails,
+// releases every one it prepared before it. Two volumes that show one
+// directory of one filesystem, so that their images would be one file, fail
+// the launch. The guest finds the image by its size, which no guest root
+// image shares, formats it as ext2 when its first 64 KiB are all zero, and
+// mounts it synchronously; a non-blank image that does not mount is never
+// formatted. Every volume image has the same size, so a guest with more than
+// one volume finds two drives of that size and fails its boot before it
+// formats anything. Each volume must be a JuiceFS mount. Cloud Controller
+// strips the driver name from volume_mounts, so vm-launch reads the
+// filesystem type of the mount at each volume path from /proc/self/mountinfo
+// and lets the registry of volume providers (see pdi.go) pick the provider
+// that owns it. JuiceFS, which owns fuse.juicefs, is the only provider, so
+// any other type, or a path with no mount entry, fails the launch with exit
+// 125 before anything boots.
 //
 // Environment: the guest command sees the container's environment after the
 // changes the CF launcher would have made to it. vm-launch reads its
@@ -197,8 +206,8 @@
 // smaller of limits.disk and the space free in the work directory, less 32
 // MiB kept for other writers in the container, so that the guest's own
 // filesystem fills before the quota does; it is 1 MiB smaller when that would
-// equal the volume image's size. The hypervisor gets it as a second drive,
-// after the volume image's and with discard turned on, so that the blocks the
+// equal the volume image's size. The hypervisor gets it as the last drive,
+// after the volume images' and with discard turned on, so that the blocks the
 // guest frees go back to the quota. When less than 16 MiB is left after the
 // 32 MiB, or the image cannot be created, vm-launch exits 125 with a line
 // that says why. A missing or malformed limits.disk leaves the guest root in
@@ -219,12 +228,12 @@
 //
 // The initramfs that holds the guest's /init, busybox, command, and
 // environment is built in a sealed memfd and never written to disk. The
-// hypervisor gets it as the file descriptor after the volume image's, 3
-// without a volume and 4 with one, and vm-launch closes its own copy once
-// the hypervisor has started. A QEMU monitor socket comes next, and the
-// guest root image last, so the image is file descriptor 4 without a volume
-// or a monitor and 6 with both; vm-launch closes its copy of it, too, once
-// the hypervisor has started.
+// hypervisor gets it as the file descriptor after the volume images', 3
+// without a volume, 4 with one, and 7 with four, and vm-launch closes its
+// own copy once the hypervisor has started. A QEMU monitor socket comes
+// next, and the guest root image last, so the image is file descriptor 4
+// without a volume or a monitor and 6 with one volume and a monitor;
+// vm-launch closes its copy of it, too, once the hypervisor has started.
 //
 // Core dumps: vm-launch sets its RLIMIT_CORE to zero, soft and hard, and its
 // coredump_filter to zero before it does anything else, and the hypervisor
@@ -257,10 +266,12 @@
 //	       that it could not read, a
 //	       hypervisor it could not run, PORT already in use in the
 //	       container, or a volume it cannot use:
-//	       VCAP_SERVICES that is not valid JSON, more than one volume
-//	       mount, a read-only mount, a bad volume path,
+//	       VCAP_SERVICES that is not valid JSON, more than four volume
+//	       mounts, two volume mounts on one path, two volumes that share a
+//	       directory, a read-only mount, a bad volume path,
 //	       CF_INSTANCE_INDEX, application_id, or process_type, a task with
-//	       a volume, an image that fails a check or cannot be created, or
+//	       a volume, an image that fails a check or cannot be created,
+//	       volume images of different sizes, or
 //	       an image another instance still holds after 30 seconds, a
 //	       guest environment that is too large, with one entry over
 //	       131071 bytes or more than 1 MiB in all, or a value that holds a
@@ -499,12 +510,12 @@ func run(argv []string, logger *log.Logger) int {
 		}
 	}
 	// The registry refuses a volume no provider owns here, before the work
-	// directory exists and before CredHub is asked anything.
-	vol, err := volumeFromEnv(lookupEnv)
-	var provider diskProvider
-	var volMount mountRecord
-	if err == nil && vol != nil {
-		provider, volMount, err = findVolumeProvider(mountInfoPath, vol.ContainerDir)
+	// directory exists and before CredHub is asked anything. Every volume
+	// is checked before any of them is prepared.
+	vols, err := volumesFromEnv(lookupEnv)
+	var selected []selectedVolume
+	if err == nil && len(vols) > 0 {
+		selected, err = findVolumeProviders(mountInfoPath, vols)
 	}
 	if err != nil {
 		logger.Print(err)
@@ -581,36 +592,38 @@ func run(argv []string, logger *log.Logger) int {
 		return exitLaunchError
 	}
 
-	// The provider's attachment stays fenced until the hypervisor is reaped:
-	// its Release runs on the way out of run, after sup.run has waited for
-	// the hypervisor, which shares the open file and with it the lock.
-	var img *os.File
-	var volumeBytes int64
-	if vol != nil {
-		att, err := provider.Prepare(prepareRequest{Mount: volMount, ImageName: vol.ImageName, Mode: attachFileImage, Signals: sigs})
-		if err != nil {
-			// A provider that fails after it fenced the disk may hand back
-			// what it built along with the error.
+	// The providers' attachments stay fenced until the hypervisor is reaped:
+	// their Release functions run on the way out of run, after sup.run has
+	// waited for the hypervisor, which shares the open files and with them
+	// the locks. The volumes are prepared in volume order, so two instances
+	// that start at once take their locks in the same order. When a volume
+	// fails, the deferred release lets go of every volume prepared before
+	// it, after the failure's own line.
+	var prepared preparedVolumes
+	defer func() { prepared.release(logger) }()
+	for _, v := range selected {
+		if att, err := prepared.prepare(v, sigs, logger); err != nil {
 			logger.Print(err)
 			discardAttachment(att, logger)
 			return stepExitCode(err)
 		}
-		if err := checkAttachment(provider, att, logger); err != nil {
-			logger.Print(err)
-			return exitLaunchError
-		}
-		defer func() {
-			if err := att.Release(); err != nil {
-				logger.Printf("releasing the volume image: %v", err)
+	}
+	// The guest's /init finds a volume's drive by its size, and /rvm/disks
+	// gives one size, the first volume's. With more than one volume of that
+	// size, /init sees two drives of the size and fails the boot before it
+	// formats anything. A volume of another size would instead be left
+	// unmounted while the app wrote to the guest root, so it is refused.
+	var vol *guestVolume
+	var volumeBytes int64
+	if len(prepared) > 0 {
+		vol, volumeBytes = &vols[0], prepared[0].Bytes
+		for _, v := range prepared[1:] {
+			if v.Bytes != volumeBytes {
+				logger.Printf("the volume images at %s and %s are %d and %d bytes; the guest finds its volumes by size, so every volume image must have the first one's size",
+					quoteForLog(prepared[0].Path), quoteForLog(v.Path), volumeBytes, v.Bytes)
+				return exitLaunchError
 			}
-		}()
-		img = att.File
-		info, err := img.Stat()
-		if err != nil {
-			logger.Printf("reading the size of the volume image: %v", err)
-			return exitLaunchError
 		}
-		volumeBytes = info.Size()
 	}
 
 	// The guest root image is sized from the quota the work directory has
@@ -676,8 +689,8 @@ func run(argv []string, logger *log.Logger) int {
 		}
 		defer monitor.Close()
 	}
-	files, drivePath, initrdPath, monitorFD, rootPath := hypervisorFiles(img, initrd, qemuMonitor, rootImg)
-	hvArgv, err := hypervisorArgv(cfg.backend, cfg.artifacts, workDir, initrdPath, memMiB, nw, drivePath, rootPath, monitorFD)
+	files, drivePaths, initrdPath, monitorFD, rootPath := hypervisorFiles(prepared.files(), initrd, qemuMonitor, rootImg)
+	hvArgv, err := hypervisorArgv(cfg.backend, cfg.artifacts, workDir, initrdPath, memMiB, nw, drivePaths, rootPath, monitorFD)
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError
@@ -759,8 +772,8 @@ func closeFile(f *os.File, what string, logger *log.Logger) {
 // newHypervisorCmd returns the hypervisor command: an empty environment,
 // vm-launch's stderr, and SIGKILL when vm-launch dies. files, from
 // hypervisorFiles, become the child's file descriptors from firstExtraFD on.
-// A volume image shares vm-launch's open file and with it the flock, so the
-// lock lasts while either process lives.
+// Each volume image shares vm-launch's open file and with it the flock, so
+// the lock lasts while either process lives.
 func newHypervisorCmd(argv []string, files []*os.File) *exec.Cmd {
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = []string{}

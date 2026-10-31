@@ -101,7 +101,7 @@ type capabilities struct {
 type prepareRequest struct {
 	Mount mountRecord
 	// ImageName is the disk's file name in the volume root, which
-	// volumeFromEnv derived from the application, process type, and
+	// volumesFromEnv derived from the application, process type, and
 	// instance index.
 	ImageName string
 	Mode      attachMode

@@ -77,10 +77,10 @@ var _ = Describe("guest memory", func() {
 
 	It("gives the size to QEMU's -m and Firecracker's mem_size_mib", func() {
 		nw := &network{ports: []int{8080}}
-		Expect(optionAfter(qemuArgv(goldenArt, goldenInitrd, 320, nw, "", 0), "-m", "")).To(Equal("320"))
+		Expect(optionAfter(qemuArgv(goldenArt, goldenInitrd, 320, nw, nil, 0), "-m", "")).To(Equal("320"))
 
 		var cfg firecrackerConfig
-		Expect(json.Unmarshal([]byte(fcConfigJSON(goldenInitrd, 832, nw, "", "")), &cfg)).To(Succeed())
+		Expect(json.Unmarshal([]byte(fcConfigJSON(goldenInitrd, 832, nw, nil, "")), &cfg)).To(Succeed())
 		Expect(cfg.MachineConfig).To(Equal(firecrackerMachineConfig{VCPUCount: 1, MemSizeMiB: 832}))
 	})
 })

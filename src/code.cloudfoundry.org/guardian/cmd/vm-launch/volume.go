@@ -6,10 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"maps"
+	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // Volume discovery. Cloud Controller copies each service binding's
@@ -23,6 +28,10 @@ const (
 	instanceIndexEnv   = "CF_INSTANCE_INDEX"
 	volumeModeReadOnly = "r"
 	volumeModeRW       = "rw"
+
+	// maxVolumes is the most volume mounts a VM app may have. Each one is a
+	// drive of its own, vol0 to vol3, ahead of the guest root's drive.
+	maxVolumes = 4
 
 	// maxVolumePathLen bounds container_dir. The guest shell and the kernel
 	// both handle far longer paths; the bound keeps error lines short and
@@ -56,9 +65,9 @@ var processTypePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,62}$`)
 // proc nodes, the resolver configuration, or the files /init runs.
 var reservedGuestDirs = []string{"/bin", "/dev", "/etc", "/init", "/proc", "/rvm", "/sys"}
 
-// guestVolume is the one volume a VM app gets: the path the container sees,
-// at which the guest mounts the image, and the image's file name in the
-// volume root.
+// guestVolume is one volume a VM app gets: the path the container sees, at
+// which the guest mounts the image, and the image's file name in the volume
+// root.
 type guestVolume struct {
 	ContainerDir string
 	ImageName    string
@@ -81,18 +90,27 @@ type vcapServices map[string][]struct {
 	} `json:"volume_mounts"`
 }
 
-// volumeFromEnv returns the guest volume named in VCAP_SERVICES, or nil when
-// the app has none. More than one volume mount, a mode other than rw, a
-// container path the guest cannot use, a missing or malformed application_id
-// or process_type in VCAP_APPLICATION, a bad CF_INSTANCE_INDEX, and a task
-// are errors, so a misconfigured app fails to start instead of losing data to
-// the wrong volume. Errors never repeat VCAP_SERVICES, which carries
-// credentials. lookup reads the environment the rest of vm-launch shares
-// (see lastWinsEnv), so the volume comes from the pre-resolution
-// VCAP_SERVICES, which the guest also gets apart from resolved credentials.
-// vm-launch reads the volume before it resolves CredHub references, which
-// replace credentials and never a volume mount.
-func volumeFromEnv(lookup func(string) (string, bool)) (*guestVolume, error) {
+// volumesFromEnv returns the guest volumes named in VCAP_SERVICES, in
+// volume order, or none when the app has none. More than maxVolumes volume
+// mounts, two mounts on one path, a mode other than rw, a container path the
+// guest cannot use, a missing or malformed application_id or process_type in
+// VCAP_APPLICATION, a bad CF_INSTANCE_INDEX, and a task are errors, so a
+// misconfigured app fails to start instead of losing data to the wrong
+// volume. Errors never repeat VCAP_SERVICES, which carries credentials.
+// lookup reads the environment the rest of vm-launch shares (see
+// lastWinsEnv), so the volumes come from the pre-resolution VCAP_SERVICES,
+// which the guest also gets apart from resolved credentials. vm-launch reads
+// the volumes before it resolves CredHub references, which replace
+// credentials and never a volume mount.
+//
+// Volume order is the byte order of the container paths. It decides each
+// volume's drive, file descriptor, and lock order, so it depends on nothing
+// but the paths: not on the order of the labels in VCAP_SERVICES, which is a
+// JSON object, and not on the order of Go's map iteration. Byte order also
+// puts a path before every path below it. Every volume of an instance gets
+// the same image name, because each image lives in the root of its own
+// volume.
+func volumesFromEnv(lookup func(string) (string, bool)) ([]guestVolume, error) {
 	raw, ok := lookup(vcapServicesEnv)
 	if !ok {
 		return nil, nil
@@ -108,8 +126,8 @@ func volumeFromEnv(lookup func(string) (string, bool)) (*guestVolume, error) {
 
 	type mount struct{ dir, mode string }
 	var mounts []mount
-	for _, bindings := range services {
-		for _, b := range bindings {
+	for _, label := range slices.Sorted(maps.Keys(services)) {
+		for _, b := range services[label] {
 			for _, vm := range b.VolumeMounts {
 				mounts = append(mounts, mount{dir: vm.ContainerDir, mode: vm.Mode})
 			}
@@ -118,20 +136,35 @@ func volumeFromEnv(lookup func(string) (string, bool)) (*guestVolume, error) {
 	switch {
 	case len(mounts) == 0:
 		return nil, nil
-	case len(mounts) > 1:
-		return nil, fmt.Errorf("VM backends support one volume mount; this app has %d", len(mounts))
+	case len(mounts) > maxVolumes:
+		return nil, fmt.Errorf("VM backends support up to %d volume mounts; this app has %d", maxVolumes, len(mounts))
 	}
+	// The labels are sorted and each binding list keeps its order, so two
+	// mounts on one path keep an order of their own too, and the first
+	// error is the same on every start.
+	slices.SortStableFunc(mounts, func(a, b mount) int { return strings.Compare(a.dir, b.dir) })
 
-	m := mounts[0]
-	switch m.mode {
-	case volumeModeRW:
-	case volumeModeReadOnly:
-		return nil, errors.New("read-only volume mounts are not supported on VM backends")
-	default:
-		return nil, fmt.Errorf("volume mount mode %s is not supported on VM backends; want %q", quoteForLog(m.mode), volumeModeRW)
+	for _, m := range mounts {
+		switch m.mode {
+		case volumeModeRW:
+		case volumeModeReadOnly:
+			return nil, fmt.Errorf("volume path %s: read-only volume mounts are not supported on VM backends", quoteForLog(m.dir))
+		default:
+			return nil, fmt.Errorf("volume path %s: volume mount mode %s is not supported on VM backends; want %q", quoteForLog(m.dir), quoteForLog(m.mode), volumeModeRW)
+		}
+		if err := checkVolumeDir(m.dir); err != nil {
+			return nil, err
+		}
 	}
-	if err := checkVolumeDir(m.dir); err != nil {
-		return nil, err
+	for i := 0; i < len(mounts); {
+		j := i + 1
+		for j < len(mounts) && mounts[j].dir == mounts[i].dir {
+			j++
+		}
+		if j-i > 1 {
+			return nil, fmt.Errorf("volume path %s has %d volume mounts; each volume mount on a VM backend needs a path of its own", quoteForLog(mounts[i].dir), j-i)
+		}
+		i = j
 	}
 
 	app, err := applicationFromEnv(lookup)
@@ -143,7 +176,11 @@ func volumeFromEnv(lookup func(string) (string, bool)) (*guestVolume, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &guestVolume{ContainerDir: m.dir, ImageName: name}, nil
+	vols := make([]guestVolume, len(mounts))
+	for i, m := range mounts {
+		vols[i] = guestVolume{ContainerDir: m.dir, ImageName: name}
+	}
+	return vols, nil
 }
 
 // vcapApplication is the part of VCAP_APPLICATION vm-launch reads. Both
@@ -272,4 +309,106 @@ func findVolumeProvider(mountinfo, dir string) (diskProvider, mountRecord, error
 		return nil, mountRecord{}, err
 	}
 	return p, m, nil
+}
+
+// selectedVolume is a volume with the provider that owns it and the mount
+// behind it, as findVolumeProviders found them.
+type selectedVolume struct {
+	Volume   guestVolume
+	Provider diskProvider
+	Mount    mountRecord
+}
+
+// findVolumeProviders runs findVolumeProvider for each of vols, in order,
+// and stops at the first refusal. It also refuses two volumes whose mounts
+// show the same directory of one filesystem, the same device numbers and the
+// same root, because both images would then be one file, which the guest
+// would mount twice. That happens when two service instances name one share.
+// A copy that this check cannot see, such as one directory reached through
+// two separate mounts of a network filesystem, waits for its own lock and
+// fails, and preparedVolumes.prepare refuses an image that is open twice.
+func findVolumeProviders(mountinfo string, vols []guestVolume) ([]selectedVolume, error) {
+	selected := make([]selectedVolume, 0, len(vols))
+	for _, v := range vols {
+		p, m, err := findVolumeProvider(mountinfo, v.ContainerDir)
+		if err != nil {
+			return nil, err
+		}
+		for _, prev := range selected {
+			if prev.Mount.Major == m.Major && prev.Mount.Minor == m.Minor && prev.Mount.Root == m.Root {
+				return nil, fmt.Errorf("volume paths %s and %s are the same directory of one filesystem (device %d:%d, root %s), so they would share one disk image; bind each volume to a directory of its own",
+					quoteForLog(prev.Volume.ContainerDir), quoteForLog(v.ContainerDir), m.Major, m.Minor, quoteForLog(m.Root))
+			}
+		}
+		selected = append(selected, selectedVolume{Volume: v, Provider: p, Mount: m})
+	}
+	return selected, nil
+}
+
+// preparedVolume is a volume whose provider prepared its disk.
+type preparedVolume struct {
+	Path       string
+	Attachment *attachment
+	// Bytes is the size of the disk, which the guest finds it by.
+	Bytes int64
+	// dev and ino name the disk's inode, so that no disk is attached twice.
+	dev, ino uint64
+}
+
+// preparedVolumes are the volumes of one launch, in volume order. Their
+// attachments stay fenced until release.
+type preparedVolumes []preparedVolume
+
+// prepare asks v's provider for its disk, in file-image mode, and adds it.
+// An attachment without a usable disk is refused and cleaned up (see
+// checkAttachment), and so is a disk that an earlier volume already holds
+// open. The errors carry the provider's kinds, so stepExitCode maps a signal
+// during a lock wait to 128+N. On an error, prepare returns what the caller
+// must discard once it has logged the error, so that the error's line comes
+// before the cleanup's: a provider that fails after it fenced the disk may
+// hand back what it built along with the error. The volumes added before
+// keep their fences, and the caller releases them too.
+func (pv *preparedVolumes) prepare(v selectedVolume, signals <-chan os.Signal, logger *log.Logger) (*attachment, error) {
+	att, err := v.Provider.Prepare(prepareRequest{Mount: v.Mount, ImageName: v.Volume.ImageName, Mode: attachFileImage, Signals: signals})
+	if err != nil {
+		return att, err
+	}
+	if err := checkAttachment(v.Provider, att, logger); err != nil {
+		return nil, err
+	}
+	info, err := att.File.Stat()
+	if err != nil {
+		return att, fmt.Errorf("reading the size of the volume image: %w", err)
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return att, fmt.Errorf("reading the inode of the volume image at %s: the file system gave no inode", quoteForLog(v.Volume.ContainerDir))
+	}
+	for _, prev := range *pv {
+		if prev.dev == st.Dev && prev.ino == st.Ino {
+			return att, fmt.Errorf("volume paths %s and %s reach the same disk image; bind each volume to a directory of its own",
+				quoteForLog(prev.Path), quoteForLog(v.Volume.ContainerDir))
+		}
+	}
+	*pv = append(*pv, preparedVolume{Path: v.Volume.ContainerDir, Attachment: att, Bytes: info.Size(), dev: st.Dev, ino: st.Ino})
+	return nil, nil
+}
+
+// files returns the disks, in volume order, for hypervisorFiles.
+func (pv preparedVolumes) files() []*os.File {
+	files := make([]*os.File, len(pv))
+	for i, v := range pv {
+		files[i] = v.Attachment.File
+	}
+	return files
+}
+
+// release releases every attachment, last first, and logs each release that
+// fails. vm-launch calls it once the hypervisor has exited or never started.
+func (pv preparedVolumes) release(logger *log.Logger) {
+	for i := len(pv) - 1; i >= 0; i-- {
+		if err := pv[i].Attachment.Release(); err != nil {
+			logger.Printf("releasing the volume image: %v", err)
+		}
+	}
 }

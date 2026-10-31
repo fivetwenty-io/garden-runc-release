@@ -158,7 +158,7 @@ echo "disks=$(ls /sys/block | grep -c '^vd')"
 		out := bootRealGuestWith(withVolume(`echo kept-from-the-first-boot >/home/vcap/data/kept
 echo kept-in-root >/root-only
 grep ' /home/vcap/data ' /proc/mounts
-`+guestDisksCommand), vol, root)
+`+guestDisksCommand), []*os.File{vol}, root)
 		Expect(out).To(MatchRegexp(`(?m)^/dev/vd[a-z]+ /home/vcap/data ext4 `), out)
 		Expect(guestDisks(out)).To(Equal(disks), out)
 		Expect(extLabel(root)).To(Equal("rvm-root"))
@@ -169,7 +169,7 @@ grep ' /home/vcap/data ' /proc/mounts
 		root = realRootImage()
 		out = bootRealGuestWith(withVolume(`echo "volume=$(cat /home/vcap/data/kept)"
 echo "root=$(cat /root-only 2>/dev/null || echo gone)"
-`+guestDisksCommand), vol, root)
+`+guestDisksCommand), []*os.File{vol}, root)
 		Expect(out).To(ContainSubstring("volume=kept-from-the-first-boot"), out)
 		Expect(out).To(ContainSubstring("root=gone"), out)
 		Expect(guestDisks(out)).To(Equal(disks), out)
@@ -306,7 +306,7 @@ echo "sync-f-volume=$?"
 `)
 		g.vol, g.volumeBytes = &guestVolume{ContainerDir: "/home/vcap/data", ImageName: "volume.img"}, defaultImageSize
 		withRealRoot(&g)
-		out := bootRealGuestWith(g, vol, realRootImage())
+		out := bootRealGuestWith(g, []*os.File{vol}, realRootImage())
 
 		Expect(out).To(MatchRegexp(`(?m)^sync-f-volume=0\r?$`), out)
 		Expect(out).To(ContainSubstring(exitTag(testNonce) + "0"))

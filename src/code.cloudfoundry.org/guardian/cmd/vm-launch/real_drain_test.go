@@ -98,7 +98,7 @@ while :; do sleep 0.1; done`)
 			DeferCleanup(func() { _ = qemuEnd.Close() })
 			files, _, initrdPath, monitorFD, rootPath := hypervisorFiles(nil, withUserspaceMark(f), qemuEnd, realRootImage())
 			consoleLog := filepath.Join(GinkgoT().TempDir(), "console.log")
-			argv := consoleLogArgv(markedArgv(tcgArgv(qemu, withRealRootDrive(qemuArgv(art, initrdPath, minGuestMemoryMiB, nw, "", monitorFD), rootPath))), consoleLog)
+			argv := consoleLogArgv(markedArgv(tcgArgv(qemu, withRealRootDrive(qemuArgv(art, initrdPath, minGuestMemoryMiB, nw, nil, monitorFD), rootPath))), consoleLog)
 			cmd := newHypervisorCmd(argv, files)
 			stderr := &safeBuffer{}
 			cmd.Stderr = stderr

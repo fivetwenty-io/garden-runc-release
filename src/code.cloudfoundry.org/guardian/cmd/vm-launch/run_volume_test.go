@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -22,14 +23,20 @@ import (
 // fdThreeChecks is fake hypervisor shell that fails unless its file
 // descriptor 3 is the image at img and is locked, checked the way a
 // hypervisor uses it: a new open of /proc/self/fd/3, which cannot take the
-// flock that vm-launch's open file holds. The reopen uses fd 9, because fd 4
-// is the initramfs when there is a volume.
+// flock that vm-launch's open file holds. The reopen uses fd 20, above every
+// file vm-launch passes, because fd 4 is the initramfs when there is one
+// volume and fd 9 is the root image when there are four.
 func fdThreeChecks(img string) string {
-	return `[ -f /proc/self/fd/3 ] || { echo "fd 3 is not a regular file" >&2; exit 1; }
-[ "$(stat -L -c %d:%i /proc/self/fd/3)" = "$(stat -c %d:%i ` + shellQuote(img) + `)" ] || { echo "fd 3 is not the image" >&2; exit 1; }
-exec 9<>/proc/self/fd/3 || { echo "cannot reopen /proc/self/fd/3" >&2; exit 1; }
-if flock -n 9; then echo "the image is not locked" >&2; exit 1; fi
-exec 9>&-
+	return imageAtFD("3", img)
+}
+
+// imageAtFD is fdThreeChecks for file descriptor fd.
+func imageAtFD(fd, img string) string {
+	return `[ -f /proc/self/fd/` + fd + ` ] || { echo "fd ` + fd + ` is not a regular file" >&2; exit 1; }
+[ "$(stat -L -c %d:%i /proc/self/fd/` + fd + `)" = "$(stat -c %d:%i ` + shellQuote(img) + `)" ] || { echo "fd ` + fd + ` is not the image ` + img + `" >&2; exit 1; }
+exec 20<>/proc/self/fd/` + fd + ` || { echo "cannot reopen /proc/self/fd/` + fd + `" >&2; exit 1; }
+if flock -n 20; then echo "the image on fd ` + fd + ` is not locked" >&2; exit 1; fi
+exec 20>&-
 `
 }
 
@@ -186,11 +193,21 @@ var _ = Describe("run with a volume", func() {
 		}
 	}
 
-	It("exits 125 for two volume mounts before it creates anything", func() {
-		GinkgoT().Setenv("VCAP_SERVICES", vcapWith(map[string][]string{"juicefs": {mountJSON(volDir, "rw")}, "nfs": {mountJSON("/other", "rw")}}))
+	It("exits 125 for five volume mounts before it creates anything", func() {
+		GinkgoT().Setenv("VCAP_SERVICES", vcapWith(map[string][]string{"juicefs": {mountJSON(volDir, "rw"), mountJSON("/a", "rw")}, "nfs": {mountJSON("/b", "rw"), mountJSON("/c", "rw"), mountJSON("/d", "rw")}}))
 		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
 		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
-		Expect(logBuf.String()).To(ContainSubstring("VM backends support one volume mount; this app has 2"))
+		Expect(logBuf.String()).To(Equal("VM backends support up to 4 volume mounts; this app has 5\n"))
+		Expect(os.ReadDir(tmp)).To(BeEmpty())
+		Expect(os.ReadDir(volDir)).To(BeEmpty())
+		Expect(argvFile).NotTo(BeAnExistingFile())
+	})
+
+	It("exits 125 for two volume mounts on one path before it creates anything", func() {
+		GinkgoT().Setenv("VCAP_SERVICES", vcapWith(map[string][]string{"juicefs": {mountJSON(volDir, "rw")}, "nfs": {mountJSON(volDir, "rw")}}))
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(Equal("volume path " + quoteForLog(volDir) + " has 2 volume mounts; each volume mount on a VM backend needs a path of its own\n"))
 		Expect(os.ReadDir(tmp)).To(BeEmpty())
 		Expect(os.ReadDir(volDir)).To(BeEmpty())
 		Expect(argvFile).NotTo(BeAnExistingFile())
@@ -398,5 +415,348 @@ stat -L -c %s /proc/self/fd/3 /proc/self/fd/5 >`+shellQuote(sizesFile)+` || exit
 		Expect(logBuf.String()).To(ContainSubstring("guest never started its command; last console output follows"))
 		Expect(logBuf.String()).To(ContainSubstring("vm-launch guest setup: mounting the volume image rvm-disk-2.img at /data failed"))
 		Expect(lockedElsewhere(img)).To(BeFalse())
+	})
+})
+
+var _ = Describe("run with several volumes", func() {
+	const imageName = "rvm-disk-" + testAppID + "-web-2.img"
+	var (
+		art     string
+		tmp     string
+		scratch string
+		infoDir string
+		logBuf  *bytes.Buffer
+
+		// dirs are the volume directories in volume order, and imgs the
+		// image each one gets.
+		dirs []string
+		imgs []string
+	)
+
+	// setMountInfo makes the mount table the given lines, outside the TMPDIR
+	// the specs check for leftovers.
+	setMountInfo := func(lines ...string) {
+		mountInfoPath = filepath.Join(infoDir, "mountinfo")
+		Expect(os.WriteFile(mountInfoPath, []byte(strings.Join(lines, "")), 0o644)).To(Succeed())
+	}
+
+	// bind binds n volume directories, each the root of a JuiceFS mount of
+	// its own, with the labels and the mounts in VCAP_SERVICES in the
+	// opposite order to the paths.
+	bind := func(n int) {
+		dirs, imgs = nil, nil
+		var table []string
+		labels := map[string][]string{}
+		var oneBinding []string
+		for i := range n {
+			d := filepath.Join(scratch, "vol"+strconv.Itoa(i))
+			Expect(os.Mkdir(d, 0o755)).To(Succeed())
+			dirs = append(dirs, d)
+			imgs = append(imgs, filepath.Join(d, imageName))
+			table = append(table, mountinfoLine(40+i, d, "fuse.juicefs"))
+			labels["l"+strconv.Itoa(n-i)] = []string{mountJSON(d, "rw")}
+			oneBinding = append([]string{mountJSON(d, "rw")}, oneBinding...)
+		}
+		setMountInfo(table...)
+		if n%2 == 0 {
+			GinkgoT().Setenv("VCAP_SERVICES", vcapWith(labels))
+		} else {
+			GinkgoT().Setenv("VCAP_SERVICES", vcapWith(map[string][]string{"juicefs": oneBinding}))
+		}
+	}
+
+	BeforeEach(func() {
+		art = makeArtifacts()
+		scratch = GinkgoT().TempDir()
+		infoDir = GinkgoT().TempDir()
+		tmp = GinkgoT().TempDir()
+		GinkgoT().Setenv("TMPDIR", tmp)
+		GinkgoT().Setenv("CF_INSTANCE_INDEX", "2")
+		GinkgoT().Setenv("VCAP_APPLICATION", vcapApp)
+		logBuf = &bytes.Buffer{}
+		DeferCleanup(func(saved string) { mountInfoPath = saved }, mountInfoPath)
+
+		saved := defaultImageOptions
+		DeferCleanup(func() { defaultImageOptions = saved })
+		defaultImageOptions.IsMountRoot = alwaysMountRoot
+		defaultImageOptions.LockWait = 300 * time.Millisecond
+		defaultImageOptions.LockPoll = 20 * time.Millisecond
+	})
+
+	runVM := func(kind backend.Kind) int {
+		return run([]string{"--backend", string(kind), "--artifacts", art, "--", "/tmp/lifecycle/launcher", "app", "true", ""}, log.New(logBuf, "", 0))
+	}
+
+	noWorkDirs := func() {
+		entries, err := os.ReadDir(tmp)
+		Expect(err).NotTo(HaveOccurred())
+		for _, e := range entries {
+			Expect(e.Name()).NotTo(HavePrefix("vm-launch-"))
+		}
+	}
+
+	// diskFile returns a new disk of size bytes for a fake provider, outside
+	// TMPDIR.
+	diskFile := func(size int64) *os.File {
+		f, err := os.CreateTemp(scratch, "disk")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(f.Truncate(size)).To(Succeed())
+		return f
+	}
+
+	It("gives QEMU each locked image on its own file descriptor, in the order of the paths, and the initramfs after them", func() {
+		requireOpenat2()
+		bind(4)
+		var checks string
+		for i, img := range imgs {
+			checks += imageAtFD(strconv.Itoa(3+i), img)
+		}
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), checks+initramfsAt("7")+initramfsReleased+noFilesUnder(tmp))
+		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
+
+		argv, err := os.ReadFile(argvFile)
+		Expect(err).NotTo(HaveOccurred())
+		drives := concat(goldenQEMUVolumeDrive(0, "3"), goldenQEMUVolumeDrive(1, "4"), goldenQEMUVolumeDrive(2, "5"), goldenQEMUVolumeDrive(3, "6"))
+		Expect(string(argv)).To(HaveSuffix("\n" + strings.Join(drives, "\n") + "\n"))
+		Expect(string(argv)).To(ContainSubstring("\n-initrd\n/proc/self/fd/7\n"))
+		for i, img := range imgs {
+			Expect(string(argv)).NotTo(ContainSubstring(dirs[i]))
+			Expect(statOf(img).Size).To(Equal(int64(defaultImageSize)))
+			Expect(lockedElsewhere(img)).To(BeFalse(), "the lock on %s ends with the run", img)
+		}
+		noWorkDirs()
+	})
+
+	It("gives Firecracker each locked image as a drive of its own, in the order of the paths", func() {
+		requireOpenat2()
+		bind(2)
+		fcCopy := filepath.Join(scratch, "fc.json")
+		writeFakeHypervisor(filepath.Join(art, "firecracker/firecracker"), imageAtFD("3", imgs[0])+imageAtFD("4", imgs[1])+initramfsAt("5")+initramfsReleased+noFilesUnder(tmp)+
+			`p=; for a in "$@"; do [ "$p" = --config-file ] && cp "$a" `+shellQuote(fcCopy)+`; p=$a; done
+`)
+		Expect(runVM(backend.VMFirecracker)).To(Equal(0), logBuf.String())
+
+		cfg, err := os.ReadFile(fcCopy)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(cfg)).To(ContainSubstring(`"drives":[` + goldenFCVolumeDrive(0, "3") + `,` + goldenFCVolumeDrive(1, "4") + `]`))
+		Expect(string(cfg)).To(ContainSubstring(`"initrd_path":"/proc/self/fd/5"`))
+		for _, d := range dirs {
+			Expect(string(cfg)).NotTo(ContainSubstring(d))
+		}
+		noWorkDirs()
+	})
+
+	It("tells the guest the first volume's path and size, which every volume image shares", func() {
+		requireOpenat2()
+		bind(3)
+		initrdCopy := filepath.Join(scratch, "initrd")
+		writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), initramfsAt("6")+`cp "$initrd" `+shellQuote(initrdCopy)+" || exit 1\n")
+		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
+		initrd, err := os.ReadFile(initrdCopy)
+		Expect(err).NotTo(HaveOccurred())
+		_, byName := archiveEntries(initrd)
+		Expect(string(byName["rvm/disks"].data)).To(HaveSuffix(fmt.Sprintf("RVM_VOLUME_SECTORS=%d\n", defaultImageSize/512)))
+		Expect(strings.Count(string(byName["rvm/disks"].data), "RVM_VOLUME_SECTORS=")).To(Equal(1))
+		Expect(string(byName["rvm/mounts"].data)).To(Equal(mountsFile(&guestVolume{ContainerDir: dirs[0], ImageName: imageName})))
+		Expect(string(byName["rvm/mounts"].data)).NotTo(ContainSubstring(dirs[1]))
+	})
+
+	It("prepares the volumes in the order of the paths and, when one fails, releases every one it prepared, last first, after the failure's line", func() {
+		for failAt := range 4 {
+			for name, failure := range map[string]struct {
+				err  error
+				code int
+			}{
+				"an ordinary error": {errors.New("the fake disk failed"), exitLaunchError},
+				"a signal":          {&signalledError{Sig: syscall.SIGTERM, during: "waiting for the fake disk"}, 128 + int(syscall.SIGTERM)},
+			} {
+				bind(4)
+				var prepared, released []string
+				p := fake("Fake", "fuse.juicefs", strongMatch)
+				p.prepare = func(r prepareRequest) (*attachment, error) {
+					Expect(r.ImageName).To(Equal(imageName))
+					Expect(r.Mode).To(Equal(attachFileImage))
+					dir := r.Mount.ContainerDir
+					prepared = append(prepared, dir)
+					if len(prepared) == failAt+1 {
+						return nil, failure.err
+					}
+					f := diskFile(defaultImageSize)
+					return &attachment{File: f, Release: func() error {
+						released = append(released, dir)
+						Expect(f.Close()).To(Succeed())
+						return errors.New("the fence of " + filepath.Base(dir) + " would not let go")
+					}}, nil
+				}
+				withProviders(p)
+				logBuf.Reset()
+				argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+				Expect(runVM(backend.VMQemu)).To(Equal(failure.code), "%s at volume %d", name, failAt)
+				Expect(prepared).To(Equal(dirs[:failAt+1]), "%s at volume %d", name, failAt)
+				want := slices.Clone(dirs[:failAt])
+				slices.Reverse(want)
+				Expect(slices.Equal(released, want)).To(BeTrue(), "%s at volume %d released %q, want %q", name, failAt, released, want)
+				lines := failure.err.Error() + "\n"
+				if _, ok := failure.err.(*signalledError); ok {
+					lines = "received terminated while waiting for the fake disk\n"
+				}
+				for _, d := range want {
+					lines += "releasing the volume image: the fence of " + filepath.Base(d) + " would not let go\n"
+				}
+				Expect(logBuf.String()).To(HaveSuffix(lines), "%s at volume %d", name, failAt)
+				Expect(argvFile).NotTo(BeAnExistingFile())
+				Expect(os.ReadDir(tmp)).To(BeEmpty())
+				Expect(os.RemoveAll(scratch)).To(Succeed())
+				Expect(os.Mkdir(scratch, 0o755)).To(Succeed())
+			}
+		}
+	})
+
+	It("releases the volumes prepared before an unusable attachment, and cleans up the unusable one", func() {
+		bind(3)
+		var released []string
+		var half *os.File
+		p := fake("Fake", "fuse.juicefs", strongMatch)
+		p.prepare = func(r prepareRequest) (*attachment, error) {
+			dir := r.Mount.ContainerDir
+			f := diskFile(defaultImageSize)
+			if dir == dirs[2] {
+				half = f
+				return &attachment{File: f}, nil
+			}
+			return &attachment{File: f, Release: func() error { released = append(released, dir); return f.Close() }}, nil
+		}
+		withProviders(p)
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(HaveSuffix("the Fake volume provider prepared the disk without an error but returned no Release function\n"))
+		Expect(released).To(Equal([]string{dirs[1], dirs[0]}))
+		Expect(half.Close()).NotTo(Succeed(), "the unusable attachment's file was closed")
+		Expect(argvFile).NotTo(BeAnExistingFile())
+		Expect(os.ReadDir(tmp)).To(BeEmpty())
+	})
+
+	It("refuses two volumes whose disks are one file, and releases both", func() {
+		bind(2)
+		shared := diskFile(defaultImageSize)
+		Expect(shared.Close()).To(Succeed())
+		var released []string
+		p := fake("Fake", "fuse.juicefs", strongMatch)
+		p.prepare = func(r prepareRequest) (*attachment, error) {
+			dir := r.Mount.ContainerDir
+			f, err := os.OpenFile(shared.Name(), os.O_RDWR, 0)
+			Expect(err).NotTo(HaveOccurred())
+			return &attachment{File: f, Release: func() error { released = append(released, dir); return f.Close() }}, nil
+		}
+		withProviders(p)
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(HaveSuffix("volume paths " + quoteForLog(dirs[0]) + " and " + quoteForLog(dirs[1]) + " reach the same disk image; bind each volume to a directory of its own\n"))
+		Expect(released).To(Equal([]string{dirs[1], dirs[0]}))
+		Expect(argvFile).NotTo(BeAnExistingFile())
+	})
+
+	It("refuses volume images of different sizes, since the guest finds its volumes by size, and releases them all", func() {
+		bind(3)
+		var released []string
+		sizes := map[string]int64{}
+		p := fake("Fake", "fuse.juicefs", strongMatch)
+		p.prepare = func(r prepareRequest) (*attachment, error) {
+			dir := r.Mount.ContainerDir
+			size := int64(defaultImageSize)
+			if dir == dirs[2] {
+				size = 2 * defaultImageSize
+			}
+			sizes[dir] = size
+			f := diskFile(size)
+			return &attachment{File: f, Release: func() error { released = append(released, dir); return f.Close() }}, nil
+		}
+		withProviders(p)
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(HaveSuffix(fmt.Sprintf("the volume images at %s and %s are %d and %d bytes; the guest finds its volumes by size, so every volume image must have the first one's size\n",
+			quoteForLog(dirs[0]), quoteForLog(dirs[2]), defaultImageSize, 2*defaultImageSize)))
+		Expect(released).To(Equal([]string{dirs[2], dirs[1], dirs[0]}))
+		Expect(argvFile).NotTo(BeAnExistingFile())
+		Expect(os.ReadDir(tmp)).To(BeEmpty())
+	})
+
+	It("releases every volume after the hypervisor exits, last first", func() {
+		bind(3)
+		hypervisorDone := filepath.Join(scratch, "hypervisor-done")
+		var released []string
+		p := fake("Fake", "fuse.juicefs", strongMatch)
+		p.prepare = func(r prepareRequest) (*attachment, error) {
+			dir := r.Mount.ContainerDir
+			f := diskFile(defaultImageSize)
+			return &attachment{File: f, Release: func() error {
+				Expect(hypervisorDone).To(BeAnExistingFile(), "Release runs after the hypervisor")
+				released = append(released, dir)
+				return f.Close()
+			}}, nil
+		}
+		withProviders(p)
+		writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), `: >`+shellQuote(hypervisorDone)+"\n")
+		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
+		Expect(released).To(Equal([]string{dirs[2], dirs[1], dirs[0]}))
+	})
+
+	It("checks every volume's mount before it prepares any, and creates nothing when a later one is refused", func() {
+		requireOpenat2()
+		bind(3)
+		setMountInfo(mountinfoLine(40, dirs[0], "fuse.juicefs"), mountinfoLine(41, dirs[1], "fuse.juicefs"), mountinfoLine(42, dirs[2], "nfs4"))
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(HaveSuffix("volume path " + quoteForLog(dirs[2]) + ` is a "nfs4" mount; VM backends support only JuiceFS volumes today` + "\n"))
+		for _, d := range dirs {
+			Expect(os.ReadDir(d)).To(BeEmpty())
+		}
+		Expect(os.ReadDir(tmp)).To(BeEmpty())
+		Expect(argvFile).NotTo(BeAnExistingFile())
+	})
+
+	It("refuses two volumes that show one directory of one filesystem before it creates anything", func() {
+		requireOpenat2()
+		bind(2)
+		// Two mounts of one JuiceFS directory, as two service instances that
+		// name one share would give: one device and one root.
+		setMountInfo("40 29 0:52 /share "+dirs[0]+" rw,relatime shared:40 - fuse.juicefs JuiceFS:vol rw\n",
+			"41 29 0:52 /share "+dirs[1]+" rw,relatime shared:41 - fuse.juicefs JuiceFS:vol rw\n")
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(HaveSuffix("volume paths " + quoteForLog(dirs[0]) + " and " + quoteForLog(dirs[1]) +
+			` are the same directory of one filesystem (device 0:52, root "/share"), so they would share one disk image; bind each volume to a directory of its own` + "\n"))
+		for _, d := range dirs {
+			Expect(os.ReadDir(d)).To(BeEmpty())
+		}
+		Expect(os.ReadDir(tmp)).To(BeEmpty())
+		Expect(argvFile).NotTo(BeAnExistingFile())
+	})
+
+	It("starts two volumes on one filesystem when each shows a directory of its own", func() {
+		requireOpenat2()
+		bind(2)
+		setMountInfo("40 29 0:52 /a "+dirs[0]+" rw,relatime shared:40 - fuse.juicefs JuiceFS:vol rw\n",
+			"41 29 0:52 /b "+dirs[1]+" rw,relatime shared:41 - fuse.juicefs JuiceFS:vol rw\n")
+		writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), imageAtFD("3", imgs[0])+imageAtFD("4", imgs[1]))
+		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
+	})
+
+	It("exits 125 after the wait when another instance holds a later volume's image, and lets go of the earlier ones", func() {
+		requireOpenat2()
+		bind(2)
+		writeImage(imgs[1], defaultImageSize, nil)
+		holder, err := os.OpenFile(imgs[1], os.O_RDWR, 0)
+		Expect(err).NotTo(HaveOccurred())
+		defer holder.Close()
+		Expect(syscall.Flock(int(holder.Fd()), syscall.LOCK_EX)).To(Succeed())
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+
+		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(ContainSubstring("volume image " + imgs[1] + " is in use by another instance; VM backends allow one writer per image"))
+		Expect(statOf(imgs[0]).Size).To(Equal(int64(defaultImageSize)))
+		Expect(lockedElsewhere(imgs[0])).To(BeFalse(), "the first volume's lock ended")
+		Expect(argvFile).NotTo(BeAnExistingFile())
+		noWorkDirs()
 	})
 })

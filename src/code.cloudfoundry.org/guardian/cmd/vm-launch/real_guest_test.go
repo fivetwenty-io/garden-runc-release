@@ -38,18 +38,18 @@ func bootRealGuest(g guestContents) string {
 	return bootRealGuestWith(g, nil, realRootImage())
 }
 
-// bootRealGuestWith is bootRealGuest with the volume image vol and the guest
-// root image root, either of which can be nil, and with g as it is, so g
-// names the root image's size when root is not nil.
-func bootRealGuestWith(g guestContents, vol, root *os.File) string {
+// bootRealGuestWith is bootRealGuest with the volume images vols, in volume
+// order, and the guest root image root, either of which can be nil, and with
+// g as it is, so g names the root image's size when root is not nil.
+func bootRealGuestWith(g guestContents, vols []*os.File, root *os.File) string {
 	art := realArtifacts()
 	qemu := realQEMU()
 	requireMicrovm(qemu)
 	f, err := newInitramfs(guestBusybox(), g)
 	Expect(err).NotTo(HaveOccurred())
 	DeferCleanup(f.Close)
-	files, drivePath, initrdPath, _, rootPath := hypervisorFiles(vol, withUserspaceMark(f), nil, root)
-	argv := markedArgv(tcgArgv(qemu, withRealRootDrive(qemuArgv(art, initrdPath, minGuestMemoryMiB, g.nw, drivePath, 0), rootPath)))
+	files, drivePaths, initrdPath, _, rootPath := hypervisorFiles(vols, withUserspaceMark(f), nil, root)
+	argv := markedArgv(tcgArgv(qemu, withRealRootDrive(qemuArgv(art, initrdPath, minGuestMemoryMiB, g.nw, drivePaths, 0), rootPath)))
 	code, stdout, stderr := bootRealQEMU(argv, files)
 	Expect(code).To(Equal(0), "QEMU failed: %s\n%s", stderr, stdout)
 	Expect(stdout).To(ContainSubstring(startTag(testNonce)), stdout)
@@ -560,7 +560,7 @@ echo served`)
 			DeferCleanup(func() { _ = qemuEnd.Close() })
 			files, _, initrdPath, monitorFD, rootPath := hypervisorFiles(nil, withUserspaceMark(f), qemuEnd, realRootImage())
 			consoleLog := filepath.Join(GinkgoT().TempDir(), "console.log")
-			argv := consoleLogArgv(markedArgv(tcgArgv(qemu, withRealRootDrive(qemuArgv(art, initrdPath, minGuestMemoryMiB, nw, "", monitorFD), rootPath))), consoleLog)
+			argv := consoleLogArgv(markedArgv(tcgArgv(qemu, withRealRootDrive(qemuArgv(art, initrdPath, minGuestMemoryMiB, nw, nil, monitorFD), rootPath))), consoleLog)
 			cmd := newHypervisorCmd(argv, files)
 			stderr = &safeBuffer{}
 			cmd.Stderr = stderr
@@ -768,7 +768,7 @@ echo served`)
 			DeferCleanup(func() { _ = qemuEnd.Close() })
 			files, _, initrdPath, monitorFD, rootPath := hypervisorFiles(nil, withUserspaceMark(f), qemuEnd, realRootImage())
 			consoleLog := filepath.Join(GinkgoT().TempDir(), "console.log")
-			argv := consoleLogArgv(markedArgv(tcgArgv(qemu, withRealRootDrive(qemuArgv(art, initrdPath, minGuestMemoryMiB, nw, "", monitorFD), rootPath))), consoleLog)
+			argv := consoleLogArgv(markedArgv(tcgArgv(qemu, withRealRootDrive(qemuArgv(art, initrdPath, minGuestMemoryMiB, nw, nil, monitorFD), rootPath))), consoleLog)
 			cmd := newHypervisorCmd(argv, files)
 			stderr = &safeBuffer{}
 			cmd.Stderr = stderr

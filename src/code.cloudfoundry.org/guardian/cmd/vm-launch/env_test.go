@@ -195,10 +195,10 @@ var _ = Describe("guest environment", func() {
 				"VCAP_SERVICES=" + last,
 			}, logger)
 
-			vol, err := volumeFromEnv(lookupIn(env))
+			vols, err := volumesFromEnv(lookupIn(env))
 			Expect(err).NotTo(HaveOccurred())
-			Expect(vol).NotTo(BeNil())
-			Expect(vol.ContainerDir).To(Equal(volDir))
+			Expect(vols).To(HaveLen(1))
+			Expect(vols[0].ContainerDir).To(Equal(volDir))
 
 			envFile := build(env)
 			Expect(sourceAndDumpEnv([]string{"/bin/sh"}, writeTempFile("env", envFile))).To(HaveKeyWithValue("VCAP_SERVICES", last))

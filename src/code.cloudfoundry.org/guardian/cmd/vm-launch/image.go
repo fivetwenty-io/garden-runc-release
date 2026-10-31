@@ -1139,7 +1139,7 @@ func checkExistingSize(size, want int64, path string) error {
 }
 
 // checkImageRequest rejects a volume or options that openVolumeImage cannot
-// use. volumeFromEnv already produces valid volumes; the volume is checked
+// use. volumesFromEnv already produces valid volumes; the volume is checked
 // again because it decides which file vm-launch creates.
 func checkImageRequest(v *guestVolume, o imageOptions) error {
 	if v == nil {
