@@ -208,11 +208,13 @@ type CommonCommand struct {
 	} `group:"Containerd"`
 
 	ExecutionBackends struct {
-		Enabled        []string `long:"execution-backend" description:"Execution backend to enable: oci-gvisor, vm-qemu, or vm-firecracker. oci-runc is always enabled. Can be specified multiple times. Cannot be combined with an alternative --containerd-runtime-type."`
-		VMArtifactsDir string   `long:"vm-artifacts-dir" default:"/var/vcap/data/vm-runtime/artifacts" description:"Host directory with the VM kernels and hypervisors, bound read-only into vm-* containers at /opt/garden-vm/artifacts."`
-		VMLaunchBin    string   `long:"vm-launch-bin" description:"Host path of the static vm-launch binary, bound read-only into vm-* containers at /opt/garden-vm/vm-launch. Required when a vm-* backend is enabled."`
-		VMKVMGid       uint32   `long:"vm-kvm-gid" description:"Host gid that owns /dev/kvm, added to the vm-launch process. Resolved from the host kvm group when not set."`
-		VMBlockVolumes bool     `long:"vm-block-volumes" description:"Give a vm-* container the block device named by each bind mount whose source is a read-only pdi: descriptor tmpfs, as a root:kvm 0660 node at /dev/pdi/MAJOR-MINOR with a read-write device cgroup rule. A device that is the wrong size, mounted, held, or busy on the host refuses the container. The descriptor bind mount must be read-write. Off by default."`
+		Enabled             []string `long:"execution-backend" description:"Execution backend to enable: oci-gvisor, vm-qemu, or vm-firecracker. oci-runc is always enabled. Can be specified multiple times. Cannot be combined with an alternative --containerd-runtime-type."`
+		VMArtifactsDir      string   `long:"vm-artifacts-dir" default:"/var/vcap/data/vm-runtime/artifacts" description:"Host directory with the VM kernels and hypervisors, bound read-only into vm-* containers at /opt/garden-vm/artifacts."`
+		VMLaunchBin         string   `long:"vm-launch-bin" description:"Host path of the static vm-launch binary, bound read-only into vm-* containers at /opt/garden-vm/vm-launch. Required when a vm-* backend is enabled."`
+		VMKVMGid            uint32   `long:"vm-kvm-gid" description:"Host gid that owns /dev/kvm, added to the vm-launch process. Resolved from the host kvm group when not set."`
+		VMBlockVolumes      bool     `long:"vm-block-volumes" description:"Give a vm-* container the block device named by each bind mount whose source is a read-only pdi: descriptor tmpfs, as a root:kvm 0660 node at /dev/pdi/MAJOR-MINOR with a read-write device cgroup rule. A device that is the wrong size, mounted, held, or busy on the host refuses the container. The descriptor bind mount must be read-write. Off by default."`
+		VMVolumeShares      bool     `long:"vm-volume-shares" description:"Let an app on a vm-qemu container ask for a volume as a share in VM_VOLUMES. Garden passes --allow-volume-shares and the virtiofsd wrapper's path to vm-launch. Off by default, and a share is refused on vm-firecracker whatever its value."`
+		VMVolumeAsyncMounts bool     `long:"vm-volume-async-mounts" description:"Mount a journalled ext4 image volume of a vm-* container without sync and dirsync, which vm-launch otherwise uses. A legacy ext2 image without a journal keeps them. Garden passes --volume-sync-mounts=false to vm-launch only when this is set. Off by default."`
 	} `group:"Execution Backends"`
 
 	CPUThrottling struct {
@@ -662,6 +664,9 @@ func (cmd *CommonCommand) wireContainerizer(
 	if backends.kvmGid != 0 {
 		processBuilderOpts = append(processBuilderOpts, processes.WithKVMGid(backends.kvmGid))
 	}
+	if len(backends.vmLaunchFlags) > 0 {
+		processBuilderOpts = append(processBuilderOpts, processes.WithVMLaunchFlags(backends.vmLaunchFlags...))
+	}
 	if cmd.runscCell() {
 		processBuilderOpts = append(processBuilderOpts, processes.WithConfinedRootDir())
 	}
@@ -829,6 +834,11 @@ type executionBackends struct {
 	// blockVolumes is the block volume step of vm-* containers. It is nil
 	// unless --vm-block-volumes is set and a vm-* backend is enabled.
 	blockVolumes *bundlerules.PDIDevices
+
+	// vmLaunchFlags are the volume flags that the wrapped vm-launch of every
+	// vm-* container gets. They are empty unless a vm-* backend is enabled and
+	// the operator turned on shares or turned on asynchronous image mounts.
+	vmLaunchFlags []string
 }
 
 // taskPidListerFactory is implemented by factories that can list the processes
@@ -923,6 +933,7 @@ func (cmd *CommonCommand) wireExecutionBackends(log lager.Logger) (*executionBac
 
 	if len(kinds) == 0 {
 		cmd.logUnusedBlockVolumes(log)
+		cmd.logUnusedVolumeFlags(log)
 		return &executionBackends{}, nil
 	}
 
@@ -960,6 +971,7 @@ func (cmd *CommonCommand) wireExecutionBackends(log lager.Logger) (*executionBac
 
 	if len(kinds) == 0 {
 		cmd.logUnusedBlockVolumes(log)
+		cmd.logUnusedVolumeFlags(log)
 		return &executionBackends{}, nil
 	}
 
@@ -980,9 +992,16 @@ func (cmd *CommonCommand) wireExecutionBackends(log lager.Logger) (*executionBac
 		}
 	}
 
-	log.Info("enabled", lager.Data{"backends": kinds, "kvm-gid": kvmGid, "block-volumes": blockVolumes != nil})
+	var vmLaunchFlags []string
+	if kvmGid != 0 {
+		vmLaunchFlags = cmd.vmLaunchVolumeFlags()
+	} else {
+		cmd.logUnusedVolumeFlags(log)
+	}
 
-	return &executionBackends{registry: registry, kvmGid: kvmGid, blockVolumes: blockVolumes}, nil
+	log.Info("enabled", lager.Data{"backends": kinds, "kvm-gid": kvmGid, "block-volumes": blockVolumes != nil, "vm-launch-flags": vmLaunchFlags})
+
+	return &executionBackends{registry: registry, kvmGid: kvmGid, blockVolumes: blockVolumes, vmLaunchFlags: vmLaunchFlags}, nil
 }
 
 // logUnusedBlockVolumes notes that --vm-block-volumes has no effect because no
@@ -990,6 +1009,23 @@ func (cmd *CommonCommand) wireExecutionBackends(log lager.Logger) (*executionBac
 func (cmd *CommonCommand) logUnusedBlockVolumes(log lager.Logger) {
 	if cmd.ExecutionBackends.VMBlockVolumes {
 		log.Info("block-volumes-unused-without-a-vm-backend")
+	}
+}
+
+// vmLaunchVolumeFlags returns the volume flags for the wrapped vm-launch of a
+// vm-* container, which are empty for the defaults.
+func (cmd *CommonCommand) vmLaunchVolumeFlags() []string {
+	return processes.VMLaunchVolumeFlags(cmd.ExecutionBackends.VMVolumeShares, bundlerules.VMVirtiofsdPath, !cmd.ExecutionBackends.VMVolumeAsyncMounts)
+}
+
+// logUnusedVolumeFlags notes that --vm-volume-shares or
+// --vm-volume-async-mounts has no effect because no vm-* backend is enabled.
+func (cmd *CommonCommand) logUnusedVolumeFlags(log lager.Logger) {
+	if cmd.ExecutionBackends.VMVolumeShares {
+		log.Info("volume-shares-unused-without-a-vm-backend")
+	}
+	if cmd.ExecutionBackends.VMVolumeAsyncMounts {
+		log.Info("volume-async-mounts-unused-without-a-vm-backend")
 	}
 }
 

@@ -16,6 +16,11 @@ const (
 	// VMArtifactsMountPath is where the host artifacts directory appears inside a vm-* container.
 	VMArtifactsMountPath = "/opt/garden-vm/artifacts"
 
+	// VMVirtiofsdPath is the executable that runs virtiofsd for a share, as
+	// vm-launch sees it inside a vm-* container. It sits in the artifacts
+	// directory, where the cell's runtime config installs the wrapper.
+	VMVirtiofsdPath = VMArtifactsMountPath + "/virtiofsd/virtiofsd-wrapper"
+
 	// VMLaunchMountPath is where the host vm-launch binary appears inside a vm-* container.
 	VMLaunchMountPath = processes.VMLaunchPath
 

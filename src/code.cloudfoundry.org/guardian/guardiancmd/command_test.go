@@ -514,6 +514,122 @@ var _ = Describe("execution backend flags", func() {
 		})
 	})
 
+	Describe("volume shares and asynchronous image mounts", func() {
+		parse := func(args ...string) *CommonCommand {
+			GinkgoHelper()
+			parsed := &CommonCommand{}
+			_, err := flags.NewParser(parsed, flags.IgnoreUnknown).ParseArgs(args)
+			Expect(err).NotTo(HaveOccurred())
+			return parsed
+		}
+
+		It("keeps shares off and image mounts synchronous when no flag is given", func() {
+			parsed := &CommonCommand{}
+			_, err := flags.NewParser(parsed, flags.None).ParseArgs([]string{})
+			if err != nil {
+				Skip("host lacks a default binary: " + err.Error())
+			}
+			Expect(parsed.ExecutionBackends.VMVolumeShares).To(BeFalse())
+			Expect(parsed.ExecutionBackends.VMVolumeAsyncMounts).To(BeFalse())
+		})
+
+		It("turns shares on with --vm-volume-shares", func() {
+			Expect(parse("--vm-volume-shares").ExecutionBackends.VMVolumeShares).To(BeTrue())
+		})
+
+		It("turns asynchronous mounts on with --vm-volume-async-mounts", func() {
+			Expect(parse("--vm-volume-async-mounts").ExecutionBackends.VMVolumeAsyncMounts).To(BeTrue())
+		})
+
+		It("reads both settings from the ini file the job renders", func() {
+			ini := filepath.Join(GinkgoT().TempDir(), "config.ini")
+			Expect(os.WriteFile(ini, []byte("[server]\n  vm-volume-shares = true\n  vm-volume-async-mounts = true\n"), 0o600)).To(Succeed())
+
+			gdn := &GdnCommand{ServerCommand: &ServerCommand{CommonCommand: &CommonCommand{}}}
+			parser := flags.NewParser(gdn, flags.IgnoreUnknown)
+			parser.NamespaceDelimiter = "-"
+			Expect(flags.NewIniParser(parser).ParseFile(ini)).To(Succeed())
+			Expect(gdn.ServerCommand.ExecutionBackends.VMVolumeShares).To(BeTrue())
+			Expect(gdn.ServerCommand.ExecutionBackends.VMVolumeAsyncMounts).To(BeTrue())
+		})
+
+		Context("with a vm-* backend", func() {
+			BeforeEach(func() {
+				cmd.ExecutionBackends.Enabled = []string{"vm-qemu"}
+				cmd.ExecutionBackends.VMLaunchBin = launchBin
+			})
+
+			It("passes vm-launch no volume flag by default", func() {
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vmLaunchFlags).To(BeEmpty())
+			})
+
+			It("passes the share flag and the wrapper's path inside the container when shares are on", func() {
+				cmd.ExecutionBackends.VMVolumeShares = true
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vmLaunchFlags).To(Equal([]string{
+					"--allow-volume-shares",
+					"--virtiofsd-path", "/opt/garden-vm/artifacts/virtiofsd/virtiofsd-wrapper",
+				}))
+			})
+
+			It("passes only --volume-sync-mounts=false when asynchronous mounts are on", func() {
+				cmd.ExecutionBackends.VMVolumeAsyncMounts = true
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vmLaunchFlags).To(Equal([]string{"--volume-sync-mounts=false"}))
+			})
+
+			It("passes all three flags when both settings differ from the defaults", func() {
+				cmd.ExecutionBackends.VMVolumeShares = true
+				cmd.ExecutionBackends.VMVolumeAsyncMounts = true
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vmLaunchFlags).To(Equal([]string{
+					"--allow-volume-shares",
+					"--virtiofsd-path", "/opt/garden-vm/artifacts/virtiofsd/virtiofsd-wrapper",
+					"--volume-sync-mounts=false",
+				}))
+			})
+
+			It("passes nothing when the vm-* backends were dropped for want of a kvm gid", func() {
+				cmd.ExecutionBackends.VMVolumeShares = true
+				lookupKVMGroup = func(name string) (*user.Group, error) { return nil, user.UnknownGroupError(name) }
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vmLaunchFlags).To(BeEmpty())
+				Expect(log).To(gbytes.Say("volume-shares-unused-without-a-vm-backend"))
+			})
+		})
+
+		It("passes nothing and says so when only oci-gvisor is enabled", func() {
+			cmd.ExecutionBackends.VMVolumeShares = true
+			cmd.ExecutionBackends.VMVolumeAsyncMounts = true
+			cmd.ExecutionBackends.Enabled = []string{"oci-gvisor"}
+			cmd.Containerd.Socket = "/run/containerd.sock"
+
+			backends, err := cmd.wireExecutionBackends(log)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(backends.vmLaunchFlags).To(BeEmpty())
+			Expect(log).To(gbytes.Say("volume-shares-unused-without-a-vm-backend"))
+			Expect(log).To(gbytes.Say("volume-async-mounts-unused-without-a-vm-backend"))
+		})
+
+		It("passes nothing when no backend is enabled", func() {
+			cmd.ExecutionBackends.VMVolumeShares = true
+
+			backends, err := cmd.wireExecutionBackends(log)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(backends.vmLaunchFlags).To(BeEmpty())
+		})
+	})
+
 	Describe("block volumes", func() {
 		It("are off unless --vm-block-volumes is given", func() {
 			parsed := &CommonCommand{}

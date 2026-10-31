@@ -57,6 +57,19 @@ const (
 	// process without PORT, such as a task, gets neither.
 	VMLaunchTransparentProxyFlag = "--transparent-proxy"
 
+	// VMLaunchAllowVolumeSharesFlag tells vm-launch that the operator allows an
+	// app to ask for a volume as a share in VM_VOLUMES.
+	VMLaunchAllowVolumeSharesFlag = "--allow-volume-shares"
+
+	// VMLaunchVirtiofsdFlag gives vm-launch the path, inside the container, of
+	// the executable that runs virtiofsd for a share.
+	VMLaunchVirtiofsdFlag = "--virtiofsd-path"
+
+	// VMLaunchVolumeSyncMountsFlag tells vm-launch whether the guest mounts a
+	// journalled image volume with sync and dirsync. vm-launch defaults to true,
+	// so VMLaunchVolumeFlags passes the flag only to turn that off.
+	VMLaunchVolumeSyncMountsFlag = "--volume-sync-mounts"
+
 	// portEnvPrefix starts the environment entry that names the port of a
 	// process that serves one. vm-launch forwards ports only when the entry
 	// is present, whatever its value, and exits when the value is no port.
@@ -132,6 +145,9 @@ type ProcBuilder struct {
 	// confinedRootDir resolves every working directory inside the image
 	// root, not only those of gVisor containers.
 	confinedRootDir bool
+	// vmLaunchFlags are the operator's volume flags, which BuildProcess
+	// passes to the wrapped vm-launch.
+	vmLaunchFlags []string
 }
 
 // Option customises a ProcBuilder.
@@ -154,6 +170,40 @@ func WithKVMGid(gid uint32) Option {
 func WithConfinedRootDir() Option {
 	return func(p *ProcBuilder) {
 		p.confinedRootDir = true
+	}
+}
+
+// VMLaunchVolumeFlags returns the vm-launch flags that carry the operator's
+// volume settings, in a fixed order. It returns none for the defaults, which
+// are no shares and synchronous image mounts, so that vm-launch gets the
+// arguments it gets today. With shares allowed it returns
+// VMLaunchAllowVolumeSharesFlag and, when virtiofsdPath is not empty,
+// VMLaunchVirtiofsdFlag with that path, and the path is never passed without
+// shares because nothing would use it. With syncMounts false it returns
+// VMLaunchVolumeSyncMountsFlag set to false.
+func VMLaunchVolumeFlags(allowShares bool, virtiofsdPath string, syncMounts bool) []string {
+	var flags []string
+	if allowShares {
+		flags = append(flags, VMLaunchAllowVolumeSharesFlag)
+		if virtiofsdPath != "" {
+			flags = append(flags, VMLaunchVirtiofsdFlag, virtiofsdPath)
+		}
+	}
+	if !syncMounts {
+		flags = append(flags, VMLaunchVolumeSyncMountsFlag+"=false")
+	}
+	return flags
+}
+
+// WithVMLaunchFlags makes BuildProcess pass flags to the vm-launch process
+// that the containerizer wrapped in a vm-* container, after the transparent
+// proxy flag when it adds one and before vm-launch's own arguments. It never
+// adds them to any other process. VMLaunchVolumeFlags builds the usual list.
+// The builder keeps a copy.
+func WithVMLaunchFlags(flags ...string) Option {
+	kept := append([]string(nil), flags...)
+	return func(p *ProcBuilder) {
+		p.vmLaunchFlags = kept
 	}
 }
 
@@ -209,8 +259,9 @@ func (p *ProcBuilder) CheckUser(bndl goci.Bndl, spec garden.ProcessSpec, user *u
 // its environment gets CAP_NET_RAW in every capability set, ambient
 // included, so that it holds the capability as the non-root app user, and
 // the --transparent-proxy flag before its own arguments (vm-launch keeps the
-// hypervisor from inheriting the capability). The marker is removed before
-// the process is built.
+// hypervisor from inheriting the capability). That wrapped vm-launch also
+// gets the flags set with WithVMLaunchFlags after it. The marker is removed
+// before the process is built.
 // Callers check the resolved user with CheckUser first, because a kvm primary
 // gid cannot be removed here.
 func (p *ProcBuilder) BuildProcess(bndl goci.Bndl, spec garden.ProcessSpec, user *users.ExecUser) *specs.Process {
@@ -245,11 +296,15 @@ func (p *ProcBuilder) BuildProcess(bndl goci.Bndl, spec garden.ProcessSpec, user
 	}
 
 	env := p.envDeterminer.EnvFor(bndl, spec, user.Uid)
-	args := append([]string{spec.Path}, spec.Args...)
+	args := []string{spec.Path}
 	if wrapped && kind == backend.VMFirecracker && hasPort(env) {
 		capabilities = WithCapability(capabilities, CapNetRaw)
-		args = append([]string{spec.Path, VMLaunchTransparentProxyFlag}, spec.Args...)
+		args = append(args, VMLaunchTransparentProxyFlag)
 	}
+	if wrapped {
+		args = append(args, p.vmLaunchFlags...)
+	}
+	args = append(args, spec.Args...)
 
 	return &specs.Process{
 		Args:        args,
