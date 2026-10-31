@@ -30,7 +30,7 @@ func (juicefsProvider) Match(m mountRecord) matchStrength {
 }
 
 func (juicefsProvider) Capabilities(mountRecord) capabilities {
-	return capabilities{Modes: []attachMode{attachFileImage}, Fence: fenceDistributedFlock}
+	return capabilities{Modes: []attachMode{attachFileImage}, Fence: fenceDistributedFlock, Sharing: sharingShared}
 }
 
 // Prepare opens, and creates when missing, the instance's image with

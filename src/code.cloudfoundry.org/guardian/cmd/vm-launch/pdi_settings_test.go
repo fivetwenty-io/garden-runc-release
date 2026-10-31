@@ -393,11 +393,11 @@ var _ = Describe("applyVolumeSettings", func() {
 		Expect(v).To(Equal(vols()))
 	})
 
-	It("refuses a share, which this vm-launch cannot attach yet, instead of giving the app a private disk", func() {
+	It("records a share as the volume's mode and leaves the grant to grantShares", func() {
 		v := vols()
-		err := applyVolumeSettings(env(`{"/b":{"mode":"share"}}`, true), v)
-		Expect(err).To(MatchError(`VM_VOLUMES "/b" mode "share" is not supported by this vm-launch yet; shares need a later release`))
-		Expect(v).To(Equal(vols()))
+		Expect(applyVolumeSettings(env(`{"/b":{"mode":"share"}}`, true), v)).To(Succeed())
+		Expect(v[0].Settings).To(Equal(volumeSettings{}))
+		Expect(v[1].Settings).To(Equal(volumeSettings{Mode: volumeShare}))
 	})
 
 	It("accepts an explicit private mode", func() {
@@ -469,7 +469,6 @@ var _ = Describe("run with VM_VOLUMES", func() {
 			{`{"` + volDir + `":{"size":"20 G"}}`, `VM_VOLUMES ` + quoteForLog(volDir) + ` size "20 G" is not a whole number followed by M, G, or T`},
 			{`{"` + volDir + `":{"size":"32M"}}`, `VM_VOLUMES ` + quoteForLog(volDir) + ` size "32M" is below the 64M minimum`},
 			{`{"` + volDir + `":{"mode":"share","size":"1G"}}`, `VM_VOLUMES ` + quoteForLog(volDir) + ` sets a size, but a share has no image; its space is the volume's own quota`},
-			{`{"` + volDir + `":{"mode":"share"}}`, `VM_VOLUMES ` + quoteForLog(volDir) + ` mode "share" is not supported by this vm-launch yet; shares need a later release`},
 		} {
 			refusedBeforeAnything(c.value, c.line)
 		}

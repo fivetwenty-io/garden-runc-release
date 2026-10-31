@@ -58,7 +58,7 @@ func (nfsProvider) Match(m mountRecord) matchStrength {
 }
 
 func (nfsProvider) Capabilities(mountRecord) capabilities {
-	return capabilities{Modes: []attachMode{attachFileImage}, Fence: fenceDistributedFlock}
+	return capabilities{Modes: []attachMode{attachFileImage}, Fence: fenceDistributedFlock, Sharing: sharingShared}
 }
 
 // Prepare refuses a mount that refuseNFSMount refuses, as a second line of
