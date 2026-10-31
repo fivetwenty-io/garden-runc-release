@@ -3,7 +3,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -606,11 +605,17 @@ var _ = Describe("hypervisor drives for several volumes against a real QEMU", fu
 		Expect(stderr).To(ContainSubstring("vol0"))
 	})
 
-	It("boots a guest with two volume images of one size that refuses to start, and formats neither image nor the root", func() {
+	It("boots a guest with two volume images of one size and mounts each at its own path from the drive with its identity", func() {
 		vols := []*os.File{sparseImage(defaultImageSize), sparseImage(defaultImageSize)}
 		root := realRootImage()
-		g := taskGuest("echo the-command-ran\n")
-		g.vol, g.drives.volumes = &guestVolume{ContainerDir: "/home/vcap/data", ImageName: "volume.img"}, qemuImageDrives(defaultImageSize, defaultImageSize)
+		g := taskGuest(`for p in /home/vcap/data /home/vcap/logs; do
+	d=$(grep " $p ext4 " /proc/mounts | cut -d ' ' -f 1)
+	d=${d#/dev/}
+	echo "mount=$p:$d:$(cat /sys/block/$d/serial)"
+done
+`)
+		g.vols = []guestVolume{{ContainerDir: "/home/vcap/data", ImageName: "volume.img"}, {ContainerDir: "/home/vcap/logs", ImageName: "volume.img"}}
+		g.drives.volumes = qemuImageDrives(defaultImageSize, defaultImageSize)
 		withRealRoot(&g)
 
 		art := realArtifacts()
@@ -624,14 +629,19 @@ var _ = Describe("hypervisor drives for several volumes against a real QEMU", fu
 		argv := markedArgv(tcgArgv(qemu, withRealRootDrive(qemuArgv(art, initrdPath, minGuestMemoryMiB, g.nw, drivePaths, 0), rootPath)))
 		code, stdout, stderr := bootRealQEMU(argv, files)
 		Expect(code).To(Equal(0), "QEMU failed: %s\n%s", stderr, stdout)
-		Expect(stdout).To(MatchRegexp(`vm-launch guest setup: two block devices, /dev/vd[a-z] and /dev/vd[a-z], have the size of the volume, so the guest cannot tell which one it is`), stdout)
-		Expect(stdout).NotTo(ContainSubstring(startTag(testNonce)))
-		Expect(stdout).NotTo(ContainSubstring("the-command-ran"))
-		for i, img := range append(vols, root) {
-			head := make([]byte, 64<<10)
-			_, err := img.ReadAt(head, 0)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(bytes.Count(head, []byte{0})).To(Equal(len(head)), "image %d was written", i)
+		Expect(stdout).NotTo(ContainSubstring("vm-launch guest setup"), stdout)
+		Expect(stdout).To(ContainSubstring(exitTag(testNonce)+"0"), stdout)
+
+		devices := map[string]string{}
+		for _, m := range regexp.MustCompile(`(?m)^mount=([^:\r\n]+):(vd[a-z]+):([^\r\n]*)\r?$`).FindAllStringSubmatch(stdout, -1) {
+			Expect(devices).NotTo(HaveKey(m[1]), stdout)
+			devices[m[1]] = m[3]
+			Expect(m[2]).NotTo(BeEmpty())
 		}
+		Expect(devices).To(Equal(map[string]string{"/home/vcap/data": "rvm-vol0", "/home/vcap/logs": "rvm-vol1"}), stdout)
+		for i, img := range vols {
+			Expect(extLabel(img)).To(Equal("rvm-volume"), "volume image %d", i)
+		}
+		Expect(extLabel(root)).To(Equal("rvm-root"))
 	})
 })

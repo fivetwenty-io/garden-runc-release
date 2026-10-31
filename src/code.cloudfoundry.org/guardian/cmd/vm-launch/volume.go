@@ -394,7 +394,7 @@ func findVolumeProviders(mountinfo string, vols []guestVolume) ([]selectedVolume
 type preparedVolume struct {
 	Path       string
 	Attachment *attachment
-	// Bytes is the size of the disk, which the guest finds it by.
+	// Bytes is the size of the disk, which stage 1 checks the drive against.
 	Bytes int64
 	// dev and ino name the disk's inode, so that no disk is attached twice.
 	dev, ino uint64

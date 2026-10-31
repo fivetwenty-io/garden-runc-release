@@ -199,9 +199,9 @@ func buildInitramfs(busybox []byte, command string, nw *network, vol *guestVolum
 func buildInitramfsWithEnv(busybox []byte, command string, nw *network, guestEnv string, vol *guestVolume) []byte {
 	bb := filepath.Join(GinkgoT().TempDir(), "busybox")
 	Expect(os.WriteFile(bb, busybox, 0o755)).To(Succeed())
-	g := guestContents{command: command, nonce: testNonce, nw: nw, env: guestEnv, vol: vol, nofile: testNofile}
+	g := guestContents{command: command, nonce: testNonce, nw: nw, env: guestEnv, nofile: testNofile}
 	if vol != nil {
-		g.drives.volumes = qemuImageDrives(defaultImageSize)
+		g.vols, g.drives.volumes = []guestVolume{*vol}, qemuImageDrives(defaultImageSize)
 	}
 	f, err := newInitramfs(bb, g)
 	Expect(err).NotTo(HaveOccurred())

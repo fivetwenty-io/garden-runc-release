@@ -392,11 +392,13 @@ stat -L -c %d%r%i /proc/self/fd/3 /proc/self/fd/5 >`+shellQuote(filepath.Join(ou
 	// path ran through the provider registry, with the same environment. The
 	// drive identities came later: the serials on QEMU's two devices, and the
 	// RVM_ROOT_ID, RVM_VOLUMES, and RVM_VOL0 lines in /rvm/disks, whose
-	// identities stand in as @ROOTID and @VOLID.
+	// identities stand in as @ROOTID and @VOLID. With the lookup by identity,
+	// /rvm/disks lost RVM_VOLUME_SECTORS, and /rvm/mounts names each volume
+	// by its index.
 	const (
-		goldenPDIMounts = "RVM_VOLUME_PATH='@VOL'\nRVM_VOLUME_IMAGE='rvm-disk-" + testAppID + "-web-2.img'\n"
+		goldenPDIMounts = "RVM_VOLUMES=1\nRVM_VOL0_PATH='@VOL'\nRVM_VOL0_IMAGE='rvm-disk-" + testAppID + "-web-2.img'\n"
 		goldenPDIDisks  = "RVM_ROOT_ID=@ROOTID\nRVM_ROOT_SECTORS=65536\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUMES=1\n" +
-			"RVM_VOL0_KIND=image\nRVM_VOL0_ID=@VOLID\nRVM_VOL0_SECTORS=2097152\nRVM_VOLUME_SECTORS=2097152\n"
+			"RVM_VOL0_KIND=image\nRVM_VOL0_ID=@VOLID\nRVM_VOL0_SECTORS=2097152\n"
 		goldenPDIFC = `{"boot-source":{"kernel_image_path":"@ART/kernel/vmlinux","initrd_path":"/proc/self/fd/4","boot_args":"console=ttyS0 reboot=k panic=1 rdinit=/init quiet"},` +
 			`"drives":[{"drive_id":"vol0","path_on_host":"/proc/self/fd/3","is_root_device":false,"is_read_only":false,"cache_type":"Writeback","io_engine":"Sync"},` +
 			`{"drive_id":"root0","path_on_host":"/proc/self/fd/5","is_root_device":false,"is_read_only":false,"cache_type":"Unsafe","io_engine":"Sync","discard":true}],` +

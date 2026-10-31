@@ -289,15 +289,20 @@ var _ = Describe("checkDriveIDs", func() {
 })
 
 var _ = Describe("the drive identities in /rvm/disks", func() {
-	vol := &guestVolume{ContainerDir: "/data", ImageName: "rvm-disk-0.img"}
+	// vols returns n guest volumes, one for each volume drive.
+	vols := func(n int) []guestVolume {
+		var vs []guestVolume
+		for i := range n {
+			vs = append(vs, guestVolume{ContainerDir: "/data" + strconv.Itoa(i), ImageName: "rvm-disk-0.img"})
+		}
+		return vs
+	}
 
 	guest := func(rootID string, drives ...guestDrive) guestContents {
 		g := taskGuest("true")
 		g.rootBytes, g.rootInodeRatio = 64*bytesPerMiB, 16384
 		g.drives = guestDrives{rootID: rootID, volumes: drives}
-		if len(drives) > 0 {
-			g.vol = vol
-		}
+		g.vols = vols(len(drives))
 		return g
 	}
 
@@ -308,8 +313,7 @@ var _ = Describe("the drive identities in /rvm/disks", func() {
 		Expect(got).To(Equal("RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=131072\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUMES=3\n" +
 			"RVM_VOL0_KIND=image\nRVM_VOL0_ID=rvm-vol0\nRVM_VOL0_SECTORS=2097152\n" +
 			"RVM_VOL1_KIND=image\nRVM_VOL1_ID=rvm-vol1\nRVM_VOL1_SECTORS=4194304\n" +
-			"RVM_VOL2_KIND=image\nRVM_VOL2_ID=rvm-vol2\nRVM_VOL2_SECTORS=2097152\n" +
-			"RVM_VOLUME_SECTORS=2097152\n"))
+			"RVM_VOL2_KIND=image\nRVM_VOL2_ID=rvm-vol2\nRVM_VOL2_SECTORS=2097152\n"))
 
 		out, err := exec.Command("/bin/sh", "-c", `set -eu; . "$1"; printf '%s|' "$RVM_ROOT_ID" "$RVM_VOLUMES" "$RVM_VOL0_ID" "$RVM_VOL1_KIND" "$RVM_VOL1_SECTORS" "$RVM_VOL2_ID"`, "sh", writeTempFile("disks", got)).CombinedOutput()
 		Expect(err).NotTo(HaveOccurred(), string(out))
@@ -321,7 +325,7 @@ var _ = Describe("the drive identities in /rvm/disks", func() {
 		got, err := disksFile(g)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(got).To(Equal("RVM_ROOT_ID=6477201831457\nRVM_ROOT_SECTORS=131072\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUMES=1\n" +
-			"RVM_VOL0_KIND=image\nRVM_VOL0_ID=717943911\nRVM_VOL0_SECTORS=2097152\nRVM_VOLUME_SECTORS=2097152\n"))
+			"RVM_VOL0_KIND=image\nRVM_VOL0_ID=717943911\nRVM_VOL0_SECTORS=2097152\n"))
 	})
 
 	It("names four volumes without a root", func() {
@@ -332,6 +336,15 @@ var _ = Describe("the drive identities in /rvm/disks", func() {
 		Expect(got).To(HavePrefix("RVM_VOLUMES=4\nRVM_VOL0_KIND=image\n"))
 		Expect(got).To(ContainSubstring("RVM_VOL3_ID=rvm-vol3\nRVM_VOL3_SECTORS=2097152\n"))
 		Expect(strings.Count(got, "_KIND=")).To(Equal(4))
+	})
+
+	It("names a volume of the root's size, and volumes of one size, since the guest tells drives apart by identity alone", func() {
+		g := guest("rvm-root", qemuImageDrives(64*bytesPerMiB, 64*bytesPerMiB)...)
+		got, err := disksFile(g)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got).To(Equal("RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=131072\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUMES=2\n" +
+			"RVM_VOL0_KIND=image\nRVM_VOL0_ID=rvm-vol0\nRVM_VOL0_SECTORS=131072\n" +
+			"RVM_VOL1_KIND=image\nRVM_VOL1_ID=rvm-vol1\nRVM_VOL1_SECTORS=131072\n"))
 	})
 
 	DescribeTable("refuses drives the guest could not find or tell apart, so no initramfs is built",
@@ -363,20 +376,23 @@ var _ = Describe("the drive identities in /rvm/disks", func() {
 			`drive vol0 holds a "block", and the guest supports only "image" volume drives`),
 		Entry("a later volume that is not whole sectors", guest("rvm-root", qemuImageDrives(defaultImageSize, defaultImageSize+1)...),
 			"the volume image of 1073741825 bytes on drive vol1 is not a positive whole number of 512-byte sectors"),
-		Entry("a later volume of the root's size", guest("rvm-root", qemuImageDrives(defaultImageSize, 64*bytesPerMiB)...),
-			"the guest root image and the volume image are both 67108864 bytes, so the guest could not tell them apart"),
 		Entry("more volumes than a guest can have", guest("rvm-root", qemuImageDrives(1<<30, 1<<30, 1<<30, 1<<30, 1<<30)...),
 			"5 volume drives, over the 4 a guest can have"),
 		Entry("volume drives for a guest without a volume", func() guestContents {
 			g := guest("rvm-root", qemuImageDrives(defaultImageSize)...)
-			g.vol = nil
+			g.vols = nil
 			return g
-		}(), "1 volume drives for a guest without a volume"),
+		}(), "1 volume drives for 0 guest volumes"),
 		Entry("a guest volume without a volume drive", func() guestContents {
 			g := guest("rvm-root")
-			g.vol = vol
+			g.vols = vols(1)
 			return g
-		}(), "a guest volume without a volume drive"),
+		}(), "0 volume drives for 1 guest volumes"),
+		Entry("fewer volume drives than guest volumes", func() guestContents {
+			g := guest("rvm-root", qemuImageDrives(defaultImageSize, defaultImageSize)...)
+			g.vols = vols(3)
+			return g
+		}(), "2 volume drives for 3 guest volumes"),
 	)
 })
 
