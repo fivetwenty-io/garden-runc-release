@@ -150,7 +150,16 @@ type prepareRequest struct {
 	// provider that allows one instance checks.
 	Index int
 	Mode  attachMode
-	// Signals stops a lock wait early.
+	// Size is the requested floor for a file image, from VM_VOLUMES: the
+	// engine grows a smaller image to it and never shrinks a larger one. Zero
+	// leaves the engine's default, which is 1 GiB. A block provider ignores
+	// it, because a block device has the size of its plan.
+	Size int64
+	// Logger takes the lines a provider prints that are not errors, such as
+	// the line for an image kept at a larger size than asked for. It may be
+	// nil, which leaves them out.
+	Logger *log.Logger
+	// Signals stops a lock wait, or a grow that writes zeros, early.
 	Signals <-chan os.Signal
 	// LockBudget is the wait for fences that the launch's volumes share. A
 	// provider that waits for a fence takes the time it waits from it, so
@@ -163,6 +172,22 @@ type prepareRequest struct {
 	// It lets vm-launch refuse a disk that an earlier volume of the launch
 	// already holds, which the provider's fence would otherwise wait for.
 	BeforeLock func(disk *os.File) error
+}
+
+// fileImageOptions returns base with what req sets for a file image: the
+// size floor when req asks for one, the lock budget, the check before the
+// lock, and the logger for the engine's lines.
+func (req prepareRequest) fileImageOptions(base imageOptions) imageOptions {
+	o := base
+	if req.Size != 0 {
+		o.Size = req.Size
+	}
+	o.BeforeLock = req.BeforeLock
+	o.LockBudget = req.LockBudget
+	if req.Logger != nil {
+		o.Logf = req.Logger.Printf
+	}
+	return o
 }
 
 // attachment is a prepared, fenced disk. It stays fenced until Release.

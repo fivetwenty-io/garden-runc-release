@@ -398,11 +398,37 @@ var _ = Describe("the NFS provider's Prepare", func() {
 		Expect(os.ReadDir(dir)).To(BeEmpty())
 	})
 
+	It("exits 125 with the quota's line before it creates anything when the export has too little free space", func() {
+		defaultImageOptions.fstatfs = fakeStatfs(1<<20, 1<<20, 51160, 10)
+		defaultImageOptions.fallocate = func(int, uint32, int64, int64) error { Fail("the allocation was tried"); return nil }
+		req := kernelNFS4()
+		req.Size = 20 << 30
+		_, err := nfsProvider{}.Prepare(req)
+		Expect(err).To(MatchError("volume " + quoteForLog(dir) + `: creating image "rvm-disk-0.img" at 20 GiB needs 20 GiB, and the volume has 10 MiB free of 49.9 GiB; ` + quotaAdvice))
+		Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+		Expect(os.ReadDir(dir)).To(BeEmpty())
+	})
+
+	It("exits 125 with the quota's line before it grows an image when the export has too little free space", func() {
+		writeImage(img, 64<<20, []byte("keep"))
+		defaultImageOptions.fstatfs = fakeStatfs(1<<20, 1<<20, 100, 3)
+		defaultImageOptions.fallocate = func(int, uint32, int64, int64) error { Fail("the allocation was tried"); return nil }
+		req := kernelNFS4()
+		req.Size = 128 << 20
+		_, err := nfsProvider{}.Prepare(req)
+		Expect(err).To(MatchError(ContainSubstring("from 64 MiB to 128 MiB needs 64 MiB, and the volume has 3 MiB free of 100 MiB")))
+		Expect(readPrefix(img, 4)).To(Equal("keep"))
+		fi, serr := os.Stat(img)
+		Expect(serr).NotTo(HaveOccurred())
+		Expect(fi.Size()).To(Equal(int64(64 << 20)))
+	})
+
 	It("exits 125 with the quota's words and leaves nothing on the volume when the server refuses the allocation", func() {
 		defaultImageOptions.fallocate = func(int, uint32, int64, int64) error { return unix.ENOSPC }
 		_, err := nfsProvider{}.Prepare(kernelNFS4())
 		Expect(errors.Is(err, unix.ENOSPC)).To(BeTrue(), "%v", err)
-		Expect(err.Error()).To(HaveSuffix("(the volume's quota refused it)"))
+		Expect(err.Error()).To(ContainSubstring("and the volume's quota refused it (no space left on device)"))
+		Expect(err.Error()).To(HaveSuffix("; no image was created"))
 		Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 		Expect(os.ReadDir(dir)).To(BeEmpty())
 	})

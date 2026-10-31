@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -74,6 +75,23 @@ func writeImage(path string, size int64, data []byte) {
 	Expect(f.Close()).To(Succeed())
 }
 
+// juicefsFallocate answers fallocate as JuiceFS does. Mode 0 raises the
+// length to the end of the range when that is past it, and writes no data, so
+// the image stays sparse. Any other mode is refused.
+func juicefsFallocate(fd int, mode uint32, off, length int64) error {
+	if mode != 0 {
+		return unix.EOPNOTSUPP
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return err
+	}
+	if off+length > st.Size {
+		return unix.Ftruncate(fd, off+length)
+	}
+	return nil
+}
+
 // ageTemp sets the modification time of path to well beyond tempOrphanAge ago,
 // as a temp file that a killed launch left has.
 func ageTemp(path string) {
@@ -129,14 +147,21 @@ var _ = Describe("openVolumeImage", func() {
 
 	open := func() (*os.File, error) { return openVolumeImage(vol, opts, nil) }
 
-	It("defaults to a fixed sparse 1 GiB image, a 30 second wait, and the statx mount root check", func() {
+	It("defaults to a sparse 1 GiB image published at 64 MiB, a 30 second wait, and the statx mount root check", func() {
 		Expect(defaultImageOptions.Size).To(Equal(int64(1 << 30)))
+		Expect(defaultImageOptions.creationSize()).To(Equal(int64(64 << 20)))
+		Expect(defaultImageOptions.Logf).To(BeNil(), "each provider sets the logger from its request")
 		Expect(defaultImageOptions.LockWait).To(Equal(30 * time.Second))
 		Expect(defaultImageOptions.LockPoll).To(Equal(500 * time.Millisecond))
 		Expect(defaultImageOptions.IsMountRoot).NotTo(BeNil())
 	})
 
 	It("creates a sparse 1 GiB image with mode 0600 owned by the caller, whatever the umask", func() {
+		var calls []fallocateCall
+		opts.fallocate = func(fd int, mode uint32, off, length int64) error {
+			calls = append(calls, fallocateCall{mode, off, length})
+			return juicefsFallocate(fd, mode, off, length)
+		}
 		old := unix.Umask(0o277)
 		f, err := open()
 		Expect(unix.Umask(old)).To(Equal(0o277), "the umask is restored")
@@ -147,6 +172,8 @@ var _ = Describe("openVolumeImage", func() {
 		st := statOf(img)
 		Expect(st.Size).To(Equal(int64(1 << 30)))
 		Expect(st.Blocks*512).To(BeNumerically("<", 1<<20), "the image must be sparse")
+		Expect(calls).To(Equal([]fallocateCall{{0, imageCreationStep, 1<<30 - imageCreationStep}}),
+			"the image is published at the creation step and grown by fallocate mode 0, which JuiceFS answers by setting the length")
 		Expect(st.Mode & 0o7777).To(Equal(uint32(0o600)))
 		Expect(st.Mode & syscall.S_IFMT).To(Equal(uint32(syscall.S_IFREG)))
 		Expect(int(st.Uid)).To(Equal(os.Geteuid()))
@@ -203,21 +230,23 @@ var _ = Describe("openVolumeImage", func() {
 		writeImage(img, 0, nil)
 		_, err := open()
 		Expect(errors.Is(err, errImageSize)).To(BeTrue(), "%v", err)
-		Expect(err).To(MatchError("volume image " + img + ": size 0, want 1073741824; vm-launch resizes only an image it creates, so inspect or delete it"))
+		Expect(err).To(MatchError("volume image " + img + ": size 0 is below the 67108864 bytes vm-launch publishes a new image at, so vm-launch did not make it; inspect or delete it"))
 		Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 		Expect(statOf(img).Size).To(BeZero())
 		Expect(lockedElsewhere(img)).To(BeFalse(), "a rejected image is closed")
 	})
 
-	It("never shrinks or grows an existing image whose size is not the fixed size", func() {
-		for _, size := range []int64{64 << 20, 2 << 30} {
+	It("never grows or touches an image smaller than the creation step, which vm-launch did not make", func() {
+		for _, size := range []int64{512, 4096, 64<<20 - 512} {
 			Expect(os.Remove(img) == nil || !fileExists(img)).To(BeTrue())
 			writeImage(img, size, []byte("data"))
 			_, err := open()
 			Expect(errors.Is(err, errImageSize)).To(BeTrue(), "%d: %v", size, err)
-			Expect(err).To(MatchError(ContainSubstring(": size " + strconv.FormatInt(size, 10) + ", want 1073741824; vm-launch resizes only an image it creates")))
+			Expect(err).To(MatchError("volume image " + img + ": size " + strconv.FormatInt(size, 10) + " is below the 67108864 bytes vm-launch publishes a new image at, so vm-launch did not make it; inspect or delete it"))
+			Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 			Expect(statOf(img).Size).To(Equal(size))
-			Expect(os.ReadFile(img)).To(HavePrefix("data"))
+			Expect(readPrefix(img, 4)).To(Equal("data"))
+			Expect(lockedElsewhere(img)).To(BeFalse(), "a rejected image is closed")
 		}
 	})
 
@@ -232,7 +261,7 @@ var _ = Describe("openVolumeImage", func() {
 		_, err = open()
 		Expect(time.Since(began)).To(BeNumerically("<", time.Second))
 		Expect(errors.Is(err, errImageSize)).To(BeTrue(), "%v", err)
-		Expect(err).To(MatchError(ContainSubstring("size 0, want 1073741824")))
+		Expect(err).To(MatchError(ContainSubstring("size 0 is below the 67108864 bytes")))
 	})
 
 	It("opens an image that exists without touching it, and creates one that does not", func() {
@@ -240,16 +269,18 @@ var _ = Describe("openVolumeImage", func() {
 		dirfd, err := unix.Open(dir, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 		Expect(err).NotTo(HaveOccurred())
 		defer unix.Close(dirfd)
-		fd, err := openImageFile(dirfd, "rvm-disk-0.img", img, opts, nil)
+		fd, created, err := openImageFile(dirfd, "rvm-disk-0.img", img, opts, nil)
 		Expect(err).NotTo(HaveOccurred())
 		defer unix.Close(fd)
+		Expect(created).To(BeFalse())
 		Expect(statOf(img).Size).To(Equal(int64(8 << 20)))
 		Expect(os.ReadFile(img)).To(HavePrefix("keep"))
 
-		fd2, err := openImageFile(dirfd, "rvm-disk-new.img", filepath.Join(dir, "rvm-disk-new.img"), opts, nil)
+		fd2, created, err := openImageFile(dirfd, "rvm-disk-new.img", filepath.Join(dir, "rvm-disk-new.img"), opts, nil)
 		Expect(err).NotTo(HaveOccurred())
 		defer unix.Close(fd2)
-		Expect(statOf(filepath.Join(dir, "rvm-disk-new.img")).Size).To(Equal(int64(defaultImageSize)))
+		Expect(created).To(BeTrue())
+		Expect(statOf(filepath.Join(dir, "rvm-disk-new.img")).Size).To(Equal(int64(imageCreationStep)), "a new image is published at the creation step")
 	})
 
 	It("rejects an image whose size is not a whole number of sectors", func() {
@@ -461,15 +492,20 @@ var _ = Describe("openVolumeImage", func() {
 		})
 	})
 
-	It("reports an image it cannot size, removes its temp file, and creates the image on the next launch", func() {
+	It("reports an image it cannot grow, keeps it published at the creation step, and grows it on the next launch", func() {
 		opts.Size = 1 << 62
+		opts.fstatfs = fakeVolume(1<<62, 1<<62)
+		opts.fallocate = juicefsFallocate
 		_, err := open()
 		if err == nil {
-			Skip("this filesystem accepts a 4 EiB file, so sizing cannot fail here")
+			Skip("this filesystem accepts a 4 EiB file, so growing cannot fail here")
 		}
-		Expect(err).To(MatchError(ContainSubstring("creating volume image " + img)))
-		Expect(img).NotTo(BeAnExistingFile(), "the published name never refers to an unsized file")
+		Expect(err).To(MatchError(HavePrefix(`volume ` + quoteForLog(dir) + `: growing image "rvm-disk-0.img" from 64 MiB to 4194304 TiB: allocating 4611686018360279040 bytes at offset 67108864: `)))
+		Expect(err).To(MatchError(HaveSuffix("; the image stays at 64 MiB")))
+		Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+		Expect(statOf(img).Size).To(Equal(int64(imageCreationStep)), "the published image keeps the length it reached")
 		Expect(tempFiles(dir)).To(BeEmpty())
+		Expect(lockedElsewhere(img)).To(BeFalse(), "a failed grow closes the image")
 
 		opts.Size = defaultImageSize
 		f, err := open()
@@ -504,7 +540,7 @@ var _ = Describe("openVolumeImage", func() {
 
 			Expect(seen).To(HaveLen(1))
 			Expect(seen[0]).To(MatchRegexp(`^\.rvm-disk-[0-9a-f]{16}\.tmp$`))
-			Expect(tempSize).To(Equal(int64(defaultImageSize)), "the file is sized before it is published")
+			Expect(tempSize).To(Equal(int64(imageCreationStep)), "the file is sized to the creation step before it is published")
 			Expect(tempMode).To(Equal(uint32(0o600)))
 			Expect(tempFiles(dir)).To(BeEmpty())
 			Expect(statOf(img).Size).To(Equal(int64(defaultImageSize)))
@@ -956,6 +992,10 @@ var _ = Describe("openVolumeImage", func() {
 		Entry("a negative wait", func(_ *guestVolume, o *imageOptions) { o.LockWait = -1 }, "is negative"),
 		Entry("no poll interval", func(_ *guestVolume, o *imageOptions) { o.LockPoll = 0 }, "is not positive"),
 		Entry("no mount root check", func(_ *guestVolume, o *imageOptions) { o.IsMountRoot = nil }, "no mount root check"),
+		Entry("a size over 2^62 bytes", func(_ *guestVolume, o *imageOptions) { o.Size = 1<<62 + 512 }, "is over the 4611686018427387904-byte limit"),
+		Entry("a creation step that is not whole sectors", func(_ *guestVolume, o *imageOptions) { o.creationStep = 1000 }, "creation step 1000 is not a multiple of 512"),
+		Entry("a negative creation step", func(_ *guestVolume, o *imageOptions) { o.creationStep = -512 }, "creation step -512 is not a multiple of 512"),
+		Entry("a negative progress interval", func(_ *guestVolume, o *imageOptions) { o.progressInterval = -1 }, "progress interval -1ns is negative"),
 	)
 
 	It("rejects a nil volume", func() {
@@ -1090,8 +1130,8 @@ var _ = Describe("preallocateImage", func() {
 				Expect(chunks).To(BeEmpty())
 				Expect(sizeOf()).To(BeZero())
 			},
-			Entry("ENOSPC", unix.ENOSPC, " (the volume's quota refused it)"),
-			Entry("EDQUOT", unix.EDQUOT, " (the volume's quota refused it)"),
+			Entry("ENOSPC", unix.ENOSPC, ""),
+			Entry("EDQUOT", unix.EDQUOT, ""),
 			Entry("EIO", unix.EIO, ""),
 			Entry("ENOSYS, which is not the NFS 4.1 answer", unix.ENOSYS, ""),
 			Entry("EINVAL", unix.EINVAL, ""),
@@ -1190,7 +1230,7 @@ var _ = Describe("preallocateImage", func() {
 			Expect(syncs).To(BeZero())
 		})
 
-		It("reports a write the quota refuses in the middle of the range, with the quota's words, and does not sync", func() {
+		It("reports a write the quota refuses in the middle of the range, and does not sync", func() {
 			newFile(0, "")
 			var writes []int64
 			opts.pwrite = func(fd int, b []byte, off int64) error {
@@ -1202,7 +1242,7 @@ var _ = Describe("preallocateImage", func() {
 			}
 			err := preallocate(0, 5<<20, nil)
 			Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
-			Expect(err).To(MatchError("writing zeros at offset 2097152: disk quota exceeded (the volume's quota refused it)"))
+			Expect(err).To(MatchError("writing zeros at offset 2097152: disk quota exceeded"))
 			Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 			Expect(writes).To(Equal([]int64{0, 1 << 20, 2 << 20}))
 			Expect(chunks).To(Equal([]int64{1 << 20, 2 << 20}), "the failed chunk is not counted")
@@ -1210,12 +1250,12 @@ var _ = Describe("preallocateImage", func() {
 			Expect(sizeOf()).To(Equal(int64(2<<20)), "the two chunks before the failure stay")
 		})
 
-		It("adds the quota's words to an ENOSPC write error, and none to another one", func() {
+		It("keeps the errno of an ENOSPC write error and of another one", func() {
 			for i, c := range []struct {
 				errno error
 				want  string
 			}{
-				{unix.ENOSPC, "writing zeros at offset 0: no space left on device (the volume's quota refused it)"},
+				{unix.ENOSPC, "writing zeros at offset 0: no space left on device"},
 				{unix.EIO, "writing zeros at offset 0: input/output error"},
 			} {
 				errno, want := c.errno, c.want
@@ -1233,7 +1273,7 @@ var _ = Describe("preallocateImage", func() {
 			newFile(0, "")
 			opts.syncFile = func(int) error { return unix.EDQUOT }
 			err := preallocate(0, 2<<20, nil)
-			Expect(err).To(MatchError("syncing the zeros written so far: disk quota exceeded (the volume's quota refused it)"))
+			Expect(err).To(MatchError("syncing the zeros written so far: disk quota exceeded"))
 			Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue())
 
 			err = preallocate(2<<20, 300<<20, nil)
@@ -1264,7 +1304,7 @@ var _ = Describe("preallocateImage", func() {
 
 	It("reports an image it cannot stat", func() {
 		newFile(0, "")
-		Expect(preallocateImage(-1, path, 0, 512, opts, nil)).To(MatchError(ContainSubstring("fstat: bad file descriptor")))
+		Expect(preallocateImage(-1, path, 0, 512, opts, nil)).To(MatchError(ContainSubstring("statx: bad file descriptor")))
 	})
 })
 
@@ -1357,9 +1397,11 @@ var _ = Describe("creating an image with preallocation", func() {
 
 	It("exits 125 with the quota's words and leaves nothing behind when the allocation is refused", func() {
 		opts.fallocate = func(int, uint32, int64, int64) error { return unix.ENOSPC }
+		opts.fstatfs = fakeVolume(7<<30+1<<29, 10<<30)
 		_, err := openVolumeImage(vol, opts, nil)
 		Expect(errors.Is(err, unix.ENOSPC)).To(BeTrue(), "%v", err)
-		Expect(err).To(MatchError("creating volume image " + img + ": allocating 4194304 bytes at offset 0: no space left on device (the volume's quota refused it)"))
+		Expect(errors.Is(err, errQuotaRefused)).To(BeTrue(), "%v", err)
+		Expect(err).To(MatchError("volume " + quoteForLog(dir) + `: creating image "rvm-disk-0.img" at 4 MiB needs 4 MiB, and the volume's quota refused it (no space left on device); the volume has 7.5 GiB free of 10 GiB; ` + quotaAdvice + "; no image was created"))
 		Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 		Expect(os.ReadDir(dir)).To(BeEmpty())
 	})
@@ -1369,7 +1411,7 @@ var _ = Describe("creating an image with preallocation", func() {
 		opts.syncFile = func(int) error { return unix.EDQUOT }
 		_, err := openVolumeImage(vol, opts, nil)
 		Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
-		Expect(err.Error()).To(HavePrefix("creating volume image " + img + ": syncing the zeros written so far"))
+		Expect(err.Error()).To(HavePrefix("volume " + quoteForLog(dir) + `: creating image "rvm-disk-0.img" at 4 MiB needs 4 MiB, and the volume's quota refused it (disk quota exceeded)`))
 		Expect(os.ReadDir(dir)).To(BeEmpty())
 	})
 
@@ -1383,9 +1425,10 @@ var _ = Describe("creating an image with preallocation", func() {
 			}
 			return pwriteFull(fd, b, off)
 		}
+		opts.fstatfs = fakeVolume(7<<30+1<<29, 10<<30)
 		_, err := openVolumeImage(vol, opts, nil)
 		Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
-		Expect(err).To(MatchError("creating volume image " + img + ": writing zeros at offset 2097152: disk quota exceeded (the volume's quota refused it)"))
+		Expect(err).To(MatchError("volume " + quoteForLog(dir) + `: creating image "rvm-disk-0.img" at 4 MiB needs 4 MiB, and the volume's quota refused it (disk quota exceeded); the volume has 7.5 GiB free of 10 GiB; ` + quotaAdvice + "; no image was created"))
 		Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 		Expect(writes).To(Equal(3), "no write follows the failed one")
 		Expect(os.ReadDir(dir)).To(BeEmpty(), "the part written temp file is removed and no image is published")
@@ -1623,7 +1666,8 @@ var _ = Describe("publishing a new image by link", func() {
 		opts.fallocate = func(int, uint32, int64, int64) error { return unix.ENOSPC }
 		_, err := open()
 		Expect(errors.Is(err, unix.ENOSPC)).To(BeTrue(), "%v", err)
-		Expect(err.Error()).To(HaveSuffix("(the volume's quota refused it)"))
+		Expect(err.Error()).To(ContainSubstring("and the volume's quota refused it (no space left on device)"))
+		Expect(err.Error()).To(HaveSuffix("; no image was created"))
 		Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 		Expect(os.ReadDir(dir)).To(BeEmpty())
 	})
@@ -1680,7 +1724,7 @@ var _ = Describe("publishing a new image by link", func() {
 			go func() {
 				defer GinkgoRecover()
 				defer wg.Done()
-				fd, err := openImageFile(dirfd, "rvm-disk-0.img", img, opts, nil)
+				fd, _, err := openImageFile(dirfd, "rvm-disk-0.img", img, opts, nil)
 				if err == nil {
 					unix.Close(fd)
 				}
@@ -2090,3 +2134,994 @@ var _ = Describe("publishing a new image by link", func() {
 		Expect(defaultImageOptions.Publish).To(Equal(publishRename))
 	})
 })
+
+// growEvent is one write of zeros or one sync that a grow spec saw.
+type growEvent struct {
+	sync     bool
+	off, len int64
+	// cut is a truncate back to off bytes after a failed sync.
+	cut bool
+}
+
+var _ = Describe("growing an image to the size asked for", func() {
+	var (
+		dir   string
+		vol   *guestVolume
+		img   string
+		vq    string
+		opts  imageOptions
+		lines []string
+	)
+
+	BeforeEach(func() {
+		requireOpenat2()
+		dir = GinkgoT().TempDir()
+		vol = &guestVolume{ContainerDir: dir, ImageName: "rvm-disk-0.img"}
+		img = filepath.Join(dir, "rvm-disk-0.img")
+		vq = quoteForLog(dir)
+		lines = nil
+		opts = imageOptions{Size: 8 << 20, LockWait: 200 * time.Millisecond, LockPoll: 20 * time.Millisecond,
+			IsMountRoot: alwaysMountRoot, creationStep: 1 << 20,
+			Logf: func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }}
+	})
+
+	open := func(sigs <-chan os.Signal) (*os.File, error) { return openVolumeImage(vol, opts, sigs) }
+	// openOK opens the image, which must succeed, and closes it at the end of
+	// the spec.
+	openOK := func() *os.File {
+		GinkgoHelper()
+		f, err := open(nil)
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(f.Close)
+		return f
+	}
+	// readAt returns n bytes of the image at off.
+	readAt := func(off int64, n int) []byte {
+		GinkgoHelper()
+		r, err := os.Open(img)
+		Expect(err).NotTo(HaveOccurred())
+		defer r.Close()
+		b := make([]byte, n)
+		_, err = r.ReadAt(b, off)
+		Expect(err).NotTo(HaveOccurred())
+		return b
+	}
+	// allZero reports whether the image holds only zeros from off to its end.
+	allZero := func(off int64) bool {
+		GinkgoHelper()
+		end := statOf(img).Size
+		return bytes.Count(readAt(off, int(end-off)), []byte{0}) == int(end-off)
+	}
+	// markImage writes guest bytes at the start and just before the end of
+	// the image, which the grow must leave alone.
+	markImage := func() {
+		GinkgoHelper()
+		w, err := os.OpenFile(img, os.O_RDWR, 0)
+		Expect(err).NotTo(HaveOccurred())
+		defer w.Close()
+		_, err = w.WriteAt([]byte("guest"), 0)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = w.WriteAt([]byte("tail"), statOf(img).Size-4)
+		Expect(err).NotTo(HaveOccurred())
+	}
+	marksKept := func(oldEnd int64) {
+		GinkgoHelper()
+		Expect(string(readAt(0, 5))).To(Equal("guest"))
+		Expect(string(readAt(oldEnd-4, 4))).To(Equal("tail"))
+	}
+	growLine := func(from, to string) string {
+		return "volume " + vq + `: growing image "rvm-disk-0.img" from ` + from + " to " + to
+	}
+	noFallocateLine := func(from, to string) string {
+		return "volume " + vq + `: the volume does not support fallocate, so vm-launch writes zeros to grow image "rvm-disk-0.img" from ` + from + " to " + to +
+			"; a start that is stopped part way continues on the next one"
+	}
+	progressLine := func(to, sofar string) string {
+		return "volume " + vq + `: growing image "rvm-disk-0.img" to ` + to + ": " + sofar + " so far"
+	}
+
+	Describe("by fallocate, as on JuiceFS", func() {
+		var (
+			calls     []fallocateCall
+			truncates []int64
+		)
+
+		BeforeEach(func() {
+			calls, truncates = nil, nil
+			opts.fallocate = func(fd int, mode uint32, off, length int64) error {
+				Expect(lockedElsewhere(img)).To(BeTrue(), "the grow runs under the image's lock")
+				calls = append(calls, fallocateCall{mode, off, length})
+				err := unix.Fallocate(fd, mode, off, length)
+				if errors.Is(err, unix.EOPNOTSUPP) {
+					Skip("this filesystem has no fallocate; the truncate specs cover a volume without one")
+				}
+				return err
+			}
+			opts.truncate = func(fd int, size int64) error {
+				truncates = append(truncates, size)
+				return unix.Ftruncate(fd, size)
+			}
+		})
+
+		It("grows an existing smaller image with fallocate mode 0 on the range past its end, and never truncates it", func() {
+			writeImage(img, 2<<20, nil)
+			markImage()
+			openOK()
+			Expect(calls).To(Equal([]fallocateCall{{0, 2 << 20, 6 << 20}}))
+			Expect(truncates).To(BeEmpty())
+			Expect(statOf(img).Size).To(Equal(int64(8 << 20)))
+			marksKept(2 << 20)
+			Expect(allZero(2 << 20)).To(BeTrue())
+			Expect(lines).To(Equal([]string{growLine("2 MiB", "8 MiB")}))
+		})
+
+		// grow runs the grow of the image at img, under a lock that the spec
+		// holds, with the length that lookedAt answers for the check under
+		// the lock, and returns its error.
+		grow := func(lookedAt func(fd int) int64) error {
+			GinkgoHelper()
+			d, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+			Expect(err).NotTo(HaveOccurred())
+			defer unix.Close(d)
+			f, err := os.OpenFile(img, os.O_RDWR, 0)
+			Expect(err).NotTo(HaveOccurred())
+			defer f.Close()
+			lock, err := os.Open(img)
+			Expect(err).NotTo(HaveOccurred())
+			defer lock.Close()
+			Expect(unix.Flock(int(lock.Fd()), unix.LOCK_EX)).To(Succeed())
+			fd := int(f.Fd())
+			return growImage(fd, newGrowTarget(d, img), lookedAt(fd), false, opts, nil)
+		}
+		// growStale runs the grow as growImage gets it after a look at the
+		// image's length that answered stale bytes.
+		growStale := func(stale int64) error {
+			GinkgoHelper()
+			return grow(func(int) int64 { return stale })
+		}
+
+		It("keeps every byte of an image that is longer than a stale length said, because fallocate cannot shrink it", func() {
+			writeImage(img, 16<<20, nil)
+			markImage()
+			Expect(growStale(2 << 20)).To(Succeed())
+			Expect(calls).To(Equal([]fallocateCall{{0, 2 << 20, 6 << 20}}))
+			Expect(truncates).To(BeEmpty())
+			Expect(statOf(img).Size).To(Equal(int64(16<<20)), "nothing shrinks")
+			marksKept(16 << 20)
+			Expect(lines).To(Equal([]string{
+				growLine("2 MiB", "8 MiB"),
+				"volume " + vq + `: image "rvm-disk-0.img" is 16 MiB, larger than the 8 MiB asked for; vm-launch never shrinks an image, so it keeps 16 MiB`,
+			}))
+		})
+
+		It("exits 125 with the quota's words when fallocate is refused, and says the length a fresh look finds", func() {
+			writeImage(img, 2<<20, nil)
+			markImage()
+			opts.fallocate = func(fd int, _ uint32, _, _ int64) error {
+				// A refusal part way can leave the image partly extended.
+				Expect(unix.Ftruncate(fd, 5<<20)).To(Succeed())
+				return unix.EDQUOT
+			}
+			opts.fstatfs = fakeVolume(7<<30+1<<29, 10<<30)
+			_, err := open(nil)
+			Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
+			Expect(err).To(MatchError("volume " + vq + `: growing image "rvm-disk-0.img" from 2 MiB to 8 MiB needs 6 MiB, and the volume's quota refused it (disk quota exceeded); the volume has 7.5 GiB free of 10 GiB; ` + quotaAdvice + "; the image stays at 5 MiB"))
+			Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+			Expect(truncates).To(BeEmpty(), "a refused fallocate is not followed by a truncate")
+			Expect(statOf(img).Size).To(Equal(int64(5 << 20)))
+			marksKept(2 << 20)
+		})
+
+		It("gives a fallocate failure that is not the quota's its own words", func() {
+			writeImage(img, 2<<20, nil)
+			opts.fallocate = func(int, uint32, int64, int64) error { return unix.EIO }
+			_, err := open(nil)
+			Expect(err).To(MatchError("volume " + vq + `: growing image "rvm-disk-0.img" from 2 MiB to 8 MiB: allocating 6291456 bytes at offset 2097152: input/output error; the image stays at 2 MiB`))
+			Expect(errors.Is(err, errQuotaRefused)).To(BeFalse())
+			Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+			Expect(truncates).To(BeEmpty())
+		})
+
+		It("tries fallocate again after an interrupt", func() {
+			writeImage(img, 2<<20, nil)
+			n := 0
+			opts.fallocate = func(fd int, mode uint32, off, length int64) error {
+				n++
+				if n < 3 {
+					return unix.EINTR
+				}
+				return unix.Fallocate(fd, mode, off, length)
+			}
+			openOK()
+			Expect(n).To(Equal(3))
+			Expect(truncates).To(BeEmpty())
+			Expect(statOf(img).Size).To(Equal(int64(8 << 20)))
+		})
+
+		Describe("when the volume has no fallocate", func() {
+			var reads []int64
+
+			BeforeEach(func() {
+				reads = nil
+				opts.fallocate = func(int, uint32, int64, int64) error { return unix.EOPNOTSUPP }
+				// Every truncate must set a length at or above the last
+				// fresh look at the image's end, so that it cannot cut it.
+				opts.truncate = func(fd int, size int64) error {
+					Expect(reads).NotTo(BeEmpty(), "the length is read fresh before a truncate")
+					Expect(size).To(BeNumerically(">", reads[len(reads)-1]), "a truncate only raises the length")
+					truncates = append(truncates, size)
+					return unix.Ftruncate(fd, size)
+				}
+			})
+
+			// staleThen makes a fake fstat that answers its first look with
+			// stale bytes, as a client cache would, and every later one with
+			// the real length.
+			staleThen := func(stale int64) {
+				looks := 0
+				opts.statSize = func(fd int) (int64, error) {
+					n, err := freshSize(fd)
+					if looks++; looks == 1 {
+						n = stale
+					}
+					reads = append(reads, n)
+					return n, err
+				}
+			}
+			// fresh answers every look with the real length.
+			fresh := func() {
+				opts.statSize = func(fd int) (int64, error) {
+					n, err := freshSize(fd)
+					reads = append(reads, n)
+					return n, err
+				}
+			}
+
+			It("truncates nothing when a fresh look finds the image longer than a stale length said", func() {
+				writeImage(img, 16<<20, nil)
+				markImage()
+				fresh()
+				Expect(growStale(2 << 20)).To(Succeed())
+				Expect(reads).To(Equal([]int64{16 << 20}))
+				Expect(truncates).To(BeEmpty())
+				Expect(statOf(img).Size).To(Equal(int64(16<<20)), "nothing shrinks")
+				marksKept(16 << 20)
+				Expect(lines[len(lines)-1]).To(HaveSuffix("vm-launch never shrinks an image, so it keeps 16 MiB"))
+			})
+
+			It("truncates nothing when another writer grows the image between the check under the lock and the fresh look", func() {
+				writeImage(img, 2<<20, nil)
+				markImage()
+				fresh()
+				opts.fallocate = func(fd int, _ uint32, _, _ int64) error {
+					// A co-bound app that ignores the lock writes past the
+					// size asked for while the grow runs.
+					w, err := os.OpenFile(img, os.O_RDWR, 0)
+					Expect(err).NotTo(HaveOccurred())
+					defer w.Close()
+					_, err = w.WriteAt([]byte("app"), 12<<20-3)
+					Expect(err).NotTo(HaveOccurred())
+					return unix.EOPNOTSUPP
+				}
+				openOK()
+				Expect(reads).To(Equal([]int64{12 << 20}))
+				Expect(truncates).To(BeEmpty())
+				Expect(statOf(img).Size).To(Equal(int64(12 << 20)))
+				Expect(string(readAt(12<<20-3, 3))).To(Equal("app"))
+				marksKept(2 << 20)
+			})
+
+			It("truncates to the size asked for when a fresh look after a stale one still finds the image shorter", func() {
+				writeImage(img, 4<<20, nil)
+				markImage()
+				// The check under the lock said 2 MiB, and the fresh look,
+				// which is no longer stale, finds 4 MiB, still below 8 MiB.
+				fresh()
+				Expect(growStale(2 << 20)).To(Succeed())
+				Expect(reads).To(Equal([]int64{4 << 20}))
+				Expect(truncates).To(Equal([]int64{8 << 20}))
+				Expect(statOf(img).Size).To(Equal(int64(8 << 20)))
+				marksKept(4 << 20)
+			})
+
+			It("follows the fresh look when the reported length changes between reads, and cuts nothing", func() {
+				writeImage(img, 16<<20, nil)
+				markImage()
+				// The check under the lock reads 2 MiB from the fake fstat's
+				// stale answer, and the fresh look gets the real 16 MiB.
+				staleThen(2 << 20)
+				Expect(grow(func(fd int) int64 {
+					n, err := opts.statSize(fd)
+					Expect(err).NotTo(HaveOccurred())
+					return n
+				})).To(Succeed())
+				Expect(reads).To(Equal([]int64{2 << 20, 16 << 20}))
+				Expect(truncates).To(BeEmpty())
+				Expect(statOf(img).Size).To(Equal(int64(16<<20)), "nothing shrinks")
+				marksKept(16 << 20)
+			})
+
+			It("raises a length that a stale read put below the real one, without cutting it", func() {
+				writeImage(img, 4<<20, nil)
+				markImage()
+				// A cache that has gone stale answers 3 MiB for the 4 MiB
+				// image. Both are below the 8 MiB asked for, so the truncate
+				// still only raises the length.
+				staleThen(3 << 20)
+				openOK()
+				Expect(reads).To(Equal([]int64{3 << 20}))
+				Expect(truncates).To(Equal([]int64{8 << 20}))
+				Expect(statOf(img).Size).To(Equal(int64(8 << 20)))
+				marksKept(4 << 20)
+			})
+
+			It("exits 125 without a truncate when the fresh look fails", func() {
+				writeImage(img, 2<<20, nil)
+				opts.statSize = func(int) (int64, error) { return 0, fmt.Errorf("statx: %w", unix.ESTALE) }
+				_, err := open(nil)
+				Expect(errors.Is(err, unix.ESTALE)).To(BeTrue(), "%v", err)
+				Expect(err).To(MatchError("volume " + vq + `: growing image "rvm-disk-0.img" from 2 MiB to 8 MiB: reading its length before the truncate: statx: stale file handle; its length could not be read after the failure (statx: stale file handle)`))
+				Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+				Expect(truncates).To(BeEmpty())
+				Expect(statOf(img).Size).To(Equal(int64(2 << 20)))
+			})
+		})
+	})
+
+	Describe("by truncate, on a JuiceFS volume that has no fallocate", func() {
+		var truncates []int64
+
+		BeforeEach(func() {
+			truncates = nil
+			opts.fallocate = func(int, uint32, int64, int64) error { return unix.EOPNOTSUPP }
+			opts.truncate = func(fd int, size int64) error {
+				Expect(lockedElsewhere(img)).To(BeTrue(), "the grow runs under the image's lock")
+				truncates = append(truncates, size)
+				return unix.Ftruncate(fd, size)
+			}
+		})
+
+		It("publishes a new image at the creation step, then grows it under the lock to the size asked for, sparse and with no line", func() {
+			var tempSize int64 = -1
+			opts.afterTempCreate = func(_ int, tempName string) {
+				tempSize = statOf(filepath.Join(dir, tempName)).Size
+				Expect(fileExists(img)).To(BeFalse(), "nothing is published before the temp file is built")
+			}
+			f := openOK()
+			Expect(tempSize).To(Equal(int64(1<<20)), "the temp file is published at the creation step")
+			Expect(truncates).To(Equal([]int64{8 << 20}))
+			st := statOf(img)
+			Expect(st.Size).To(Equal(int64(8 << 20)))
+			Expect(st.Blocks*512).To(BeNumerically("<", 1<<20), "a truncate leaves the image sparse")
+			Expect(tempFiles(dir)).To(BeEmpty())
+			Expect(lockedElsewhere(img)).To(BeTrue())
+			Expect(lines).To(BeEmpty(), "a new image grows without a line")
+			info, err := f.Stat()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(info.Size()).To(Equal(int64(8<<20)), "the hypervisor's size comes from the grown file")
+		})
+
+		It("grows an existing smaller image with one truncate past its end, keeps every byte, and logs a line", func() {
+			writeImage(img, 2<<20, nil)
+			markImage()
+			openOK()
+			Expect(truncates).To(Equal([]int64{8 << 20}))
+			Expect(statOf(img).Size).To(Equal(int64(8 << 20)))
+			marksKept(2 << 20)
+			Expect(allZero(2 << 20)).To(BeTrue())
+			Expect(lines).To(Equal([]string{growLine("2 MiB", "8 MiB")}))
+		})
+
+		It("keeps a larger image as it is and logs the one line that names the volume", func() {
+			writeImage(img, 16<<20, nil)
+			markImage()
+			opts.truncate = func(int, int64) error { Fail("the image was truncated"); return nil }
+			openOK()
+			Expect(statOf(img).Size).To(Equal(int64(16 << 20)))
+			marksKept(16 << 20)
+			Expect(lines).To(Equal([]string{"volume " + vq + `: image "rvm-disk-0.img" is 16 MiB, larger than the 8 MiB asked for; vm-launch never shrinks an image, so it keeps 16 MiB`}))
+			Expect(lockedElsewhere(img)).To(BeTrue())
+		})
+
+		It("leaves an image of the size asked for alone, with no line", func() {
+			writeImage(img, 8<<20, []byte("data"))
+			opts.truncate = func(int, int64) error { Fail("the image was truncated"); return nil }
+			openOK()
+			Expect(statOf(img).Size).To(Equal(int64(8 << 20)))
+			Expect(lines).To(BeEmpty())
+		})
+
+		It("keeps a 1 GiB image when the app asks for less than the 1 GiB default", func() {
+			opts.creationStep = 0
+			opts.Size = 256 << 20
+			writeImage(img, defaultImageSize, []byte("data"))
+			opts.truncate = func(int, int64) error { Fail("the image was truncated"); return nil }
+			openOK()
+			Expect(statOf(img).Size).To(Equal(int64(defaultImageSize)))
+			Expect(lines).To(Equal([]string{"volume " + vq + `: image "rvm-disk-0.img" is 1 GiB, larger than the 256 MiB asked for; vm-launch never shrinks an image, so it keeps 1 GiB`}))
+		})
+
+		It("makes a new image below the 1 GiB default at the size asked for, from the 64 MiB minimum up", func() {
+			opts.creationStep = 0
+			for _, c := range []struct {
+				size  int64
+				grows []int64
+			}{{64 << 20, nil}, {256 << 20, []int64{256 << 20}}} {
+				Expect(os.Remove(img) == nil || !fileExists(img)).To(BeTrue())
+				truncates = nil
+				opts.Size = c.size
+				var tempSize int64
+				opts.afterTempCreate = func(_ int, tempName string) { tempSize = statOf(filepath.Join(dir, tempName)).Size }
+				f, err := open(nil)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(f.Close()).To(Succeed())
+				Expect(tempSize).To(Equal(int64(imageCreationStep)), "%d", c.size)
+				Expect(statOf(img).Size).To(Equal(c.size))
+				if c.grows == nil {
+					Expect(truncates).To(BeEmpty(), "an image asked for at the creation step needs no grow")
+				} else {
+					Expect(truncates).To(Equal(c.grows), "an image asked for above the creation step grows once")
+				}
+			}
+			Expect(lines).To(BeEmpty())
+		})
+
+		It("grows an image that a killed launch published at the creation step on the next start", func() {
+			writeImage(img, 1<<20, nil)
+			openOK()
+			Expect(statOf(img).Size).To(Equal(int64(8 << 20)))
+			Expect(lines).To(Equal([]string{growLine("1 MiB", "8 MiB")}))
+		})
+
+		It("exits 125 with the quota's words when the truncate is refused, keeps the image at its length, and grows it on the next start", func() {
+			writeImage(img, 2<<20, nil)
+			markImage()
+			opts.truncate = func(int, int64) error { return unix.EDQUOT }
+			opts.fstatfs = fakeVolume(7<<30+1<<29, 10<<30)
+			_, err := open(nil)
+			Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
+			Expect(err).To(MatchError("volume " + vq + `: growing image "rvm-disk-0.img" from 2 MiB to 8 MiB needs 6 MiB, and the volume's quota refused it (disk quota exceeded); the volume has 7.5 GiB free of 10 GiB; ` + quotaAdvice + "; the image stays at 2 MiB"))
+			Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+			Expect(statOf(img).Size).To(Equal(int64(2 << 20)))
+			marksKept(2 << 20)
+			Expect(lockedElsewhere(img)).To(BeFalse(), "a failed grow closes the image")
+
+			opts.truncate = nil
+			openOK()
+			Expect(statOf(img).Size).To(Equal(int64(8 << 20)))
+			marksKept(2 << 20)
+		})
+
+		It("tries the truncate again after an interrupt", func() {
+			writeImage(img, 2<<20, nil)
+			calls := 0
+			opts.truncate = func(fd int, size int64) error {
+				calls++
+				if calls < 3 {
+					return unix.EINTR
+				}
+				return unix.Ftruncate(fd, size)
+			}
+			openOK()
+			Expect(calls).To(Equal(3))
+			Expect(statOf(img).Size).To(Equal(int64(8 << 20)))
+		})
+
+		It("refuses an image that the filesystem did not lengthen", func() {
+			writeImage(img, 2<<20, nil)
+			opts.truncate = func(int, int64) error { return nil }
+			_, err := open(nil)
+			Expect(errors.Is(err, errImageSize)).To(BeTrue(), "%v", err)
+			Expect(err).To(MatchError("volume " + vq + `: image "rvm-disk-0.img" is 2097152 bytes after growing it to 8388608`))
+			Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+		})
+	})
+
+	Describe("with preallocation, as on NFS", func() {
+		var (
+			events  []growEvent
+			pending chan os.Signal
+		)
+
+		BeforeEach(func() {
+			events, pending = nil, nil
+			opts.Preallocate = true
+			opts.Publish = publishLink
+			opts.truncate = func(fd int, size int64) error {
+				now, err := freshSize(fd)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(size).To(BeNumerically("<=", now), "a preallocated image is never grown by truncate")
+				events = append(events, growEvent{cut: true, off: size})
+				return unix.Ftruncate(fd, size)
+			}
+			opts.pwrite = func(fd int, b []byte, off int64) error {
+				events = append(events, growEvent{off: off, len: int64(len(b))})
+				return pwriteFull(fd, b, off)
+			}
+			opts.syncFile = func(fd int) error {
+				events = append(events, growEvent{sync: true})
+				return unix.Fsync(fd)
+			}
+		})
+
+		// writes lists the zero writes in events, as offset and length.
+		writes := func() [][2]int64 {
+			var out [][2]int64
+			for _, e := range events {
+				if !e.sync && !e.cut {
+					out = append(out, [2]int64{e.off, e.len})
+				}
+			}
+			return out
+		}
+
+		It("grows an existing image with fallocate mode 0 on the range past its end only", func() {
+			writeImage(img, 2<<20, nil)
+			markImage()
+			var calls []fallocateCall
+			var refused error
+			opts.fallocate = func(fd int, mode uint32, off, length int64) error {
+				Expect(lockedElsewhere(img)).To(BeTrue(), "the grow runs under the image's lock")
+				calls = append(calls, fallocateCall{mode, off, length})
+				refused = unix.Fallocate(fd, mode, off, length)
+				return refused
+			}
+			openOK()
+			if errors.Is(refused, unix.EOPNOTSUPP) {
+				Skip("this filesystem has no fallocate, so the zero write grow ran; the specs for it follow")
+			}
+			Expect(calls).To(Equal([]fallocateCall{{0, 2 << 20, 6 << 20}}))
+			st := statOf(img)
+			Expect(st.Size).To(Equal(int64(8 << 20)))
+			Expect(st.Blocks*512).To(BeNumerically(">=", 6<<20), "the new range is allocated")
+			marksKept(2 << 20)
+			Expect(allZero(2 << 20)).To(BeTrue())
+			Expect(writes()).To(BeEmpty())
+			Expect(lines).To(Equal([]string{growLine("2 MiB", "8 MiB")}))
+		})
+
+		It("exits 125 with the quota's words when fallocate is refused, and keeps the image as it was", func() {
+			writeImage(img, 2<<20, nil)
+			markImage()
+			opts.fallocate = func(int, uint32, int64, int64) error { return unix.ENOSPC }
+			opts.fstatfs = fakeVolume(7<<30+1<<29, 10<<30)
+			_, err := open(nil)
+			Expect(errors.Is(err, unix.ENOSPC)).To(BeTrue(), "%v", err)
+			Expect(err).To(MatchError("volume " + vq + `: growing image "rvm-disk-0.img" from 2 MiB to 8 MiB needs 6 MiB, and the volume's quota refused it (no space left on device); the volume has 7.5 GiB free of 10 GiB; ` + quotaAdvice + "; the image stays at 2 MiB"))
+			Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+			Expect(statOf(img).Size).To(Equal(int64(2 << 20)))
+			marksKept(2 << 20)
+			Expect(writes()).To(BeEmpty())
+		})
+
+		It("says the length a fresh look finds when fallocate fails part way, as on a server that extends the file as it allocates", func() {
+			writeImage(img, 2<<20, nil)
+			markImage()
+			opts.fallocate = func(fd int, _ uint32, _, _ int64) error {
+				Expect(unix.Ftruncate(fd, 5<<20)).To(Succeed())
+				return unix.ENOSPC
+			}
+			opts.fstatfs = fakeVolume(7<<30+1<<29, 10<<30)
+			_, err := open(nil)
+			Expect(errors.Is(err, unix.ENOSPC)).To(BeTrue(), "%v", err)
+			Expect(err).To(MatchError(HaveSuffix("; the image stays at 5 MiB")))
+			Expect(statOf(img).Size).To(Equal(int64(5 << 20)))
+			marksKept(2 << 20)
+
+			opts.fallocate = nil
+			openOK()
+			Expect(statOf(img).Size).To(Equal(int64(8<<20)), "the next start continues from the length the volume kept")
+			marksKept(2 << 20)
+		})
+
+		Describe("when the volume has no fallocate", func() {
+			BeforeEach(func() {
+				opts.fallocate = func(int, uint32, int64, int64) error { return unix.EOPNOTSUPP }
+			})
+
+			It("writes zeros only past the end, from the next 1 MiB boundary on, and logs its start and its progress", func() {
+				// A launch killed in the middle of a write leaves a length
+				// that is a whole number of pages but not of chunks.
+				writeImage(img, 2<<20+4096, nil)
+				markImage()
+				opts.progressInterval = time.Nanosecond
+				openOK()
+				Expect(writes()).To(Equal([][2]int64{
+					{2<<20 + 4096, 1<<20 - 4096}, {3 << 20, 1 << 20}, {4 << 20, 1 << 20}, {5 << 20, 1 << 20}, {6 << 20, 1 << 20}, {7 << 20, 1 << 20},
+				}))
+				Expect(events[len(events)-1].sync).To(BeTrue(), "the zeros are synced at the end")
+				st := statOf(img)
+				Expect(st.Size).To(Equal(int64(8 << 20)))
+				Expect(st.Blocks*512).To(BeNumerically(">=", 6<<20), "zeros are written, not left sparse")
+				marksKept(2<<20 + 4096)
+				Expect(allZero(2<<20 + 4096)).To(BeTrue())
+				Expect(lines).To(Equal([]string{
+					growLine("2 MiB", "8 MiB"),
+					noFallocateLine("2 MiB", "8 MiB"),
+					progressLine("8 MiB", "3 MiB"), progressLine("8 MiB", "4 MiB"), progressLine("8 MiB", "5 MiB"),
+					progressLine("8 MiB", "6 MiB"), progressLine("8 MiB", "7 MiB"), progressLine("8 MiB", "8 MiB"),
+				}))
+			})
+
+			It("logs no progress line before the progress interval has passed", func() {
+				writeImage(img, 2<<20, nil)
+				openOK()
+				Expect(lines).To(Equal([]string{growLine("2 MiB", "8 MiB"), noFallocateLine("2 MiB", "8 MiB")}))
+			})
+
+			It("stops a new image's grow at a signal after a last sync, leaves it published, and the next start continues from its end", func() {
+				pending = make(chan os.Signal, 1)
+				opts.afterZeroChunk = func(end int64) {
+					if end == 4<<20 {
+						pending <- syscall.SIGTERM
+					}
+				}
+				opts.progressInterval = time.Nanosecond
+				_, err := open(pending)
+				var sig *signalledError
+				Expect(errors.As(err, &sig)).To(BeTrue(), "%v", err)
+				Expect(sig.Sig).To(Equal(syscall.SIGTERM))
+				Expect(stepExitCode(err)).To(Equal(128 + int(syscall.SIGTERM)))
+				Expect(err).To(MatchError("volume " + vq + `: growing image "rvm-disk-0.img" to 8 MiB: received terminated while writing zeros; it is 4 MiB now, and the next start continues from there`))
+
+				// The creation wrote the first 1 MiB into the temp file and
+				// synced it, and the grow wrote three chunks past the
+				// published image's end and synced them after the signal.
+				Expect(events).To(Equal([]growEvent{
+					{off: 0, len: 1 << 20}, {sync: true},
+					{off: 1 << 20, len: 1 << 20}, {off: 2 << 20, len: 1 << 20}, {off: 3 << 20, len: 1 << 20}, {sync: true},
+				}))
+				st := statOf(img)
+				Expect(st.Size).To(Equal(int64(4<<20)), "the image stays published at the length it reached")
+				Expect(int(st.Nlink)).To(Equal(1))
+				Expect(tempFiles(dir)).To(BeEmpty())
+				Expect(lockedElsewhere(img)).To(BeFalse(), "the stopped launch let go of the image")
+				Expect(allZero(0)).To(BeTrue(), "a published image that is still growing is blank")
+				Expect(lines).To(Equal([]string{
+					noFallocateLine("1 MiB", "8 MiB"),
+					progressLine("8 MiB", "2 MiB"), progressLine("8 MiB", "3 MiB"), progressLine("8 MiB", "4 MiB"),
+				}))
+
+				// Bytes before the end must survive the next start, whatever
+				// they are.
+				markImage()
+				events, lines, opts.afterZeroChunk = nil, nil, nil
+				openOK()
+				Expect(writes()).To(Equal([][2]int64{{4 << 20, 1 << 20}, {5 << 20, 1 << 20}, {6 << 20, 1 << 20}, {7 << 20, 1 << 20}}),
+					"the next start writes only from where the last one stopped")
+				Expect(statOf(img).Size).To(Equal(int64(8 << 20)))
+				marksKept(4 << 20)
+				Expect(allZero(4 << 20)).To(BeTrue())
+				Expect(lines).To(Equal([]string{
+					growLine("4 MiB", "8 MiB"),
+					noFallocateLine("4 MiB", "8 MiB"),
+					progressLine("8 MiB", "5 MiB"), progressLine("8 MiB", "6 MiB"), progressLine("8 MiB", "7 MiB"), progressLine("8 MiB", "8 MiB"),
+				}))
+				Expect(lockedElsewhere(img)).To(BeTrue())
+			})
+
+			It("writes nothing and syncs nothing when the signal came before the first write", func() {
+				writeImage(img, 2<<20, nil)
+				pending = make(chan os.Signal, 1)
+				pending <- syscall.SIGINT
+				_, err := open(pending)
+				Expect(stepExitCode(err)).To(Equal(128 + int(syscall.SIGINT)))
+				Expect(err).To(MatchError(ContainSubstring("it is 2 MiB now, and the next start continues from there")))
+				Expect(events).To(BeEmpty())
+				Expect(statOf(img).Size).To(Equal(int64(2 << 20)))
+			})
+
+			It("still exits 128 plus the signal when the last sync fails, and says so in the signal's line", func() {
+				writeImage(img, 2<<20, nil)
+				pending = make(chan os.Signal, 1)
+				opts.afterZeroChunk = func(end int64) {
+					if end == 3<<20 {
+						pending <- syscall.SIGTERM
+					}
+				}
+				opts.syncFile = func(fd int) error {
+					events = append(events, growEvent{sync: true})
+					return unix.EIO
+				}
+				_, err := open(pending)
+				Expect(stepExitCode(err)).To(Equal(128 + int(syscall.SIGTERM)))
+				Expect(err).To(MatchError("volume " + vq + `: growing image "rvm-disk-0.img" to 8 MiB: received terminated while writing zeros, and syncing the zeros written so far failed: input/output error; it is 2 MiB now, and the next start continues from there`))
+				Expect(events).To(Equal([]growEvent{{off: 2 << 20, len: 1 << 20}, {sync: true}, {cut: true, off: 2 << 20}}),
+					"the zeros that did not sync are cut")
+				Expect(statOf(img).Size).To(Equal(int64(2 << 20)))
+			})
+
+			It("keeps what it wrote when a zero write is refused part way, syncs it, exits 125 with the quota's words, and the next start continues", func() {
+				writeImage(img, 2<<20, nil)
+				markImage()
+				opts.pwrite = func(fd int, b []byte, off int64) error {
+					events = append(events, growEvent{off: off, len: int64(len(b))})
+					if off == 4<<20 {
+						return unix.EDQUOT
+					}
+					return pwriteFull(fd, b, off)
+				}
+				opts.fstatfs = fakeVolume(7<<30+1<<29, 10<<30)
+				_, err := open(nil)
+				Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
+				Expect(err).To(MatchError("volume " + vq + `: growing image "rvm-disk-0.img" from 2 MiB to 8 MiB needs 6 MiB, and the volume's quota refused it (disk quota exceeded); the volume has 7.5 GiB free of 10 GiB; ` + quotaAdvice + "; the image stays at 4 MiB"))
+				Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+				Expect(events).To(Equal([]growEvent{
+					{off: 2 << 20, len: 1 << 20}, {off: 3 << 20, len: 1 << 20}, {off: 4 << 20, len: 1 << 20}, {sync: true},
+				}), "the chunks before the refused one are synced")
+				Expect(statOf(img).Size).To(Equal(int64(4 << 20)))
+				marksKept(2 << 20)
+
+				opts.pwrite = nil
+				openOK()
+				Expect(statOf(img).Size).To(Equal(int64(8 << 20)))
+				marksKept(2 << 20)
+				Expect(allZero(2 << 20)).To(BeTrue())
+			})
+
+			It("reports a sync that fails with EDQUOT after a refused write in the quota's words, keeps both errnos, and cuts back to what synced", func() {
+				writeImage(img, 2<<20, nil)
+				markImage()
+				opts.pwrite = func(fd int, b []byte, off int64) error {
+					events = append(events, growEvent{off: off, len: int64(len(b))})
+					if off == 3<<20 {
+						return unix.EIO
+					}
+					return pwriteFull(fd, b, off)
+				}
+				opts.syncFile = func(int) error {
+					events = append(events, growEvent{sync: true})
+					return unix.EDQUOT
+				}
+				opts.fstatfs = fakeVolume(7<<30+1<<29, 10<<30)
+				_, err := open(nil)
+				Expect(errors.Is(err, unix.EIO)).To(BeTrue(), "%v", err)
+				Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
+				Expect(errors.Is(err, errQuotaRefused)).To(BeTrue(), "%v", err)
+				Expect(err).To(MatchError("volume " + vq + `: growing image "rvm-disk-0.img" from 2 MiB to 8 MiB needs 6 MiB, and the volume's quota refused it (disk quota exceeded); the volume has 7.5 GiB free of 10 GiB; ` + quotaAdvice + "; the image stays at 2 MiB"))
+				Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+				Expect(events).To(Equal([]growEvent{
+					{off: 2 << 20, len: 1 << 20}, {off: 3 << 20, len: 1 << 20}, {sync: true}, {cut: true, off: 2 << 20},
+				}))
+				Expect(statOf(img).Size).To(Equal(int64(2 << 20)))
+				marksKept(2 << 20)
+			})
+
+			It("cuts the image back to what synced when the last sync fails after every write succeeded, as NFS reports a refused writeback, and the next start continues", func() {
+				writeImage(img, 2<<20, nil)
+				markImage()
+				opts.syncFile = func(int) error {
+					events = append(events, growEvent{sync: true})
+					return unix.EDQUOT
+				}
+				opts.fstatfs = fakeVolume(7<<30+1<<29, 10<<30)
+				_, err := open(nil)
+				Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
+				Expect(err).To(MatchError("volume " + vq + `: growing image "rvm-disk-0.img" from 2 MiB to 8 MiB needs 6 MiB, and the volume's quota refused it (disk quota exceeded); the volume has 7.5 GiB free of 10 GiB; ` + quotaAdvice + "; the image stays at 2 MiB"))
+				Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+				Expect(writes()).To(HaveLen(6), "every write succeeded")
+				Expect(events[len(events)-2:]).To(Equal([]growEvent{{sync: true}, {cut: true, off: 2 << 20}}))
+				Expect(statOf(img).Size).To(Equal(int64(2<<20)), "no length past what synced is left")
+				marksKept(2 << 20)
+
+				events = nil
+				opts.syncFile = nil
+				openOK()
+				Expect(writes()).To(Equal([][2]int64{{2 << 20, 1 << 20}, {3 << 20, 1 << 20}, {4 << 20, 1 << 20}, {5 << 20, 1 << 20}, {6 << 20, 1 << 20}, {7 << 20, 1 << 20}}),
+					"the next start writes again from the length that synced")
+				Expect(statOf(img).Size).To(Equal(int64(8 << 20)))
+				marksKept(2 << 20)
+				Expect(allZero(2 << 20)).To(BeTrue())
+			})
+
+			It("cuts back to the last periodic sync that succeeded when a later one fails", func() {
+				writeImage(img, 2<<20, nil)
+				opts.Size = 600 << 20
+				opts.fstatfs = fakeVolume(1<<30, 10<<30)
+				// Each write extends the image sparsely, so the spec need not
+				// write 600 MiB.
+				opts.pwrite = func(fd int, b []byte, off int64) error {
+					return unix.Ftruncate(fd, off+int64(len(b)))
+				}
+				syncs := 0
+				opts.syncFile = func(int) error {
+					if syncs++; syncs == 2 {
+						return unix.EIO
+					}
+					return nil
+				}
+				_, err := open(nil)
+				Expect(errors.Is(err, unix.EIO)).To(BeTrue(), "%v", err)
+				Expect(err).To(MatchError("volume " + vq + `: growing image "rvm-disk-0.img" from 2 MiB to 600 MiB: syncing the zeros written so far: input/output error; the image stays at 258 MiB`))
+				Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+				Expect(syncs).To(Equal(2))
+				Expect(statOf(img).Size).To(Equal(int64(2<<20 + syncInterval)))
+				Expect(events).To(Equal([]growEvent{{cut: true, off: 2<<20 + syncInterval}}))
+			})
+
+			It("says so, and the length a fresh look finds, when the cut back fails too", func() {
+				writeImage(img, 2<<20, nil)
+				opts.syncFile = func(int) error { return unix.EIO }
+				opts.truncate = func(int, int64) error { return unix.EPERM }
+				_, err := open(nil)
+				Expect(errors.Is(err, unix.EIO)).To(BeTrue(), "%v", err)
+				Expect(errors.Is(err, unix.EPERM)).To(BeTrue(), "%v", err)
+				Expect(err).To(MatchError("volume " + vq + `: growing image "rvm-disk-0.img" from 2 MiB to 8 MiB: syncing the zeros written so far: input/output error; cutting the image back to the 2097152 bytes that synced also failed: operation not permitted; the image stays at 8 MiB`))
+				Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+			})
+
+			It("keeps a larger image without writing anything", func() {
+				writeImage(img, 16<<20, nil)
+				openOK()
+				Expect(events).To(BeEmpty())
+				Expect(statOf(img).Size).To(Equal(int64(16 << 20)))
+				Expect(lines).To(HaveLen(1))
+				Expect(lines[0]).To(HaveSuffix("vm-launch never shrinks an image, so it keeps 16 MiB"))
+			})
+		})
+	})
+
+	It("still refuses an image whose size is not whole sectors, below or above the size asked for", func() {
+		for _, size := range []int64{2<<20 + 100, 16<<20 + 100} {
+			Expect(os.Remove(img) == nil || !fileExists(img)).To(BeTrue())
+			writeImage(img, size, []byte("data"))
+			_, err := open(nil)
+			Expect(errors.Is(err, errImageSize)).To(BeTrue(), "%d: %v", size, err)
+			Expect(err).To(MatchError(fmt.Sprintf("volume image %s: size %d is not a multiple of 512", img, size)))
+			Expect(statOf(img).Size).To(Equal(size))
+		}
+		Expect(lines).To(BeEmpty())
+	})
+
+	It("prints nothing without a logger", func() {
+		opts.Logf = nil
+		writeImage(img, 16<<20, nil)
+		openOK()
+		Expect(statOf(img).Size).To(Equal(int64(16 << 20)))
+	})
+})
+
+var _ = Describe("the file-image providers and the size asked for", func() {
+	var (
+		dir    string
+		img    string
+		logBuf *bytes.Buffer
+	)
+
+	BeforeEach(func() {
+		requireOpenat2()
+		dir = GinkgoT().TempDir()
+		img = filepath.Join(dir, "rvm-disk-0.img")
+		logBuf = &bytes.Buffer{}
+		saved, savedProbe := defaultImageOptions, dirProbe
+		DeferCleanup(func() { defaultImageOptions, dirProbe = saved, savedProbe })
+		defaultImageOptions.IsMountRoot = alwaysMountRoot
+		defaultImageOptions.LockWait = 100 * time.Millisecond
+		defaultImageOptions.LockPoll = 10 * time.Millisecond
+		defaultImageOptions.creationStep = 1 << 20
+		dirProbe = func(int, string) (mountProbe, error) { return mountProbe{MountID: 40, MountRoot: true}, nil }
+	})
+
+	request := func(fstype string, size int64) prepareRequest {
+		return prepareRequest{Mount: mountRecord{ContainerDir: dir, MountID: 40, FSType: fstype, SuperOptions: []string{nfsLocalLockNone}},
+			ImageName: "rvm-disk-0.img", Mode: attachFileImage, Size: size, Logger: log.New(logBuf, "vm-launch: ", 0)}
+	}
+
+	It("gives the engine the request's size, lock budget, check before the lock, and logger", func() {
+		budget := newLockBudget(time.Second)
+		called := false
+		req := request(juicefsFSType, 20<<30)
+		req.LockBudget = budget
+		req.BeforeLock = func(*os.File) error { called = true; return nil }
+		o := req.fileImageOptions(defaultImageOptions)
+		Expect(o.Size).To(Equal(int64(20 << 30)))
+		Expect(o.LockBudget).To(BeIdenticalTo(budget))
+		Expect(o.BeforeLock(nil)).To(Succeed())
+		Expect(called).To(BeTrue())
+		o.Logf("a line %d", 1)
+		Expect(logBuf.String()).To(Equal("vm-launch: a line 1\n"))
+		Expect(o.LockWait).To(Equal(defaultImageOptions.LockWait), "the rest of the options are the defaults")
+	})
+
+	It("leaves the default size for a request with no size, and no logger for a request with none", func() {
+		req := request(juicefsFSType, 0)
+		req.Logger = nil
+		o := req.fileImageOptions(defaultImageOptions)
+		Expect(o.Size).To(Equal(int64(defaultImageSize)))
+		Expect(o.Logf).To(BeNil())
+	})
+
+	It("grows a JuiceFS image to the size asked for, and keeps a larger one with the line, through Prepare", func() {
+		writeImage(img, 2<<20, []byte("guest"))
+		var calls []fallocateCall
+		defaultImageOptions.fallocate = func(fd int, mode uint32, off, length int64) error {
+			calls = append(calls, fallocateCall{mode, off, length})
+			return unix.Fallocate(fd, mode, off, length)
+		}
+		att, err := juicefsProvider{}.Prepare(request(juicefsFSType, 8<<20))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(statOf(img).Size).To(Equal(int64(8 << 20)))
+		Expect(calls).To(Equal([]fallocateCall{{0, 2 << 20, 6 << 20}}), "JuiceFS grows by fallocate mode 0 past the end")
+		Expect(readPrefix(img, 5)).To(Equal("guest"))
+		Expect(att.Release()).To(Succeed())
+		Expect(logBuf.String()).To(Equal("vm-launch: volume " + quoteForLog(dir) + `: growing image "rvm-disk-0.img" from 2 MiB to 8 MiB` + "\n"))
+
+		logBuf.Reset()
+		att, err = juicefsProvider{}.Prepare(request(juicefsFSType, 4<<20))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(att.Release()).To(Succeed())
+		Expect(statOf(img).Size).To(Equal(int64(8 << 20)))
+		Expect(logBuf.String()).To(Equal("vm-launch: volume " + quoteForLog(dir) + `: image "rvm-disk-0.img" is 8 MiB, larger than the 4 MiB asked for; vm-launch never shrinks an image, so it keeps 8 MiB` + "\n"))
+	})
+
+	It("creates a JuiceFS image at the default 1 GiB for a request with no size", func() {
+		defaultImageOptions.creationStep = 0
+		att, err := juicefsProvider{}.Prepare(request(juicefsFSType, 0))
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(att.Release)
+		Expect(statOf(img).Size).To(Equal(int64(defaultImageSize)))
+		Expect(logBuf.String()).To(BeEmpty())
+	})
+
+	It("grows an NFS image with preallocation to the size asked for, through Prepare", func() {
+		writeImage(img, 2<<20, []byte("guest"))
+		var offsets []int64
+		defaultImageOptions.fallocate = func(int, uint32, int64, int64) error { return unix.EOPNOTSUPP }
+		defaultImageOptions.pwrite = func(fd int, b []byte, off int64) error {
+			offsets = append(offsets, off)
+			return pwriteFull(fd, b, off)
+		}
+		att, err := nfsProvider{}.Prepare(request(nfs4FSType, 4<<20))
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(att.Release)
+		Expect(offsets).To(Equal([]int64{2 << 20, 3 << 20}))
+		st := statOf(img)
+		Expect(st.Size).To(Equal(int64(4 << 20)))
+		Expect(st.Blocks * 512).To(BeNumerically(">=", 2<<20))
+		Expect(readPrefix(img, 5)).To(Equal("guest"))
+		Expect(logBuf.String()).To(ContainSubstring("the volume does not support fallocate"))
+	})
+
+	It("stops an NFS grow at a signal through Prepare, with 128 plus the signal", func() {
+		writeImage(img, 2<<20, nil)
+		sigs := make(chan os.Signal, 1)
+		defaultImageOptions.fallocate = func(int, uint32, int64, int64) error { return unix.EOPNOTSUPP }
+		defaultImageOptions.afterZeroChunk = func(end int64) {
+			if end == 3<<20 {
+				sigs <- syscall.SIGTERM
+			}
+		}
+		req := request(nfs4FSType, 8<<20)
+		req.Signals = sigs
+		_, err := nfsProvider{}.Prepare(req)
+		Expect(stepExitCode(err)).To(Equal(128 + int(syscall.SIGTERM)))
+		Expect(statOf(img).Size).To(Equal(int64(3 << 20)))
+		Expect(lockedElsewhere(img)).To(BeFalse())
+	})
+})
+
+var _ = DescribeTable("exactSize",
+	func(n int64, want string) { Expect(exactSize(n)).To(Equal(want)) },
+	Entry("a whole number of GiB", int64(20<<30), "20 GiB"),
+	Entry("1 GiB", int64(1<<30), "1 GiB"),
+	Entry("a size that is not whole GiB", int64(1536<<20), "1536 MiB"),
+	Entry("the 64 MiB minimum", int64(64<<20), "64 MiB"),
+	Entry("TiB", int64(3<<40), "3 TiB"),
+	Entry("the 2^62-byte limit", int64(1<<62), "4194304 TiB"),
+	Entry("KiB", int64(4096), "4 KiB"),
+	Entry("a size that is no whole unit", int64(1<<20+512), "1049088 bytes"),
+	Entry("zero", int64(0), "0 bytes"),
+)
+
+var _ = DescribeTable("roughSize",
+	func(n int64, want string) { Expect(roughSize(n)).To(Equal(want)) },
+	Entry("a whole number of GiB", int64(20<<30), "20 GiB"),
+	Entry("a half", int64(5<<30+512<<20), "5.5 GiB"),
+	Entry("just under the next unit, cut and not rounded", int64(1<<30-1), "1023.9 MiB"),
+	Entry("a length a page past a MiB", int64(2<<20+4096), "2 MiB"),
+	Entry("7.5 GiB", int64(15<<29), "7.5 GiB"),
+	Entry("TiB", int64(1<<40+1<<39), "1.5 TiB"),
+	Entry("the 2^62-byte limit", int64(1<<62), "4194304 TiB"),
+	Entry("bytes", int64(512), "512 bytes"),
+	Entry("zero", int64(0), "0 bytes"),
+)

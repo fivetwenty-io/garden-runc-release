@@ -215,7 +215,7 @@ var _ = Describe("an image on the directory named by "+imageDirEnv, func() {
 			go func() {
 				defer GinkgoRecover()
 				defer wg.Done()
-				fd, err := openImageFile(dirfd, name, img, o, nil)
+				fd, _, err := openImageFile(dirfd, name, img, o, nil)
 				if err == nil {
 					unix.Close(fd)
 				}
@@ -253,7 +253,7 @@ var _ = Describe("an image on the directory named by "+imageDirEnv, func() {
 		noSillyRenames()
 		st := statOf(img)
 		Expect(int(st.Nlink)).To(Equal(1))
-		Expect(st.Size).To(Equal(size))
+		Expect(st.Size).To(Equal(o.creationSize()), "openImageFile publishes at the creation step, and the grow comes after the lock")
 	})
 
 	It("removes a temp name that a killed launch left, an orphan or a second name of the image, and keeps the image", func() {
@@ -284,8 +284,16 @@ var _ = Describe("an image on the directory named by "+imageDirEnv, func() {
 		_, err := nfsProvider{}.Prepare(nfsRequest())
 		GinkgoWriter.Printf("error: %v\n", err)
 		Expect(err).To(HaveOccurred())
-		Expect(errors.Is(err, unix.ENOSPC) || errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
-		Expect(err.Error()).To(HaveSuffix("(the volume's quota refused it)"))
+		// The free space that fstatfs reports refuses an image that is larger
+		// than it, before anything is written. A server whose accounting lags
+		// its enforcement can still refuse the allocation itself, and then the
+		// line says so in the same words.
+		if errors.Is(err, errVolumeFull) {
+			Expect(err.Error()).To(ContainSubstring(", and the volume has "))
+		} else {
+			Expect(errors.Is(err, unix.ENOSPC) || errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
+			Expect(err.Error()).To(ContainSubstring(", and the volume's quota refused it ("))
+		}
 		Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 		entries, rerr := os.ReadDir(dir)
 		Expect(rerr).NotTo(HaveOccurred())

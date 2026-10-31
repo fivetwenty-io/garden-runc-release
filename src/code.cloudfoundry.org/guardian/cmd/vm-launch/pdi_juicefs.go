@@ -13,10 +13,12 @@ const juicefsFSType = "fuse.juicefs"
 
 func init() { registerDiskProvider(juicefsProvider{}) }
 
-// juicefsProvider is the JuiceFS volume service. Its disk is a sparse 1 GiB
-// image file in the volume root, which openVolumeImage creates, checks, and
-// locks. A JuiceFS flock holds across cells, and its quota counts file
-// length, so a new image is charged its whole size as soon as it is sized.
+// juicefsProvider is the JuiceFS volume service. Its disk is a sparse image
+// file in the volume root, 1 GiB unless the app asks for another size, which
+// openVolumeImage creates, checks, locks, and grows by fallocate, or by
+// truncate where the volume has no fallocate. A JuiceFS flock holds across
+// cells, and its quota counts file length, so an image is charged its whole
+// size as soon as it is sized or grown.
 type juicefsProvider struct{}
 
 func (juicefsProvider) Name() string { return "JuiceFS" }
@@ -34,16 +36,15 @@ func (juicefsProvider) Capabilities(mountRecord) capabilities {
 }
 
 // Prepare opens, and creates when missing, the instance's image with
-// defaultImageOptions, and returns it locked. The lock lasts until Release
-// closes vm-launch's copy and the hypervisor, which shares the open file,
-// has exited.
+// defaultImageOptions and the size the request asks for, grows it to that
+// size, and returns it locked. The lock lasts until Release closes
+// vm-launch's copy and the hypervisor, which shares the open file, has
+// exited.
 func (juicefsProvider) Prepare(req prepareRequest) (*attachment, error) {
 	if req.Mode != attachFileImage {
 		return nil, fmt.Errorf("the JuiceFS volume provider attaches only in %s, not in %s", attachFileImage, req.Mode)
 	}
-	opts := defaultImageOptions
-	opts.BeforeLock = req.BeforeLock
-	opts.LockBudget = req.LockBudget
+	opts := req.fileImageOptions(defaultImageOptions)
 	img, err := openVolumeImage(&guestVolume{
 		ContainerDir: req.Mount.ContainerDir, ImageName: req.ImageName,
 		MountID: req.Mount.MountID, MountIDKnown: true,

@@ -64,8 +64,9 @@ func (nfsProvider) Capabilities(mountRecord) capabilities {
 // Prepare refuses a mount that refuseNFSMount refuses, as a second line of
 // defence behind the registry, and otherwise opens, and creates when missing,
 // the instance's image with defaultImageOptions plus preallocation and the
-// link publish, and returns it locked. The lock lasts until Release closes
-// vm-launch's copy and the hypervisor, which shares the open file, has exited.
+// link publish, grows it to the size the request asks for, and returns it
+// locked. The lock lasts until Release closes vm-launch's copy and the
+// hypervisor, which shares the open file, has exited.
 func (nfsProvider) Prepare(req prepareRequest) (*attachment, error) {
 	if req.Mode != attachFileImage {
 		return nil, fmt.Errorf("the NFS volume provider attaches only in %s, not in %s", attachFileImage, req.Mode)
@@ -73,11 +74,9 @@ func (nfsProvider) Prepare(req prepareRequest) (*attachment, error) {
 	if err := refuseNFSMount(req.Mount); err != nil {
 		return nil, err
 	}
-	o := defaultImageOptions
+	o := req.fileImageOptions(defaultImageOptions)
 	o.Preallocate = true
 	o.Publish = publishLink
-	o.BeforeLock = req.BeforeLock
-	o.LockBudget = req.LockBudget
 	img, err := openVolumeImage(&guestVolume{
 		ContainerDir: req.Mount.ContainerDir, ImageName: req.ImageName,
 		MountID: req.Mount.MountID, MountIDKnown: true,
