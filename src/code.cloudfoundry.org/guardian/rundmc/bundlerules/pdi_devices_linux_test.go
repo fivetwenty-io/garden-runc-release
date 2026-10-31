@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -186,6 +187,94 @@ var _ = Describe("LinuxPDIHost", func() {
 				Expect(unix.Lstat(node, &st)).To(MatchError(unix.ENOENT))
 			})
 		})
+	})
+
+	Describe("publishing a claim", func() {
+		It("creates the claim with its content and mode 0600, and never replaces one", func() {
+			old := unix.Umask(0o077)
+			defer unix.Umask(old)
+
+			Expect(bundlerules.PublishPDIClaim(dir, "8-16", []byte("g\nh\n7\n"))).To(Succeed())
+			data, err := os.ReadFile(filepath.Join(dir, "8-16"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(data)).To(Equal("g\nh\n7\n"))
+			info, err := os.Stat(filepath.Join(dir, "8-16"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(info.Mode().Perm()).To(Equal(os.FileMode(0o600)))
+
+			err = bundlerules.PublishPDIClaim(dir, "8-16", []byte("other\n"))
+			Expect(errors.Is(err, os.ErrExist)).To(BeTrue(), "%v", err)
+			data, err = os.ReadFile(filepath.Join(dir, "8-16"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(data)).To(Equal("g\nh\n7\n"))
+		})
+
+		It("leaves no other file in the directory", func() {
+			Expect(bundlerules.PublishPDIClaim(dir, "8-16", []byte("x\n"))).To(Succeed())
+			Expect(bundlerules.PublishPDIClaim(dir, "8-16", []byte("y\n"))).NotTo(Succeed())
+			entries, err := os.ReadDir(dir)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(entries).To(HaveLen(1))
+		})
+
+		It("lets a reader see either no claim or the whole claim, never part of it", func() {
+			content := []byte(strings.Repeat("h", 60000) + "\n")
+			claim := filepath.Join(dir, "8-16")
+			done := make(chan struct{})
+			exited := make(chan struct{})
+			problems := make(chan string, 1)
+			go func() {
+				defer GinkgoRecover()
+				defer close(exited)
+				for {
+					select {
+					case <-done:
+						return
+					default:
+					}
+					data, err := os.ReadFile(claim)
+					if err == nil && len(data) != len(content) {
+						select {
+						case problems <- "read " + strconv.Itoa(len(data)) + " bytes":
+						default:
+						}
+					}
+				}
+			}()
+			for i := 0; i < 200; i++ {
+				Expect(bundlerules.PublishPDIClaim(dir, "8-16", content)).To(Succeed())
+				Expect(os.Remove(claim)).To(Succeed())
+			}
+			close(done)
+			Eventually(exited).Should(BeClosed())
+			Expect(problems).NotTo(Receive())
+		})
+
+		It("fails for a directory that is missing", func() {
+			Expect(bundlerules.PublishPDIClaim(filepath.Join(dir, "missing"), "8-16", []byte("x\n"))).To(MatchError(ContainSubstring("creating a claim in")))
+		})
+	})
+
+	Describe("NewPDILeftoverReleaser", func() {
+		It("returns nothing to release when no claim directory exists", func() {
+			if _, err := os.Lstat(bundlerules.DefaultPDIClaimDir); err == nil {
+				Skip(bundlerules.DefaultPDIClaimDir + " exists on this host")
+			}
+			releaser, err := bundlerules.NewPDILeftoverReleaser(nil, "")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(releaser).To(BeNil())
+		})
+
+		It("refuses a tag that holds a newline", func() {
+			_, err := bundlerules.NewPDILeftoverReleaser(nil, "a\nb")
+			Expect(err).To(MatchError(ContainSubstring("newline")))
+		})
+	})
+
+	It("NewPDIDevices waits for a held device as long as vm-launch waits for a busy one", func() {
+		volumes, err := bundlerules.NewPDIDevices(nil, 991, "")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(volumes.ClaimWait).To(Equal(30 * time.Second))
 	})
 
 	Describe("Probe against a loop device", func() {

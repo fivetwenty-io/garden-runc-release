@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -46,6 +47,19 @@ import (
 // go of it. Firecracker's identity for the drive comes from the node's own
 // st_dev, st_rdev, and st_ino (see firecrackerDriveID), because the node is
 // the file it opens.
+//
+// A device number names whichever disk has it now, so a disk that is detached
+// and replaced by another under the same number would pass the node checks.
+// Garden reads each disk's sequence number (diskseq, from Linux 5.15) when it
+// grants the device and records it in the source of a tmpfs it mounts in the
+// container (gardenDiskseqSource). vm-launch refuses a device whose
+// BLKGETDISKSEQ on the exclusive descriptor differs from that record.
+// The kernel gives every disk it attaches a higher number, so the check
+// proves that vm-launch opened the disk Garden granted. It cannot reach a
+// hypervisor that is already running when its disk is detached and another
+// takes the number. That hypervisor still has the device node in the
+// container, and only the kernel's exclusive hold of the new disk, by a host
+// mount or another VM, stops it from opening the new disk again.
 
 // The block-mode descriptor, which must match the bosh-disk driver's
 // pkg/driver/descriptor.go in cf-bosh-disk-broker-release (DescriptorSource,
@@ -144,6 +158,9 @@ type blockHost interface {
 	// deviceBytes is the size of the open block device fd, from
 	// BLKGETSIZE64.
 	deviceBytes(fd int) (uint64, error)
+	// diskSeq is the disk sequence number of the open block device fd, from
+	// BLKGETDISKSEQ.
+	diskSeq(fd int) (uint64, error)
 }
 
 // linuxBlockHost is the kernel.
@@ -162,6 +179,129 @@ func (linuxBlockHost) fstat(fd int, st *unix.Stat_t) error {
 
 func (linuxBlockHost) deviceBytes(fd int) (uint64, error) {
 	return ioctlBlockSize(fd)
+}
+
+func (linuxBlockHost) diskSeq(fd int) (uint64, error) {
+	var seq uint64
+	err := retryEINTR(func() error {
+		_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(unix.BLKGETDISKSEQ), uintptr(unsafe.Pointer(&seq)))
+		if errno != 0 {
+			return errno
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("BLKGETDISKSEQ: %w", err)
+	}
+	return seq, nil
+}
+
+// gardenDiskseqSource starts the source of the tmpfs that Garden mounts in a
+// VM container with block volumes, and the disk sequence number of each block
+// device it granted follows it, as MAJOR:MINOR=SEQ entries separated by
+// commas. Only root can mount a filesystem, and the container has no
+// CAP_SYS_ADMIN, so an app cannot add or change one. The environment would
+// not do, because runc keeps the last of two entries with one name, and a
+// process's own variables come after the bundle's.
+const gardenDiskseqSource = "garden-pdi-diskseq:"
+
+// diskseqMountInfo is the mount table that gardenDiskseq reads. The specs
+// point it at a file.
+var diskseqMountInfo = "/proc/self/mountinfo"
+
+// gardenDiskseq returns the disk sequence number that Garden recorded for
+// device major:minor. It is an error when no record mount is found, when
+// there is more than one, when a record is malformed, and when it has no
+// entry or more than one for the device.
+func gardenDiskseq(major, minor uint32) (uint64, error) {
+	record, err := gardenDiskseqRecord()
+	if err != nil {
+		return 0, err
+	}
+	want := strconv.FormatUint(uint64(major), 10) + ":" + strconv.FormatUint(uint64(minor), 10)
+	var seq uint64
+	found := false
+	for _, entry := range strings.Split(record, ",") {
+		numbers, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			return 0, fmt.Errorf("%s entry %q is not MAJOR:MINOR=SEQ", gardenDiskseqSource, entry)
+		}
+		a, b, ok := strings.Cut(numbers, ":")
+		if !ok {
+			return 0, fmt.Errorf("%s entry %q is not MAJOR:MINOR=SEQ", gardenDiskseqSource, entry)
+		}
+		if _, err := parseDescriptorUint(a, 32); err != nil {
+			return 0, fmt.Errorf("%s entry %q: major %w", gardenDiskseqSource, entry, err)
+		}
+		if _, err := parseDescriptorUint(b, 32); err != nil {
+			return 0, fmt.Errorf("%s entry %q: minor %w", gardenDiskseqSource, entry, err)
+		}
+		v, err := parseDescriptorUint(value, 64)
+		if err != nil {
+			return 0, fmt.Errorf("%s entry %q: sequence number %w", gardenDiskseqSource, entry, err)
+		}
+		if v == 0 {
+			return 0, fmt.Errorf("%s entry %q has sequence number 0, which no disk has", gardenDiskseqSource, entry)
+		}
+		if numbers != want {
+			continue
+		}
+		if found {
+			return 0, fmt.Errorf("%s names device %s more than once", gardenDiskseqSource, want)
+		}
+		seq, found = v, true
+	}
+	if !found {
+		return 0, fmt.Errorf("%s has no entry for device %s, so Garden did not grant it to this container", gardenDiskseqSource, want)
+	}
+	return seq, nil
+}
+
+// gardenDiskseqRecord returns the entries of the one tmpfs in the mount table
+// whose source starts with gardenDiskseqSource. A line that names the source
+// and does not parse is refused rather than skipped.
+func gardenDiskseqRecord() (string, error) {
+	f, err := os.Open(diskseqMountInfo)
+	if err != nil {
+		var pathErr *os.PathError
+		if errors.As(err, &pathErr) {
+			err = pathErr.Err
+		}
+		return "", fmt.Errorf("reading %s to find the disks Garden granted: %w", diskseqMountInfo, err)
+	}
+	defer f.Close()
+	var records []string
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := sc.Text()
+		if !strings.Contains(line, gardenDiskseqSource) {
+			continue
+		}
+		rec, err := parseMountInfoRecord(line)
+		if err != nil {
+			return "", fmt.Errorf("a line of %s that names %s is malformed: %w", diskseqMountInfo, gardenDiskseqSource, err)
+		}
+		value, ok := strings.CutPrefix(rec.Source, gardenDiskseqSource)
+		if !ok {
+			continue
+		}
+		if rec.FSType != tmpfsFSType {
+			return "", fmt.Errorf("the %s record at %s is a %s mount, and Garden makes it on tmpfs", gardenDiskseqSource, quoteForLog(rec.MountPoint), rec.FSType)
+		}
+		records = append(records, value)
+	}
+	if err := sc.Err(); err != nil {
+		return "", fmt.Errorf("reading %s to find the disks Garden granted: %w", diskseqMountInfo, err)
+	}
+	switch len(records) {
+	case 0:
+		return "", fmt.Errorf("the container has no %s mount, so this Garden did not record which disk it granted; block volumes need a Garden that records it", gardenDiskseqSource)
+	case 1:
+		return records[0], nil
+	default:
+		return "", fmt.Errorf("the container has %d %s mounts, and Garden makes one", len(records), gardenDiskseqSource)
+	}
 }
 
 // ioctlBlockSize returns BLKGETSIZE64 of the block device fd.
@@ -362,6 +502,10 @@ func (p *blockProvider) openBlockVolume(req prepareRequest) (*os.File, error) {
 	node := p.nodeDir + "/" + strconv.FormatUint(uint64(desc.Major), 10) + "-" + strconv.FormatUint(uint64(desc.Minor), 10)
 	what := fmt.Sprintf("the %s device %s (%s) for volume path %s", p.name, node, desc.DiskName, qdir)
 	rdev := unix.Mkdev(desc.Major, desc.Minor)
+	grantedSeq, err := gardenDiskseq(desc.Major, desc.Minor)
+	if err != nil {
+		return nil, fmt.Errorf("checking %s: %w", what, err)
+	}
 
 	pathFD, err := p.host.open(node, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC)
 	if err != nil {
@@ -403,6 +547,13 @@ func (p *blockProvider) openBlockVolume(req prepareRequest) (*os.File, error) {
 	}
 	if err := checkBlockNode(&got, rdev, desc, what); err != nil {
 		return nil, err
+	}
+	seq, err := p.host.diskSeq(fd)
+	if err != nil {
+		return nil, fmt.Errorf("reading the disk sequence number of %s: %w", what, err)
+	}
+	if seq != grantedSeq {
+		return nil, fmt.Errorf("%s is disk sequence number %d, and Garden granted disk sequence number %d; another disk now has the device number, and vm-launch refuses it", what, seq, grantedSeq)
 	}
 	raw, err := p.host.deviceBytes(fd)
 	if err != nil {

@@ -109,9 +109,10 @@ type TaskPidLister interface {
 }
 
 // DeviceReleaser removes the host device nodes that a container was given
-// when its bundle was generated. Release is called once the runtime has
-// deleted the container, and it must succeed for a container that was given
-// none and when called again.
+// when its bundle was generated. Destroy calls Release once the runtime has
+// deleted the container and its cgroups are gone, or, when removing the
+// cgroups fails, once the runtime reports the container stopped. Release must
+// succeed for a container that was given none and when called again.
 type DeviceReleaser interface {
 	Release(log lager.Logger, handle string) error
 }
@@ -666,13 +667,34 @@ func (c *Containerizer) Destroy(log lager.Logger, handle string) error {
 		return err
 	}
 
+	// The cgroup removal fails while any process of the container is left,
+	// so its success shows that nothing holds the container's devices. When
+	// it fails, only a stopped state from the runtime lets the devices go. A
+	// claim that is kept is released by a later destroy or by the start-up
+	// sweep.
+	cgErr := c.cpuCgrouper.CleanupCgroups(handle)
 	if c.deviceReleaser != nil {
+		if cgErr != nil && !c.reportsStopped(log, handle) {
+			log.Info("devices-kept", lager.Data{"cgroup-error": cgErr.Error()})
+			return cgErr
+		}
 		if err := c.deviceReleaser.Release(log, handle); err != nil {
-			return err
+			return errors.Join(cgErr, err)
 		}
 	}
 
-	return c.cpuCgrouper.CleanupCgroups(handle)
+	return cgErr
+}
+
+// reportsStopped reports whether the runtime says the container is stopped. A
+// failed state lookup counts as not stopped.
+func (c *Containerizer) reportsStopped(log lager.Logger, handle string) bool {
+	state, err := c.runtime.State(log, handle)
+	if err != nil {
+		log.Info("state-unknown-after-delete", lager.Data{"error": err.Error()})
+		return false
+	}
+	return state.Status == StoppedStatus
 }
 
 func (c *Containerizer) RemoveBundle(log lager.Logger, handle string) error {

@@ -34,6 +34,9 @@ const (
 	testBlockDisk  = "bosh-disk-0123456789abcdef01"
 	// testBlockMountID is the descriptor tmpfs's mount ID in the fake specs.
 	testBlockMountID = 50
+	// testBlockDiskseq is the fake disk's sequence number, which Garden
+	// records in the fake specs' environment.
+	testBlockDiskseq = 42
 	// overflowUID is the uid a file owned outside the container's user
 	// namespace shows inside it.
 	overflowUID = 65534
@@ -98,6 +101,8 @@ type fakeBlockHost struct {
 	descUID  uint32
 	size     uint64
 	sizeErr  error
+	seq      uint64
+	seqErr   error
 	// openErr, when set, answers an open before the file is opened.
 	openErr func(path string, flags int) error
 	// replace makes the exclusive open report another inode.
@@ -121,6 +126,7 @@ func newFakeBlockHost() *fakeBlockHost {
 		nodeType: unix.S_IFBLK,
 		descUID:  overflowUID,
 		size:     testBlockSize,
+		seq:      testBlockDiskseq,
 		nodes:    map[int]fakeNodeFD{},
 	}
 }
@@ -188,6 +194,39 @@ func (h *fakeBlockHost) deviceBytes(int) (uint64, error) {
 	return h.size, h.sizeErr
 }
 
+func (h *fakeBlockHost) diskSeq(int) (uint64, error) {
+	return h.seq, h.seqErr
+}
+
+// setDiskseqTable makes gardenDiskseq read a mount table with lines until the
+// spec ends.
+func setDiskseqTable(lines ...string) {
+	path := filepath.Join(GinkgoT().TempDir(), "mountinfo")
+	table := "22 1 0:21 / / rw,relatime - overlay overlay rw\n"
+	for _, line := range lines {
+		table += line + "\n"
+	}
+	Expect(os.WriteFile(path, []byte(table), 0o644)).To(Succeed())
+	saved := diskseqMountInfo
+	DeferCleanup(func() { diskseqMountInfo = saved })
+	diskseqMountInfo = path
+}
+
+// diskseqLine is a mount table line for a record tmpfs with source
+// gardenDiskseqSource followed by entries, as Garden mounts it.
+func diskseqLine(id int, entries string) string {
+	return fmt.Sprintf("%d 22 0:%d / /opt/garden-vm/pdi-diskseq ro,nosuid,nodev,noexec - tmpfs %s%s ro,size=4k", id, id, gardenDiskseqSource, entries)
+}
+
+// setDiskseqRecords makes gardenDiskseq find one record tmpfs per entry list.
+func setDiskseqRecords(records ...string) {
+	var lines []string
+	for i, r := range records {
+		lines = append(lines, diskseqLine(60+i, r))
+	}
+	setDiskseqTable(lines...)
+}
+
 // blockFixture is a volume directory with a descriptor and a node directory
 // with the node the descriptor names, for one blockProvider.
 type blockFixture struct {
@@ -208,6 +247,7 @@ func newBlockFixture() *blockFixture {
 	dirProbe = func(int, string) (mountProbe, error) {
 		return mountProbe{MountID: testBlockMountID, MountRoot: true}, nil
 	}
+	setDiskseqRecords(fmt.Sprintf("%d:%d=%d", testBlockMajor, testBlockMinor, testBlockDiskseq))
 	return f
 }
 
@@ -647,6 +687,57 @@ var _ = Describe("the block provider", func() {
 				Expect(f.prepareRefused(f.request())).To(MatchError(fmt.Sprintf("reading the size of %s: BLKGETSIZE64: inappropriate ioctl for device", f.what())))
 			})
 
+			It("is refused when it is another disk than the one Garden granted", func() {
+				f.host.seq = testBlockDiskseq + 1
+				Expect(f.prepareRefused(f.request())).To(MatchError(fmt.Sprintf("%s is disk sequence number 43, and Garden granted disk sequence number 42; another disk now has the device number, and vm-launch refuses it", f.what())))
+			})
+
+			It("is refused when its disk sequence number cannot be read", func() {
+				f.host.seqErr = errors.New("BLKGETDISKSEQ: inappropriate ioctl for device")
+				Expect(f.prepareRefused(f.request())).To(MatchError(fmt.Sprintf("reading the disk sequence number of %s: BLKGETDISKSEQ: inappropriate ioctl for device", f.what())))
+			})
+
+			It("passes with Garden's entries for other devices beside its own", func() {
+				setDiskseqRecords("8:32=7,8:16=42,253:0=9")
+				att, err := f.provider.Prepare(f.request())
+				Expect(err).NotTo(HaveOccurred())
+				Expect(att.Release()).To(Succeed())
+			})
+
+			DescribeTable("is refused, before anything is opened, unless Garden recorded the disk once",
+				func(lines []string, msg string) {
+					setDiskseqTable(lines...)
+					Expect(f.prepareRefused(f.request())).To(MatchError(fmt.Sprintf("checking %s: %s", f.what(), msg)))
+					Expect(f.host.opens).To(BeEmpty())
+				},
+				Entry("without the record", nil, "the container has no garden-pdi-diskseq: mount, so this Garden did not record which disk it granted; block volumes need a Garden that records it"),
+				Entry("with two records", []string{diskseqLine(60, "8:16=42"), diskseqLine(61, "8:16=42")}, "the container has 2 garden-pdi-diskseq: mounts, and Garden makes one"),
+				Entry("with a record that is not on tmpfs", []string{"60 22 0:60 / /opt/garden-vm/pdi-diskseq ro - ext4 garden-pdi-diskseq:8:16=42 ro"}, `the garden-pdi-diskseq: record at "/opt/garden-vm/pdi-diskseq" is a ext4 mount, and Garden makes it on tmpfs`),
+				Entry("without the device", []string{diskseqLine(60, "8:32=42")}, "garden-pdi-diskseq: has no entry for device 8:16, so Garden did not grant it to this container"),
+				Entry("empty", []string{diskseqLine(60, "")}, `garden-pdi-diskseq: entry "" is not MAJOR:MINOR=SEQ`),
+				Entry("without a sequence number", []string{diskseqLine(60, "8:16")}, `garden-pdi-diskseq: entry "8:16" is not MAJOR:MINOR=SEQ`),
+				Entry("without a minor", []string{diskseqLine(60, "8=42")}, `garden-pdi-diskseq: entry "8=42" is not MAJOR:MINOR=SEQ`),
+				Entry("with a signed major", []string{diskseqLine(60, "+8:16=42")}, `garden-pdi-diskseq: entry "+8:16=42": major "+8" is not a decimal number`),
+				Entry("with a padded minor", []string{diskseqLine(60, "8:016=42")}, `garden-pdi-diskseq: entry "8:016=42": minor "016" has a leading zero`),
+				Entry("with a sequence number that overflows", []string{diskseqLine(60, "8:16=18446744073709551616")}, `garden-pdi-diskseq: entry "8:16=18446744073709551616": sequence number "18446744073709551616" is out of range`),
+				Entry("with sequence number 0", []string{diskseqLine(60, "8:16=0")}, `garden-pdi-diskseq: entry "8:16=0" has sequence number 0, which no disk has`),
+				Entry("with a malformed entry for another device", []string{diskseqLine(60, "8:16=42,8:32=x")}, `garden-pdi-diskseq: entry "8:32=x": sequence number "x" is not a decimal number`),
+				Entry("naming the device twice", []string{diskseqLine(60, "8:16=42,8:16=43")}, "garden-pdi-diskseq: names device 8:16 more than once"),
+			)
+
+			It("is refused, before anything is opened, when a line that names the record does not parse", func() {
+				setDiskseqTable("60 22 0:60 / /opt/garden-vm/pdi-diskseq ro tmpfs garden-pdi-diskseq:8:16=42 ro")
+				Expect(f.prepareRefused(f.request())).To(MatchError(HavePrefix(fmt.Sprintf("checking %s: a line of %s that names garden-pdi-diskseq: is malformed: ", f.what(), diskseqMountInfo))))
+				Expect(f.host.opens).To(BeEmpty())
+			})
+
+			It("ignores a mount whose path, not its source, holds the record's prefix", func() {
+				setDiskseqTable(diskseqLine(60, "8:16=42"), "61 22 0:61 / /data/garden-pdi-diskseq:8:16=1 rw - tmpfs tmpfs rw")
+				att, err := f.provider.Prepare(f.request())
+				Expect(err).NotTo(HaveOccurred())
+				Expect(att.Release()).To(Succeed())
+			})
+
 			It("is refused when its size is not whole sectors, even when the descriptor agrees", func() {
 				f.writeDescriptor(blockDescriptorText(testBlockMajor, testBlockMinor, testBlockSize+1, testBlockUUID, testBlockDisk))
 				f.host.size = testBlockSize + 1
@@ -878,6 +969,15 @@ func newLoopDisk(size int64, mkfsArgs ...string) *loopDisk {
 // descriptorMount mounts a tmpfs with the driver's source and options at a
 // new directory, writes text as its descriptor with the driver's mode, and
 // remounts it read-only, as the driver does. The spec's cleanup unmounts it.
+// sysfsDiskseq returns the disk sequence number of d from sysfs.
+func sysfsDiskseq(d *loopDisk) uint64 {
+	raw, err := os.ReadFile(fmt.Sprintf("/sys/dev/block/%d:%d/diskseq", d.major, d.minor))
+	Expect(err).NotTo(HaveOccurred(), "block volumes need a kernel with diskseq, Linux 5.15 or later")
+	seq, err := strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 64)
+	Expect(err).NotTo(HaveOccurred())
+	return seq
+}
+
 func descriptorMount(text string) string {
 	dir := GinkgoT().TempDir()
 	runTool("mount", "-t", "tmpfs", "-o", "size=16k,mode=0755,nodev,nosuid,noexec", boshDiskDescriptorSource, dir)
@@ -891,10 +991,38 @@ func descriptorMount(text string) string {
 var _ = Describe("the block provider on a loop device", func() {
 	var disk *loopDisk
 
+	// grant mounts the record tmpfs of the disks, as Garden does when it grants
+	// them, and unmounts the one an earlier grant in the spec mounted, so the
+	// kernel's mount table always holds one.
+	var unmountGrant func()
+	grantRecord := func(entries string) {
+		if unmountGrant != nil {
+			unmountGrant()
+		}
+		dir := GinkgoT().TempDir()
+		runTool("mount", "-t", "tmpfs", "-o", "ro,size=4k,nodev,nosuid,noexec", gardenDiskseqSource+entries, dir)
+		mounted := true
+		unmountGrant = func() {
+			if mounted {
+				runTool("umount", dir)
+				mounted = false
+			}
+		}
+		DeferCleanup(unmountGrant)
+	}
+	grant := func(disks ...*loopDisk) {
+		var entries []string
+		for _, d := range disks {
+			entries = append(entries, fmt.Sprintf("%d:%d=%d", d.major, d.minor, sysfsDiskseq(d)))
+		}
+		grantRecord(strings.Join(entries, ","))
+	}
+
 	BeforeEach(func() {
 		requireLoopDevices()
 		volumeProbe, dirProbe = probeVolume, probeMountFD
 		disk = newLoopDisk(64 << 20)
+		grant(disk)
 	})
 
 	descriptorFor := func(d *loopDisk) string {
@@ -990,8 +1118,17 @@ var _ = Describe("the block provider on a loop device", func() {
 		Expect(err.Error()).NotTo(ContainSubstring(disk.uuid))
 	})
 
+	It("refuses a disk that is not the one Garden granted, which the kernel numbers anew", func() {
+		seq := sysfsDiskseq(disk)
+		grantRecord(fmt.Sprintf("%d:%d=%d", disk.major, disk.minor, seq+1))
+		dir := descriptorMount(descriptorFor(disk))
+		_, err := prepareAt(disk, dir)
+		Expect(err).To(MatchError(fmt.Sprintf("%s is disk sequence number %d, and Garden granted disk sequence number %d; another disk now has the device number, and vm-launch refuses it", what(disk, dir), seq, seq+1)))
+	})
+
 	It("refuses an ext4 filesystem without a journal", func() {
 		bare := newLoopDisk(64<<20, "-O", "^has_journal")
+		grant(bare)
 		dir := descriptorMount(descriptorFor(bare))
 		_, err := prepareAt(bare, dir)
 		Expect(err).To(MatchError(what(bare, dir) + " holds an ext4 filesystem without a journal; the volume driver formats a block-mode disk with one"))

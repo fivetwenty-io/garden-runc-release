@@ -1383,6 +1383,56 @@ var _ = Describe("Rundmc", func() {
 					Expect(containerizer.Destroy(logger, "some-handle")).To(MatchError("node busy"))
 				})
 			})
+
+			It("releases the devices only once the cgroups are gone, which shows no process is left", func() {
+				fakeCPUCgrouper.CleanupCgroupsStub = func(string) error {
+					Expect(fakeReleaser.ReleaseCallCount()).To(BeZero())
+					return nil
+				}
+
+				Expect(containerizer.Destroy(logger, "some-handle")).To(Succeed())
+				Expect(fakeReleaser.ReleaseCallCount()).To(Equal(1))
+				Expect(fakeOCIRuntime.StateCallCount()).To(BeZero())
+			})
+
+			Context("when removing the cgroups fails", func() {
+				BeforeEach(func() {
+					fakeCPUCgrouper.CleanupCgroupsReturns(errors.New("cgroup busy"))
+				})
+
+				It("releases the devices when the runtime reports the container stopped, and still returns the error", func() {
+					fakeOCIRuntime.StateReturns(rundmc.State{Status: rundmc.StoppedStatus}, nil)
+
+					Expect(containerizer.Destroy(logger, "some-handle")).To(MatchError("cgroup busy"))
+					Expect(fakeReleaser.ReleaseCallCount()).To(Equal(1))
+					_, handle := fakeOCIRuntime.StateArgsForCall(0)
+					Expect(handle).To(Equal("some-handle"))
+				})
+
+				It("keeps the devices when the runtime reports the container still running", func() {
+					fakeOCIRuntime.StateReturns(rundmc.State{Status: rundmc.RunningStatus}, nil)
+
+					Expect(containerizer.Destroy(logger, "some-handle")).To(MatchError("cgroup busy"))
+					Expect(fakeReleaser.ReleaseCallCount()).To(BeZero())
+				})
+
+				It("keeps the devices when the runtime cannot say, and leaves them to a later destroy or the start-up sweep", func() {
+					fakeOCIRuntime.StateReturns(rundmc.State{}, errors.New("runc state failed"))
+
+					Expect(containerizer.Destroy(logger, "some-handle")).To(MatchError("cgroup busy"))
+					Expect(fakeReleaser.ReleaseCallCount()).To(BeZero())
+					Expect(logger).To(gbytes.Say("devices-kept"))
+				})
+
+				It("returns both errors when the release after a stopped state fails", func() {
+					fakeOCIRuntime.StateReturns(rundmc.State{Status: rundmc.StoppedStatus}, nil)
+					fakeReleaser.ReleaseReturns(errors.New("node busy"))
+
+					err := containerizer.Destroy(logger, "some-handle")
+					Expect(err).To(MatchError(ContainSubstring("cgroup busy")))
+					Expect(err).To(MatchError(ContainSubstring("node busy")))
+				})
+			})
 		})
 
 		It("does not need a device releaser", func() {

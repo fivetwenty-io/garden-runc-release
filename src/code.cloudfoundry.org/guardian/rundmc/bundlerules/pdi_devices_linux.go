@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 	"unsafe"
 
@@ -30,9 +31,81 @@ func NewPDIDevices(logger lager.Logger, kvmGid uint32, tag string) (*PDIDevices,
 		ClaimDir:      DefaultPDIClaimDir,
 		SysfsDir:      "/sys",
 		MountInfoPath: "/proc/self/mountinfo",
+		ClaimWait:     DefaultPDIClaimWait,
 		Host:          LinuxPDIHost{},
 		Logger:        logger,
 	}, nil
+}
+
+// NewPDILeftoverReleaser returns a block volume step that only releases, for
+// a Garden that runs with block volumes turned off. Its Claim refuses every
+// descriptor, and its Release and ReleaseUnknown remove the nodes and claims
+// that this Garden's tag left when it last ran with block volumes on. It
+// returns nil when the claim directory does not exist, because then there is
+// nothing to release.
+func NewPDILeftoverReleaser(logger lager.Logger, tag string) (*PDIDevices, error) {
+	if strings.Contains(tag, "\n") {
+		return nil, errors.New("block volumes cannot record a tag that holds a newline")
+	}
+	info, err := os.Lstat(DefaultPDIClaimDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("checking for block volume claims left by an earlier run: %w", err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("%s is not a directory (%s)", DefaultPDIClaimDir, info.Mode().Type())
+	}
+	return &PDIDevices{
+		Tag:           tag,
+		NodeDir:       DefaultPDINodeDir,
+		ClaimDir:      DefaultPDIClaimDir,
+		SysfsDir:      "/sys",
+		MountInfoPath: "/proc/self/mountinfo",
+		Host:          LinuxPDIHost{},
+		Logger:        logger,
+	}, nil
+}
+
+// publishPDIClaim creates the claim file name in dir holding data, and fails
+// with an error wrapping os.ErrExist when name already exists. The file is
+// written in full as an unnamed file and then linked to its name, which fails
+// if the name exists, so no other reader and no crash ever sees a partial
+// claim. The link goes through /proc/self/fd, which works without the
+// CAP_DAC_READ_SEARCH that linkat with AT_EMPTY_PATH needs.
+func publishPDIClaim(dir, name string, data []byte) error {
+	fd, err := unix.Open(dir, unix.O_TMPFILE|unix.O_WRONLY|unix.O_CLOEXEC, 0600)
+	if err != nil {
+		if errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.EISDIR) {
+			return fmt.Errorf("the filesystem of %s cannot make an unnamed file (O_TMPFILE), which a claim needs: %w", dir, err)
+		}
+		return fmt.Errorf("creating a claim in %s: %w", dir, err)
+	}
+	defer unix.Close(fd)
+
+	for rest := data; len(rest) > 0; {
+		n, err := unix.Write(fd, rest)
+		if err != nil {
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
+			return fmt.Errorf("writing a claim in %s: %w", dir, err)
+		}
+		rest = rest[n:]
+	}
+	if err := unix.Fchmod(fd, 0600); err != nil {
+		return fmt.Errorf("setting the mode of a claim in %s: %w", dir, err)
+	}
+
+	final := filepath.Join(dir, name)
+	if err := unix.Linkat(unix.AT_FDCWD, fmt.Sprintf("/proc/self/fd/%d", fd), unix.AT_FDCWD, final, unix.AT_SYMLINK_FOLLOW); err != nil {
+		if errors.Is(err, unix.EEXIST) {
+			return fmt.Errorf("%s: %w", final, os.ErrExist)
+		}
+		return fmt.Errorf("publishing %s: %w", final, err)
+	}
+	return nil
 }
 
 // LinuxPDIHost performs the device step's host operations with Linux system

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"code.cloudfoundry.org/guardian/backend"
 	spec "code.cloudfoundry.org/guardian/gardener/container-spec"
@@ -35,6 +37,8 @@ type deviceNode struct {
 	gid     uint32
 	// access is the cgroup rule's access, such as "rwm".
 	access string
+	// diskseq is the disk sequence number of a block volume's disk, or 0.
+	diskseq uint64
 }
 
 var (
@@ -160,6 +164,9 @@ func (r ExecutionBackend) Apply(bndl goci.Bndl, spec spec.DesiredContainerSpec) 
 		process.Capabilities = processes.WithoutCapability(process.Capabilities, processes.CapSetGID)
 		process.NoNewPrivileges = true
 		bndl = bndl.WithProcess(process)
+		if m, ok := pdiDiskseqMount(nodes); ok {
+			bndl = bndl.WithMounts(m)
+		}
 	}
 
 	annotations := make(map[string]string, len(bndl.Spec.Annotations)+1)
@@ -184,6 +191,30 @@ func (r ExecutionBackend) checkArtifacts(kind backend.Kind) error {
 		}
 	}
 	return nil
+}
+
+// pdiDiskseqMount returns the tmpfs that records, in its source, the disk
+// sequence number of each block node, and reports false when there is no block
+// node. vm-launch refuses a block volume unless it finds exactly one such
+// mount with the device's number. Only root can mount a filesystem, so,
+// unlike an environment variable, which runc lets a process's own value
+// replace, an app cannot change the record.
+func pdiDiskseqMount(nodes []deviceNode) (specs.Mount, bool) {
+	var entries []string
+	for _, n := range nodes {
+		if n.devType == "b" && n.diskseq != 0 {
+			entries = append(entries, fmt.Sprintf("%d:%d=%s", n.major, n.minor, strconv.FormatUint(n.diskseq, 10)))
+		}
+	}
+	if len(entries) == 0 {
+		return specs.Mount{}, false
+	}
+	return specs.Mount{
+		Destination: PDIDiskseqMountPath,
+		Source:      PDIDiskseqSource + strings.Join(entries, ","),
+		Type:        "tmpfs",
+		Options:     []string{"ro", "nosuid", "nodev", "noexec", "size=4k", "mode=0555"},
+	}, true
 }
 
 func unwrapPathError(err error) error {
