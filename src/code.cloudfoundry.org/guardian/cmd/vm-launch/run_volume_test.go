@@ -459,10 +459,11 @@ var _ = Describe("run with several volumes", func() {
 		Expect(os.WriteFile(mountInfoPath, []byte(strings.Join(lines, "")), 0o644)).To(Succeed())
 	}
 
-	// bind binds n volume directories, each the root of a JuiceFS mount of
-	// its own, with the labels and the mounts in VCAP_SERVICES in the
-	// opposite order to the paths.
-	bind := func(n int) {
+	// bindWith binds n volume directories, each the root of a mount of its
+	// own that mountLine describes, with the labels and the mounts in
+	// VCAP_SERVICES in the opposite order to the paths. With an odd n all the
+	// mounts are in one binding under label.
+	bindWith := func(n int, label string, mountLine func(id int, dir string) string) {
 		dirs, imgs = nil, nil
 		var table []string
 		labels := map[string][]string{}
@@ -472,7 +473,7 @@ var _ = Describe("run with several volumes", func() {
 			Expect(os.Mkdir(d, 0o755)).To(Succeed())
 			dirs = append(dirs, d)
 			imgs = append(imgs, filepath.Join(d, imageName))
-			table = append(table, mountinfoLine(40+i, d, "fuse.juicefs"))
+			table = append(table, mountLine(40+i, d))
 			labels["l"+strconv.Itoa(n-i)] = []string{mountJSON(d, "rw")}
 			oneBinding = append([]string{mountJSON(d, "rw")}, oneBinding...)
 		}
@@ -480,7 +481,30 @@ var _ = Describe("run with several volumes", func() {
 		if n%2 == 0 {
 			GinkgoT().Setenv("VCAP_SERVICES", vcapWith(labels))
 		} else {
-			GinkgoT().Setenv("VCAP_SERVICES", vcapWith(map[string][]string{"juicefs": oneBinding}))
+			GinkgoT().Setenv("VCAP_SERVICES", vcapWith(map[string][]string{label: oneBinding}))
+		}
+	}
+
+	// bind binds n volume directories, each the root of a JuiceFS mount of
+	// its own.
+	bind := func(n int) {
+		bindWith(n, "juicefs", func(id int, d string) string { return mountinfoLine(id, d, "fuse.juicefs") })
+	}
+
+	// bindNFS binds n volume directories, each the root of a kernel NFSv4
+	// mount of its own with local_lock=none, and makes the mount ID probe
+	// answer for them, since the directories are not mounts.
+	bindNFS := func(n int) {
+		bindWith(n, "nfs", func(id int, d string) string {
+			return nfsMountinfoLine(id, d, "nfs4", "10.0.0.5:/export"+strconv.Itoa(id), labNFSOptions)
+		})
+		DeferCleanup(func(saved func(int, string) (mountProbe, error)) { dirProbe = saved }, dirProbe)
+		dirProbe = func(_ int, dir string) (mountProbe, error) {
+			i := slices.Index(dirs, dir)
+			if i < 0 {
+				return mountProbe{}, fmt.Errorf("no volume directory %s", dir)
+			}
+			return mountProbe{MountID: uint64(40 + i), MountRoot: true}, nil
 		}
 	}
 
@@ -544,6 +568,89 @@ var _ = Describe("run with several volumes", func() {
 			Expect(lockedElsewhere(img)).To(BeFalse(), "the lock on %s ends with the run", img)
 		}
 		noWorkDirs()
+	})
+
+	It("gives four NFS volumes what four JuiceFS volumes get: each image on its own descriptor, in the order of the paths, locked until the run ends", func() {
+		requireOpenat2()
+		bindNFS(4)
+		// The NFS provider allocates the whole image, so the images are small.
+		const size = 4 << 20
+		defaultImageOptions.Size = size
+		var checks string
+		for i, img := range imgs {
+			checks += imageAtFD(strconv.Itoa(3+i), img)
+		}
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), checks+initramfsAt("7")+initramfsReleased+noFilesUnder(tmp))
+		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
+
+		argv, err := os.ReadFile(argvFile)
+		Expect(err).NotTo(HaveOccurred())
+		drives := concat(goldenQEMUVolumeDrive(0, "3"), goldenQEMUVolumeDrive(1, "4"), goldenQEMUVolumeDrive(2, "5"), goldenQEMUVolumeDrive(3, "6"))
+		Expect(string(argv)).To(HaveSuffix("\n" + strings.Join(drives, "\n") + "\n"))
+		for i, img := range imgs {
+			Expect(string(argv)).NotTo(ContainSubstring(dirs[i]))
+			Expect(statOf(img).Size).To(Equal(int64(size)))
+			Expect(lockedElsewhere(img)).To(BeFalse(), "the lock on %s ends with the run", img)
+			entries, err := os.ReadDir(dirs[i])
+			Expect(err).NotTo(HaveOccurred())
+			Expect(entries).To(HaveLen(1), "no temp name stays beside the image")
+		}
+		noWorkDirs()
+	})
+
+	It("gives each provider its own volume when one is JuiceFS and one is NFS, with the duplicate check and the shared lock wait for both", func() {
+		bind(2)
+		setMountInfo(mountinfoLine(40, dirs[0], "fuse.juicefs"),
+			nfsMountinfoLine(41, dirs[1], "nfs4", "10.0.0.5:/export", labNFSOptions))
+		GinkgoT().Setenv("VCAP_SERVICES", vcapWith(map[string][]string{
+			"nfs":     {mountJSON(dirs[1], "rw")},
+			"juicefs": {mountJSON(dirs[0], "rw")},
+		}))
+		type call struct {
+			provider    string
+			dir         string
+			before      bool
+			budget      *lockBudget
+			noDuplicate bool
+		}
+		var calls []call
+		var released []string
+		prepare := func(name string) func(prepareRequest) (*attachment, error) {
+			return func(r prepareRequest) (*attachment, error) {
+				c := call{provider: name, dir: r.Mount.ContainerDir, before: r.BeforeLock != nil, budget: r.LockBudget}
+				Expect(r.ImageName).To(Equal(imageName))
+				Expect(r.Mode).To(Equal(attachFileImage))
+				f := diskFile(defaultImageSize)
+				if r.BeforeLock != nil {
+					// A provider that calls BeforeLock before it locks sees the
+					// duplicate check pass for a disk of its own.
+					c.noDuplicate = r.BeforeLock(f) == nil
+				}
+				calls = append(calls, c)
+				return &attachment{File: f, Release: func() error { released = append(released, name); return f.Close() }}, nil
+			}
+		}
+		juice, nfs := fake("JuiceFS", "fuse.juicefs", strongMatch), fake("NFS", "nfs4", strongMatch)
+		juice.prepare, nfs.prepare = prepare("JuiceFS"), prepare("NFS")
+		withProviders(juice, nfs)
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
+
+		Expect(calls).To(HaveLen(2))
+		Expect(calls[0].provider).To(Equal("JuiceFS"))
+		Expect(calls[0].dir).To(Equal(dirs[0]))
+		Expect(calls[1].provider).To(Equal("NFS"))
+		Expect(calls[1].dir).To(Equal(dirs[1]))
+		for _, c := range calls {
+			Expect(c.before).To(BeTrue(), "%s got BeforeLock", c.provider)
+			Expect(c.noDuplicate).To(BeTrue(), "%s: its own disk is not a duplicate", c.provider)
+			Expect(c.budget).NotTo(BeNil(), "%s got the shared lock budget", c.provider)
+		}
+		Expect(calls[1].budget).To(BeIdenticalTo(calls[0].budget), "one lock wait for both volumes")
+		Expect(released).To(Equal([]string{"NFS", "JuiceFS"}))
+		argv, err := os.ReadFile(argvFile)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(argv)).To(ContainSubstring(strings.Join(concat(goldenQEMUVolumeDrive(0, "3"), goldenQEMUVolumeDrive(1, "4")), "\n")))
 	})
 
 	It("gives Firecracker each locked image as a drive of its own, in the order of the paths", func() {
@@ -714,6 +821,39 @@ var _ = Describe("run with several volumes", func() {
 		Expect(argvFile).NotTo(BeAnExistingFile())
 	})
 
+	It("refuses a duplicate across a JuiceFS and an NFS volume before either provider waits for a lock", func() {
+		bind(2)
+		setMountInfo(mountinfoLine(40, dirs[0], "fuse.juicefs"),
+			nfsMountinfoLine(41, dirs[1], "nfs4", "10.0.0.5:/export", labNFSOptions))
+		GinkgoT().Setenv("VCAP_SERVICES", vcapWith(map[string][]string{
+			"nfs":     {mountJSON(dirs[1], "rw")},
+			"juicefs": {mountJSON(dirs[0], "rw")},
+		}))
+		shared := diskFile(defaultImageSize)
+		Expect(shared.Close()).To(Succeed())
+		var released []string
+		prepare := func(name string) func(prepareRequest) (*attachment, error) {
+			return func(r prepareRequest) (*attachment, error) {
+				f, err := os.OpenFile(shared.Name(), os.O_RDWR, 0)
+				Expect(err).NotTo(HaveOccurred())
+				if err := r.BeforeLock(f); err != nil {
+					Expect(f.Close()).To(Succeed())
+					return nil, err
+				}
+				return &attachment{File: f, Release: func() error { released = append(released, name); return f.Close() }}, nil
+			}
+		}
+		juice, nfs := fake("JuiceFS", "fuse.juicefs", strongMatch), fake("NFS", "nfs4", strongMatch)
+		juice.prepare, nfs.prepare = prepare("JuiceFS"), prepare("NFS")
+		withProviders(juice, nfs)
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(HaveSuffix(sameImageLine()))
+		Expect(released).To(Equal([]string{"JuiceFS"}))
+		Expect(argvFile).NotTo(BeAnExistingFile())
+		noWorkDirs()
+	})
+
 	It("refuses volume images of different sizes, since the guest finds its volumes by size, and releases them all", func() {
 		bind(3)
 		var released []string
@@ -762,10 +902,10 @@ var _ = Describe("run with several volumes", func() {
 	It("checks every volume's mount before it prepares any, and creates nothing when a later one is refused", func() {
 		requireOpenat2()
 		bind(3)
-		setMountInfo(mountinfoLine(40, dirs[0], "fuse.juicefs"), mountinfoLine(41, dirs[1], "fuse.juicefs"), mountinfoLine(42, dirs[2], "nfs4"))
+		setMountInfo(mountinfoLine(40, dirs[0], "fuse.juicefs"), mountinfoLine(41, dirs[1], "fuse.juicefs"), mountinfoLine(42, dirs[2], "cifs"))
 		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
 		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
-		Expect(logBuf.String()).To(HaveSuffix("volume path " + quoteForLog(dirs[2]) + ` is a "nfs4" mount; VM backends support only JuiceFS volumes today` + "\n"))
+		Expect(logBuf.String()).To(HaveSuffix("volume path " + quoteForLog(dirs[2]) + ` is a "cifs" mount; VM backends support only JuiceFS and NFS volumes today` + "\n"))
 		for _, d := range dirs {
 			Expect(os.ReadDir(d)).To(BeEmpty())
 		}

@@ -595,8 +595,8 @@ var _ = Describe("findVolumeProviders", func() {
 
 	It("stops at the first volume it refuses", func() {
 		_, err := findAll([]string{"/a", "/b", "/c"},
-			mountinfoLine(40, "/a", "fuse.juicefs"), mountinfoLine(41, "/b", "nfs4"), mountinfoLine(42, "/c", "ext4"))
-		Expect(err).To(MatchError(`volume path "/b" is a "nfs4" mount; VM backends support only JuiceFS volumes today`))
+			mountinfoLine(40, "/a", "fuse.juicefs"), mountinfoLine(41, "/b", "cifs"), mountinfoLine(42, "/c", "ext4"))
+		Expect(err).To(MatchError(`volume path "/b" is a "cifs" mount; VM backends support only JuiceFS and NFS volumes today`))
 	})
 
 	It("refuses two volumes that show one directory of one filesystem", func() {

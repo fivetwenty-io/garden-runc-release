@@ -339,6 +339,50 @@ var _ = Describe("the NFS provider's Prepare", func() {
 		Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 	})
 
+	It("passes BeforeLock through as JuiceFS does, runs it on the open image before the lock, and fails the volume with its error", func() {
+		writeImage(img, 4<<20, nil)
+		holder, err := os.OpenFile(img, os.O_RDWR, 0)
+		Expect(err).NotTo(HaveOccurred())
+		defer holder.Close()
+		Expect(syscall.Flock(int(holder.Fd()), syscall.LOCK_EX)).To(Succeed())
+		// Another instance holds the lock for longer than the spec can wait,
+		// so an error from BeforeLock is the only way out in time.
+		defaultImageOptions.LockWait = 20 * time.Second
+		refusal := errors.New("the earlier volume holds this disk")
+		var seen []os.FileInfo
+		req := kernelNFS4()
+		req.BeforeLock = func(f *os.File) error {
+			st, err := f.Stat()
+			Expect(err).NotTo(HaveOccurred())
+			seen = append(seen, st)
+			return refusal
+		}
+		began := time.Now()
+		_, err = nfsProvider{}.Prepare(req)
+		Expect(err).To(BeIdenticalTo(refusal))
+		Expect(time.Since(began)).To(BeNumerically("<", 5*time.Second))
+		Expect(seen).To(HaveLen(1))
+		held, err := os.Stat(img)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(os.SameFile(seen[0], held)).To(BeTrue(), "BeforeLock got the image")
+	})
+
+	It("takes its lock wait from the LockBudget it is given, as JuiceFS does", func() {
+		writeImage(img, 4<<20, nil)
+		holder, err := os.OpenFile(img, os.O_RDWR, 0)
+		Expect(err).NotTo(HaveOccurred())
+		defer holder.Close()
+		Expect(syscall.Flock(int(holder.Fd()), syscall.LOCK_EX)).To(Succeed())
+		defaultImageOptions.LockWait = 20 * time.Second
+		req := kernelNFS4()
+		req.LockBudget = newLockBudget(150 * time.Millisecond)
+		began := time.Now()
+		_, err = nfsProvider{}.Prepare(req)
+		Expect(errors.Is(err, errVolumeInUse)).To(BeTrue(), "%v", err)
+		Expect(time.Since(began)).To(BeNumerically("<", 5*time.Second))
+		Expect(req.LockBudget.remaining).To(BeZero(), "the wait came out of the budget")
+	})
+
 	It("exits 128 plus the signal when one arrives while it writes the zeros, and leaves nothing on the volume", func() {
 		sigs := make(chan os.Signal, 1)
 		defaultImageOptions.fallocate = func(int, uint32, int64, int64) error { return unix.EOPNOTSUPP }

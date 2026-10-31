@@ -76,6 +76,8 @@ func (nfsProvider) Prepare(req prepareRequest) (*attachment, error) {
 	o := defaultImageOptions
 	o.Preallocate = true
 	o.Publish = publishLink
+	o.BeforeLock = req.BeforeLock
+	o.LockBudget = req.LockBudget
 	img, err := openVolumeImage(&guestVolume{
 		ContainerDir: req.Mount.ContainerDir, ImageName: req.ImageName,
 		MountID: req.Mount.MountID, MountIDKnown: true,
