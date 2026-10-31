@@ -373,8 +373,8 @@ var _ = Describe("the initramfs memfd against a real QEMU", func() {
 		qemu := realQEMU()
 		requireMicrovm(qemu)
 		// Every drive has a size of its own, so a serial on the wrong drive
-		// shows. The guest's /rvm/disks names none of them, so /init leaves
-		// them alone and the command reads them raw.
+		// shows. The guest's /rvm/disks names every drive, as stage 1 needs
+		// it to, and the command reads the serials and sizes raw.
 		sizes := []int64{1 << 20, 2 << 20, 3 << 20, 4 << 20}
 		vols := make([]*os.File, len(sizes))
 		for i, size := range sizes {
@@ -389,11 +389,20 @@ var _ = Describe("the initramfs memfd against a real QEMU", func() {
 		}
 		Expect(want).To(HaveLen(len(sizes) + 1))
 
-		f := memfdInitramfs(guestBusybox(), `for d in /sys/block/vd*; do echo "drive=$(cat "$d/serial"):$(cat "$d/size")"; done`, noGuestEnv)
+		g := taskGuest(`for d in /sys/block/vd*; do echo "drive=$(cat "$d/serial"):$(cat "$d/size")"; done`)
+		g.drives = drives
+		for i := range vols {
+			g.vols = append(g.vols, guestVolume{ContainerDir: "/vol" + strconv.Itoa(i), ImageName: "volume.img"})
+		}
+		g.rootBytes, g.rootInodeRatio = 8<<20, inodeRatioFor(8<<20)
+		f, err := newInitramfs(guestBusybox(), g)
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(f.Close)
 		files, drivePaths, initrdPath, _, rootPath := hypervisorFiles(vols, withUserspaceMark(f), nil, root)
 		argv := markedArgv(tcgArgv(qemu, withRealRootDrive(qemuArgv(art, initrdPath, minGuestMemoryMiB, taskNetwork(), drivePaths, 0), rootPath)))
 		code, stdout, stderr := bootRealQEMU(argv, files)
 		Expect(code).To(Equal(0), "QEMU failed: %s\n%s", stderr, stdout)
+		Expect(stdout).NotTo(ContainSubstring("vm-launch guest setup"), stdout)
 		Expect(stdout).To(ContainSubstring(exitTag(testNonce)+"0"), stdout)
 
 		got := map[string]string{}

@@ -27,9 +27,9 @@ const (
 )
 
 // goldenRootInit is the /init script, stage 1 of the guest's boot, of every
-// guest. It finds the drives by size, formats a blank guest root disk and
-// enters the overlay root on it when /rvm/disks names one, and runs stage 2
-// with the volume's device.
+// guest. It finds the drives by identity and checks their sizes, formats a
+// blank guest root disk and enters the overlay root on it when /rvm/disks
+// names one, and runs stage 2 with each volume's device.
 const goldenRootInit = `#!/bin/busybox sh
 /bin/busybox --install -s /bin
 export PATH=/bin
@@ -39,49 +39,97 @@ rvm_devtmpfs=
 mount -t devtmpfs dev /dev 2>/dev/null && rvm_devtmpfs=1
 rvm_fail() { echo "vm-launch guest setup: $1"; reboot -nf; exit 1; }
 rvm_number() { case "$1" in '' | 0* | *[!0-9]*) return 1 ;; esac; }
-rvm_disk() {
-	rvm_dev=
-	for rvm_b in "$1"/vd*; do
-		[ -r "$rvm_b/size" ] && read -r rvm_s 2>/dev/null <"$rvm_b/size" && [ "$rvm_s" = "$2" ] || continue
-		[ -z "$rvm_dev" ] || rvm_fail "two block devices, $rvm_dev and /dev/${rvm_b##*/}, have the size of the $3, so the guest cannot tell which one it is"
-		rvm_dev=/dev/${rvm_b##*/}
-	done
-	[ -n "$rvm_dev" ] && [ -b "$rvm_dev" ]
+rvm_ident() {
+	case "$1" in '' | *[!A-Za-z0-9-]*) return 1 ;; esac
+	[ "${#1}" -le 20 ]
 }
-. /rvm/disks
-if [ -n "${RVM_ROOT_SECTORS:-}" ]; then
-	rvm_number "$RVM_ROOT_SECTORS" && rvm_number "${RVM_ROOT_INODE_RATIO:-}" || rvm_fail "the guest root size or inode ratio in /rvm/disks is not a positive number"
-	[ "$RVM_ROOT_SECTORS" != "${RVM_VOLUME_SECTORS:-}" ] || rvm_fail "the guest root and the volume have the same size, so the guest cannot tell them apart"
-fi
-if [ -n "${RVM_VOLUME_SECTORS:-}" ]; then
-	rvm_number "$RVM_VOLUME_SECTORS" || rvm_fail "the volume size in /rvm/disks is not a positive number"
-fi
-rvm_root=
-rvm_volume=
-rvm_missing=
-rvm_find() {
+rvm_scan() {
 	rvm_missing=
-	if [ -n "${RVM_ROOT_SECTORS:-}" ]; then
-		if rvm_disk /sys/block "$RVM_ROOT_SECTORS" "guest root"; then
-			rvm_root=$rvm_dev
-		else
-			rvm_missing="no block device of $RVM_ROOT_SECTORS sectors for the guest root"
+	for rvm_d in $rvm_drives; do
+		eval "rvm_dev_$rvm_d="
+	done
+	for rvm_b in /sys/block/vd*; do
+		[ -e "$rvm_b" ] || continue
+		rvm_n=/dev/${rvm_b##*/}
+		if ! rvm_id=$(cat "$rvm_b/serial" 2>/dev/null); then
+			rvm_missing="${rvm_missing:+$rvm_missing, and }no readable identity yet on the block device $rvm_n"
+			continue
 		fi
-	fi
-	if [ -n "${RVM_VOLUME_SECTORS:-}" ]; then
-		if rvm_disk /sys/block "$RVM_VOLUME_SECTORS" volume; then
-			rvm_volume=$rvm_dev
+		[ -n "$rvm_id" ] || rvm_fail "the block device $rvm_n has no identity, so it is no drive /rvm/disks names, and the guest will not boot with it"
+		rvm_m=
+		for rvm_d in $rvm_drives; do
+			eval "rvm_w=\$rvm_want_$rvm_d"
+			if [ "$rvm_w" = "$rvm_id" ]; then
+				rvm_m=$rvm_d
+				break
+			fi
+		done
+		[ -n "$rvm_m" ] || rvm_fail "the block device $rvm_n has the identity $rvm_id, which /rvm/disks gives no drive, so the guest will not boot with it"
+		eval "rvm_o=\$rvm_dev_$rvm_m rvm_l=\$rvm_label_$rvm_m rvm_w=\$rvm_sectors_$rvm_m"
+		[ -z "$rvm_o" ] || rvm_fail "two block devices, $rvm_o and $rvm_n, have the identity $rvm_id of the $rvm_l, so the guest cannot tell which one it is"
+		eval "rvm_dev_$rvm_m=\$rvm_n"
+		if [ -r "$rvm_b/size" ] && read -r rvm_s 2>/dev/null <"$rvm_b/size"; then
+			[ "$rvm_s" = "$rvm_w" ] || rvm_fail "the $rvm_l $rvm_n has $rvm_s sectors, and /rvm/disks gives it $rvm_w, so the guest will not use it"
+			[ -b "$rvm_n" ] || rvm_missing="${rvm_missing:+$rvm_missing, and }no device node $rvm_n yet for the $rvm_l"
 		else
-			rvm_missing="${rvm_missing:+$rvm_missing, and }no block device of $RVM_VOLUME_SECTORS sectors for the volume"
+			rvm_missing="${rvm_missing:+$rvm_missing, and }no readable size yet for the $rvm_l on $rvm_n"
 		fi
-	fi
+	done
+	for rvm_d in $rvm_drives; do
+		eval "rvm_o=\$rvm_dev_$rvm_d rvm_l=\$rvm_label_$rvm_d rvm_w=\$rvm_want_$rvm_d"
+		[ -n "$rvm_o" ] || rvm_missing="${rvm_missing:+$rvm_missing, and }no block device with the identity $rvm_w for the $rvm_l"
+	done
 	[ -z "$rvm_missing" ]
 }
+. /rvm/disks
+rvm_drives=
+if [ -n "${RVM_ROOT_ID:-}${RVM_ROOT_SECTORS:-}" ]; then
+	rvm_number "${RVM_ROOT_SECTORS:-}" && rvm_number "${RVM_ROOT_INODE_RATIO:-}" || rvm_fail "the guest root size or inode ratio in /rvm/disks is not a positive number"
+	rvm_ident "${RVM_ROOT_ID:-}" || rvm_fail "the guest root drive's identity in /rvm/disks is not 1 to 20 letters, digits, and hyphens"
+	rvm_drives=root
+	rvm_want_root=$RVM_ROOT_ID
+	rvm_sectors_root=$RVM_ROOT_SECTORS
+	rvm_label_root="guest root drive"
+fi
+case "${RVM_VOLUMES:-}" in
+[0-4]) ;;
+*) rvm_fail "the volume count in /rvm/disks is not a number from 0 to 4" ;;
+esac
+rvm_i=0
+while [ "$rvm_i" -lt "$RVM_VOLUMES" ]; do
+	rvm_l="volume drive vol$rvm_i"
+	eval "rvm_k=\${RVM_VOL${rvm_i}_KIND:-} rvm_w=\${RVM_VOL${rvm_i}_ID:-} rvm_s=\${RVM_VOL${rvm_i}_SECTORS:-}"
+	case "$rvm_k" in
+	image) ;;
+	'') rvm_fail "the $rvm_l in /rvm/disks has no kind" ;;
+	*)
+		eval "rvm_dev_vol$rvm_i="
+		rvm_i=$((rvm_i + 1))
+		continue
+		;;
+	esac
+	rvm_ident "$rvm_w" || rvm_fail "the $rvm_l's identity in /rvm/disks is not 1 to 20 letters, digits, and hyphens"
+	rvm_number "$rvm_s" || rvm_fail "the $rvm_l's size in /rvm/disks is not a positive number"
+	for rvm_d in $rvm_drives; do
+		eval "rvm_o=\$rvm_want_$rvm_d rvm_ol=\$rvm_label_$rvm_d"
+		[ "$rvm_o" != "$rvm_w" ] || rvm_fail "the $rvm_ol and the $rvm_l have the one identity $rvm_w in /rvm/disks, so the guest cannot tell them apart"
+	done
+	eval "rvm_want_vol$rvm_i=\$rvm_w rvm_sectors_vol$rvm_i=\$rvm_s rvm_label_vol$rvm_i=\$rvm_l"
+	rvm_drives="$rvm_drives vol$rvm_i"
+	rvm_i=$((rvm_i + 1))
+done
 n=0
-until rvm_find; do
+until rvm_scan; do
 	n=$((n + 1))
 	[ "$n" -gt 5 ] && rvm_fail "$rvm_missing"
 	sleep 1
+done
+rvm_root=${rvm_dev_root:-}
+set --
+rvm_i=0
+while [ "$rvm_i" -lt "$RVM_VOLUMES" ]; do
+	eval "set -- \"\$@\" \"\$rvm_dev_vol$rvm_i\""
+	rvm_i=$((rvm_i + 1))
 done
 if [ -n "$rvm_root" ]; then
 	[ -n "$rvm_devtmpfs" ] || rvm_fail "mounting devtmpfs at /dev failed"
@@ -102,9 +150,9 @@ if [ -n "$rvm_root" ]; then
 		mount -o move "/$rvm_m" "/rvm/root/$rvm_m" || rvm_fail "moving /$rvm_m into the overlay root failed"
 	done
 	cd /rvm/root && mount -o move . / || rvm_fail "moving the overlay root onto / failed"
-	exec chroot . /bin/sh /rvm/init "$rvm_volume"
+	exec chroot . /bin/sh /rvm/init "$@"
 fi
-exec /bin/sh /rvm/init "$rvm_volume"
+exec /bin/sh /rvm/init "$@"
 `
 
 // archiveEntries parses a gzip newc archive into its entry names, in order,
@@ -144,20 +192,33 @@ var _ = Describe("guest volume initramfs", func() {
 		}
 	})
 
-	It("adds /rvm/mounts with the quoted path and the image name, and the volume's size to /rvm/disks", func() {
+	It("writes the numbers stage 1 compares in the text it gives the guest's shell", func() {
+		Expect(virtioBlockIDBytesText).To(Equal(strconv.Itoa(virtioBlockIDBytes)))
+		Expect(maxVolumesText).To(Equal(strconv.Itoa(maxVolumes)))
+		Expect(maxVolumesText).To(HaveLen(1), "stage 1 matches the volume count with a one-digit pattern")
+	})
+
+	It("adds /rvm/mounts with the count, the quoted path, and the image name, and the volume's drive to /rvm/disks", func() {
 		names, byName := archiveEntries(writeArchive(task, vol))
 		Expect(names).To(Equal([]string{"bin", "dev", "dev/console", "dev/null", "etc", "proc", "sys", "tmp", "rvm",
 			"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "rvm/limits", "etc/resolv.conf", "rvm/mounts", "rvm/disks", "rvm/init", "init", cpioTrailer}))
 		Expect(string(byName["rvm/mounts"].data)).To(Equal(
-			"RVM_VOLUME_PATH='/data/it'\\''s $here'\nRVM_VOLUME_IMAGE='rvm-disk-3.img'\n"))
+			"RVM_VOLUMES=1\nRVM_VOL0_PATH='/data/it'\\''s $here'\nRVM_VOL0_IMAGE='rvm-disk-3.img'\n"))
 		Expect(byName["rvm/mounts"].mode).To(Equal(uint32(0o100644)))
-		Expect(string(byName["rvm/disks"].data)).To(Equal("RVM_VOLUMES=1\nRVM_VOL0_KIND=image\nRVM_VOL0_ID=rvm-vol0\nRVM_VOL0_SECTORS=2097152\nRVM_VOLUME_SECTORS=2097152\n"))
+		Expect(string(byName["rvm/disks"].data)).To(Equal("RVM_VOLUMES=1\nRVM_VOL0_KIND=image\nRVM_VOL0_ID=rvm-vol0\nRVM_VOL0_SECTORS=2097152\n"))
 		Expect(string(byName["rvm/init"].data)).To(Equal(initScript(testNonce, true)))
+	})
 
-		path := writeTempFile("mounts", mountsFile(vol))
-		out, err := exec.Command("/bin/sh", "-c", `. "$1"; printf '%s|%s|%s' "${RVM_VOLUME_DEVICE-unset}" "$RVM_VOLUME_PATH" "$RVM_VOLUME_IMAGE"`, "sh", path).Output()
+	It("names every volume in /rvm/mounts by its index, in volume order, so that each sources back as it was", func() {
+		vols := []guestVolume{*vol, {ContainerDir: "/home/vcap/logs", ImageName: "rvm-disk-3.img"}, {ContainerDir: "/x y", ImageName: "z"}}
+		got := mountsFile(vols)
+		Expect(got).To(Equal("RVM_VOLUMES=3\n" +
+			"RVM_VOL0_PATH='/data/it'\\''s $here'\nRVM_VOL0_IMAGE='rvm-disk-3.img'\n" +
+			"RVM_VOL1_PATH='/home/vcap/logs'\nRVM_VOL1_IMAGE='rvm-disk-3.img'\n" +
+			"RVM_VOL2_PATH='/x y'\nRVM_VOL2_IMAGE='z'\n"))
+		out, err := exec.Command("/bin/sh", "-c", `. "$1"; printf '%s|' "${RVM_VOLUME_PATH-unset}" "$RVM_VOLUMES" "$RVM_VOL0_PATH" "$RVM_VOL0_IMAGE" "$RVM_VOL1_PATH" "$RVM_VOL2_PATH" "$RVM_VOL2_IMAGE"`, "sh", writeTempFile("mounts", got)).Output()
 		Expect(err).NotTo(HaveOccurred())
-		Expect(string(out)).To(Equal("unset|/data/it's $here|rvm-disk-3.img"))
+		Expect(string(out)).To(Equal("unset|3|/data/it's $here|rvm-disk-3.img|/home/vcap/logs|/x y|z|"))
 	})
 
 	It("adds /rvm/mounts after the network files of an LRP", func() {
@@ -177,7 +238,7 @@ var _ = Describe("guest volume initramfs", func() {
 		}
 	})
 
-	It("mounts the volume before the start tag and unmounts it after the command, before the exit tag", func() {
+	It("mounts the volumes before the start tag and unmounts them after the command, before the exit tag", func() {
 		script := initScript(testNonce, true)
 		start := strings.Index(script, "\necho RVM_START_"+testNonce+"\n")
 		Expect(start).To(BeNumerically(">", 0))
@@ -194,10 +255,10 @@ var _ = Describe("guest volume initramfs", func() {
 	})
 
 	It("formats only after a blank check, and mounts synchronously with the ext4 driver", func() {
-		Expect(guestVolumeSetup).To(HavePrefix(". /rvm/mounts\nRVM_VOLUME_DEVICE=${1:-}\n"))
-		Expect(guestVolumeSetup).To(ContainSubstring(`dd if="$RVM_VOLUME_DEVICE" of=/rvm/volume-head bs=4096 count=16 || rvm_fail`))
-		Expect(guestVolumeSetup).To(ContainSubstring(`mke2fs -F -m 0 -L rvm-volume "$RVM_VOLUME_DEVICE"`))
-		Expect(guestVolumeSetup).To(ContainSubstring(`mount -t ext4 -o sync,dirsync,noatime,errors=remount-ro "$RVM_VOLUME_DEVICE" "$RVM_VOLUME_PATH"`))
+		Expect(guestVolumeSetup).To(HavePrefix(". /rvm/mounts\n"))
+		Expect(guestVolumeSetup).To(ContainSubstring(`dd if="$rvm_vdev" of=/rvm/volume-head bs=4096 count=16 || rvm_fail`))
+		Expect(guestVolumeSetup).To(ContainSubstring(`mke2fs -F -m 0 -L rvm-volume "$rvm_vdev"`))
+		Expect(guestVolumeSetup).To(ContainSubstring(`mount -t ext4 -o sync,dirsync,noatime,errors=remount-ro "$rvm_vdev" "$rvm_vpath"`))
 		Expect(strings.Count(guestVolumeSetup, "mke2fs")).To(Equal(1))
 	})
 
@@ -233,6 +294,16 @@ var _ = Describe("guest volume initramfs", func() {
 			mnt     string
 		)
 
+		// writeMounts writes the test /rvm/mounts for mounts, the paths of
+		// the volumes in volume order, each with its own image name.
+		writeMounts := func(mounts ...string) {
+			var vols []guestVolume
+			for i, m := range mounts {
+				vols = append(vols, guestVolume{ContainerDir: m, ImageName: "rvm-disk-" + strconv.Itoa(i) + ".img"})
+			}
+			Expect(os.WriteFile(filepath.Join(dir, "mounts"), []byte(mountsFile(vols)), 0o644)).To(Succeed())
+		}
+
 		BeforeEach(func() {
 			dir = GinkgoT().TempDir()
 			bin = filepath.Join(dir, "bin")
@@ -242,45 +313,51 @@ var _ = Describe("guest volume initramfs", func() {
 			mnt = filepath.Join(dir, "mnt", "da'ta")
 
 			// Each stub records its argv. dd writes what DD_MODE says to its
-			// of= file; the others exit with their *_RC.
+			// of= file, or, for the device named in DD_DATA_IF, data; the
+			// others exit with their *_RC, and mount fails for the mount
+			// point MOUNT_FAIL_AT names.
 			stub := func(name, body string) {
 				script := "#!/bin/sh\necho \"" + name + " $*\" >> " + shellQuote(callLog) + "\n" + body + "\n"
 				Expect(os.WriteFile(filepath.Join(bin, name), []byte(script), 0o755)).To(Succeed())
 			}
-			stub("dd", `for a; do case $a in of=*) of=${a#of=} ;; esac; done
-case "$DD_MODE" in
+			stub("dd", `for a; do case $a in of=*) of=${a#of=} ;; if=*) in=${a#if=} ;; esac; done
+mode=$DD_MODE
+[ -n "${DD_DATA_IF:-}" ] && [ "$in" = "$DD_DATA_IF" ] && mode=data
+case "$mode" in
 zeros) head -c 65536 /dev/zero > "$of" ;;
 data) { head -c 1024 /dev/zero; printf 'E'; head -c 64511 /dev/zero; } > "$of" ;;
 empty) : > "$of" ;;
 fail) echo "dd: can't open device" >&2; exit 1 ;;
 esac`)
 			stub("mke2fs", `exit "${MKE2FS_RC:-0}"`)
-			stub("mount", `exit "${MOUNT_RC:-0}"`)
+			stub("mount", `for a; do last=$a; done
+[ -n "${MOUNT_FAIL_AT:-}" ] && [ "$last" = "$MOUNT_FAIL_AT" ] && exit 32
+exit "${MOUNT_RC:-0}"`)
 			stub("sleep", `exit 0`)
 			stub("sync", `exit 0`)
 			stub("umount", `exit "${UMOUNT_RC:-0}"`)
 
 			// This /rvm/mounts points the path at a test mount point. The
 			// device is the argument stage 1 passes, here a test file.
-			Expect(os.WriteFile(filepath.Join(dir, "mounts"), []byte("RVM_VOLUME_PATH="+shellQuote(mnt)+"\nRVM_VOLUME_IMAGE='rvm-disk-0.img'\n"), 0o644)).To(Succeed())
+			writeMounts(mnt)
 		})
 
 		// runWith executes rvm_fail and the volume setup under /bin/sh, with
-		// arg as stage 2's argument, the guest paths moved into the test
-		// directory, a regular file standing in for the block device, and
+		// args as stage 2's arguments, the guest paths moved into the test
+		// directory, a regular file standing in for each block device, and
 		// reboot replaced by a marker.
-		runWith := func(arg string, env ...string) setupRun {
+		runWith := func(args []string, env ...string) setupRun {
 			script := strings.NewReplacer(
 				"/rvm/mounts", filepath.Join(dir, "mounts"),
 				"/rvm/volume-", filepath.Join(dir, "volume-"),
-				`[ -b "$RVM_VOLUME_DEVICE" ]`, `[ -f "$RVM_VOLUME_DEVICE" ]`,
+				`[ -b "$rvm_vdev" ]`, `[ -f "$rvm_vdev" ]`,
 				"reboot -nf", "echo REBOOT",
 			).Replace(guestFailFunc+guestVolumeSetup) + "echo REACHED_START\n"
 			Expect(script).NotTo(ContainSubstring(guestVolumeHead))
 			Expect(script).NotTo(ContainSubstring(guestVolumeUsed))
 			Expect(script).NotTo(ContainSubstring("-b \""))
 
-			cmd := exec.Command("/bin/sh", "-c", script, "sh", arg)
+			cmd := exec.Command("/bin/sh", append([]string{"-c", script, "sh"}, args...)...)
 			cmd.Env = append([]string{"PATH=" + bin + ":/usr/bin:/bin"}, env...)
 			out, _ := cmd.CombinedOutput()
 			calls, err := os.ReadFile(callLog)
@@ -290,14 +367,15 @@ esac`)
 			Expect(err).NotTo(HaveOccurred())
 			return setupRun{out: string(out), calls: string(calls)}
 		}
-		run := func(env ...string) setupRun { return runWith(device, env...) }
+		run := func(env ...string) setupRun { return runWith([]string{device}, env...) }
 
 		// The stubs' expected argv lines, built once BeforeEach set the paths.
-		var mountCall, ddCall string
-		BeforeEach(func() {
-			mountCall = "mount -t ext4 -o sync,dirsync,noatime,errors=remount-ro " + device + " " + mnt + "\n"
-			ddCall = "dd if=" + device + " of=" + filepath.Join(dir, "volume-head") + " bs=4096 count=16\n"
-		})
+		mountCall := func(device, mnt string) string {
+			return "mount -t ext4 -o sync,dirsync,noatime,errors=remount-ro " + device + " " + mnt + "\n"
+		}
+		ddCall := func(device string) string {
+			return "dd if=" + device + " of=" + filepath.Join(dir, "volume-head") + " bs=4096 count=16\n"
+		}
 
 		BeforeEach(func() {
 			Expect(os.WriteFile(device, nil, 0o600)).To(Succeed())
@@ -307,7 +385,7 @@ esac`)
 			r := run("DD_MODE=zeros")
 			Expect(r.out).To(ContainSubstring("REACHED_START"))
 			Expect(r.out).NotTo(ContainSubstring("REBOOT"))
-			Expect(r.calls).To(Equal(ddCall + "mke2fs -F -m 0 -L rvm-volume " + device + "\n" + mountCall))
+			Expect(r.calls).To(Equal(ddCall(device) + "mke2fs -F -m 0 -L rvm-volume " + device + "\n" + mountCall(device, mnt)))
 			Expect(mnt).To(BeADirectory())
 			Expect(filepath.Join(dir, "volume-head")).NotTo(BeAnExistingFile())
 			Expect(filepath.Join(dir, "volume-used")).NotTo(BeAnExistingFile())
@@ -316,7 +394,64 @@ esac`)
 		It("mounts an image with data without formatting it", func() {
 			r := run("DD_MODE=data")
 			Expect(r.out).To(ContainSubstring("REACHED_START"))
-			Expect(r.calls).To(Equal(ddCall + mountCall))
+			Expect(r.calls).To(Equal(ddCall(device) + mountCall(device, mnt)))
+		})
+
+		It("mounts every volume on the device stage 1 passed in its place, in volume order, and formats only the blank ones", func() {
+			devices := []string{filepath.Join(dir, "vdc"), filepath.Join(dir, "vda"), filepath.Join(dir, "vdb")}
+			mounts := []string{filepath.Join(dir, "data"), filepath.Join(dir, "logs"), filepath.Join(dir, "cache dir")}
+			for _, d := range devices {
+				Expect(os.WriteFile(d, nil, 0o600)).To(Succeed())
+			}
+			writeMounts(mounts...)
+			r := runWith(devices, "DD_MODE=zeros", "DD_DATA_IF="+devices[1])
+			Expect(r.out).To(Equal("REACHED_START\n"))
+			Expect(r.calls).To(Equal(
+				ddCall(devices[0]) + "mke2fs -F -m 0 -L rvm-volume " + devices[0] + "\n" + mountCall(devices[0], mounts[0]) +
+					ddCall(devices[1]) + mountCall(devices[1], mounts[1]) +
+					ddCall(devices[2]) + "mke2fs -F -m 0 -L rvm-volume " + devices[2] + "\n" + mountCall(devices[2], mounts[2])))
+			for _, m := range mounts {
+				Expect(m).To(BeADirectory())
+			}
+		})
+
+		It("stops at the first volume whose setup fails, naming its image and path, and touches no later one", func() {
+			devices := []string{filepath.Join(dir, "vda"), filepath.Join(dir, "vdb"), filepath.Join(dir, "vdc")}
+			mounts := []string{filepath.Join(dir, "data"), filepath.Join(dir, "logs"), filepath.Join(dir, "cache")}
+			for _, d := range devices {
+				Expect(os.WriteFile(d, nil, 0o600)).To(Succeed())
+			}
+			writeMounts(mounts...)
+			r := runWith(devices, "DD_MODE=data", "MOUNT_FAIL_AT="+mounts[1])
+			Expect(r.out).To(Equal("vm-launch guest setup: mounting the volume image rvm-disk-1.img at " + mounts[1] + " failed; it is not blank, so vm-launch will not format it; inspect or delete rvm-disk-1.img on the volume\nREBOOT\n"))
+			Expect(r.calls).To(Equal(ddCall(devices[0]) + mountCall(devices[0], mounts[0]) + ddCall(devices[1]) + mountCall(devices[1], mounts[1])))
+			Expect(mounts[2]).NotTo(BeAnExistingFile())
+		})
+
+		It("fails at once, touching nothing, when stage 1 passed another number of devices than /rvm/mounts has volumes", func() {
+			writeMounts(mnt, filepath.Join(dir, "logs"))
+			for _, args := range [][]string{nil, {device}, {device, device, device}} {
+				r := runWith(args, "DD_MODE=zeros")
+				Expect(r.out).To(Equal(fmt.Sprintf("vm-launch guest setup: stage 1 passed %d volume devices for the 2 volumes in %s\nREBOOT\n", len(args), filepath.Join(dir, "mounts"))), "arguments %q", args)
+				Expect(r.calls).To(BeEmpty())
+				Expect(mnt).NotTo(BeAnExistingFile())
+			}
+		})
+
+		It("fails at once, touching nothing, when /rvm/mounts has no volume count it can use or no path for a volume", func() {
+			mounts := filepath.Join(dir, "mounts")
+			for content, line := range map[string]string{
+				"":                                  "the volume count in " + mounts + " is not a number from 1 to 4",
+				"RVM_VOLUMES=0\n":                   "the volume count in " + mounts + " is not a number from 1 to 4",
+				"RVM_VOLUMES=5\n":                   "the volume count in " + mounts + " is not a number from 1 to 4",
+				"RVM_VOLUMES=x\n":                   "the volume count in " + mounts + " is not a number from 1 to 4",
+				"RVM_VOLUMES=1\nRVM_VOL0_IMAGE=a\n": mounts + " gives volume 0 no path",
+			} {
+				Expect(os.WriteFile(mounts, []byte(content), 0o644)).To(Succeed())
+				r := run("DD_MODE=zeros")
+				Expect(r.out).To(Equal("vm-launch guest setup: "+line+"\nREBOOT\n"), "%q", content)
+				Expect(r.calls).To(BeEmpty())
+			}
 		})
 
 		It("never formats an image with data that does not mount", func() {
@@ -331,7 +466,7 @@ esac`)
 			r := run("DD_MODE=fail")
 			Expect(r.out).To(ContainSubstring("vm-launch guest setup: reading the start of " + device + " failed"))
 			Expect(r.out).To(ContainSubstring("REBOOT"))
-			Expect(r.calls).To(Equal(ddCall))
+			Expect(r.calls).To(Equal(ddCall(device)))
 		})
 
 		It("does not format an image it read nothing from", func() {
@@ -342,7 +477,7 @@ esac`)
 
 		It("fails when formatting fails", func() {
 			r := run("DD_MODE=zeros", "MKE2FS_RC=1")
-			Expect(r.out).To(ContainSubstring("vm-launch guest setup: formatting the blank volume image rvm-disk-0.img failed"))
+			Expect(r.out).To(ContainSubstring("vm-launch guest setup: formatting the blank volume image rvm-disk-0.img for " + mnt + " failed"))
 			Expect(r.out).NotTo(ContainSubstring("REACHED_START"))
 			Expect(r.calls).NotTo(ContainSubstring("mount -t"))
 		})
@@ -353,10 +488,10 @@ esac`)
 			Expect(r.out).NotTo(ContainSubstring("REACHED_START"))
 		})
 
-		It("fails at once, touching nothing, when stage 1 passed no device or one that is missing", func() {
+		It("fails at once, touching nothing, when stage 1 passed an empty device or one that is missing", func() {
 			for _, arg := range []string{"", filepath.Join(dir, "vdz")} {
-				r := runWith(arg, "DD_MODE=zeros")
-				Expect(r.out).To(Equal("vm-launch guest setup: no block device for the volume image rvm-disk-0.img\nREBOOT\n"), "argument %q", arg)
+				r := runWith([]string{arg}, "DD_MODE=zeros")
+				Expect(r.out).To(Equal("vm-launch guest setup: no block device for the volume image rvm-disk-0.img at "+mnt+"\nREBOOT\n"), "argument %q", arg)
 				Expect(r.calls).To(BeEmpty(), "argument %q", arg)
 				Expect(mnt).NotTo(BeAnExistingFile())
 			}
@@ -385,6 +520,16 @@ esac`)
 				r := teardown("7")
 				Expect(r.out).To(Equal("status=7\n"))
 				Expect(r.calls).To(Equal("sync -f " + mnt + "\numount " + mnt + "\n"))
+			})
+
+			It("syncs and unmounts every volume, last first", func() {
+				mounts := []string{filepath.Join(dir, "data"), filepath.Join(dir, "logs"), filepath.Join(dir, "cache dir")}
+				writeMounts(mounts...)
+				r := teardown("3")
+				Expect(r.out).To(Equal("status=3\n"))
+				Expect(r.calls).To(Equal("sync -f " + mounts[2] + "\numount " + mounts[2] + "\n" +
+					"sync -f " + mounts[1] + "\numount " + mounts[1] + "\n" +
+					"sync -f " + mounts[0] + "\numount " + mounts[0] + "\n"))
 			})
 
 			It("reports a failed unmount and still keeps the command's status", func() {
@@ -521,24 +666,31 @@ var _ = Describe("the guest's /rvm/disks", func() {
 	// QEMU.
 	const goldenVol0Disks = "RVM_VOL0_KIND=image\nRVM_VOL0_ID=rvm-vol0\nRVM_VOL0_SECTORS=2097152\n"
 
+	// guestWith returns a task guest with a root disk of rootBytes at ratio
+	// bytes per inode, when rootBytes is not 0, and vol on a 1 GiB image,
+	// when vol is not nil, both with their QEMU serials.
+	guestWith := func(rootBytes, ratio int64, vol *guestVolume) guestContents {
+		g := taskGuest("true")
+		g.rootBytes, g.rootInodeRatio = rootBytes, ratio
+		if rootBytes > 0 {
+			g.drives.rootID = qemuRootSerial
+		}
+		if vol != nil {
+			g.vols, g.drives.volumes = []guestVolume{*vol}, qemuImageDrives(defaultImageSize)
+		}
+		return g
+	}
+
 	DescribeTable("names each drive the guest has by its identity and its size in sectors",
 		func(rootBytes, ratio int64, vol *guestVolume, want string) {
-			g := taskGuest("true")
-			g.rootBytes, g.rootInodeRatio, g.vol = rootBytes, ratio, vol
-			if rootBytes > 0 {
-				g.drives.rootID = qemuRootSerial
-			}
-			if vol != nil {
-				g.drives.volumes = qemuImageDrives(defaultImageSize)
-			}
-			got, err := disksFile(g)
+			got, err := disksFile(guestWith(rootBytes, ratio, vol))
 			Expect(err).NotTo(HaveOccurred())
 			Expect(got).To(Equal(want))
 
-			out, err := exec.Command("/bin/sh", "-c", `. "$1"; printf '%s|%s|%s' "${RVM_ROOT_SECTORS-unset}" "${RVM_ROOT_INODE_RATIO-unset}" "${RVM_VOLUME_SECTORS-unset}"`, "sh", writeTempFile("disks", got)).Output()
+			out, err := exec.Command("/bin/sh", "-c", `. "$1"; printf '%s|%s|%s|%s' "${RVM_ROOT_SECTORS-unset}" "${RVM_ROOT_INODE_RATIO-unset}" "${RVM_VOL0_SECTORS-unset}" "${RVM_VOLUME_SECTORS-unset}"`, "sh", writeTempFile("disks", got)).Output()
 			Expect(err).NotTo(HaveOccurred())
 			fields := strings.Split(string(out), "|")
-			Expect(fields).To(HaveLen(3))
+			Expect(fields).To(HaveLen(4))
 			if rootBytes > 0 {
 				Expect(fields[:2]).To(Equal([]string{strconv.FormatInt(rootBytes/512, 10), strconv.FormatInt(ratio, 10)}))
 			} else {
@@ -549,26 +701,22 @@ var _ = Describe("the guest's /rvm/disks", func() {
 			} else {
 				Expect(fields[2]).To(Equal("unset"))
 			}
+			Expect(fields[3]).To(Equal("unset"), "the guest finds the volume by its identity, not by a size")
 		},
 		Entry("no root disk and no volume", int64(0), int64(0), nil, "RVM_VOLUMES=0\n"),
 		Entry("a root disk", int64(rootBytes), int64(16384), nil, "RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=131072\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUMES=0\n"),
-		Entry("a volume", int64(0), int64(0), vol, "RVM_VOLUMES=1\n"+goldenVol0Disks+"RVM_VOLUME_SECTORS=2097152\n"),
-		Entry("both", int64(rootBytes), int64(16384), vol, "RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=131072\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUMES=1\n"+goldenVol0Disks+"RVM_VOLUME_SECTORS=2097152\n"),
-		Entry("a root disk 1 MiB under the volume's size, as rootDiskSize makes it", int64(defaultImageSize-bytesPerMiB), int64(16384), vol,
-			"RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=2095104\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUMES=1\n"+goldenVol0Disks+"RVM_VOLUME_SECTORS=2097152\n"),
+		Entry("a volume", int64(0), int64(0), vol, "RVM_VOLUMES=1\n"+goldenVol0Disks),
+		Entry("both", int64(rootBytes), int64(16384), vol, "RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=131072\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUMES=1\n"+goldenVol0Disks),
+		Entry("a root disk of the volume's size, since the guest tells the drives apart by identity", int64(defaultImageSize), int64(16384), vol,
+			"RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=2097152\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUMES=1\n"+goldenVol0Disks),
+		Entry("a root disk larger than the volume", int64(2*defaultImageSize), int64(16384), vol,
+			"RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=4194304\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUMES=1\n"+goldenVol0Disks),
 		Entry("a root disk of the volume's size without a volume", int64(defaultImageSize), int64(16384), nil, "RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=2097152\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUMES=0\n"),
 	)
 
-	DescribeTable("rejects sizes that would leave the guest to guess, so no initramfs is built",
+	DescribeTable("rejects a root disk the guest could not format as asked, so no initramfs is built",
 		func(rootBytes, ratio int64, vol *guestVolume, want string) {
-			g := taskGuest("true")
-			g.rootBytes, g.rootInodeRatio, g.vol = rootBytes, ratio, vol
-			if rootBytes > 0 {
-				g.drives.rootID = qemuRootSerial
-			}
-			if vol != nil {
-				g.drives.volumes = qemuImageDrives(defaultImageSize)
-			}
+			g := guestWith(rootBytes, ratio, vol)
 			_, err := disksFile(g)
 			Expect(err).To(MatchError(want))
 
@@ -579,8 +727,6 @@ var _ = Describe("the guest's /rvm/disks", func() {
 			Expect(err).To(MatchError("writing the initramfs: " + want))
 			Expect(heldInitramfs()).To(Equal(held))
 		},
-		Entry("a root disk of the volume's size", int64(defaultImageSize), int64(16384), vol,
-			"the guest root image and the volume image are both 1073741824 bytes, so the guest could not tell them apart"),
 		Entry("a root disk of part of a sector", int64(rootBytes+100), int64(16384), nil,
 			"the guest root image of 67108964 bytes is not a whole number of 512-byte sectors"),
 		Entry("a root disk without an inode ratio", int64(rootBytes), int64(0), vol, "the guest root image of 67108864 bytes has no inode ratio"),
@@ -590,22 +736,17 @@ var _ = Describe("the guest's /rvm/disks", func() {
 	)
 
 	It("names the size of the volume image it was given, not the size of a new one", func() {
-		g := taskGuest("true")
-		g.vol, g.drives.volumes = vol, qemuImageDrives(2*defaultImageSize)
-		g.rootBytes, g.rootInodeRatio, g.drives.rootID = defaultImageSize, 16384, qemuRootSerial
+		g := guestWith(defaultImageSize, 16384, vol)
+		g.drives.volumes = qemuImageDrives(2 * defaultImageSize)
 		got, err := disksFile(g)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(got).To(Equal("RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=2097152\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUMES=1\nRVM_VOL0_KIND=image\nRVM_VOL0_ID=rvm-vol0\nRVM_VOL0_SECTORS=4194304\nRVM_VOLUME_SECTORS=4194304\n"))
-
-		g.rootBytes = 2 * defaultImageSize
-		_, err = disksFile(g)
-		Expect(err).To(MatchError("the guest root image and the volume image are both 2147483648 bytes, so the guest could not tell them apart"))
+		Expect(got).To(Equal("RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=2097152\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUMES=1\nRVM_VOL0_KIND=image\nRVM_VOL0_ID=rvm-vol0\nRVM_VOL0_SECTORS=4194304\n"))
 	})
 
 	DescribeTable("rejects a volume image whose size is not a whole number of sectors",
 		func(volumeBytes int64) {
-			g := taskGuest("true")
-			g.vol, g.drives.volumes = vol, qemuImageDrives(volumeBytes)
+			g := guestWith(0, 0, vol)
+			g.drives.volumes = qemuImageDrives(volumeBytes)
 			_, err := disksFile(g)
 			Expect(err).To(MatchError(fmt.Sprintf("the volume image of %d bytes on drive vol0 is not a positive whole number of 512-byte sectors", volumeBytes)))
 		},
@@ -627,8 +768,21 @@ var _ = Describe("stage 1 of the guest's boot", func() {
 		volumeSectors = "2097152"
 		rootSectors   = "131072"
 		rootRatio     = "16384"
-		bothDisks     = "RVM_ROOT_SECTORS=" + rootSectors + "\nRVM_ROOT_INODE_RATIO=" + rootRatio + "\nRVM_VOLUME_SECTORS=" + volumeSectors + "\n"
 	)
+
+	// rootEntry is what /rvm/disks names a guest root drive by, with the
+	// identity id and a size of sectors, and volEntry the same for the
+	// image volume at index i.
+	rootEntry := func(id, sectors string) string {
+		return "RVM_ROOT_ID=" + id + "\nRVM_ROOT_SECTORS=" + sectors + "\nRVM_ROOT_INODE_RATIO=" + rootRatio + "\n"
+	}
+	volEntry := func(i int, id, sectors string) string {
+		n := strconv.Itoa(i)
+		return "RVM_VOL" + n + "_KIND=image\nRVM_VOL" + n + "_ID=" + id + "\nRVM_VOL" + n + "_SECTORS=" + sectors + "\n"
+	}
+	// bothDisks names a 64 MiB root and one 1 GiB volume by their QEMU
+	// serials.
+	bothDisks := rootEntry("rvm-root", rootSectors) + "RVM_VOLUMES=1\n" + volEntry(0, "rvm-vol0", volumeSectors)
 
 	type stage1Run struct {
 		out   string
@@ -640,12 +794,14 @@ var _ = Describe("stage 1 of the guest's boot", func() {
 		dir     string
 		bin     string
 		callLog string
+		late    string
 	)
 
 	BeforeEach(func() {
 		dir = GinkgoT().TempDir()
 		bin = filepath.Join(dir, "bin")
 		callLog = filepath.Join(dir, "calls")
+		late = filepath.Join(dir, "late")
 		for _, d := range []string{bin, filepath.Join(dir, "sys", "block"), filepath.Join(dir, "dev")} {
 			Expect(os.MkdirAll(d, 0o755)).To(Succeed())
 		}
@@ -660,29 +816,36 @@ var _ = Describe("stage 1 of the guest's boot", func() {
 		stub("mke2fs", `exit "${MKE2FS_RC:-0}"`)
 		stub("mount", `[ -n "${MOUNT_FAIL:-}" ] && [ "$2" = "$MOUNT_FAIL" ] && exit 32
 exit 0`)
-		// sleep appears the device file that NODE_AT names, as a late probe
-		// would create it, blank.
-		stub("sleep", `[ -z "${NODE_AT:-}" ] || dd if=/dev/zero of="$NODE_AT" bs=4096 count=16 2>/dev/null
+		// The first sleep runs the script in late, once, as a late probe
+		// would make a device, its device file, or its identity appear.
+		stub("sleep", `if [ -f `+shellQuote(late)+` ]; then
+	mv `+shellQuote(late)+` `+shellQuote(late+".ran")+` && sh `+shellQuote(late+".ran")+`
+fi
 exit 0`)
 		stub("chroot", `echo "chroot in $(pwd -P)" >> `+shellQuote(callLog))
 		stub("stage2", `exit 0`)
 	})
 
-	// disk adds the block device name to the fake sysfs with size sectors
-	// and, unless content is nil, its device file with content.
-	disk := func(name, sectors string, content []byte) {
-		Expect(os.MkdirAll(filepath.Join(dir, "sys", "block", name), 0o755)).To(Succeed())
-		Expect(os.WriteFile(filepath.Join(dir, "sys", "block", name, "size"), []byte(sectors+"\n"), 0o444)).To(Succeed())
+	// sysBlock is the fake sysfs directory of the block device name.
+	sysBlock := func(name string) string { return filepath.Join(dir, "sys", "block", name) }
+	dev := func(name string) string { return filepath.Join(dir, "dev", name) }
+
+	// disk adds the block device name to the fake sysfs with the identity
+	// serial, written without a newline as virtio_blk gives it, and size
+	// sectors, and, unless content is nil, its device file with content.
+	disk := func(name, serial, sectors string, content []byte) {
+		Expect(os.MkdirAll(sysBlock(name), 0o755)).To(Succeed())
+		Expect(os.WriteFile(filepath.Join(sysBlock(name), "serial"), []byte(serial), 0o444)).To(Succeed())
+		Expect(os.WriteFile(filepath.Join(sysBlock(name), "size"), []byte(sectors+"\n"), 0o444)).To(Succeed())
 		if content != nil {
-			Expect(os.WriteFile(filepath.Join(dir, "dev", name), content, 0o600)).To(Succeed())
+			Expect(os.WriteFile(dev(name), content, 0o600)).To(Succeed())
 		}
 	}
-	dev := func(name string) string { return filepath.Join(dir, "dev", name) }
 
 	// reset takes the test directory back to no devices, no calls, and no
 	// mount points, keeping the stubs.
 	reset := func() {
-		for _, p := range []string{callLog, filepath.Join(dir, "disk"), filepath.Join(dir, "root"), filepath.Join(dir, "sys"), filepath.Join(dir, "dev")} {
+		for _, p := range []string{callLog, late, late + ".ran", filepath.Join(dir, "disk"), filepath.Join(dir, "root"), filepath.Join(dir, "sys"), filepath.Join(dir, "dev")} {
 			Expect(os.RemoveAll(p)).To(Succeed())
 		}
 		Expect(os.MkdirAll(filepath.Join(dir, "sys", "block"), 0o755)).To(Succeed())
@@ -696,14 +859,21 @@ exit 0`)
 	formatted := make([]byte, 128<<10)
 	formatted[1024+56], formatted[1024+57] = 0x53, 0xef
 
+	// standard adds the volume as vda and the guest root as vdb, with their
+	// QEMU serials and the sizes bothDisks gives them.
+	standard := func() {
+		disk("vda", "rvm-vol0", volumeSectors, formatted)
+		disk("vdb", "rvm-root", rootSectors, blank)
+	}
+
 	// run executes stage 1 from rvm_fail on in shell, with disks as
 	// /rvm/disks, the guest paths moved into the test directory, the
 	// commands that would change the host stubbed, and reboot replaced by
-	// a marker. dd, tr, rm, and mkdir are the real ones. The overlay root
-	// has the shell and stage 2 unless env holds NO_SH=1 or NO_STAGE2=1, and
-	// the devtmpfs mount succeeds unless env holds NO_DEVTMPFS=1. The device
-	// files are regular files, so the check for a block device is for any
-	// file.
+	// a marker. dd, tr, rm, cat, and mkdir are the real ones. The overlay
+	// root has the shell and stage 2 unless env holds NO_SH=1 or
+	// NO_STAGE2=1, and the devtmpfs mount succeeds unless env holds
+	// NO_DEVTMPFS=1. The device files are regular files, so the check for a
+	// block device is for any file.
 	run := func(shell guestShell, disks string, env ...string) stage1Run {
 		Expect(os.WriteFile(filepath.Join(dir, "disks"), []byte(disks), 0o644)).To(Succeed())
 		if !slices.Contains(env, "NO_SH=1") {
@@ -719,6 +889,7 @@ exit 0`)
 			devtmpfs = "rvm_devtmpfs=\n"
 		}
 		Expect(guestRootInit).To(HavePrefix(stage1Head))
+		Expect(guestRootInit).To(ContainSubstring(`[ -b "$rvm_n" ]`))
 		script := strings.NewReplacer(
 			"/rvm/disks", filepath.Join(dir, "disks"),
 			"/rvm/root-", filepath.Join(dir, "root-"),
@@ -726,7 +897,7 @@ exit 0`)
 			"/rvm/root", filepath.Join(dir, "root"),
 			"/sys/block", filepath.Join(dir, "sys", "block"),
 			"/dev/${rvm_b##*/}", filepath.Join(dir, "dev")+"/${rvm_b##*/}",
-			`[ -b "$rvm_dev" ]`, `[ -e "$rvm_dev" ]`,
+			`[ -b "$rvm_n" ]`, `[ -e "$rvm_n" ]`,
 			"mke2fs -F", filepath.Join(bin, "mke2fs")+" -F",
 			"mount -", filepath.Join(bin, "mount")+" -",
 			"sleep 1", filepath.Join(bin, "sleep")+" 1",
@@ -737,6 +908,7 @@ exit 0`)
 		script = devtmpfs + script
 		Expect(strings.ReplaceAll(script, guestStage2, "")).NotTo(ContainSubstring("/rvm/"))
 		Expect(script).NotTo(ContainSubstring(" /sys/"))
+		Expect(script).NotTo(ContainSubstring("-b \""))
 
 		c := exec.Command(shell.argv[0], append(shell.argv[1:], "-c", script)...)
 		c.Env = append([]string{"PATH=/usr/bin:/bin"}, env...)
@@ -764,9 +936,22 @@ exit 0`)
 		Expect(r.calls).To(Equal(calls), r.out)
 	}
 
+	// handoff is the end of stage 2's command line: the volumes' devices, in
+	// volume order, as stage 1 passes them.
+	handoff := func(volumes []string) string {
+		if len(volumes) == 0 {
+			return ""
+		}
+		return " " + strings.Join(volumes, " ")
+	}
+
+	// ramRoot is what the stubs record for a guest that keeps the RAM root
+	// and passes volumes to stage 2.
+	ramRoot := func(volumes ...string) string { return "stage2 " + guestStage2 + handoff(volumes) + "\n" }
+
 	// entered is what the stubs record for a root disk at root that stage
-	// 1 formats and enters, passing volume to stage 2.
-	entered := func(root, volume string) string {
+	// 1 formats and enters, passing volumes to stage 2.
+	entered := func(root string, volumes ...string) string {
 		d := filepath.Join(dir, "disk")
 		r := filepath.Join(dir, "root")
 		real, err := filepath.EvalSymlinks(dir)
@@ -778,25 +963,39 @@ exit 0`)
 			"mount -o move /sys " + r + "/sys\n" +
 			"mount -o move /dev " + r + "/dev\n" +
 			"mount -o move . /\n" +
-			"chroot . /bin/sh /rvm/init " + volume + "\n" +
+			"chroot . /bin/sh " + guestStage2 + handoff(volumes) + "\n" +
 			"chroot in " + filepath.Join(real, "root") + "\n"
 	}
 
-	DescribeTable("formats the one device of the root's size and hands the volume's device to stage 2, in either device order",
+	// The harness moves /rvm/disks into dir, and the messages name it.
+	disksPath := func() string { return filepath.Join(dir, "disks") }
+
+	DescribeTable("finds the drives by identity alone, in any device order and with one size for all, and hands each volume's device to stage 2 in volume order",
 		func(shellOf func() guestShell) {
 			shell := shellOf()
-			for _, order := range [][2]string{{"vda", "vdb"}, {"vdb", "vda"}} {
-				volume, root := order[0], order[1]
+			// The root and both volumes have one size, so only their
+			// identities tell them apart.
+			disks := rootEntry("rvm-root", volumeSectors) + "RVM_VOLUMES=2\n" + volEntry(0, "rvm-vol0", volumeSectors) + volEntry(1, "rvm-vol1", volumeSectors)
+			for _, order := range [][3]string{{"rvm-root", "rvm-vol0", "rvm-vol1"}, {"rvm-vol1", "rvm-root", "rvm-vol0"}, {"rvm-vol0", "rvm-vol1", "rvm-root"}} {
 				reset()
-				disk(volume, volumeSectors, formatted)
-				disk(root, rootSectors, blank)
+				at := map[string]string{}
+				for i, id := range order {
+					name := "vd" + string(rune('a'+i))
+					at[id] = name
+					content := formatted
+					if id == "rvm-root" {
+						content = blank
+					}
+					disk(name, id, volumeSectors, content)
+				}
 
-				r := run(shell, bothDisks)
-				Expect(r.code).To(Equal(0), "%s, root %s: %s", shell.name, root, r.out)
+				r := run(shell, disks)
+				Expect(r.code).To(Equal(0), "%s, order %v: %s", shell.name, order, r.out)
 				Expect(r.out).NotTo(ContainSubstring("vm-launch guest setup"))
-				Expect(r.calls).To(Equal(entered(dev(root), dev(volume))), "%s, root %s", shell.name, root)
-				Expect(r.calls).NotTo(ContainSubstring("mke2fs -F -b 4096 -m 0 -I 256 -i " + rootRatio + " -L rvm-root " + dev(volume)))
-				Expect(os.ReadFile(dev(volume))).To(Equal(formatted), "the volume is never written")
+				Expect(r.calls).To(Equal(entered(dev(at["rvm-root"]), dev(at["rvm-vol0"]), dev(at["rvm-vol1"]))), "%s, order %v", shell.name, order)
+				for _, v := range []string{"rvm-vol0", "rvm-vol1"} {
+					Expect(os.ReadFile(dev(at[v]))).To(Equal(formatted), "the volume %s is never written", v)
+				}
 				Expect(filepath.Join(dir, "disk", "upper")).To(BeADirectory())
 				Expect(filepath.Join(dir, "disk", "work")).To(BeADirectory())
 				Expect(filepath.Join(dir, "root-head")).NotTo(BeAnExistingFile())
@@ -806,141 +1005,275 @@ exit 0`)
 		shellEntries(""),
 	)
 
+	DescribeTable("matches the identities Firecracker gives, and an identity read with a newline",
+		func(shellOf func() guestShell) {
+			shell := shellOf()
+			const rootID, volID = "64768123456789012345", "6476802-1"
+			disk("vda", volID+"\n", volumeSectors, formatted)
+			disk("vdb", rootID, rootSectors, blank)
+			r := run(shell, rootEntry(rootID, rootSectors)+"RVM_VOLUMES=1\n"+volEntry(0, volID, volumeSectors))
+			Expect(r.code).To(Equal(0), r.out)
+			Expect(r.calls).To(Equal(entered(dev("vdb"), dev("vda"))))
+		},
+		shellEntries(""),
+	)
+
 	DescribeTable("keeps the RAM root and formats nothing when /rvm/disks names no root disk",
 		func(shellOf func() guestShell) {
 			shell := shellOf()
-			disk("vda", volumeSectors, formatted)
-			r := run(shell, "RVM_VOLUME_SECTORS="+volumeSectors+"\n")
+			disk("vda", "rvm-vol1", volumeSectors, formatted)
+			disk("vdb", "rvm-vol0", rootSectors, formatted)
+			r := run(shell, "RVM_VOLUMES=2\n"+volEntry(0, "rvm-vol0", rootSectors)+volEntry(1, "rvm-vol1", volumeSectors))
 			Expect(r.code).To(Equal(0), r.out)
-			Expect(r.calls).To(Equal("stage2 /rvm/init " + dev("vda") + "\n"))
+			Expect(r.calls).To(Equal(ramRoot(dev("vdb"), dev("vda"))))
 			Expect(filepath.Join(dir, "disk")).NotTo(BeAnExistingFile())
 			Expect(os.ReadFile(dev("vda"))).To(Equal(formatted))
 
-			Expect(os.Remove(callLog)).To(Succeed())
-			r = run(shell, "")
+			reset()
+			r = run(shell, "RVM_VOLUMES=0\n")
 			Expect(r.code).To(Equal(0), r.out)
-			Expect(r.calls).To(Equal("stage2 /rvm/init \n"))
+			Expect(r.calls).To(Equal(ramRoot()))
 		},
 		shellEntries(""),
 	)
 
-	DescribeTable("never formats the volume: it fails before touching any device when the sizes cannot tell the drives apart",
+	DescribeTable("keeps the place of a volume without a drive, passing it an empty argument, and still refuses a device no drive names",
 		func(shellOf func() guestShell) {
 			shell := shellOf()
-			disk("vda", volumeSectors, formatted)
-			r := run(shell, "RVM_ROOT_SECTORS="+volumeSectors+"\nRVM_ROOT_INODE_RATIO="+rootRatio+"\nRVM_VOLUME_SECTORS="+volumeSectors+"\n")
-			failed(r, "the guest root and the volume have the same size, so the guest cannot tell them apart", "")
+			disks := "RVM_VOLUMES=3\n" + volEntry(0, "rvm-vol0", volumeSectors) + "RVM_VOL1_KIND=share\n" + volEntry(2, "rvm-vol2", volumeSectors)
+			disk("vda", "rvm-vol2", volumeSectors, formatted)
+			disk("vdb", "rvm-vol0", volumeSectors, formatted)
+			// A variable the kernel left in init's environment does not
+			// stand in for the volume without a drive.
+			r := run(shell, disks, "rvm_dev_vol1="+dev("vda"))
+			Expect(r.code).To(Equal(0), r.out)
+			Expect(r.calls).To(Equal(ramRoot(dev("vdb"), "", dev("vda"))))
+
+			reset()
+			disk("vda", "rvm-vol2", volumeSectors, formatted)
+			disk("vdb", "rvm-vol0", volumeSectors, formatted)
+			disk("vdc", "rvm-vol1", volumeSectors, formatted)
+			failed(run(shell, disks), "the block device "+dev("vdc")+" has the identity rvm-vol1, which "+disksPath()+" gives no drive, so the guest will not boot with it", "")
+		},
+		shellEntries(""),
+	)
+
+	DescribeTable("fails at once, touching no device, on a block device that /rvm/disks names no drive by",
+		func(shellOf func() guestShell) {
+			shell := shellOf()
+			standard()
+			disk("vdc", "rvm-vol1", volumeSectors, formatted)
+			failed(run(shell, bothDisks), "the block device "+dev("vdc")+" has the identity rvm-vol1, which "+disksPath()+" gives no drive, so the guest will not boot with it", "")
+
+			// A device without an identity, as virtio_blk gives one whose
+			// hypervisor sets none, is no drive /rvm/disks names either.
+			reset()
+			standard()
+			disk("vdc", "", volumeSectors, formatted)
+			failed(run(shell, bothDisks), "the block device "+dev("vdc")+" has no identity, so it is no drive "+disksPath()+" names, and the guest will not boot with it", "")
+
+			// A guest without drives refuses any device.
+			reset()
+			disk("vda", "rvm-vol0", volumeSectors, formatted)
+			failed(run(shell, "RVM_VOLUMES=0\n"), "the block device "+dev("vda")+" has the identity rvm-vol0, which "+disksPath()+" gives no drive, so the guest will not boot with it", "")
 			Expect(os.ReadFile(dev("vda"))).To(Equal(formatted))
 		},
 		shellEntries(""),
 	)
 
-	DescribeTable("never formats the volume: it fails when two devices have the root's size",
+	DescribeTable("fails at once, touching no device, when two block devices have one drive's identity",
 		func(shellOf func() guestShell) {
 			shell := shellOf()
-			disk("vda", rootSectors, formatted)
-			disk("vdb", rootSectors, blank)
-			disk("vdc", volumeSectors, formatted)
-			r := run(shell, bothDisks)
-			failed(r, "two block devices, "+dev("vda")+" and "+dev("vdb")+", have the size of the guest root, so the guest cannot tell which one it is", "")
+			disk("vda", "rvm-root", rootSectors, formatted)
+			disk("vdb", "rvm-root", rootSectors, blank)
+			disk("vdc", "rvm-vol0", volumeSectors, formatted)
+			failed(run(shell, bothDisks), "two block devices, "+dev("vda")+" and "+dev("vdb")+", have the identity rvm-root of the guest root drive, so the guest cannot tell which one it is", "")
 			Expect(os.ReadFile(dev("vda"))).To(Equal(formatted))
+
+			reset()
+			disk("vda", "rvm-root", rootSectors, blank)
+			disk("vdb", "rvm-vol0", volumeSectors, formatted)
+			disk("vdc", "rvm-vol0", volumeSectors, formatted)
+			failed(run(shell, bothDisks), "two block devices, "+dev("vdb")+" and "+dev("vdc")+", have the identity rvm-vol0 of the volume drive vol0, so the guest cannot tell which one it is", "")
 		},
 		shellEntries(""),
 	)
 
-	DescribeTable("never formats the volume: it fails when the device of the root's size is not blank",
+	DescribeTable("fails at once, touching no device, when a drive's size is not the one /rvm/disks gives it",
+		func(shellOf func() guestShell) {
+			shell := shellOf()
+			disk("vda", "rvm-vol0", volumeSectors, formatted)
+			disk("vdb", "rvm-root", volumeSectors, formatted)
+			failed(run(shell, bothDisks), "the guest root drive "+dev("vdb")+" has "+volumeSectors+" sectors, and "+disksPath()+" gives it "+rootSectors+", so the guest will not use it", "")
+			Expect(os.ReadFile(dev("vdb"))).To(Equal(formatted))
+
+			reset()
+			disk("vda", "rvm-vol0", rootSectors, formatted)
+			disk("vdb", "rvm-root", rootSectors, blank)
+			failed(run(shell, bothDisks), "the volume drive vol0 "+dev("vda")+" has "+rootSectors+" sectors, and "+disksPath()+" gives it "+volumeSectors+", so the guest will not use it", "")
+		},
+		shellEntries(""),
+	)
+
+	DescribeTable("never formats a drive with data: it fails when the root drive is not blank",
 		func(shellOf func() guestShell) {
 			shell := shellOf()
 			// A volume that stood where the root disk should be, as when a
-			// host passed the wrong file.
-			disk("vda", rootSectors, formatted)
-			disk("vdb", volumeSectors, blank)
-			r := run(shell, bothDisks)
-			failed(r, "the guest root disk "+dev("vda")+" is not blank, so vm-launch will not format it", "")
+			// host passed the wrong file under the root's identity.
+			disk("vda", "rvm-root", rootSectors, formatted)
+			disk("vdb", "rvm-vol0", volumeSectors, blank)
+			failed(run(shell, bothDisks), "the guest root disk "+dev("vda")+" is not blank, so vm-launch will not format it", "")
 			Expect(os.ReadFile(dev("vda"))).To(Equal(formatted))
 			Expect(filepath.Join(dir, "root-head")).NotTo(BeAnExistingFile())
 		},
 		shellEntries(""),
 	)
 
-	DescribeTable("fails rather than guess when /rvm/disks gives a size that is not a sector count",
+	DescribeTable("fails rather than guess, before it looks at any device, when /rvm/disks names its drives in a way it cannot use",
 		func(shellOf func() guestShell) {
 			shell := shellOf()
-			disk("vda", volumeSectors, formatted)
-			disk("vdb", rootSectors, blank)
-			// The harness moves /rvm/disks into dir, and the messages name it.
-			disksPath := filepath.Join(dir, "disks")
-			rootLine := "the guest root size or inode ratio in " + disksPath + " is not a positive number"
-			volumeLine := "the volume size in " + disksPath + " is not a positive number"
-			for disks, line := range map[string]string{
-				"RVM_ROOT_SECTORS=" + rootSectors + "\n":                                                                 rootLine,
-				"RVM_ROOT_SECTORS=" + rootSectors + "\nRVM_ROOT_INODE_RATIO=\n":                                          rootLine,
-				"RVM_ROOT_SECTORS=0" + rootSectors + "\nRVM_ROOT_INODE_RATIO=" + rootRatio + "\n":                        rootLine,
-				"RVM_ROOT_SECTORS='" + rootSectors + " '\nRVM_ROOT_INODE_RATIO=" + rootRatio + "\n":                      rootLine,
-				"RVM_ROOT_SECTORS=-1\nRVM_ROOT_INODE_RATIO=" + rootRatio + "\n":                                          rootLine,
-				"RVM_ROOT_SECTORS=" + rootSectors + "\nRVM_ROOT_INODE_RATIO=16k\n":                                       rootLine,
-				"RVM_ROOT_SECTORS=" + rootSectors + "\nRVM_ROOT_INODE_RATIO=0\n":                                         rootLine,
-				"RVM_VOLUME_SECTORS=1GiB\n":                                                                              volumeLine,
-				"RVM_VOLUME_SECTORS=0\n":                                                                                 volumeLine,
-				"RVM_ROOT_SECTORS=" + rootSectors + "\nRVM_ROOT_INODE_RATIO=" + rootRatio + "\nRVM_VOLUME_SECTORS='*'\n": volumeLine,
+			standard()
+			disks := disksPath()
+			rootLine := "the guest root size or inode ratio in " + disks + " is not a positive number"
+			rootIDLine := "the guest root drive's identity in " + disks + " is not 1 to " + virtioBlockIDBytesText + " letters, digits, and hyphens"
+			countLine := "the volume count in " + disks + " is not a number from 0 to " + maxVolumesText
+			vol0 := volEntry(0, "rvm-vol0", volumeSectors)
+			root := rootEntry("rvm-root", rootSectors)
+			for table, line := range map[string]string{
+				"RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=" + rootSectors + "\nRVM_VOLUMES=0\n":                           rootLine,
+				"RVM_ROOT_ID=rvm-root\nRVM_VOLUMES=0\n":                                                                 rootLine,
+				"RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=" + rootSectors + "\nRVM_ROOT_INODE_RATIO=\nRVM_VOLUMES=0\n":    rootLine,
+				rootEntry("rvm-root", "0"+rootSectors) + "RVM_VOLUMES=0\n":                                              rootLine,
+				rootEntry("rvm-root", "'"+rootSectors+" '") + "RVM_VOLUMES=0\n":                                         rootLine,
+				rootEntry("rvm-root", "-1") + "RVM_VOLUMES=0\n":                                                         rootLine,
+				"RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=" + rootSectors + "\nRVM_ROOT_INODE_RATIO=16k\nRVM_VOLUMES=0\n": rootLine,
+				"RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=" + rootSectors + "\nRVM_ROOT_INODE_RATIO=0\nRVM_VOLUMES=0\n":   rootLine,
+				"RVM_ROOT_SECTORS=" + rootSectors + "\nRVM_ROOT_INODE_RATIO=" + rootRatio + "\nRVM_VOLUMES=0\n":         rootIDLine,
+				rootEntry("rvm_root", rootSectors) + "RVM_VOLUMES=0\n":                                                  rootIDLine,
+				rootEntry("'rvm root'", rootSectors) + "RVM_VOLUMES=0\n":                                                rootIDLine,
+				rootEntry(strings.Repeat("7", virtioBlockIDBytes+1), rootSectors) + "RVM_VOLUMES=0\n":                   rootIDLine,
+				"":                        countLine,
+				root:                      countLine,
+				"RVM_VOLUMES=5\n" + vol0:  countLine,
+				"RVM_VOLUMES=01\n" + vol0: countLine,
+				"RVM_VOLUMES=-1\n":        countLine,
+				"RVM_VOLUMES=x\n":         countLine,
+				root + "RVM_VOLUMES=1\n":  "the volume drive vol0 in " + disks + " has no kind",
+				root + "RVM_VOLUMES=1\nRVM_VOL0_KIND=image\nRVM_VOL0_SECTORS=" + volumeSectors + "\n": "the volume drive vol0's identity in " + disks + " is not 1 to " + virtioBlockIDBytesText + " letters, digits, and hyphens",
+				root + "RVM_VOLUMES=1\n" + volEntry(0, "rvm.vol0", volumeSectors):                     "the volume drive vol0's identity in " + disks + " is not 1 to " + virtioBlockIDBytesText + " letters, digits, and hyphens",
+				root + "RVM_VOLUMES=1\n" + volEntry(0, "rvm-vol0", "1GiB"):                            "the volume drive vol0's size in " + disks + " is not a positive number",
+				root + "RVM_VOLUMES=1\n" + volEntry(0, "rvm-vol0", "0"):                               "the volume drive vol0's size in " + disks + " is not a positive number",
+				root + "RVM_VOLUMES=1\n" + volEntry(0, "rvm-vol0", "'*'"):                             "the volume drive vol0's size in " + disks + " is not a positive number",
+				root + "RVM_VOLUMES=1\n" + volEntry(0, "rvm-root", volumeSectors):                     "the guest root drive and the volume drive vol0 have the one identity rvm-root in " + disks + ", so the guest cannot tell them apart",
+				"RVM_VOLUMES=2\n" + vol0 + volEntry(1, "rvm-vol0", volumeSectors):                     "the volume drive vol0 and the volume drive vol1 have the one identity rvm-vol0 in " + disks + ", so the guest cannot tell them apart",
 			} {
 				Expect(os.RemoveAll(callLog)).To(Succeed())
-				r := run(shell, disks)
-				Expect(r.out).To(HaveSuffix("vm-launch guest setup: "+line+"\nREBOOT\n"), "%s: %q", shell.name, disks)
-				Expect(r.calls).To(BeEmpty(), "%s: %q", shell.name, disks)
+				r := run(shell, table)
+				Expect(r.out).To(HaveSuffix("vm-launch guest setup: "+line+"\nREBOOT\n"), "%s: %q", shell.name, table)
+				Expect(r.code).To(Equal(1), "%s: %q", shell.name, table)
+				Expect(r.calls).To(BeEmpty(), "%s: %q", shell.name, table)
 			}
+			Expect(os.ReadFile(dev("vda"))).To(Equal(formatted))
 		},
 		shellEntries(""),
 	)
 
-	DescribeTable("fails after six checks, before it formats anything, and names the drive that never appears and its sectors",
+	DescribeTable("fails after six checks, before it formats anything, and names each drive that never appears by its identity",
 		func(shellOf func() guestShell) {
 			shell := shellOf()
-			rootLine := "no block device of " + rootSectors + " sectors for the guest root"
-			volumeLine := "no block device of " + volumeSectors + " sectors for the volume"
-			for _, c := range []struct{ name, sectors, line string }{
-				{"vda", volumeSectors, rootLine},
-				{"vda", rootSectors, volumeLine},
-				{"vda", "4096", rootLine + ", and " + volumeLine},
-			} {
-				reset()
-				disk(c.name, c.sectors, blank)
-				r := run(shell, bothDisks)
-				failed(r, c.line, strings.Repeat("sleep 1\n", 5))
-			}
+			rootLine := "no block device with the identity rvm-root for the guest root drive"
+			volumeLine := "no block device with the identity rvm-vol0 for the volume drive vol0"
+
+			disk("vda", "rvm-vol0", volumeSectors, formatted)
+			failed(run(shell, bothDisks), rootLine, strings.Repeat("sleep 1\n", 5))
+
+			reset()
+			disk("vda", "rvm-root", rootSectors, blank)
+			failed(run(shell, bothDisks), volumeLine, strings.Repeat("sleep 1\n", 5))
+
+			reset()
+			failed(run(shell, bothDisks), rootLine+", and "+volumeLine, strings.Repeat("sleep 1\n", 5))
 		},
 		shellEntries(""),
 	)
 
-	DescribeTable("waits for the device file of a drive that sysfs lists, and uses the drive once it appears",
+	DescribeTable("waits for a drive that appears late, and uses it once it does",
 		func(shellOf func() guestShell) {
 			shell := shellOf()
-			disk("vda", volumeSectors, formatted)
-			disk("vdb", rootSectors, nil)
-			r := run(shell, bothDisks, "NODE_AT="+dev("vdb"))
+			// writeLate makes the first sleep run script.
+			writeLate := func(script string) { Expect(os.WriteFile(late, []byte(script), 0o644)).To(Succeed()) }
+
+			// A device file that is not there yet.
+			disk("vda", "rvm-vol0", volumeSectors, formatted)
+			disk("vdb", "rvm-root", rootSectors, nil)
+			writeLate("dd if=/dev/zero of=" + shellQuote(dev("vdb")) + " bs=4096 count=16 2>/dev/null\n")
+			r := run(shell, bothDisks)
 			Expect(r.code).To(Equal(0), "%s: %s", shell.name, r.out)
 			Expect(r.calls).To(Equal("sleep 1\n" + entered(dev("vdb"), dev("vda"))))
 
 			reset()
-			disk("vda", volumeSectors, formatted)
-			disk("vdb", rootSectors, nil)
+			disk("vda", "rvm-vol0", volumeSectors, formatted)
+			disk("vdb", "rvm-root", rootSectors, nil)
+			failed(run(shell, bothDisks), "no device node "+dev("vdb")+" yet for the guest root drive", strings.Repeat("sleep 1\n", 5))
+
+			// An identity that cannot be read yet.
+			reset()
+			disk("vda", "rvm-vol0", volumeSectors, formatted)
+			disk("vdb", "rvm-root", rootSectors, blank)
+			Expect(os.Remove(filepath.Join(sysBlock("vdb"), "serial"))).To(Succeed())
+			writeLate("printf rvm-root > " + shellQuote(filepath.Join(sysBlock("vdb"), "serial")) + "\n")
 			r = run(shell, bothDisks)
-			failed(r, "no block device of "+rootSectors+" sectors for the guest root", strings.Repeat("sleep 1\n", 5))
+			Expect(r.code).To(Equal(0), "%s: %s", shell.name, r.out)
+			Expect(r.calls).To(Equal("sleep 1\n" + entered(dev("vdb"), dev("vda"))))
+
+			reset()
+			disk("vda", "rvm-vol0", volumeSectors, formatted)
+			disk("vdb", "rvm-root", rootSectors, blank)
+			Expect(os.Remove(filepath.Join(sysBlock("vdb"), "serial"))).To(Succeed())
+			failed(run(shell, bothDisks), "no readable identity yet on the block device "+dev("vdb")+", and no block device with the identity rvm-root for the guest root drive", strings.Repeat("sleep 1\n", 5))
+
+			// A size that cannot be read yet: vdb's is a directory, which
+			// every user, root included, fails to read.
+			reset()
+			disk("vda", "rvm-vol0", volumeSectors, formatted)
+			disk("vdb", "rvm-root", rootSectors, blank)
+			size := filepath.Join(sysBlock("vdb"), "size")
+			Expect(os.Remove(size)).To(Succeed())
+			Expect(os.Mkdir(size, 0o755)).To(Succeed())
+			writeLate("rmdir " + shellQuote(size) + " && echo " + rootSectors + " > " + shellQuote(size) + "\n")
+			r = run(shell, bothDisks)
+			Expect(r.code).To(Equal(0), "%s: %s", shell.name, r.out)
+			Expect(r.calls).To(Equal("sleep 1\n" + entered(dev("vdb"), dev("vda"))))
+
+			reset()
+			disk("vda", "rvm-vol0", volumeSectors, formatted)
+			disk("vdb", "rvm-root", rootSectors, blank)
+			Expect(os.Remove(size)).To(Succeed())
+			Expect(os.Mkdir(size, 0o755)).To(Succeed())
+			failed(run(shell, bothDisks), "no readable size yet for the guest root drive on "+dev("vdb"), strings.Repeat("sleep 1\n", 5))
+
+			// A whole device that is not there yet.
+			reset()
+			disk("vda", "rvm-vol0", volumeSectors, formatted)
+			b := sysBlock("vdb")
+			writeLate("mkdir " + shellQuote(b) + " && printf rvm-root > " + shellQuote(b+"/serial") + " && echo " + rootSectors + " > " + shellQuote(b+"/size") +
+				" && dd if=/dev/zero of=" + shellQuote(dev("vdb")) + " bs=4096 count=16 2>/dev/null\n")
+			r = run(shell, bothDisks)
+			Expect(r.code).To(Equal(0), "%s: %s", shell.name, r.out)
+			Expect(r.calls).To(Equal("sleep 1\n" + entered(dev("vdb"), dev("vda"))))
 		},
 		shellEntries(""),
 	)
 
 	It("fails with its own line, before any move, when /dev is not a devtmpfs mount", func() {
 		shell := hostShell()
-		disk("vda", volumeSectors, formatted)
-		disk("vdb", rootSectors, blank)
+		standard()
 		failed(run(shell, bothDisks, "NO_DEVTMPFS=1"), "mounting devtmpfs at /dev failed", "")
 	})
 
 	It("fails with its own line, before any move, when the overlay root has no shell or no stage 2", func() {
 		shell := hostShell()
-		disk("vda", volumeSectors, formatted)
-		disk("vdb", rootSectors, blank)
+		standard()
 		root := dev("vdb")
 		formatAndMount := "mke2fs -F -b 4096 -m 0 -I 256 -i " + rootRatio + " -L rvm-root " + root + "\n" +
 			"mount -t ext4 -o noatime,discard,errors=continue " + root + " " + filepath.Join(dir, "disk") + "\n" +
@@ -953,27 +1286,11 @@ exit 0`)
 		failed(run(shell, bothDisks, "NO_STAGE2=1"), "the overlay root has no "+guestStage2, formatAndMount)
 	})
 
-	DescribeTable("skips a device whose size cannot be read",
-		func(shellOf func() guestShell) {
-			shell := shellOf()
-			// vda has no size file and vdb's is a directory, which every
-			// user, root included, fails to read.
-			Expect(os.MkdirAll(filepath.Join(dir, "sys", "block", "vda"), 0o755)).To(Succeed())
-			Expect(os.MkdirAll(filepath.Join(dir, "sys", "block", "vdb", "size"), 0o755)).To(Succeed())
-			disk("vdc", rootSectors, blank)
-			disk("vdd", volumeSectors, formatted)
-			r := run(shell, bothDisks)
-			Expect(r.code).To(Equal(0), r.out)
-			Expect(r.calls).To(Equal(entered(dev("vdc"), dev("vdd"))))
-		},
-		shellEntries(""),
-	)
-
 	It("treats a read error, or a root disk it read nothing from, as a failure, never as a blank disk", func() {
 		shell := hostShell()
-		disk("vda", volumeSectors, formatted)
+		disk("vda", "rvm-vol0", volumeSectors, formatted)
 		// vdb's device file is a directory, which dd cannot read.
-		disk("vdb", rootSectors, nil)
+		disk("vdb", "rvm-root", rootSectors, nil)
 		Expect(os.Mkdir(dev("vdb"), 0o755)).To(Succeed())
 		failed(run(shell, bothDisks), "reading the start of the guest root disk "+dev("vdb")+" failed", "")
 
@@ -985,8 +1302,7 @@ exit 0`)
 
 	It("names the step that failed, and stops there", func() {
 		shell := hostShell()
-		disk("vda", volumeSectors, formatted)
-		disk("vdb", rootSectors, blank)
+		standard()
 		root := dev("vdb")
 		mke2fs := "mke2fs -F -b 4096 -m 0 -I 256 -i " + rootRatio + " -L rvm-root " + root + "\n"
 		ext4 := "mount -t ext4 -o noatime,discard,errors=continue " + root + " " + filepath.Join(dir, "disk") + "\n"

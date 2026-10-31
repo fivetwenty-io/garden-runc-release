@@ -112,12 +112,11 @@
 // releases every one it prepared before it. Two volumes that show one
 // directory of one filesystem, so that their images would be one file, fail
 // the launch, as does a volume whose image is the file another volume already
-// holds, which vm-launch refuses before it waits for the lock. The guest finds the image by its size, which no guest root
-// image shares, formats it as ext2 when its first 64 KiB are all zero, and
-// mounts it synchronously; a non-blank image that does not mount is never
-// formatted. Every volume image has the same size, so a guest with more than
-// one volume finds two drives of that size and fails its boot before it
-// formats anything. Each volume must be a JuiceFS or NFS mount. Cloud
+// holds, which vm-launch refuses before it waits for the lock. The guest finds
+// each image's drive by the identity vm-launch gives the drive, checks its
+// size, formats it as ext2 when its first 64 KiB are all zero, and mounts it
+// synchronously at its own path; a non-blank image that does not mount is
+// never formatted. Each volume must be a JuiceFS or NFS mount. Cloud
 // Controller strips the driver name from volume_mounts, so vm-launch reads the
 // filesystem type of the mount at each volume path from /proc/self/mountinfo
 // and lets the registry of volume providers (see pdi.go) pick the provider
@@ -207,24 +206,24 @@
 // and vm-launch have let go of the image. The image is as large as the
 // smaller of limits.disk and the space free in the work directory, less 32
 // MiB kept for other writers in the container, so that the guest's own
-// filesystem fills before the quota does; it is 1 MiB smaller when that would
-// equal the volume image's size. The hypervisor gets it as the last drive,
+// filesystem fills before the quota does. The hypervisor gets it as the last drive,
 // after the volume images' and with discard turned on, so that the blocks the
 // guest frees go back to the quota. When less than 16 MiB is left after the
 // 32 MiB, or the image cannot be created, vm-launch exits 125 with a line
 // that says why. A missing or malformed limits.disk leaves the guest root in
 // RAM, with a line that says the disk quota does not apply to it.
 //
-// The guest's /init finds the image by its size in sectors, which vm-launch
-// writes in the initramfs, formats it as ext2 with online discard, and
+// The guest's /init finds the image's drive by its identity, checks its size
+// in sectors, both of which vm-launch writes in the initramfs, formats it as
+// ext2 with online discard, and
 // mounts an overlay with the initramfs as its lower layer and the image as
 // its upper. It moves /proc, /sys, and /dev into the overlay, moves the
 // overlay onto /, and runs the rest of its setup and the command inside it,
 // so everything the guest writes outside /dev and the volume lands on
 // the image and counts against the quota. Every boot formats a fresh image,
 // as every start of a runc app gets a fresh container. /init formats only
-// the one device of the image's size, and only when it reads as blank, so
-// it never formats the volume; when it cannot find, check, format, or mount
+// the one device with the image's identity, and only when it reads as blank,
+// so it never formats a volume; when it cannot find, check, format, or mount
 // the image, the guest reboots before it starts the command, and vm-launch
 // exits 123 with the console output, which ends with the step that failed.
 //
@@ -633,28 +632,10 @@ func run(argv []string, logger *log.Logger) int {
 			return stepExitCode(err)
 		}
 	}
-	// The guest's /init finds a volume's drive by its size, and /rvm/disks
-	// gives one size, the first volume's. With more than one volume of that
-	// size, /init sees two drives of the size and fails the boot before it
-	// formats anything. A volume of another size would instead be left
-	// unmounted while the app wrote to the guest root, so it is refused.
-	var vol *guestVolume
-	var volumeBytes int64
-	if len(prepared) > 0 {
-		vol, volumeBytes = &vols[0], prepared[0].Bytes
-		for _, v := range prepared[1:] {
-			if v.Bytes != volumeBytes {
-				logger.Printf("the volume images at %s and %s are %d and %d bytes; the guest finds its volumes by size, so every volume image must have the first one's size",
-					quoteForLog(prepared[0].Path), quoteForLog(v.Path), volumeBytes, v.Bytes)
-				return exitLaunchError
-			}
-		}
-	}
-
 	// The guest root image is sized from the quota the work directory has
-	// left. rootDiskSize keeps its size from equalling the volume image's,
-	// which is how the guest tells the two drives apart.
-	rootSize, rootInodeRatio, err := rootDiskSize(workDir, lookupEnv, unix.Statfs, volumeBytes, logger)
+	// left. The guest tells its drives apart by identity, so the root may
+	// have any volume image's size.
+	rootSize, rootInodeRatio, err := rootDiskSize(workDir, lookupEnv, unix.Statfs, logger)
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError
@@ -701,7 +682,7 @@ func run(argv []string, logger *log.Logger) int {
 		nonce:          nonce,
 		nw:             nw,
 		env:            envFile,
-		vol:            vol,
+		vols:           vols,
 		drives:         drives,
 		caBundle:       caBundle,
 		nofile:         nofile,

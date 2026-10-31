@@ -55,13 +55,13 @@ var _ = Describe("the guest root image size", func() {
 		logger = log.New(logBuf, "", 0)
 	})
 
-	sized := func(diskMiB string, free uint64, volume int64) (int64, int64, error) {
-		return rootDiskSize("/work", vcapWithDisk(diskMiB), statfsFreeMiB(free), volume, logger)
+	sized := func(diskMiB string, free uint64) (int64, int64, error) {
+		return rootDiskSize("/work", vcapWithDisk(diskMiB), statfsFreeMiB(free), logger)
 	}
 
 	DescribeTable("takes the smaller of the disk limit and the free space, less 32 MiB",
 		func(diskMiB string, free uint64, wantMiB int64) {
-			size, ratio, err := sized(diskMiB, free, 0)
+			size, ratio, err := sized(diskMiB, free)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(size).To(Equal(wantMiB * testMiB))
 			Expect(ratio).To(Equal(inodeRatioFor(wantMiB * testMiB)))
@@ -73,13 +73,14 @@ var _ = Describe("the guest root image size", func() {
 		Entry("the smallest root, 16 MiB after the headroom", "48", uint64(1000), int64(16)),
 		Entry("free space at the smallest root", "1000", uint64(48), int64(16)),
 		Entry("a limit just over the volume image's size", "1057", uint64(5000), int64(1025)),
+		Entry("a limit that makes the root exactly the volume image's size, since the guest tells its drives apart by identity", "1056", uint64(5000), int64(1024)),
 		Entry("a limit of 100 MiB", "100", uint64(5000), int64(68)),
 	)
 
 	It("cuts the free space to whole MiB", func() {
 		var asked string
 		// 300 MiB and 700 KiB.
-		size, _, err := rootDiskSize("/work", vcapWithDisk("4096"), freeBlocks((300*testMiB+700*1024)/4096, &asked), 0, logger)
+		size, _, err := rootDiskSize("/work", vcapWithDisk("4096"), freeBlocks((300*testMiB+700*1024)/4096, &asked), logger)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(size).To(Equal(int64(268 * testMiB)))
 		Expect(size % 4096).To(BeZero())
@@ -87,7 +88,7 @@ var _ = Describe("the guest root image size", func() {
 
 	It("asks statfs about the work directory", func() {
 		var asked string
-		_, _, err := rootDiskSize("/work/vm-launch-123", vcapWithDisk("512"), freeBlocks(1<<20, &asked), 0, logger)
+		_, _, err := rootDiskSize("/work/vm-launch-123", vcapWithDisk("512"), freeBlocks(1<<20, &asked), logger)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(asked).To(Equal("/work/vm-launch-123"))
 	})
@@ -100,7 +101,7 @@ var _ = Describe("the guest root image size", func() {
 			}
 		}
 		sizeFor := func(st unix.Statfs_t) (int64, error) {
-			size, _, err := rootDiskSize("/work", vcapWithDisk("100000"), freeOf(st), 0, logger)
+			size, _, err := rootDiskSize("/work", vcapWithDisk("100000"), freeOf(st), logger)
 			return size, err
 		}
 
@@ -134,39 +135,6 @@ var _ = Describe("the guest root image size", func() {
 		})
 	})
 
-	Describe("the volume image", func() {
-		It("takes 1 MiB off a root that would be the volume's size, so the drives differ by size", func() {
-			size, _, err := sized("1056", 5000, testGiB)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(size).To(Equal(int64(testGiB - testMiB)))
-		})
-
-		It("leaves a root of any other size alone", func() {
-			for limit, want := range map[string]int64{"1055": 1023, "1057": 1025} {
-				size, _, err := sized(limit, 5000, testGiB)
-				Expect(err).NotTo(HaveOccurred())
-				Expect(size).To(Equal(want * testMiB))
-			}
-		})
-
-		It("leaves a root of the volume's size alone when there is no volume", func() {
-			size, _, err := sized("1056", 5000, 0)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(size).To(Equal(int64(testGiB)))
-		})
-
-		It("nudges away from whatever size the volume image has", func() {
-			size, _, err := sized("96", 5000, 64*testMiB)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(size).To(Equal(int64(63 * testMiB)))
-		})
-
-		It("measures the nudged size against the smallest root", func() {
-			_, _, err := sized("48", 5000, 16*testMiB)
-			Expect(err).To(MatchError(ContainSubstring("the app's disk limit is 48 MiB")))
-		})
-	})
-
 	Describe("a quota that is too small", func() {
 		const (
 			needs = ", and the guest root needs at least 48 MiB of it, which is 16 MiB plus 32 MiB kept for other writers; raise the app's disk quota"
@@ -178,7 +146,7 @@ var _ = Describe("the guest root image size", func() {
 
 		DescribeTable("exits with the quota line, naming the MiB left when the free space is smaller and the limit when it is",
 			func(diskMiB string, free uint64, want string, leftMiB int) {
-				size, ratio, err := sized(diskMiB, free, 0)
+				size, ratio, err := sized(diskMiB, free)
 				Expect(err).To(MatchError(fmt.Sprintf(want, leftMiB)))
 				Expect(size).To(BeZero())
 				Expect(ratio).To(BeZero())
@@ -194,13 +162,13 @@ var _ = Describe("the guest root image size", func() {
 		)
 
 		It("names the smaller of the limit and the free space", func() {
-			_, _, err := sized("40", 30, 0)
+			_, _, err := sized("40", 30)
 			Expect(err).To(MatchError(fmt.Sprintf(wantLeft, 30)))
 		})
 
 		It("counts the free MiB it was cut to, not a fraction", func() {
 			var asked string
-			_, _, err := rootDiskSize("/work", vcapWithDisk("1000"), freeBlocks((47*testMiB+testMiB-4096)/4096, &asked), 0, logger)
+			_, _, err := rootDiskSize("/work", vcapWithDisk("1000"), freeBlocks((47*testMiB+testMiB-4096)/4096, &asked), logger)
 			Expect(err).To(MatchError(fmt.Sprintf(wantLeft, 47)))
 		})
 	})
@@ -213,7 +181,7 @@ var _ = Describe("the guest root image size", func() {
 
 		DescribeTable("keeps the RAM root with one line and no error",
 			func(env map[string]string, logged string) {
-				size, ratio, err := rootDiskSize("/work", envMap(env), never, 0, logger)
+				size, ratio, err := rootDiskSize("/work", envMap(env), never, logger)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(size).To(BeZero())
 				Expect(ratio).To(BeZero())
@@ -230,7 +198,7 @@ var _ = Describe("the guest root image size", func() {
 		It("checks the limit before it asks statfs, so a bad limit never fails on statfs", func() {
 			size, _, err := rootDiskSize("/work", envMap(map[string]string{}), func(string, *unix.Statfs_t) error {
 				return errors.New("statfs broke")
-			}, 0, logger)
+			}, logger)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(size).To(BeZero())
 		})
@@ -240,7 +208,7 @@ var _ = Describe("the guest root image size", func() {
 		It("is an error that names the directory and wraps the cause", func() {
 			size, ratio, err := rootDiskSize("/work/vm-launch-1", vcapWithDisk("512"), func(string, *unix.Statfs_t) error {
 				return syscall.ENOENT
-			}, 0, logger)
+			}, logger)
 			Expect(err).To(MatchError("checking the disk quota left in /work/vm-launch-1: no such file or directory"))
 			Expect(errors.Is(err, syscall.ENOENT)).To(BeTrue())
 			Expect(size).To(BeZero())
@@ -274,7 +242,7 @@ var _ = Describe("the guest root image size", func() {
 		})
 
 		It("comes with the size from rootDiskSize", func() {
-			size, ratio, err := sized("16416", 100000, 0)
+			size, ratio, err := sized("16416", 100000)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(size).To(Equal(int64(16 * testGiB)))
 			Expect(ratio).To(Equal(int64(262144)))

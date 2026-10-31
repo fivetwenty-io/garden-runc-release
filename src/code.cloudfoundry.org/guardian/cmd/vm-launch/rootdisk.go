@@ -43,15 +43,13 @@ const (
 // the space statfs reports free in workDir, less rootDiskHeadroomMiB. The
 // headroom is for other writers in the container, such as ssh sessions, so
 // that the guest's filesystem fills before the quota does and the app gets
-// ENOSPC rather than an I/O error. Both are cut to whole MiB. A size equal
-// to volumeBytes, the volume image's, loses 1 MiB, so that the guest can
-// tell the two drives apart by size.
+// ENOSPC rather than an I/O error. Both are cut to whole MiB.
 //
 // A size of 0 means the guest root stays in RAM, because limits.disk is
 // missing or malformed and there is no quota to enforce; one line says so.
 // Free space under minRootDiskMiB after the headroom, and a statfs that
 // fails, are errors.
-func rootDiskSize(workDir string, lookup func(string) (string, bool), statfs func(string, *unix.Statfs_t) error, volumeBytes int64, logger *log.Logger) (size, inodeRatio int64, err error) {
+func rootDiskSize(workDir string, lookup func(string) (string, bool), statfs func(string, *unix.Statfs_t) error, logger *log.Logger) (size, inodeRatio int64, err error) {
 	limitMiB, err := diskLimitMiB(lookup)
 	if err != nil {
 		logger.Printf("%v; the disk quota does not apply to the guest root", err)
@@ -64,9 +62,6 @@ func rootDiskSize(workDir string, lookup func(string) (string, bool), statfs fun
 	free := freeMiB(&st)
 	quotaMiB := min(limitMiB, free)
 	size = (quotaMiB - rootDiskHeadroomMiB) * bytesPerMiB
-	if size == volumeBytes {
-		size -= bytesPerMiB
-	}
 	if size < minRootDiskMiB*bytesPerMiB {
 		have := fmt.Sprintf("the container has %d MiB of disk quota left", quotaMiB)
 		if limitMiB <= free {

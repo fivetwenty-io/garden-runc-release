@@ -148,7 +148,7 @@ echo "disks=$(ls /sys/block | grep -c '^vd')"
 		Expect(vol.Truncate(defaultImageSize)).To(Succeed())
 		withVolume := func(command string) guestContents {
 			g := taskGuest(command)
-			g.vol, g.drives.volumes = &guestVolume{ContainerDir: "/home/vcap/data", ImageName: "volume.img"}, qemuImageDrives(defaultImageSize)
+			g.vols, g.drives.volumes = []guestVolume{{ContainerDir: "/home/vcap/data", ImageName: "volume.img"}}, qemuImageDrives(defaultImageSize)
 			withRealRoot(&g)
 			return g
 		}
@@ -304,7 +304,7 @@ echo writes-done
 sync -f /home/vcap/data
 echo "sync-f-volume=$?"
 `)
-		g.vol, g.drives.volumes = &guestVolume{ContainerDir: "/home/vcap/data", ImageName: "volume.img"}, qemuImageDrives(defaultImageSize)
+		g.vols, g.drives.volumes = []guestVolume{{ContainerDir: "/home/vcap/data", ImageName: "volume.img"}}, qemuImageDrives(defaultImageSize)
 		withRealRoot(&g)
 		out := bootRealGuestWith(g, []*os.File{vol}, realRootImage())
 

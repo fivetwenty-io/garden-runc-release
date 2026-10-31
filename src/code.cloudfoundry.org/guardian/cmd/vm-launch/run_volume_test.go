@@ -314,7 +314,7 @@ var _ = Describe("run with a volume", func() {
 	It("gives QEMU the locked image as fd 3 and a raw drive, without the volume path in its argv", func() {
 		requireOpenat2()
 		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), fdThreeChecks(img)+initramfsAt("4")+initramfsReleased+noFilesUnder(tmp)+
-			`gzip -dc "$initrd" | grep -a -q -F `+shellQuote("RVM_VOLUME_PATH="+shellQuote(volDir))+` || { echo "no /rvm/mounts" >&2; exit 1; }
+			`gzip -dc "$initrd" | grep -a -q -F `+shellQuote("RVM_VOL0_PATH="+shellQuote(volDir))+` || { echo "no /rvm/mounts" >&2; exit 1; }
 `)
 		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
 
@@ -329,10 +329,11 @@ var _ = Describe("run with a volume", func() {
 		noWorkDirs()
 	})
 
-	It("tells the guest root image and the volume image apart in /rvm/disks by the sizes of the drives the hypervisor gets", func() {
+	It("names the guest root image and the volume image in /rvm/disks by identity, with the sizes of the drives the hypervisor gets, even when the two sizes are equal", func() {
 		requireOpenat2()
-		// With room in the work directory, this quota would make the root
-		// image exactly the volume image's size.
+		// With room in the work directory, this quota makes the root image
+		// exactly the volume image's size, which the guest's lookup by
+		// identity allows.
 		limit := defaultImageSize/bytesPerMiB + rootDiskHeadroomMiB
 		GinkgoT().Setenv("VCAP_APPLICATION", `{"application_id":"`+testAppID+`","process_type":"web","name":"app","limits":{"disk":`+strconv.Itoa(limit)+`}}`)
 		initrdCopy := filepath.Join(GinkgoT().TempDir(), "initrd")
@@ -350,18 +351,17 @@ stat -L -c %s /proc/self/fd/3 /proc/self/fd/5 >`+shellQuote(sizesFile)+` || exit
 		Expect(sizes[0]).To(Equal(strconv.Itoa(defaultImageSize)))
 		root, err := strconv.ParseInt(sizes[1], 10, 64)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(root).NotTo(Equal(int64(defaultImageSize)))
 		var st syscall.Statfs_t
 		Expect(syscall.Statfs(tmp, &st)).To(Succeed())
 		if int64(st.Bavail)*st.Bsize/bytesPerMiB >= int64(limit) {
-			Expect(root).To(Equal(int64(defaultImageSize - bytesPerMiB)))
+			Expect(root).To(Equal(int64(defaultImageSize)))
 		}
 
 		initrd, err := os.ReadFile(initrdCopy)
 		Expect(err).NotTo(HaveOccurred())
 		_, byName := archiveEntries(initrd)
-		Expect(string(byName["rvm/disks"].data)).To(Equal(fmt.Sprintf("RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=%d\nRVM_ROOT_INODE_RATIO=%d\nRVM_VOLUMES=1\nRVM_VOL0_KIND=image\nRVM_VOL0_ID=rvm-vol0\nRVM_VOL0_SECTORS=%d\nRVM_VOLUME_SECTORS=%d\n",
-			root/512, inodeRatioFor(root), defaultImageSize/512, defaultImageSize/512)))
+		Expect(string(byName["rvm/disks"].data)).To(Equal(fmt.Sprintf("RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=%d\nRVM_ROOT_INODE_RATIO=%d\nRVM_VOLUMES=1\nRVM_VOL0_KIND=image\nRVM_VOL0_ID=rvm-vol0\nRVM_VOL0_SECTORS=%d\n",
+			root/512, inodeRatioFor(root), defaultImageSize/512)))
 		Expect(string(byName["rvm/mounts"].data)).NotTo(ContainSubstring("RVM_VOLUME_DEVICE"))
 		noWorkDirs()
 	})
@@ -673,7 +673,7 @@ var _ = Describe("run with several volumes", func() {
 		noWorkDirs()
 	})
 
-	It("tells the guest the first volume's path and size, which every volume image shares", func() {
+	It("tells the guest every volume's path, image, identity, and size, in the order of the paths", func() {
 		requireOpenat2()
 		bind(3)
 		initrdCopy := filepath.Join(scratch, "initrd")
@@ -682,12 +682,16 @@ var _ = Describe("run with several volumes", func() {
 		initrd, err := os.ReadFile(initrdCopy)
 		Expect(err).NotTo(HaveOccurred())
 		_, byName := archiveEntries(initrd)
-		Expect(string(byName["rvm/disks"].data)).To(HaveSuffix(fmt.Sprintf("RVM_VOLUME_SECTORS=%d\n", defaultImageSize/512)))
-		Expect(strings.Count(string(byName["rvm/disks"].data), "RVM_VOLUME_SECTORS=")).To(Equal(1))
-		Expect(string(byName["rvm/disks"].data)).To(ContainSubstring("RVM_VOLUMES=3\n"))
-		Expect(string(byName["rvm/disks"].data)).To(ContainSubstring("RVM_VOL2_KIND=image\nRVM_VOL2_ID=rvm-vol2\n"))
-		Expect(string(byName["rvm/mounts"].data)).To(Equal(mountsFile(&guestVolume{ContainerDir: dirs[0], ImageName: imageName})))
-		Expect(string(byName["rvm/mounts"].data)).NotTo(ContainSubstring(dirs[1]))
+		sectors := defaultImageSize / 512
+		Expect(string(byName["rvm/disks"].data)).To(HaveSuffix(fmt.Sprintf("RVM_VOLUMES=3\n"+
+			"RVM_VOL0_KIND=image\nRVM_VOL0_ID=rvm-vol0\nRVM_VOL0_SECTORS=%d\n"+
+			"RVM_VOL1_KIND=image\nRVM_VOL1_ID=rvm-vol1\nRVM_VOL1_SECTORS=%d\n"+
+			"RVM_VOL2_KIND=image\nRVM_VOL2_ID=rvm-vol2\nRVM_VOL2_SECTORS=%d\n", sectors, sectors, sectors)))
+		Expect(string(byName["rvm/disks"].data)).NotTo(ContainSubstring("RVM_VOLUME_"))
+		Expect(string(byName["rvm/mounts"].data)).To(Equal("RVM_VOLUMES=3\n" +
+			"RVM_VOL0_PATH=" + shellQuote(dirs[0]) + "\nRVM_VOL0_IMAGE=" + shellQuote(imageName) + "\n" +
+			"RVM_VOL1_PATH=" + shellQuote(dirs[1]) + "\nRVM_VOL1_IMAGE=" + shellQuote(imageName) + "\n" +
+			"RVM_VOL2_PATH=" + shellQuote(dirs[2]) + "\nRVM_VOL2_IMAGE=" + shellQuote(imageName) + "\n"))
 	})
 
 	It("prepares the volumes in the order of the paths and, when one fails, releases every one it prepared, last first, after the failure's line", func() {
@@ -857,10 +861,9 @@ var _ = Describe("run with several volumes", func() {
 		noWorkDirs()
 	})
 
-	It("refuses volume images of different sizes, since the guest finds its volumes by size, and releases them all", func() {
+	It("boots volume images of different sizes, naming each drive's own size in /rvm/disks, and releases them all", func() {
 		bind(3)
 		var released []string
-		sizes := map[string]int64{}
 		p := fake("Fake", "fuse.juicefs", strongMatch)
 		p.prepare = func(r prepareRequest) (*attachment, error) {
 			dir := r.Mount.ContainerDir
@@ -868,17 +871,20 @@ var _ = Describe("run with several volumes", func() {
 			if dir == dirs[2] {
 				size = 2 * defaultImageSize
 			}
-			sizes[dir] = size
 			f := diskFile(size)
 			return &attachment{File: f, Release: func() error { released = append(released, dir); return f.Close() }}, nil
 		}
 		withProviders(p)
-		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
-		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
-		Expect(logBuf.String()).To(HaveSuffix(fmt.Sprintf("the volume images at %s and %s are %d and %d bytes; the guest finds its volumes by size, so every volume image must have the first one's size\n",
-			quoteForLog(dirs[0]), quoteForLog(dirs[2]), defaultImageSize, 2*defaultImageSize)))
+		initrdCopy := filepath.Join(scratch, "initrd")
+		writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), initramfsAt("6")+`cp "$initrd" `+shellQuote(initrdCopy)+" || exit 1\n")
+		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
+		initrd, err := os.ReadFile(initrdCopy)
+		Expect(err).NotTo(HaveOccurred())
+		_, byName := archiveEntries(initrd)
+		Expect(string(byName["rvm/disks"].data)).To(HaveSuffix(fmt.Sprintf("RVM_VOL0_SECTORS=%d\n", defaultImageSize/512) +
+			"RVM_VOL1_KIND=image\nRVM_VOL1_ID=rvm-vol1\n" + fmt.Sprintf("RVM_VOL1_SECTORS=%d\n", defaultImageSize/512) +
+			"RVM_VOL2_KIND=image\nRVM_VOL2_ID=rvm-vol2\n" + fmt.Sprintf("RVM_VOL2_SECTORS=%d\n", 2*defaultImageSize/512)))
 		Expect(released).To(Equal([]string{dirs[2], dirs[1], dirs[0]}))
-		Expect(argvFile).NotTo(BeAnExistingFile())
 		Expect(os.ReadDir(tmp)).To(BeEmpty())
 	})
 
