@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -876,28 +877,40 @@ var _ = Describe("preallocateImage", func() {
 	})
 
 	Describe("on a filesystem that allocates", func() {
-		It("calls fallocate with KEEP_SIZE on the new range only, and leaves the length alone", func() {
+		It("calls fallocate with mode 0 on the new range only, never with KEEP_SIZE", func() {
 			newFile(0, "")
+			var refused error
 			opts.fallocate = func(fd int, mode uint32, off, length int64) error {
 				calls = append(calls, fallocateCall{mode, off, length})
-				return unix.Fallocate(fd, mode, off, length)
+				refused = unix.Fallocate(fd, mode, off, length)
+				return refused
 			}
-			Expect(preallocate(0, 4<<20, nil)).To(Succeed())
-			Expect(calls).To(Equal([]fallocateCall{{unix.FALLOC_FL_KEEP_SIZE, 0, 4 << 20}}))
-			Expect(sizeOf()).To(BeZero(), "the caller sets the length")
+			err := preallocate(0, 4<<20, nil)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(calls).To(Equal([]fallocateCall{{0, 0, 4 << 20}}))
+			Expect(calls[0].mode & unix.FALLOC_FL_KEEP_SIZE).To(BeZero())
+			if errors.Is(refused, unix.EOPNOTSUPP) {
+				Skip("this filesystem has no fallocate, so the zero write fallback ran; the specs for it are in the next group")
+			}
+			Expect(sizeOf()).To(Equal(int64(4<<20)), "mode 0 extends the file past its old end")
 			Expect(chunks).To(BeEmpty(), "no zeros are written")
 			Expect(syncs).To(BeZero())
 		})
 
 		It("allocates the blocks of the range when the filesystem supports it", func() {
 			newFile(0, "")
-			err := preallocate(0, 4<<20, nil)
-			if errors.Is(err, unix.EOPNOTSUPP) {
-				Skip("this filesystem has no fallocate")
+			var refused error
+			opts.fallocate = func(fd int, mode uint32, off, length int64) error {
+				refused = unix.Fallocate(fd, mode, off, length)
+				return refused
 			}
-			Expect(err).NotTo(HaveOccurred())
+			Expect(preallocate(0, 4<<20, nil)).To(Succeed())
+			if errors.Is(refused, unix.EOPNOTSUPP) {
+				Skip("this filesystem has no fallocate, so the zero write fallback ran; the specs for it are in the next group")
+			}
+			Expect(refused).NotTo(HaveOccurred())
 			st := statOf(path)
-			Expect(st.Size).To(Equal(int64(0)))
+			Expect(st.Size).To(Equal(int64(4 << 20)))
 			Expect(st.Blocks * 512).To(BeNumerically(">=", 4<<20))
 		})
 
@@ -908,7 +921,7 @@ var _ = Describe("preallocateImage", func() {
 				return nil
 			}
 			Expect(preallocate(1<<20, 3<<20, nil)).To(Succeed())
-			Expect(calls).To(Equal([]fallocateCall{{unix.FALLOC_FL_KEEP_SIZE, 1 << 20, 2 << 20}}))
+			Expect(calls).To(Equal([]fallocateCall{{0, 1 << 20, 2 << 20}}))
 			Expect(os.ReadFile(path)).To(HavePrefix("keep"))
 		})
 
@@ -985,13 +998,13 @@ var _ = Describe("preallocateImage", func() {
 			Expect(sizeOf()).To(Equal(int64(300 << 20)))
 		})
 
-		It("syncs just once when the range is exactly one sync interval", func() {
+		It("syncs once when the range is exactly one sync interval", func() {
 			newFile(0, "")
 			Expect(preallocate(0, 256<<20, nil)).To(Succeed())
 			Expect(syncs).To(Equal(1))
 		})
 
-		It("stops at a signal after a last sync, and a later call continues where it stopped", func() {
+		It("stops at a signal at once, without a sync, and leaves the part written file for the caller to discard", func() {
 			newFile(0, "")
 			sigs := make(chan os.Signal, 1)
 			opts.afterZeroChunk = func(end int64) {
@@ -1007,15 +1020,17 @@ var _ = Describe("preallocateImage", func() {
 			Expect(err).To(MatchError("received terminated while preallocating the volume image"))
 			Expect(stepExitCode(err)).To(Equal(128 + int(syscall.SIGTERM)))
 			Expect(chunks).To(Equal([]int64{1 << 20, 2 << 20}))
-			Expect(syncs).To(Equal(1), "a last sync after the signal")
-			Expect(sizeOf()).To(Equal(int64(2<<20)), "a multiple of 1 MiB past from")
-			Expect(statOf(path).Blocks * 512).To(BeNumerically(">=", 2<<20))
+			Expect(syncs).To(BeZero(), "a signal does not sync a file that is about to be deleted")
+			Expect(sizeOf()).To(Equal(int64(2 << 20)))
+		})
 
-			chunks, syncs = nil, 0
-			opts.afterZeroChunk = func(end int64) { chunks = append(chunks, end) }
-			Expect(preallocate(2<<20, 5<<20, nil)).To(Succeed())
-			Expect(chunks).To(Equal([]int64{3 << 20, 4 << 20, 5 << 20}))
-			Expect(sizeOf()).To(Equal(int64(5 << 20)))
+		It("exits 128 plus the signal even when a sync would have failed", func() {
+			newFile(0, "")
+			opts.syncFile = func(int) error { Fail("fsync was called after a signal"); return unix.EIO }
+			sigs := make(chan os.Signal, 1)
+			sigs <- syscall.SIGTERM
+			err := preallocate(0, 2<<20, sigs)
+			Expect(stepExitCode(err)).To(Equal(128 + int(syscall.SIGTERM)))
 		})
 
 		It("checks for a signal before the first chunk", func() {
@@ -1028,7 +1043,7 @@ var _ = Describe("preallocateImage", func() {
 			Expect(sizeOf()).To(BeZero())
 		})
 
-		It("reports a write that fails and does not sync", func() {
+		It("reports a write to a descriptor that cannot be written and does not sync", func() {
 			newFile(0, "")
 			// A descriptor that cannot be written fails the first chunk.
 			ro, err := os.Open(path)
@@ -1041,6 +1056,45 @@ var _ = Describe("preallocateImage", func() {
 			Expect(syncs).To(BeZero())
 		})
 
+		It("reports a write the quota refuses in the middle of the range, with the quota's words, and does not sync", func() {
+			newFile(0, "")
+			var writes []int64
+			opts.pwrite = func(fd int, b []byte, off int64) error {
+				writes = append(writes, off)
+				if len(writes) == 3 {
+					return unix.EDQUOT
+				}
+				return pwriteFull(fd, b, off)
+			}
+			err := preallocate(0, 5<<20, nil)
+			Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
+			Expect(err).To(MatchError("writing zeros at offset 2097152: disk quota exceeded (the volume's quota refused it)"))
+			Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+			Expect(writes).To(Equal([]int64{0, 1 << 20, 2 << 20}))
+			Expect(chunks).To(Equal([]int64{1 << 20, 2 << 20}), "the failed chunk is not counted")
+			Expect(syncs).To(BeZero())
+			Expect(sizeOf()).To(Equal(int64(2<<20)), "the two chunks before the failure stay")
+		})
+
+		It("adds the quota's words to an ENOSPC write error, and none to another one", func() {
+			for i, c := range []struct {
+				errno error
+				want  string
+			}{
+				{unix.ENOSPC, "writing zeros at offset 0: no space left on device (the volume's quota refused it)"},
+				{unix.EIO, "writing zeros at offset 0: input/output error"},
+			} {
+				errno, want := c.errno, c.want
+				each := filepath.Join(dir, "each-"+strconv.Itoa(i))
+				g, err := os.OpenFile(each, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+				Expect(err).NotTo(HaveOccurred())
+				opts.pwrite = func(int, []byte, int64) error { return errno }
+				err = preallocateImage(int(g.Fd()), each, 0, 2<<20, opts, nil)
+				g.Close()
+				Expect(err).To(MatchError(want))
+			}
+		})
+
 		It("fails when a sync fails, in the loop and at the end", func() {
 			newFile(0, "")
 			opts.syncFile = func(int) error { return unix.EDQUOT }
@@ -1051,16 +1105,6 @@ var _ = Describe("preallocateImage", func() {
 			err = preallocate(2<<20, 300<<20, nil)
 			Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
 			Expect(sizeOf()).To(Equal(int64(2<<20+256<<20)), "the loop stopped at the first sync")
-		})
-
-		It("fails a sync after a signal rather than hide it", func() {
-			newFile(0, "")
-			opts.syncFile = func(int) error { return unix.EIO }
-			sigs := make(chan os.Signal, 1)
-			sigs <- syscall.SIGTERM
-			err := preallocate(0, 2<<20, sigs)
-			Expect(err).To(MatchError("syncing the zeros written so far: input/output error"))
-			Expect(stepExitCode(err)).To(Equal(exitLaunchError))
 		})
 	})
 
@@ -1119,17 +1163,19 @@ var _ = Describe("creating an image with preallocation", func() {
 
 	It("allocates the range, sets the length, and publishes an image of exactly its size", func() {
 		var calls []fallocateCall
+		var refused error
 		opts.fallocate = func(fd int, mode uint32, off, length int64) error {
 			calls = append(calls, fallocateCall{mode, off, length})
-			return unix.Fallocate(fd, mode, off, length)
+			refused = unix.Fallocate(fd, mode, off, length)
+			return refused
 		}
 		f, err := openVolumeImage(vol, opts, nil)
-		if err != nil && errors.Is(err, unix.EOPNOTSUPP) {
-			Skip("this filesystem has no fallocate")
-		}
 		Expect(err).NotTo(HaveOccurred())
 		defer f.Close()
-		Expect(calls).To(Equal([]fallocateCall{{unix.FALLOC_FL_KEEP_SIZE, 0, 4 << 20}}))
+		Expect(calls).To(Equal([]fallocateCall{{0, 0, 4 << 20}}))
+		if errors.Is(refused, unix.EOPNOTSUPP) {
+			Skip("this filesystem has no fallocate, so the zero write fallback ran; the next spec covers it")
+		}
 		st := statOf(img)
 		Expect(st.Size).To(Equal(int64(4 << 20)))
 		Expect(st.Blocks * 512).To(BeNumerically(">=", 4<<20))
@@ -1184,13 +1230,31 @@ var _ = Describe("creating an image with preallocation", func() {
 		Expect(os.ReadDir(dir)).To(BeEmpty())
 	})
 
-	It("leaves the temp file and image name clear when a zero write fails part way", func() {
+	It("leaves the temp file and image name clear when the final sync of the zeros fails", func() {
 		opts.fallocate = func(int, uint32, int64, int64) error { return unix.EOPNOTSUPP }
 		opts.syncFile = func(int) error { return unix.EDQUOT }
 		_, err := openVolumeImage(vol, opts, nil)
 		Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
 		Expect(err.Error()).To(HavePrefix("creating volume image " + img + ": syncing the zeros written so far"))
 		Expect(os.ReadDir(dir)).To(BeEmpty())
+	})
+
+	It("leaves the temp file and image name clear, with the quota's words, when a zero write fails part way", func() {
+		opts.fallocate = func(int, uint32, int64, int64) error { return unix.EOPNOTSUPP }
+		writes := 0
+		opts.pwrite = func(fd int, b []byte, off int64) error {
+			writes++
+			if writes == 3 {
+				return unix.EDQUOT
+			}
+			return pwriteFull(fd, b, off)
+		}
+		_, err := openVolumeImage(vol, opts, nil)
+		Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
+		Expect(err).To(MatchError("creating volume image " + img + ": writing zeros at offset 2097152: disk quota exceeded (the volume's quota refused it)"))
+		Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+		Expect(writes).To(Equal(3), "no write follows the failed one")
+		Expect(os.ReadDir(dir)).To(BeEmpty(), "the part written temp file is removed and no image is published")
 	})
 
 	It("keeps an existing image as it is and does not preallocate it", func() {
@@ -1200,5 +1264,484 @@ var _ = Describe("creating an image with preallocation", func() {
 		Expect(err).NotTo(HaveOccurred())
 		defer f.Close()
 		Expect(os.ReadFile(img)).To(HavePrefix("keep"))
+	})
+})
+
+// openPaths lists the paths of the files this process has open, as the kernel
+// shows them in /proc/self/fd.
+func openPaths() []string {
+	entries, err := os.ReadDir("/proc/self/fd")
+	Expect(err).NotTo(HaveOccurred())
+	var paths []string
+	for _, e := range entries {
+		if target, err := os.Readlink(filepath.Join("/proc/self/fd", e.Name())); err == nil {
+			paths = append(paths, target)
+		}
+	}
+	return paths
+}
+
+var _ = Describe("publishing a new image by link", func() {
+	var (
+		dir  string
+		real string
+		vol  *guestVolume
+		img  string
+		opts imageOptions
+		// The names every unlink the specs saw was asked to remove.
+		unlinked []string
+		// The flags of every renameat2 call the specs saw.
+		renames []uint
+	)
+
+	BeforeEach(func() {
+		requireOpenat2()
+		dir = GinkgoT().TempDir()
+		var err error
+		real, err = filepath.EvalSymlinks(dir)
+		Expect(err).NotTo(HaveOccurred())
+		vol = &guestVolume{ContainerDir: dir, ImageName: "rvm-disk-0.img"}
+		img = filepath.Join(dir, "rvm-disk-0.img")
+		opts = imageOptions{Size: 1 << 20, LockWait: 200 * time.Millisecond, LockPoll: 20 * time.Millisecond,
+			IsMountRoot: alwaysMountRoot, Publish: publishLink}
+		unlinked, renames = nil, nil
+
+		savedRename, savedLink, savedUnlink := renameat2Call, linkatCall, unlinkatCall
+		DeferCleanup(func() { renameat2Call, linkatCall, unlinkatCall = savedRename, savedLink, savedUnlink })
+		// Any renameat2 with a flag fails as it does on a kernel NFS mount.
+		renameat2Call = func(olddirfd int, oldpath string, newdirfd int, newpath string, flags uint) error {
+			renames = append(renames, flags)
+			if flags != 0 {
+				return unix.EINVAL
+			}
+			return unix.Renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
+		}
+		// No name is unlinked while this process still has it open, which on
+		// an NFS client would turn the unlink into a silly rename.
+		unlinkatCall = func(dirfd int, name string, flags int) error {
+			unlinked = append(unlinked, name)
+			Expect(openPaths()).NotTo(ContainElement(filepath.Join(real, name)), "%s was open when it was unlinked", name)
+			return unix.Unlinkat(dirfd, name, flags)
+		}
+	})
+
+	open := func() (*os.File, error) { return openVolumeImage(vol, opts, nil) }
+
+	It("publishes an image of the right size with one link and mode 0600, and never calls renameat2", func() {
+		var tempName string
+		opts.afterTempCreate = func(_ int, name string) { tempName = name }
+		f, err := open()
+		Expect(err).NotTo(HaveOccurred())
+		defer f.Close()
+
+		Expect(f.Name()).To(Equal(img))
+		st := statOf(img)
+		Expect(st.Size).To(Equal(int64(1 << 20)))
+		Expect(int(st.Nlink)).To(Equal(1))
+		Expect(st.Mode & 0o7777).To(Equal(uint32(0o600)))
+		Expect(int(st.Uid)).To(Equal(os.Geteuid()))
+		Expect(renames).To(BeEmpty(), "the link publish makes no renameat2 call, with or without a flag")
+		Expect(unlinked).To(Equal([]string{tempName}), "only the temp name is unlinked")
+		Expect(tempFiles(dir)).To(BeEmpty())
+		Expect(lockedElsewhere(img)).To(BeTrue())
+
+		var byFD syscall.Stat_t
+		Expect(syscall.Fstat(int(f.Fd()), &byFD)).To(Succeed())
+		Expect(statOf(img).Ino).To(Equal(byFD.Ino), "the returned file is the published one")
+	})
+
+	It("gives the temp file the image's name with linkat and flags 0", func() {
+		var calls []string
+		linkatCall = func(olddirfd int, oldpath string, newdirfd int, newpath string, flags int) error {
+			calls = append(calls, fmt.Sprintf("%s>%s flags=%d same=%t", oldpath, newpath, flags, olddirfd == newdirfd))
+			return unix.Linkat(olddirfd, oldpath, newdirfd, newpath, flags)
+		}
+		var tempName string
+		opts.afterTempCreate = func(_ int, name string) { tempName = name }
+		f, err := open()
+		Expect(err).NotTo(HaveOccurred())
+		defer f.Close()
+		Expect(calls).To(Equal([]string{tempName + ">rvm-disk-0.img flags=0 same=true"}))
+	})
+
+	It("holds the lock on the temp file while it creates it, and has closed it before the link", func() {
+		var linkAt []string
+		opts.afterTempCreate = func(_ int, name string) {
+			Expect(lockedElsewhere(filepath.Join(dir, name))).To(BeTrue(), "a sweep must find the temp file of a live launch locked")
+		}
+		opts.link = func(dirfd int, oldName, newName string) error {
+			linkAt = openPaths()
+			return linkNoReplace(dirfd, oldName, newName)
+		}
+		f, err := open()
+		Expect(err).NotTo(HaveOccurred())
+		defer f.Close()
+		for _, p := range linkAt {
+			Expect(filepath.Base(p)).NotTo(MatchRegexp(`^\.rvm-disk-[0-9a-f]{16}\.tmp`), "the temp file is closed before it is linked")
+		}
+	})
+
+	It("opens the image that another launch published first, removes its own temp file, and replaces nothing", func() {
+		opts.afterTempCreate = func(_ int, _ string) { writeImage(img, 1<<20, []byte("first")) }
+		f, err := open()
+		Expect(err).NotTo(HaveOccurred())
+		defer f.Close()
+		Expect(tempFiles(dir)).To(BeEmpty())
+		got := make([]byte, 5)
+		_, err = f.ReadAt(got, 0)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(got)).To(Equal("first"))
+		Expect(int(statOf(img).Nlink)).To(Equal(1))
+		Expect(renames).To(BeEmpty())
+	})
+
+	It("checks an image that appeared first like any other, and fails closed on a wrong one", func() {
+		opts.afterTempCreate = func(_ int, _ string) { writeImage(img, 4096, []byte("planted")) }
+		_, err := open()
+		Expect(errors.Is(err, errImageSize)).To(BeTrue(), "%v", err)
+		Expect(tempFiles(dir)).To(BeEmpty())
+		Expect(os.ReadFile(img)).To(HavePrefix("planted"))
+	})
+
+	It("never publishes over a symbolic link planted at the name", func() {
+		target := filepath.Join(GinkgoT().TempDir(), "passwd")
+		Expect(os.WriteFile(target, []byte("root:x:0:0\n"), 0o644)).To(Succeed())
+		opts.afterTempCreate = func(_ int, _ string) { Expect(os.Symlink(target, img)).To(Succeed()) }
+		_, err := open()
+		Expect(errors.Is(err, unix.ELOOP)).To(BeTrue(), "%v", err)
+		Expect(os.ReadFile(target)).To(Equal([]byte("root:x:0:0\n")))
+		Expect(os.Readlink(img)).To(Equal(target))
+		Expect(tempFiles(dir)).To(BeEmpty())
+	})
+
+	It("removes its temp file and says the volume has no hard links when the link is refused", func() {
+		opts.link = func(int, string, string) error {
+			Expect(tempFiles(dir)).To(HaveLen(1), "the temp file exists when the link fails")
+			return unix.EPERM
+		}
+		_, err := open()
+		Expect(errors.Is(err, unix.EPERM)).To(BeTrue(), "%v", err)
+		Expect(err.Error()).To(ContainSubstring("publishing it"))
+		Expect(err.Error()).To(HaveSuffix("(the volume does not support hard links)"))
+		Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+		Expect(os.ReadDir(dir)).To(BeEmpty())
+	})
+
+	It("removes its temp file and adds no hint for a link error that is not about hard links", func() {
+		opts.link = func(int, string, string) error { return unix.EDQUOT }
+		_, err := open()
+		Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
+		Expect(err.Error()).NotTo(ContainSubstring("hard links"))
+		Expect(os.ReadDir(dir)).To(BeEmpty())
+	})
+
+	It("creates the image again when a sweep removes the temp file before the link", func() {
+		first := true
+		opts.afterTempCreate = func(dirfd int, name string) {
+			if first {
+				first = false
+				Expect(unix.Unlinkat(dirfd, name, 0)).To(Succeed())
+			}
+		}
+		f, err := open()
+		Expect(err).NotTo(HaveOccurred())
+		defer f.Close()
+		Expect(int(statOf(img).Nlink)).To(Equal(1))
+		Expect(statOf(img).Size).To(Equal(int64(1 << 20)))
+		Expect(tempFiles(dir)).To(BeEmpty())
+	})
+
+	It("gives up after the retries when a temp file keeps vanishing, and publishes nothing", func() {
+		opts.afterTempCreate = func(dirfd int, name string) { Expect(unix.Unlinkat(dirfd, name, 0)).To(Succeed()) }
+		_, err := open()
+		Expect(errors.Is(err, errCreateAgain)).To(BeTrue(), "%v", err)
+		Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+		Expect(os.ReadDir(dir)).To(BeEmpty())
+	})
+
+	It("stops at a signal while it writes zeros, closes the file before it unlinks the name, and leaves nothing", func() {
+		opts.Preallocate = true
+		opts.Size = 4 << 20
+		opts.fallocate = func(int, uint32, int64, int64) error { return unix.EOPNOTSUPP }
+		sigs := make(chan os.Signal, 1)
+		opts.afterZeroChunk = func(end int64) {
+			if end == 2<<20 {
+				sigs <- syscall.SIGTERM
+			}
+		}
+		_, err := openVolumeImage(vol, opts, sigs)
+		Expect(stepExitCode(err)).To(Equal(128 + int(syscall.SIGTERM)))
+		Expect(unlinked).To(HaveLen(1), "the temp name was unlinked, after its file was closed")
+		Expect(os.ReadDir(dir)).To(BeEmpty())
+	})
+
+	It("exits 125 with the quota's words and leaves nothing when the allocation is refused", func() {
+		opts.Preallocate = true
+		opts.fallocate = func(int, uint32, int64, int64) error { return unix.ENOSPC }
+		_, err := open()
+		Expect(errors.Is(err, unix.ENOSPC)).To(BeTrue(), "%v", err)
+		Expect(err.Error()).To(HaveSuffix("(the volume's quota refused it)"))
+		Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+		Expect(os.ReadDir(dir)).To(BeEmpty())
+	})
+
+	It("exits 125 with the quota's words and leaves nothing when the final sync is refused", func() {
+		opts.Preallocate = true
+		opts.fallocate = func(int, uint32, int64, int64) error { return unix.EOPNOTSUPP }
+		opts.syncFile = func(int) error { return unix.EDQUOT }
+		_, err := open()
+		Expect(errors.Is(err, unix.EDQUOT)).To(BeTrue(), "%v", err)
+		Expect(os.ReadDir(dir)).To(BeEmpty())
+	})
+
+	It("reports an image it published but could not remove the temp name of, and the next launch finishes the job", func() {
+		failing := true
+		unlinkatCall = func(dirfd int, name string, flags int) error {
+			if failing && tempNamePattern.MatchString(name) {
+				return unix.EIO
+			}
+			return unix.Unlinkat(dirfd, name, flags)
+		}
+		_, err := open()
+		Expect(errors.Is(err, unix.EIO)).To(BeTrue(), "%v", err)
+		Expect(err.Error()).To(ContainSubstring("published it, but could not remove its temp name"))
+		Expect(err.Error()).To(ContainSubstring("the next launch removes it"))
+		Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+		Expect(int(statOf(img).Nlink)).To(Equal(2), "the image has a second name until the sweep")
+		Expect(tempFiles(dir)).To(HaveLen(1))
+
+		failing = false
+		f, err := open()
+		Expect(err).NotTo(HaveOccurred(), "the sweep removes the second name before the image is checked")
+		defer f.Close()
+		Expect(int(statOf(img).Nlink)).To(Equal(1))
+		Expect(tempFiles(dir)).To(BeEmpty())
+	})
+
+	It("lets launches race on one new image, with sweeps running, and ends with one image of one link", func() {
+		dirfd, err := unix.Open(dir, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { unix.Close(dirfd) })
+		opts.Preallocate = true
+		opts.fallocate = func(fd int, mode uint32, off, length int64) error { return unix.Fallocate(fd, mode, off, length) }
+		// The races call the system calls from several goroutines, so the
+		// specs' recording hooks give way to the real calls.
+		renameat2Call, linkatCall, unlinkatCall = unix.Renameat2, unix.Linkat, unix.Unlinkat
+
+		const launches = 6
+		var wg sync.WaitGroup
+		results := make([]error, launches)
+		for i := 0; i < launches; i++ {
+			wg.Add(1)
+			go func() {
+				defer GinkgoRecover()
+				defer wg.Done()
+				fd, err := openImageFile(dirfd, "rvm-disk-0.img", img, opts, nil)
+				if err == nil {
+					unix.Close(fd)
+				}
+				results[i] = err
+			}()
+		}
+		stop := make(chan struct{})
+		var sweeps sync.WaitGroup
+		sweeps.Add(1)
+		go func() {
+			defer GinkgoRecover()
+			defer sweeps.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					sweepTempImages(dirfd)
+					time.Sleep(time.Millisecond)
+				}
+			}
+		}()
+		wg.Wait()
+		close(stop)
+		sweeps.Wait()
+
+		for i, err := range results {
+			Expect(err).NotTo(HaveOccurred(), "launch %d", i)
+		}
+		sweepTempImages(dirfd)
+		entries, err := os.ReadDir(dir)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(entries).To(HaveLen(1))
+		st := statOf(img)
+		Expect(int(st.Nlink)).To(Equal(1))
+		Expect(st.Size).To(Equal(int64(1 << 20)))
+	})
+
+	Describe("sweepTempImages", func() {
+		var dirfd int
+
+		BeforeEach(func() {
+			var err error
+			dirfd, err = unix.Open(dir, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { unix.Close(dirfd) })
+		})
+
+		const (
+			orphan = ".rvm-disk-0123456789abcdef.tmp"
+			second = ".rvm-disk-fedcba9876543210.tmp"
+		)
+
+		It("removes a temp file of a launch that was killed before it published", func() {
+			writeImage(filepath.Join(dir, orphan), 1<<20, []byte("orphan"))
+			sweepTempImages(dirfd)
+			Expect(fileExists(filepath.Join(dir, orphan))).To(BeFalse())
+		})
+
+		It("removes the second name of a published image and leaves the image whole", func() {
+			writeImage(img, 1<<20, []byte("image"))
+			Expect(os.Link(img, filepath.Join(dir, second))).To(Succeed())
+			before := statOf(img)
+
+			sweepTempImages(dirfd)
+
+			Expect(fileExists(filepath.Join(dir, second))).To(BeFalse())
+			after := statOf(img)
+			Expect(after.Ino).To(Equal(before.Ino))
+			Expect(int(after.Nlink)).To(Equal(1))
+			Expect(after.Size).To(Equal(int64(1 << 20)))
+			Expect(os.ReadFile(img)).To(HavePrefix("image"))
+		})
+
+		It("never touches the published image when only its temp name is an orphan", func() {
+			writeImage(img, 1<<20, []byte("image"))
+			writeImage(filepath.Join(dir, orphan), 1<<20, []byte("orphan"))
+			before := statOf(img)
+			sweepTempImages(dirfd)
+			Expect(statOf(img).Ino).To(Equal(before.Ino))
+			Expect(os.ReadFile(img)).To(HavePrefix("image"))
+			Expect(fileExists(filepath.Join(dir, orphan))).To(BeFalse())
+		})
+
+		It("leaves a temp file that a live launch has locked, and removes it once the lock is gone", func() {
+			p := filepath.Join(dir, orphan)
+			writeImage(p, 1<<20, []byte("live"))
+			holder, err := os.OpenFile(p, os.O_RDWR, 0)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(unix.Flock(int(holder.Fd()), unix.LOCK_EX)).To(Succeed())
+
+			sweepTempImages(dirfd)
+			Expect(os.ReadFile(p)).To(HavePrefix("live"))
+
+			Expect(holder.Close()).To(Succeed())
+			sweepTempImages(dirfd)
+			Expect(fileExists(p)).To(BeFalse())
+		})
+
+		It("closes a name before it unlinks it", func() {
+			writeImage(filepath.Join(dir, orphan), 1<<20, nil)
+			writeImage(img, 1<<20, nil)
+			Expect(os.Link(img, filepath.Join(dir, second))).To(Succeed())
+			sweepTempImages(dirfd)
+			Expect(unlinked).To(ConsistOf(orphan, second), "the unlink spec of this group fails the run when a name was open")
+		})
+
+		DescribeTable("leaves a name that is not exactly a temp name",
+			func(name string) {
+				p := filepath.Join(dir, name)
+				writeImage(p, 4096, []byte("keep"))
+				sweepTempImages(dirfd)
+				Expect(os.ReadFile(p)).To(HavePrefix("keep"))
+			},
+			Entry("a short random part", ".rvm-disk-0123456789abcde.tmp"),
+			Entry("a long random part", ".rvm-disk-0123456789abcdef0.tmp"),
+			Entry("upper case hex", ".rvm-disk-0123456789ABCDEF.tmp"),
+			Entry("a non hex letter", ".rvm-disk-0123456789abcdeg.tmp"),
+			Entry("no leading dot", "rvm-disk-0123456789abcdef.tmp"),
+			Entry("another suffix", ".rvm-disk-0123456789abcdef.tmp.bak"),
+			Entry("a prefix before it", "x.rvm-disk-0123456789abcdef.tmp"),
+			Entry("an image name", "rvm-disk-0.img"),
+			Entry("an image name with the temp prefix", ".rvm-disk-app-web-0.img"),
+			Entry("an NFS silly rename", ".nfs0000000000000001"),
+			Entry("a glob like name", ".rvm-disk-*.tmp"),
+		)
+
+		It("leaves a symbolic link with a temp name and its target alone", func() {
+			target := filepath.Join(GinkgoT().TempDir(), "target")
+			Expect(os.WriteFile(target, []byte("keep"), 0o600)).To(Succeed())
+			Expect(os.Symlink(target, filepath.Join(dir, orphan))).To(Succeed())
+			sweepTempImages(dirfd)
+			Expect(os.Readlink(filepath.Join(dir, orphan))).To(Equal(target))
+			Expect(os.ReadFile(target)).To(Equal([]byte("keep")))
+		})
+
+		It("leaves a directory with a temp name, with what is in it", func() {
+			d := filepath.Join(dir, orphan)
+			Expect(os.Mkdir(d, 0o700)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(d, "inner"), []byte("keep"), 0o600)).To(Succeed())
+			sweepTempImages(dirfd)
+			Expect(os.ReadFile(filepath.Join(d, "inner"))).To(Equal([]byte("keep")))
+		})
+
+		It("leaves a temp file that another user owns", func() {
+			if os.Geteuid() != 0 {
+				Skip("changing a file's owner needs root")
+			}
+			p := filepath.Join(dir, orphan)
+			writeImage(p, 4096, []byte("theirs"))
+			Expect(os.Chown(p, 12345, 12345)).To(Succeed())
+			sweepTempImages(dirfd)
+			Expect(os.ReadFile(p)).To(HavePrefix("theirs"))
+		})
+
+		It("does nothing for an empty directory or one it cannot list", func() {
+			sweepTempImages(dirfd)
+			sweepTempImages(-1)
+		})
+
+		It("is not run for the rename publish, which leaves a temp file from a killed launch alone", func() {
+			p := filepath.Join(dir, orphan)
+			writeImage(p, 4096, []byte("stale"))
+			opts.Publish = publishRename
+			renameat2Call = unix.Renameat2
+			f, err := open()
+			Expect(err).NotTo(HaveOccurred())
+			defer f.Close()
+			Expect(os.ReadFile(p)).To(HavePrefix("stale"))
+		})
+
+		It("is run by a launch, so that a leftover temp file does not outlive the next one", func() {
+			p := filepath.Join(dir, orphan)
+			writeImage(p, 1<<20, []byte("stale"))
+			f, err := open()
+			Expect(err).NotTo(HaveOccurred())
+			defer f.Close()
+			Expect(fileExists(p)).To(BeFalse())
+		})
+	})
+
+	DescribeTable("checkImageRequest accepts the two publish strategies and no other",
+		func(p publishStrategy, ok bool) {
+			o := opts
+			o.Publish = p
+			err := checkImageRequest(vol, o)
+			if ok {
+				Expect(err).NotTo(HaveOccurred())
+			} else {
+				Expect(err).To(MatchError(ContainSubstring("unknown way to publish an image")))
+			}
+		},
+		Entry("rename", publishRename, true),
+		Entry("link", publishLink, true),
+		Entry("a value that is neither", publishStrategy(7), false),
+		Entry("a negative value", publishStrategy(-1), false),
+	)
+
+	It("names the strategies", func() {
+		Expect(publishRename.String()).To(Equal("rename"))
+		Expect(publishLink.String()).To(Equal("link"))
+		Expect(publishStrategy(7).String()).To(Equal("publish strategy 7"))
+	})
+
+	It("leaves the default options on the rename publish, as JuiceFS needs", func() {
+		Expect(defaultImageOptions.Publish).To(Equal(publishRename))
 	})
 })

@@ -28,7 +28,7 @@ func diskLine(fstype, source, root string) string {
 
 var _ = Describe("the mount refusals", func() {
 	It("registers the BOSH disk refusal and leaves the supported providers alone", func() {
-		Expect(mountRefusals).To(HaveLen(1))
+		Expect(mountRefusals).To(HaveLen(2), "the BOSH disk refusal and the NFS refusal")
 		Expect(providerNamesOf(diskProviders)).To(Equal([]string{"JuiceFS", "NFS"}))
 		Expect(diskProviders.supportedLine()).To(Equal("VM backends support only JuiceFS and NFS volumes today"))
 	})
@@ -118,35 +118,38 @@ var _ = Describe("the mount refusals", func() {
 		}
 	})
 
-	It("never answers an NFS mount with the BOSH disk line, whichever way the NFS provider claims it", func() {
-		// The NFS provider owns nfs4 with local_lock=none strongly and claims
-		// nfs, fuse.mapfs, and nfs4 without that option weakly, to refuse them
-		// in its own words. None of them is a BOSH disk in mount mode, so the
-		// mount refusals stay silent and the registry reaches the provider,
-		// even when the source looks like a whole disk.
-		for _, c := range []struct{ name, fstype, source, superOptions string }{
-			{"a kernel NFSv4 mount the provider owns", "nfs4", "10.0.0.5:/export", labNFSOptions},
-			{"the same mount with a disk-like source", "nfs4", "/dev/sdb", labNFSOptions},
-			{"an NFSv4 mount without the lock option", "nfs4", "10.0.0.5:/export", "rw,vers=4.1"},
-			{"an NFSv4 mount without the lock option, disk-like source", "nfs4", "/dev/sdb", "rw,vers=4.1"},
-			{"a kernel NFSv3 mount", "nfs", "10.0.0.5:/export", "rw,vers=3"},
-			{"a kernel NFSv3 mount with a disk-like source", "nfs", "/dev/sdb", "rw,vers=3"},
-			{"a mapfs mount", "fuse.mapfs", "/var/vcap/data/nfs", "rw"},
-			{"a mapfs mount with a disk-like source", "fuse.mapfs", "/dev/sdb", "rw"},
+	It("never answers an NFS mount with the BOSH disk line, even when its source looks like a whole disk", func() {
+		// The NFS provider owns nfs4 with local_lock=none, and its refusal
+		// answers nfs, fuse.mapfs, and nfs4 without that option in its own
+		// words. None of them is a BOSH disk in mount mode, so the BOSH disk
+		// refusal stays silent for all of them.
+		for _, c := range []struct {
+			name, fstype, source, superOptions string
+			owned                              bool
+		}{
+			{"a kernel NFSv4 mount the provider owns", "nfs4", "10.0.0.5:/export", labNFSOptions, true},
+			{"the same mount with a disk-like source", "nfs4", "/dev/sdb", labNFSOptions, true},
+			{"an NFSv4 mount without the lock option", "nfs4", "10.0.0.5:/export", "rw,vers=4.1", false},
+			{"an NFSv4 mount without the lock option, disk-like source", "nfs4", "/dev/sdb", "rw,vers=4.1", false},
+			{"a kernel NFSv3 mount", "nfs", "10.0.0.5:/export", "rw,vers=3", false},
+			{"a kernel NFSv3 mount with a disk-like source", "nfs", "/dev/sdb", "rw,vers=3", false},
+			{"a mapfs mount", "fuse.mapfs", "/var/vcap/data/nfs", "rw", false},
+			{"a mapfs mount with a disk-like source", "fuse.mapfs", "/dev/sdb", "rw", false},
 		} {
 			m := mountRecord{ContainerDir: "/data", Root: "/", FSType: c.fstype, Source: c.source, SuperOptions: strings.Split(c.superOptions, ",")}
 			Expect(refuseBoshDiskMountMode(m)).To(Succeed(), c.name)
 
 			p, got, err := findIn(writeTempFile("mountinfo", nfsMountinfoLine(40, "/data", c.fstype, c.source, c.superOptions)), "/data")
-			Expect(err).NotTo(HaveOccurred(), c.name)
-			Expect(p.Name()).To(Equal("NFS"), c.name)
-			Expect(got.FSType).To(Equal(c.fstype), c.name)
-
-			// A mount the NFS provider refuses says so in NFS's own words.
-			if err := refuseNFSMount(got); err != nil {
-				Expect(err.Error()).NotTo(ContainSubstring("mount mode"), c.name)
-				Expect(err.Error()).NotTo(ContainSubstring("block plan"), c.name)
+			if c.owned {
+				Expect(err).NotTo(HaveOccurred(), c.name)
+				Expect(p.Name()).To(Equal("NFS"), c.name)
+				Expect(got.FSType).To(Equal(c.fstype), c.name)
+				continue
 			}
+			// A mount the NFS provider refuses says so in NFS's own words.
+			Expect(err).To(MatchError(refuseNFSMount(m)), c.name)
+			Expect(err.Error()).NotTo(ContainSubstring("mount mode"), c.name)
+			Expect(err.Error()).NotTo(ContainSubstring("block plan"), c.name)
 		}
 	})
 
@@ -160,7 +163,7 @@ var _ = Describe("the mount refusals", func() {
 	It("does not refuse NFS or the block-mode descriptor when providers claim them", func() {
 		withProviders(fake("NFS", "nfs4", strongMatch), fake("Block", "tmpfs", strongMatch))
 		for _, line := range []string{
-			diskLine("nfs4", "10.0.0.5:/export", "/"),
+			nfsMountinfoLine(41, "/data", "nfs4", "10.0.0.5:/export", labNFSOptions),
 			diskLine("tmpfs", "pdi:bosh-disk", "/"),
 		} {
 			p, _, err := findIn(writeTempFile("mountinfo", line), "/data")

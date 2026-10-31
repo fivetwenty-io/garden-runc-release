@@ -108,7 +108,7 @@ var _ = Describe("the volume provider registry", func() {
 			{[]diskProvider{fake("A", "fuse.a", strongMatch), fake("B", "fuse.b", strongMatch), fake("C", "fuse.c", strongMatch)}, "A, B, and C"},
 		} {
 			withProviders(c.providers...)
-			err := findVolumeProviderErr(writeTempFile("mountinfo", mountinfoLine(40, "/data", "nfs4")), "/data")
+			err := findVolumeProviderErr(writeTempFile("mountinfo", mountinfoLine(40, "/data", "cifs")), "/data")
 			Expect(err).To(MatchError(HaveSuffix("; VM backends support only "+c.names+" volumes today")), c.names)
 			empty := writeTempFile("mountinfo", "")
 			err = findVolumeProviderErr(empty, "/data")

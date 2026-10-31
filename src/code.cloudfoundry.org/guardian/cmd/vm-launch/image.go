@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"syscall"
 	"time"
 
@@ -42,22 +43,22 @@ const (
 	lockPoll = 500 * time.Millisecond
 
 	// tempPrefix and tempSuffix frame the unique name a new image has until
-	// it is sized and published. A launch killed in between leaves such a
-	// file behind. Nothing ever opens, trusts, or reuses a temp file, but
-	// on a volume whose quota counts file length it holds up to the image
-	// size of quota until an operator deletes it.
-	tempPrefix = ".rvm-disk-"
-	tempSuffix = ".tmp"
+	// it is sized and published, with tempRandomBytes random bytes written as
+	// hex between them. A launch killed in between leaves such a file behind.
+	// Nothing ever opens, trusts, or reuses a temp file as an image. On a
+	// volume whose quota counts file length it holds up to the image size of
+	// quota until an operator deletes it, except on a volume that publishes by
+	// link (publishLink), where the next launch removes it (sweepTempImages).
+	tempPrefix      = ".rvm-disk-"
+	tempSuffix      = ".tmp"
+	tempRandomBytes = 8
 
 	// openRetries bounds retries of an openat2 that the kernel interrupted or
 	// asked to repeat because of a concurrent rename.
 	openRetries = 8
 
 	// zeroChunk is the size of one write when preallocation has to write
-	// zeros, and syncInterval is how many bytes it writes between fsyncs. A
-	// launch stopped part way therefore leaves an image whose length is a
-	// multiple of zeroChunk from where it began, with every byte of it
-	// allocated.
+	// zeros, and syncInterval is how many bytes it writes between fsyncs.
 	zeroChunk    = 1 << 20
 	syncInterval = 256 << 20
 )
@@ -92,10 +93,62 @@ type imageOptions struct {
 	// is published. Tests use it to act as a co-bound app would.
 	afterTempCreate func(dirfd int, tempName string)
 
+	// Publish is how a new image gets its name. The zero value, publishRename,
+	// is what JuiceFS needs. The NFS provider sets publishLink.
+	Publish publishStrategy
+
 	// rename, when set, replaces renameNoReplace as the step that publishes a
-	// new image. Tests use it to fail the publish while the temp file exists.
+	// new image under publishRename. Tests use it to fail the publish while the
+	// temp file exists.
 	rename func(dirfd int, oldName, newName string) error
+
+	// link, when set, replaces linkNoReplace as the step that publishes a new
+	// image under publishLink.
+	link func(dirfd int, oldName, newName string) error
+
+	// pwrite, when set, replaces pwriteFull as the step that writes one chunk
+	// of zeros. Tests use it to fail a write part way through the range.
+	pwrite func(fd int, b []byte, off int64) error
 }
+
+// publishStrategy is how createImage moves a finished temp file to the
+// image's name without ever replacing an image another launch published.
+type publishStrategy int
+
+const (
+	// publishRename moves the temp file with renameat2(RENAME_NOREPLACE), which
+	// is atomic and leaves the image with one link. The Linux NFS client
+	// refuses renameat2 with any flag, so a volume that is NFS cannot use it.
+	publishRename publishStrategy = iota
+
+	// publishLink gives the temp file the image's name with linkat, which
+	// fails with EEXIST when the name exists on every filesystem that has hard
+	// links, NFS included, and then removes the temp name. The file is closed
+	// before its name is unlinked, because an NFS client turns the unlink of a
+	// name that is still open into a silly rename to a hidden .nfs file. A launch killed
+	// between the link and the unlink leaves a second link to a published
+	// image, which sweepTempImages removes on the next launch.
+	publishLink
+)
+
+// String names the strategy for a message.
+func (p publishStrategy) String() string {
+	switch p {
+	case publishRename:
+		return "rename"
+	case publishLink:
+		return "link"
+	}
+	return fmt.Sprintf("publish strategy %d", int(p))
+}
+
+// The system calls that publish and remove names, as variables so that specs
+// can show which of them a strategy makes.
+var (
+	renameat2Call = unix.Renameat2
+	linkatCall    = unix.Linkat
+	unlinkatCall  = unix.Unlinkat
+)
 
 var defaultImageOptions = imageOptions{
 	Size:        defaultImageSize,
@@ -168,9 +221,11 @@ func (e *signalledError) Error() string {
 // A missing image is created under a unique temporary name in the same
 // directory, sized to Size (sparse, but a quota that counts file length
 // charges all of it, and with Preallocate the whole range is allocated first),
-// synced, and only then published under its name with
-// renameat2(RENAME_NOREPLACE), so the published name never refers to an
-// unsized file, whatever happens to this launch. See createImage.
+// synced, and only then published under its name, with
+// renameat2(RENAME_NOREPLACE) or, for Publish set to publishLink, with a hard
+// link, so the published name never refers to an unsized file, whatever
+// happens to this launch. See createImage. Under publishLink, a temp name that
+// an earlier launch left behind is removed first (sweepTempImages).
 func openVolumeImage(v *guestVolume, o imageOptions, sigs <-chan os.Signal) (*os.File, error) {
 	if err := checkImageRequest(v, o); err != nil {
 		return nil, err
@@ -207,6 +262,10 @@ func openVolumeImage(v *guestVolume, o imageOptions, sigs <-chan os.Signal) (*os
 		return nil, notMountRootError(v.ContainerDir, err)
 	case !root:
 		return nil, notMountRootError(v.ContainerDir, nil)
+	}
+
+	if o.Publish == publishLink {
+		sweepTempImages(dirfd)
 	}
 
 	// The umask must not take the owner's bits away from a new image: the
@@ -260,8 +319,9 @@ func checkOpenImage(fd int, path string, want int64) error {
 // opens an existing file through the checked openat2 path, and when there is
 // none, creates the image with createImage. A name that appears between the
 // failed open and the publish is opened instead, and a name that vanishes
-// between the publish race and that open is created again, within
-// openRetries. A signal on sigs stops the creation while it preallocates.
+// between the publish race and that open, or a temp file that a sweep removed
+// during the creation, is created again, within openRetries. A signal on sigs
+// stops the creation while it preallocates.
 func openImageFile(dirfd int, name, path string, o imageOptions, sigs <-chan os.Signal) (int, error) {
 	var err error
 	for i := 0; i < openRetries; i++ {
@@ -277,7 +337,7 @@ func openImageFile(dirfd int, name, path string, o imageOptions, sigs <-chan os.
 		if err == nil {
 			return fd, nil
 		}
-		if !errors.Is(err, errImageAppeared) {
+		if !errors.Is(err, errImageAppeared) && !errors.Is(err, errCreateAgain) {
 			return -1, err
 		}
 	}
@@ -302,11 +362,18 @@ func openExistingImage(dirfd int, name string) (int, error) {
 // the image name first. createImage has already cleaned up after itself.
 var errImageAppeared = errors.New("volume image appeared while this launch created it")
 
+// errCreateAgain reports that the creation found its temp file or the new
+// image removed by another party, which only a concurrent launch's sweep or an
+// operator does. createImage has already cleaned up after itself, and the
+// caller creates the image again.
+var errCreateAgain = errors.New("the new volume image's temp file was removed while this launch created it")
+
 // createImage makes a new image and publishes it under name. It creates a
 // file with a name nothing else uses, `.rvm-disk-<random>.tmp`, in the same
 // directory with O_CREAT|O_EXCL and mode 0600, sizes it to o.Size with
 // ftruncate (after allocating the range, when o.Preallocate asks for it),
-// syncs it, and moves it to name with renameat2(RENAME_NOREPLACE).
+// syncs it, and moves it to name with renameat2(RENAME_NOREPLACE), or, for
+// o.Publish set to publishLink, by link (createImageByLink).
 // It returns the open file, which is still the one now at name. The published
 // name therefore never refers to an unsized file, and a launch killed at any
 // point leaves at worst a temp file. Nothing opens, trusts, or reuses a temp
@@ -324,6 +391,9 @@ var errImageAppeared = errors.New("volume image appeared while this launch creat
 // published name is never removed. A signal on sigs during preallocation
 // removes the temp file and returns the signal's error.
 func createImage(dirfd int, name, path string, o imageOptions, sigs <-chan os.Signal) (int, error) {
+	if o.Publish == publishLink {
+		return createImageByLink(dirfd, name, path, o, sigs)
+	}
 	tempName, fd, err := createTempImage(dirfd)
 	if err != nil {
 		return -1, fmt.Errorf("creating volume image %s: %w%s", path, err, symlinkHint(err))
@@ -364,7 +434,7 @@ func createImage(dirfd int, name, path string, o imageOptions, sigs <-chan os.Si
 // newName exists, retrying when a signal interrupted it.
 func renameNoReplace(dirfd int, oldName, newName string) error {
 	for {
-		err := unix.Renameat2(dirfd, oldName, dirfd, newName, unix.RENAME_NOREPLACE)
+		err := renameat2Call(dirfd, oldName, dirfd, newName, unix.RENAME_NOREPLACE)
 		if !errors.Is(err, unix.EINTR) {
 			return err
 		}
@@ -378,6 +448,254 @@ func renameHint(err error) string {
 		return " (the volume does not support renameat2 with RENAME_NOREPLACE)"
 	}
 	return ""
+}
+
+// createImageByLink is createImage for a volume that cannot publish with
+// renameat2(RENAME_NOREPLACE), such as a kernel NFS mount. It runs these steps
+// in this order:
+//
+//  1. It creates the temp file with O_EXCL, takes an exclusive flock on it
+//     that lasts while the file is open, and checks that the temp name still
+//     refers to the file. The lock tells a concurrent launch's sweep
+//     (sweepTempImages) that a live launch owns the file.
+//  2. It sizes the file (after allocating the range, when o.Preallocate asks
+//     for it) and syncs it.
+//  3. It closes the file.
+//  4. It gives the file the image's name with linkat, which fails with EEXIST
+//     when another launch published first. EEXIST removes the temp name and
+//     returns errImageAppeared, so the caller uses that launch's image.
+//  5. It unlinks the temp name. The file is closed by now, so an NFS client
+//     has no open name to turn into a silly rename.
+//  6. It opens the image by its name, and returns that file.
+//
+// No step unlinks a name that this process still has open. A launch killed
+// before step 4 leaves a temp file with one link, and one killed between
+// steps 4 and 5 leaves a second link to the published image. The next launch
+// removes either one (sweepTempImages), and neither is ever mistaken for the
+// image: the image's own name is never unlinked, and a published image that
+// has two links fails checkImage until the sweep has run.
+//
+// A failure in steps 1 to 3 removes the temp file, after closing it. A signal
+// during preallocation does the same and returns the signal's error. A temp
+// file that a concurrent sweep removed between steps 1 and 4 returns
+// errCreateAgain.
+func createImageByLink(dirfd int, name, path string, o imageOptions, sigs <-chan os.Signal) (int, error) {
+	tempName, fd, err := createTempImage(dirfd)
+	if err != nil {
+		return -1, fmt.Errorf("creating volume image %s: %w%s", path, err, symlinkHint(err))
+	}
+	var id unix.Stat_t
+	if err := unix.Fstat(fd, &id); err != nil {
+		unix.Close(fd)
+		return -1, fmt.Errorf("creating volume image %s: fstat of the new file: %w", path, err)
+	}
+	// Whatever the outcome, the file is closed before its name is unlinked.
+	discard := func() {
+		unix.Close(fd)
+		removeTempByID(dirfd, tempName, &id)
+	}
+	fail := func(err error) (int, error) {
+		discard()
+		return -1, err
+	}
+
+	switch err := lockTempImage(fd); {
+	case errors.Is(err, unix.EWOULDBLOCK):
+		// A sweep holds the brand new file. It is about to remove it.
+		unix.Close(fd)
+		return -1, errCreateAgain
+	case err != nil:
+		return fail(fmt.Errorf("creating volume image %s: locking the new file: %w", path, err))
+	}
+	if checkImageName(dirfd, fd, tempName, tempName) != nil {
+		unix.Close(fd)
+		return -1, errCreateAgain
+	}
+	if err := sizeNewImage(fd, path, o, sigs); err != nil {
+		return fail(err)
+	}
+	if err := unix.Fsync(fd); err != nil {
+		return fail(fmt.Errorf("creating volume image %s: syncing it: %w%s", path, err, quotaHint(err)))
+	}
+	if o.afterTempCreate != nil {
+		o.afterTempCreate(dirfd, tempName)
+	}
+	if err := unix.Close(fd); err != nil {
+		removeTempByID(dirfd, tempName, &id)
+		return -1, fmt.Errorf("creating volume image %s: closing the new file: %w%s", path, err, quotaHint(err))
+	}
+
+	publish := o.link
+	if publish == nil {
+		publish = linkNoReplace
+	}
+	switch err := publish(dirfd, tempName, name); {
+	case err == nil:
+	case errors.Is(err, unix.EEXIST):
+		removeTempByID(dirfd, tempName, &id)
+		return -1, errImageAppeared
+	case errors.Is(err, unix.ENOENT):
+		return -1, errCreateAgain
+	default:
+		removeTempByID(dirfd, tempName, &id)
+		return -1, fmt.Errorf("creating volume image %s: publishing it: %w%s", path, err, linkHint(err))
+	}
+
+	if err := unlinkTempName(dirfd, tempName); err != nil {
+		return -1, fmt.Errorf("creating volume image %s: published it, but could not remove its temp name %s: %w; the next launch removes it",
+			path, tempName, err)
+	}
+	img, err := openExistingImage(dirfd, name)
+	switch {
+	case errors.Is(err, unix.ENOENT):
+		return -1, errCreateAgain
+	case err != nil:
+		return -1, fmt.Errorf("opening volume image %s: %w%s", path, err, symlinkHint(err))
+	}
+	return img, nil
+}
+
+// lockTempImage takes an exclusive flock on the new temp file without
+// waiting, repeating after an interrupt. It fails with EWOULDBLOCK when
+// another open file holds the lock.
+func lockTempImage(fd int) error {
+	for {
+		err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB)
+		if !errors.Is(err, unix.EINTR) {
+			return err
+		}
+	}
+}
+
+// linkNoReplace gives oldName in dirfd the name newName with linkat, failing
+// with EEXIST when newName exists, retrying when a signal interrupted it.
+func linkNoReplace(dirfd int, oldName, newName string) error {
+	for {
+		err := linkatCall(dirfd, oldName, dirfd, newName, 0)
+		if !errors.Is(err, unix.EINTR) {
+			return err
+		}
+	}
+}
+
+// linkHint explains the errno linkat returns on a filesystem that does not
+// support hard links.
+func linkHint(err error) string {
+	if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.ENOSYS) {
+		return " (the volume does not support hard links)"
+	}
+	return ""
+}
+
+// unlinkTempName unlinks the temp name tempName in dirfd, repeating after an
+// interrupt. A name that is already gone counts as removed, because a
+// concurrent launch's sweep removes the second link of a published image.
+func unlinkTempName(dirfd int, tempName string) error {
+	for {
+		err := unlinkatCall(dirfd, tempName, 0)
+		switch {
+		case errors.Is(err, unix.EINTR):
+		case err == nil, errors.Is(err, unix.ENOENT):
+			return nil
+		default:
+			return err
+		}
+	}
+}
+
+// removeTempByID unlinks tempName in dirfd when it still refers to the file
+// with the device and inode of id, which the caller has closed, and does
+// nothing otherwise. It compares without following a symbolic link, so a file
+// that another party moved to the name stays. A failure is ignored: the launch
+// is already failing, or the sweep will try again.
+func removeTempByID(dirfd int, tempName string, id *unix.Stat_t) {
+	var byName unix.Stat_t
+	if err := unix.Fstatat(dirfd, tempName, &byName, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return
+	}
+	if byName.Dev != id.Dev || byName.Ino != id.Ino {
+		return
+	}
+	_ = unlinkatCall(dirfd, tempName, 0)
+}
+
+// sweepTempImages removes the temp names that earlier launches left in the
+// volume root, for a volume that publishes by link. Two things need removing.
+// A temp file with one link is the work of a launch that was killed before it
+// published, and a temp file with two or more links is the second name of an
+// image that a launch published and was killed before it removed the name.
+// The second case would fail checkImage on the image until the name is gone.
+//
+// It touches only a name that matches tempNamePattern exactly, that is a
+// regular file owned by vm-launch's effective uid, and that it opens without
+// following a link. It removes a temp file with one link only when it can take
+// an exclusive flock on it, because a launch that is creating an image holds
+// that lock on its temp file until it has closed it (createImageByLink). The
+// lock is released before the name is removed, so that an NFS client does not
+// silly-rename a name that is open here, and the name is removed only while it
+// still refers to the file that was checked. Removing a second name never
+// removes the image, because the image keeps its own name. The sweep is best
+// effort: a name it cannot open, lock, or remove stays, and the next launch
+// tries again.
+func sweepTempImages(dirfd int) {
+	dfd, err := openat2Retry(dirfd, ".", &unix.OpenHow{
+		Flags: unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC, Resolve: imageOpenResolve,
+	})
+	if err != nil {
+		return
+	}
+	dir := os.NewFile(uintptr(dfd), "volume root")
+	names, err := dir.Readdirnames(-1)
+	dir.Close()
+	if err != nil {
+		return
+	}
+	for _, name := range names {
+		if tempNamePattern.MatchString(name) {
+			sweepTempName(dirfd, name)
+		}
+	}
+}
+
+// freshLinkCount returns the link count of the open file fd, asking the
+// filesystem for fresh attributes, because an NFS client may otherwise answer
+// from a cache that another cell's link or unlink has made stale.
+func freshLinkCount(fd int) (uint32, error) {
+	var st unix.Statx_t
+	if err := unix.Statx(fd, "", unix.AT_EMPTY_PATH|unix.AT_STATX_FORCE_SYNC, unix.STATX_NLINK, &st); err != nil {
+		return 0, err
+	}
+	if st.Mask&unix.STATX_NLINK == 0 {
+		return 0, errors.New("the filesystem did not report the link count")
+	}
+	return st.Nlink, nil
+}
+
+// sweepTempName removes one temp name for sweepTempImages when it is an
+// orphan or a second link, and leaves it otherwise.
+func sweepTempName(dirfd int, name string) {
+	fd, err := openat2Retry(dirfd, name, &unix.OpenHow{Flags: imageOpenFlags, Resolve: imageOpenResolve})
+	if err != nil {
+		return
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil || st.Mode&unix.S_IFMT != unix.S_IFREG || int64(st.Uid) != int64(os.Geteuid()) {
+		unix.Close(fd)
+		return
+	}
+	links, err := freshLinkCount(fd)
+	if err != nil {
+		unix.Close(fd)
+		return
+	}
+	if links < 2 {
+		if err := lockTempImage(fd); err != nil {
+			unix.Close(fd)
+			return
+		}
+	}
+	unix.Close(fd)
+	removeTempByID(dirfd, name, &st)
 }
 
 // createTempImage creates a new empty file in dirfd under a unique temp name,
@@ -406,12 +724,17 @@ func createTempImage(dirfd int) (string, int, error) {
 
 // newTempName returns a fresh temp file name for a new image.
 func newTempName() (string, error) {
-	var b [8]byte
+	var b [tempRandomBytes]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", fmt.Errorf("drawing a temp file name: %w", err)
 	}
 	return tempPrefix + hex.EncodeToString(b[:]) + tempSuffix, nil
 }
+
+// tempNamePattern matches exactly the names newTempName makes, and nothing
+// else. Only a name that matches it is ever swept.
+var tempNamePattern = regexp.MustCompile(`^` + regexp.QuoteMeta(tempPrefix) +
+	`[0-9a-f]{` + fmt.Sprint(2*tempRandomBytes) + `}` + regexp.QuoteMeta(tempSuffix) + `$`)
 
 // removeOwnTemp unlinks tempName in dirfd when it still refers to the file
 // fd, which this launch created, and does nothing otherwise. The comparison
@@ -464,17 +787,19 @@ func sizeNewImage(fd int, path string, o imageOptions, sigs <-chan os.Signal) er
 // returns without an error. It never reads the image and writes only zeros at
 // or past its current end, so it cannot touch bytes the guest wrote.
 //
-// It first calls fallocate with FALLOC_FL_KEEP_SIZE on the range, which on a
-// server that allocates reserves the space without changing the length. NFS
-// 4.1 has no ALLOCATE, so when fallocate fails with EOPNOTSUPP it writes
-// sequential zeroChunk chunks from from, which extend the image as they go,
-// and fsyncs every syncInterval bytes and once at the end. glibc's
-// posix_fallocate is not used, because its emulation is far slower. A signal
-// on sigs, checked before each chunk, stops the writes after a last fsync and
-// returns a *signalledError; the image then keeps the length it reached, a
-// multiple of zeroChunk past from, fully allocated, and a later launch
-// continues from it. A write the quota refuses ends with that error and the
-// same length.
+// It first calls fallocate with mode 0 on the range. The NFS client accepts no
+// other mode that allocates (it refuses FALLOC_FL_KEEP_SIZE), and a server
+// with ALLOCATE refuses a range bigger than its quota. Mode 0 is safe here,
+// because the range starts at the image's current end, so it only extends the
+// file, as the truncate that follows does anyway. NFS 4.1 has no ALLOCATE, so
+// when fallocate fails with EOPNOTSUPP it writes sequential zeroChunk chunks
+// from from, which extend the image as they go, and fsyncs every syncInterval
+// bytes and once at the end. glibc's posix_fallocate is not used, because its
+// emulation is far slower. A signal on sigs, checked before each chunk, stops
+// the writes at once, without a sync, and returns a *signalledError. A
+// write or sync the quota refuses ends with that error and its hint. Either
+// way the image is left part written, so the caller discards it; nothing
+// resumes a part written image.
 func preallocateImage(fd int, path string, from, to int64, o imageOptions, sigs <-chan os.Signal) error {
 	if from < 0 || to < from || to > 1<<62 {
 		return fmt.Errorf("preallocating volume image %s: the range %d to %d is not valid", path, from, to)
@@ -496,7 +821,7 @@ func preallocateImage(fd int, path string, from, to int64, o imageOptions, sigs 
 	}
 	var err error
 	for {
-		err = call(fd, unix.FALLOC_FL_KEEP_SIZE, from, to-from)
+		err = call(fd, 0, from, to-from)
 		if !errors.Is(err, unix.EINTR) {
 			break
 		}
@@ -513,25 +838,27 @@ func preallocateImage(fd int, path string, from, to int64, o imageOptions, sigs 
 // writeZeros extends the image fd from from to to with sequential writes of
 // zeroChunk zero bytes, the last one shorter when the range is not a multiple
 // of it. It writes at explicit offsets, so a retry never depends on the file
-// position, and it syncs every syncInterval bytes.
+// position, and it syncs every syncInterval bytes. A signal returns at once,
+// without a sync, because the caller discards the file.
 func writeZeros(fd int, path string, from, to int64, o imageOptions, sigs <-chan os.Signal) error {
 	syncFile := o.syncFile
 	if syncFile == nil {
 		syncFile = unix.Fsync
+	}
+	write := o.pwrite
+	if write == nil {
+		write = pwriteFull
 	}
 	zeros := make([]byte, zeroChunk)
 	end, synced := from, from
 	for end < to {
 		select {
 		case sig := <-sigs:
-			if err := syncFile(fd); err != nil {
-				return fmt.Errorf("syncing the zeros written so far: %w", err)
-			}
 			return &signalledError{Sig: syscall.Signal(signalNumber(sig)), during: "preallocating the volume image"}
 		default:
 		}
 		n := min(int64(len(zeros)), to-end)
-		if err := pwriteFull(fd, zeros[:n], end); err != nil {
+		if err := write(fd, zeros[:n], end); err != nil {
 			return fmt.Errorf("writing zeros at offset %d: %w%s", end, err, quotaHint(err))
 		}
 		end += n
@@ -654,6 +981,8 @@ func checkImageRequest(v *guestVolume, o imageOptions) error {
 		return fmt.Errorf("volume image lock poll interval %v is not positive", o.LockPoll)
 	case o.IsMountRoot == nil:
 		return errors.New("volume image options have no mount root check")
+	case o.Publish != publishRename && o.Publish != publishLink:
+		return fmt.Errorf("volume image options have an unknown way to publish an image: %v", o.Publish)
 	}
 	return nil
 }

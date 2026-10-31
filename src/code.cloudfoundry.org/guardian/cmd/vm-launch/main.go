@@ -90,7 +90,11 @@
 // refers to an unsized file. A launch that is killed leaves at worst a
 // .rvm-disk-*.tmp file, which nothing reads but which holds up to 1 GiB of
 // quota until an operator deletes it, because a quota that counts file
-// length, as JuiceFS does, charges a new image its whole size. It sizes only
+// length, as JuiceFS does, charges a new image its whole size. On an NFS
+// volume, whose client refuses renameat2 with a flag, vm-launch allocates
+// the image, publishes it with a hard link instead, and removes the temporary
+// name, and the next launch removes a temporary name that a killed launch
+// left. It sizes only
 // an image it creates: an existing image that is not exactly 1 GiB fails the
 // launch. The volume path and the image are resolved without following
 // symbolic links, the volume path must be a mount point, and the image must

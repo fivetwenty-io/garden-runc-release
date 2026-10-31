@@ -42,7 +42,7 @@ var _ = Describe("the NFS provider", func() {
 		}
 	})
 
-	It("claims the mounts it refuses weakly, so that its own words explain the refusal", func() {
+	It("does not match the mounts it refuses, so a refused mount never reaches its Capabilities", func() {
 		for name, m := range map[string]mountRecord{
 			"an NFSv4 mount with no lock option":        record("nfs4", "rw", "vers=4.1"),
 			"an NFSv4 mount with no options":            record("nfs4"),
@@ -56,7 +56,7 @@ var _ = Describe("the NFS provider", func() {
 			"a mapfs mount":                             record("fuse.mapfs", "rw"),
 			"a mapfs mount that carries the lock label": record("fuse.mapfs", "local_lock=none"),
 		} {
-			Expect(nfsProvider{}.Match(m)).To(Equal(weakMatch), name)
+			Expect(nfsProvider{}.Match(m)).To(Equal(noMatch), name)
 		}
 	})
 
@@ -95,19 +95,68 @@ var _ = Describe("the NFS provider", func() {
 		Expect(m.SuperOptions).To(ContainElements("vers=4.1", "local_lock=none"))
 	})
 
-	It("is the provider findVolumeProvider returns for the mounts it refuses, so that Prepare can explain", func() {
+	It("registers its refusal with the registry, which asks it before any provider", func() {
+		Expect(mountRefusals).To(HaveLen(2), "the NFS refusal and the BOSH disk refusal")
+		// Every mount the NFS provider refuses is refused at selection, in its
+		// own words, whatever provider is registered and however it matches.
+		spy := &spyProvider{name: "Spy"}
+		withProviders(spy)
+		for _, m := range []mountRecord{
+			record("nfs", "rw", "vers=3"),
+			record("fuse.mapfs", "rw"),
+			record("nfs4", "rw", "vers=4.1"),
+			record("nfs4", "rw", "local_lock=posix"),
+		} {
+			_, err := diskProviders.selectProvider(m)
+			Expect(err).To(MatchError(refuseNFSMount(m)), m.FSType)
+			Expect(err).To(HaveOccurred())
+		}
+		Expect(spy.asked).To(BeEmpty(), "no provider, Match or Capabilities, is asked about a refused mount")
+	})
+
+	It("does not refuse the mount it owns, or any other filesystem", func() {
+		Expect(refuseNFSMount(record("nfs4", strings.Split(labNFSOptions, ",")...))).To(Succeed())
+		for _, fstype := range []string{"fuse.juicefs", "ext4", "cifs", "tmpfs", ""} {
+			Expect(refuseNFSMount(record(fstype))).To(Succeed(), fstype)
+		}
+	})
+
+	It("is refused by findVolumeProvider for the mounts it refuses, in the refusal's words", func() {
 		for _, c := range []struct{ fstype, options string }{
 			{"nfs", "rw,vers=3,hard,proto=tcp"},
 			{"nfs4", "rw,vers=4.1,hard"},
 			{"fuse.mapfs", "rw"},
 		} {
 			info := writeTempFile("mountinfo", nfsMountinfoLine(40, "/data", c.fstype, "src", c.options))
-			p, _, err := findIn(info, "/data")
-			Expect(err).NotTo(HaveOccurred(), c.fstype)
-			Expect(p.Name()).To(Equal("NFS"), c.fstype)
+			p, m, err := findIn(info, "/data")
+			Expect(p).To(BeNil(), c.fstype)
+			Expect(m).To(Equal(mountRecord{}), c.fstype)
+			Expect(err).To(HaveOccurred(), c.fstype)
+			Expect(err.Error()).NotTo(ContainSubstring("volumes today"), c.fstype)
 		}
 	})
 })
+
+// spyProvider claims every mount strongly and records each question it is
+// asked.
+type spyProvider struct {
+	name  string
+	asked []string
+}
+
+func (p *spyProvider) Name() string { return p.name }
+func (p *spyProvider) Match(mountRecord) matchStrength {
+	p.asked = append(p.asked, "Match")
+	return strongMatch
+}
+func (p *spyProvider) Capabilities(mountRecord) capabilities {
+	p.asked = append(p.asked, "Capabilities")
+	return capabilities{Modes: []attachMode{attachFileImage}, Fence: fenceDistributedFlock}
+}
+func (p *spyProvider) Prepare(prepareRequest) (*attachment, error) {
+	p.asked = append(p.asked, "Prepare")
+	return nil, nil
+}
 
 var _ = Describe("the NFS provider's Prepare", func() {
 	var (
@@ -139,18 +188,21 @@ var _ = Describe("the NFS provider's Prepare", func() {
 	}
 	kernelNFS4 := func() prepareRequest { return request("nfs4", strings.Split(labNFSOptions, ",")...) }
 
-	It("creates the image allocated, with fallocate KEEP_SIZE on the whole range, and returns it locked", func() {
+	It("creates the image allocated, with fallocate mode 0 on the whole range, and returns it locked", func() {
 		var calls []fallocateCall
+		var refused error
 		defaultImageOptions.fallocate = func(fd int, mode uint32, off, length int64) error {
 			calls = append(calls, fallocateCall{mode, off, length})
-			return unix.Fallocate(fd, mode, off, length)
+			refused = unix.Fallocate(fd, mode, off, length)
+			return refused
 		}
 		att, err := nfsProvider{}.Prepare(kernelNFS4())
-		if err != nil && errors.Is(err, unix.EOPNOTSUPP) {
-			Skip("this filesystem has no fallocate")
-		}
 		Expect(err).NotTo(HaveOccurred())
-		Expect(calls).To(Equal([]fallocateCall{{unix.FALLOC_FL_KEEP_SIZE, 0, 4 << 20}}))
+		Expect(calls).To(Equal([]fallocateCall{{0, 0, 4 << 20}}))
+		if errors.Is(refused, unix.EOPNOTSUPP) {
+			Expect(att.Release()).To(Succeed())
+			Skip("this filesystem has no fallocate, so the zero write fallback ran; the next spec covers it")
+		}
 		Expect(att.File.Name()).To(Equal(img))
 		st := statOf(img)
 		Expect(st.Size).To(Equal(int64(4 << 20)))
@@ -173,6 +225,88 @@ var _ = Describe("the NFS provider's Prepare", func() {
 		st := statOf(img)
 		Expect(st.Size).To(Equal(int64(4 << 20)))
 		Expect(st.Blocks * 512).To(BeNumerically(">=", 4<<20))
+	})
+
+	It("publishes a new image with a hard link, never calls renameat2 with a flag, and leaves one name", func() {
+		var renames []uint
+		var links []string
+		var unlinks []string
+		saved1, saved2, saved3 := renameat2Call, linkatCall, unlinkatCall
+		DeferCleanup(func() { renameat2Call, linkatCall, unlinkatCall = saved1, saved2, saved3 })
+		// The fake answers renameat2 with a flag as the kernel NFS client does.
+		renameat2Call = func(olddirfd int, oldpath string, newdirfd int, newpath string, flags uint) error {
+			renames = append(renames, flags)
+			if flags != 0 {
+				return unix.EINVAL
+			}
+			return unix.Renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
+		}
+		linkatCall = func(olddirfd int, oldpath string, newdirfd int, newpath string, flags int) error {
+			links = append(links, newpath)
+			return unix.Linkat(olddirfd, oldpath, newdirfd, newpath, flags)
+		}
+		unlinkatCall = func(dirfd int, name string, flags int) error {
+			unlinks = append(unlinks, name)
+			return unix.Unlinkat(dirfd, name, flags)
+		}
+
+		att, err := nfsProvider{}.Prepare(kernelNFS4())
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(att.Release)
+
+		Expect(renames).To(BeEmpty(), "NFS never calls renameat2, with a flag or without one")
+		Expect(links).To(Equal([]string{name}))
+		Expect(unlinks).To(HaveLen(1))
+		Expect(unlinks[0]).To(MatchRegexp(`^\.rvm-disk-[0-9a-f]{16}\.tmp$`))
+		Expect(int(statOf(img).Nlink)).To(Equal(1))
+		Expect(tempFiles(dir)).To(BeEmpty())
+	})
+
+	It("does not publish a JuiceFS image by link, and keeps its rename", func() {
+		var renames []uint
+		var links int
+		saved1, saved2 := renameat2Call, linkatCall
+		DeferCleanup(func() { renameat2Call, linkatCall = saved1, saved2 })
+		renameat2Call = func(olddirfd int, oldpath string, newdirfd int, newpath string, flags uint) error {
+			renames = append(renames, flags)
+			return unix.Renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
+		}
+		linkatCall = func(int, string, int, string, int) error { links++; return unix.EINVAL }
+
+		att, err := juicefsProvider{}.Prepare(prepareRequest{
+			Mount:     mountRecord{ContainerDir: dir, MountID: 40, FSType: juicefsFSType},
+			ImageName: name, Mode: attachFileImage,
+		})
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(att.Release)
+		Expect(renames).To(Equal([]uint{unix.RENAME_NOREPLACE}))
+		Expect(links).To(BeZero())
+	})
+
+	It("uses a different publish strategy than the shared defaults, which it leaves alone", func() {
+		att, err := nfsProvider{}.Prepare(kernelNFS4())
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(att.Release)
+		Expect(defaultImageOptions.Publish).To(Equal(publishRename))
+	})
+
+	It("removes a temp name an earlier launch left, whether an orphan or a second link to the image, without touching the image", func() {
+		orphan := filepath.Join(dir, ".rvm-disk-0123456789abcdef.tmp")
+		writeImage(orphan, 4<<20, []byte("orphan"))
+		writeImage(img, 4<<20, []byte("image"))
+		second := filepath.Join(dir, ".rvm-disk-fedcba9876543210.tmp")
+		Expect(os.Link(img, second)).To(Succeed())
+		before := statOf(img)
+
+		att, err := nfsProvider{}.Prepare(kernelNFS4())
+		Expect(err).NotTo(HaveOccurred(), "the second name is gone before the image's links are checked")
+		DeferCleanup(att.Release)
+
+		Expect(tempFiles(dir)).To(BeEmpty())
+		after := statOf(img)
+		Expect(after.Ino).To(Equal(before.Ino))
+		Expect(int(after.Nlink)).To(Equal(1))
+		Expect(os.ReadFile(img)).To(HavePrefix("image"))
 	})
 
 	It("uses the image options in force when it runs", func() {
@@ -278,7 +412,7 @@ var _ = Describe("the NFS provider's Prepare", func() {
 		DescribeTable("refuses a kernel NFSv4 mount whose locks stay on one cell",
 			func(superOptions ...string) {
 				refuses(request("nfs4", superOptions...),
-					"volume path "+quoted()+` is an NFSv4 mount without local_lock=none, so its flock stays local to each cell and two instances on two cells could write one image at once; VM backends need an NFSv4 mount with local_lock=none`)
+					"volume path "+quoted()+` is an NFSv4 mount without local_lock=none, so its flock stays local to each cell and two instances on two cells could write one image at once; mount the share with local_lock=none to use it for a VM app`)
 			},
 			Entry("no lock option", "rw", "vers=4.2", "hard"),
 			Entry("no options at all"),
@@ -293,6 +427,14 @@ var _ = Describe("the NFS provider's Prepare", func() {
 			Expect(err).To(HaveOccurred())
 			Expect(os.ReadFile(img)).To(HavePrefix("keep"))
 			Expect(lockedElsewhere(img)).To(BeFalse(), "a refused mount never takes the lock")
+		})
+
+		It("sweeps nothing on a mount it refuses", func() {
+			leftover := filepath.Join(dir, ".rvm-disk-0123456789abcdef.tmp")
+			writeImage(leftover, 4096, []byte("stale"))
+			_, err := nfsProvider{}.Prepare(request("fuse.mapfs", "rw"))
+			Expect(err).To(HaveOccurred())
+			Expect(os.ReadFile(leftover)).To(HavePrefix("stale"))
 		})
 
 		It("quotes a volume path that is long or holds odd bytes", func() {

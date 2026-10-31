@@ -917,6 +917,35 @@ var _ = Describe("run with CredHub references", func() {
 		Expect(argvFile).NotTo(BeAnExistingFile())
 	})
 
+	It("refuses an NFS mount it cannot fence before CredHub is asked, before the ports and the work directory", func() {
+		for name, c := range map[string]struct{ fstype, options, want string }{
+			"mapfs":                  {"fuse.mapfs", "rw", "mapfs keeps flock local to each cell"},
+			"NFSv3":                  {"nfs", "rw,vers=3", "a kernel NFSv3 mount"},
+			"NFSv4 without the lock": {"nfs4", "rw,vers=4.1", "mount the share with local_lock=none"},
+		} {
+			volDir := GinkgoT().TempDir()
+			DeferCleanup(func(saved string) { mountInfoPath = saved }, mountInfoPath)
+			mountInfoPath = writeTempFile("mountinfo", nfsMountinfoLine(40, volDir, c.fstype, "10.0.0.5:/export", c.options))
+			argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+			GinkgoT().Setenv("CF_INSTANCE_INDEX", "0")
+			GinkgoT().Setenv("VCAP_APPLICATION", vcapApp)
+			GinkgoT().Setenv(vcapServicesEnv, `{"nfs":[{"name":"vol","credentials":{"credhub-ref":"/c/`+secretSentinel+`"},"volume_mounts":[`+mountJSON(volDir, "rw")+`]}]}`)
+			logBuf.Reset()
+
+			Expect(runVM("-credhubConnectAttempts=1")).To(Equal(exitLaunchError), name)
+			Expect(logBuf.String()).To(ContainSubstring(c.want), name)
+			Expect(f.hub.seen()).To(BeEmpty(), "%s: CredHub was asked", name)
+			entries, err := os.ReadDir(tmp)
+			Expect(err).NotTo(HaveOccurred())
+			for _, e := range entries {
+				Expect(e.Name()).NotTo(HavePrefix("vm-launch-"), "%s: the work directory was made", name)
+			}
+			Expect(os.ReadDir(volDir)).To(BeEmpty(), name)
+			Expect(argvFile).NotTo(BeAnExistingFile())
+			Expect(logBuf.String()).NotTo(ContainSubstring(secretSentinel), name)
+		}
+	})
+
 	It("fails before it opens or creates a volume image", func() {
 		volDir := GinkgoT().TempDir()
 		DeferCleanup(func(saved string) { mountInfoPath = saved }, mountInfoPath)
