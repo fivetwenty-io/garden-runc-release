@@ -100,7 +100,7 @@ var _ = Describe("run with the initramfs in a memfd", func() {
 		// A 64 MiB quota leaves 32 MiB after the headroom.
 		GinkgoT().Setenv("VCAP_APPLICATION", `{"limits":{"disk":64}}`)
 		byName := initrdOf()
-		Expect(string(byName["rvm/disks"].data)).To(Equal("RVM_ROOT_SECTORS=65536\nRVM_ROOT_INODE_RATIO=16384\n"))
+		Expect(string(byName["rvm/disks"].data)).To(Equal("RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=65536\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUMES=0\n"))
 		Expect(string(byName["init"].data)).To(Equal(guestRootInit))
 		Expect(byName).To(HaveKey("rvm/init"))
 	})
@@ -109,7 +109,7 @@ var _ = Describe("run with the initramfs in a memfd", func() {
 		GinkgoT().Setenv("VCAP_APPLICATION", `{"limits":{"mem":512}}`)
 		byName := initrdOf()
 		Expect(byName).To(HaveKey("rvm/disks"))
-		Expect(byName["rvm/disks"].data).To(BeEmpty())
+		Expect(string(byName["rvm/disks"].data)).To(Equal("RVM_VOLUMES=0\n"))
 		Expect(string(byName["init"].data)).To(Equal(guestRootInit))
 	})
 

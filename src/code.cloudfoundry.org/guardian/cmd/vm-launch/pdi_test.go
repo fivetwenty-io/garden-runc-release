@@ -354,11 +354,15 @@ var _ = Describe("the JuiceFS volume path", func() {
 	// capture runs vm-launch with a fake hypervisor that keeps a copy of its
 	// argv, of the Firecracker configuration when there is one, and of the
 	// initramfs, and returns them with the temporary paths replaced by
-	// placeholders.
+	// placeholders. The fake hypervisor also keeps the device, device type,
+	// and inode numbers of the volume and the root image as it sees them
+	// through /proc/self/fd, run together as Firecracker runs them, one line
+	// for each.
 	capture := func(kind backend.Kind, hypervisor string) (argv, config, mounts, disks string) {
 		writeFakeHypervisor(filepath.Join(art, hypervisor), fdThreeChecks(img)+initramfsAt("4")+
 			`cp "$initrd" `+shellQuote(filepath.Join(out, "initrd"))+` || exit 1
 p=; for a in "$@"; do [ "$p" = --config-file ] && { cp "$a" `+shellQuote(filepath.Join(out, "fc.json"))+` || exit 1; }; p=$a; done
+stat -L -c %d%r%i /proc/self/fd/3 /proc/self/fd/5 >`+shellQuote(filepath.Join(out, "ids"))+` || exit 1
 `)
 		Expect(runVM(kind)).To(Equal(0), logBuf.String())
 		Expect(logBuf.String()).NotTo(ContainSubstring("releasing"))
@@ -385,11 +389,15 @@ p=; for a in "$@"; do [ "$p" = --config-file ] && { cp "$a" `+shellQuote(filepat
 	}
 
 	// The golden values below were recorded from vm-launch before the volume
-	// path ran through the provider registry, with the same environment.
+	// path ran through the provider registry, with the same environment. The
+	// drive identities came later: the serials on QEMU's two devices, and the
+	// RVM_ROOT_ID, RVM_VOLUMES, and RVM_VOL0 lines in /rvm/disks, whose
+	// identities stand in as @ROOTID and @VOLID.
 	const (
 		goldenPDIMounts = "RVM_VOLUME_PATH='@VOL'\nRVM_VOLUME_IMAGE='rvm-disk-" + testAppID + "-web-2.img'\n"
-		goldenPDIDisks  = "RVM_ROOT_SECTORS=65536\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUME_SECTORS=2097152\n"
-		goldenPDIFC     = `{"boot-source":{"kernel_image_path":"@ART/kernel/vmlinux","initrd_path":"/proc/self/fd/4","boot_args":"console=ttyS0 reboot=k panic=1 rdinit=/init quiet"},` +
+		goldenPDIDisks  = "RVM_ROOT_ID=@ROOTID\nRVM_ROOT_SECTORS=65536\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUMES=1\n" +
+			"RVM_VOL0_KIND=image\nRVM_VOL0_ID=@VOLID\nRVM_VOL0_SECTORS=2097152\nRVM_VOLUME_SECTORS=2097152\n"
+		goldenPDIFC = `{"boot-source":{"kernel_image_path":"@ART/kernel/vmlinux","initrd_path":"/proc/self/fd/4","boot_args":"console=ttyS0 reboot=k panic=1 rdinit=/init quiet"},` +
 			`"drives":[{"drive_id":"vol0","path_on_host":"/proc/self/fd/3","is_root_device":false,"is_read_only":false,"cache_type":"Writeback","io_engine":"Sync"},` +
 			`{"drive_id":"root0","path_on_host":"/proc/self/fd/5","is_root_device":false,"is_read_only":false,"cache_type":"Unsafe","io_engine":"Sync","discard":true}],` +
 			`"machine-config":{"vcpu_count":1,"mem_size_mib":128},` +
@@ -411,24 +419,32 @@ p=; for a in "$@"; do [ "$p" = --config-file ] && { cp "$a" `+shellQuote(filepat
 		"-netdev", "user,id=n0,net=10.0.2.0/24",
 		"-device", "virtio-net-device,netdev=n0",
 		"-drive", "if=none,id=vol0,file=/proc/self/fd/3,format=raw,cache=writeback,aio=threads,file.locking=off,werror=report,rerror=report,discard=ignore",
-		"-device", "virtio-blk-device,drive=vol0",
+		"-device", "virtio-blk-device,drive=vol0,serial=rvm-vol0",
 		"-drive", "if=none,id=root0,file=/proc/self/fd/5,format=raw,cache=unsafe,aio=threads,file.locking=off,werror=report,rerror=report,discard=unmap,detect-zeroes=unmap",
-		"-device", "virtio-blk-device,drive=root0",
+		"-device", "virtio-blk-device,drive=root0,serial=rvm-root",
 	}
 
-	It("gives QEMU the same command line, /rvm/mounts, and /rvm/disks as before the registry", func() {
+	It("gives QEMU the command line, /rvm/mounts, and /rvm/disks of before the registry, with the serials as the identities", func() {
 		argv, _, mounts, disks := capture(backend.VMQemu, "qemu/ld-linux-x86-64.so.2")
 		Expect(argv).To(Equal(strings.Join(goldenPDIQEMU, "\n") + "\n"))
 		Expect(mounts).To(Equal(goldenPDIMounts))
-		Expect(disks).To(Equal(goldenPDIDisks))
+		Expect(disks).To(Equal(strings.NewReplacer("@ROOTID", "rvm-root", "@VOLID", "rvm-vol0").Replace(goldenPDIDisks)))
 	})
 
-	It("gives Firecracker the same configuration, /rvm/mounts, and /rvm/disks as before the registry", func() {
+	It("gives Firecracker the configuration, /rvm/mounts, and /rvm/disks of before the registry, with the identities Firecracker derives from the files it opens", func() {
 		argv, config, mounts, disks := capture(backend.VMFirecracker, "firecracker/firecracker")
 		Expect(argv).To(Equal("--no-api\n--config-file\n@WORK/fc.json\n"))
 		Expect(config).To(Equal(goldenPDIFC))
 		Expect(mounts).To(Equal(goldenPDIMounts))
-		Expect(disks).To(Equal(goldenPDIDisks))
+		raw, err := os.ReadFile(filepath.Join(out, "ids"))
+		Expect(err).NotTo(HaveOccurred())
+		seen := strings.Fields(string(raw))
+		Expect(seen).To(HaveLen(2))
+		for i, id := range seen {
+			seen[i] = id[:min(len(id), virtioBlockIDBytes)]
+		}
+		Expect(seen[0]).NotTo(Equal(seen[1]))
+		Expect(disks).To(Equal(strings.NewReplacer("@ROOTID", seen[1], "@VOLID", seen[0]).Replace(goldenPDIDisks)))
 	})
 
 	It("exits 125 before it creates anything when the selected provider cannot be attached", func() {

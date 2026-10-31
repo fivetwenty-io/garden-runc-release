@@ -151,7 +151,7 @@ var _ = Describe("guest volume initramfs", func() {
 		Expect(string(byName["rvm/mounts"].data)).To(Equal(
 			"RVM_VOLUME_PATH='/data/it'\\''s $here'\nRVM_VOLUME_IMAGE='rvm-disk-3.img'\n"))
 		Expect(byName["rvm/mounts"].mode).To(Equal(uint32(0o100644)))
-		Expect(string(byName["rvm/disks"].data)).To(Equal("RVM_VOLUME_SECTORS=2097152\n"))
+		Expect(string(byName["rvm/disks"].data)).To(Equal("RVM_VOLUMES=1\nRVM_VOL0_KIND=image\nRVM_VOL0_ID=rvm-vol0\nRVM_VOL0_SECTORS=2097152\nRVM_VOLUME_SECTORS=2097152\n"))
 		Expect(string(byName["rvm/init"].data)).To(Equal(initScript(testNonce, true)))
 
 		path := writeTempFile("mounts", mountsFile(vol))
@@ -517,13 +517,19 @@ var _ = Describe("the command's subshell in /init", func() {
 var _ = Describe("the guest's /rvm/disks", func() {
 	vol := &guestVolume{ContainerDir: "/data", ImageName: "rvm-disk-0.img"}
 	const rootBytes = 64 * bytesPerMiB
+	// goldenVol0Disks is what /rvm/disks names a 1 GiB first volume by on
+	// QEMU.
+	const goldenVol0Disks = "RVM_VOL0_KIND=image\nRVM_VOL0_ID=rvm-vol0\nRVM_VOL0_SECTORS=2097152\n"
 
-	DescribeTable("names each drive the guest has by its size in sectors",
+	DescribeTable("names each drive the guest has by its identity and its size in sectors",
 		func(rootBytes, ratio int64, vol *guestVolume, want string) {
 			g := taskGuest("true")
 			g.rootBytes, g.rootInodeRatio, g.vol = rootBytes, ratio, vol
+			if rootBytes > 0 {
+				g.drives.rootID = qemuRootSerial
+			}
 			if vol != nil {
-				g.volumeBytes = defaultImageSize
+				g.drives.volumes = qemuImageDrives(defaultImageSize)
 			}
 			got, err := disksFile(g)
 			Expect(err).NotTo(HaveOccurred())
@@ -544,21 +550,24 @@ var _ = Describe("the guest's /rvm/disks", func() {
 				Expect(fields[2]).To(Equal("unset"))
 			}
 		},
-		Entry("no root disk and no volume", int64(0), int64(0), nil, ""),
-		Entry("a root disk", int64(rootBytes), int64(16384), nil, "RVM_ROOT_SECTORS=131072\nRVM_ROOT_INODE_RATIO=16384\n"),
-		Entry("a volume", int64(0), int64(0), vol, "RVM_VOLUME_SECTORS=2097152\n"),
-		Entry("both", int64(rootBytes), int64(16384), vol, "RVM_ROOT_SECTORS=131072\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUME_SECTORS=2097152\n"),
+		Entry("no root disk and no volume", int64(0), int64(0), nil, "RVM_VOLUMES=0\n"),
+		Entry("a root disk", int64(rootBytes), int64(16384), nil, "RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=131072\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUMES=0\n"),
+		Entry("a volume", int64(0), int64(0), vol, "RVM_VOLUMES=1\n"+goldenVol0Disks+"RVM_VOLUME_SECTORS=2097152\n"),
+		Entry("both", int64(rootBytes), int64(16384), vol, "RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=131072\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUMES=1\n"+goldenVol0Disks+"RVM_VOLUME_SECTORS=2097152\n"),
 		Entry("a root disk 1 MiB under the volume's size, as rootDiskSize makes it", int64(defaultImageSize-bytesPerMiB), int64(16384), vol,
-			"RVM_ROOT_SECTORS=2095104\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUME_SECTORS=2097152\n"),
-		Entry("a root disk of the volume's size without a volume", int64(defaultImageSize), int64(16384), nil, "RVM_ROOT_SECTORS=2097152\nRVM_ROOT_INODE_RATIO=16384\n"),
+			"RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=2095104\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUMES=1\n"+goldenVol0Disks+"RVM_VOLUME_SECTORS=2097152\n"),
+		Entry("a root disk of the volume's size without a volume", int64(defaultImageSize), int64(16384), nil, "RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=2097152\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUMES=0\n"),
 	)
 
 	DescribeTable("rejects sizes that would leave the guest to guess, so no initramfs is built",
 		func(rootBytes, ratio int64, vol *guestVolume, want string) {
 			g := taskGuest("true")
 			g.rootBytes, g.rootInodeRatio, g.vol = rootBytes, ratio, vol
+			if rootBytes > 0 {
+				g.drives.rootID = qemuRootSerial
+			}
 			if vol != nil {
-				g.volumeBytes = defaultImageSize
+				g.drives.volumes = qemuImageDrives(defaultImageSize)
 			}
 			_, err := disksFile(g)
 			Expect(err).To(MatchError(want))
@@ -582,11 +591,11 @@ var _ = Describe("the guest's /rvm/disks", func() {
 
 	It("names the size of the volume image it was given, not the size of a new one", func() {
 		g := taskGuest("true")
-		g.vol, g.volumeBytes = vol, 2*defaultImageSize
-		g.rootBytes, g.rootInodeRatio = defaultImageSize, 16384
+		g.vol, g.drives.volumes = vol, qemuImageDrives(2*defaultImageSize)
+		g.rootBytes, g.rootInodeRatio, g.drives.rootID = defaultImageSize, 16384, qemuRootSerial
 		got, err := disksFile(g)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(got).To(Equal("RVM_ROOT_SECTORS=2097152\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUME_SECTORS=4194304\n"))
+		Expect(got).To(Equal("RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=2097152\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUMES=1\nRVM_VOL0_KIND=image\nRVM_VOL0_ID=rvm-vol0\nRVM_VOL0_SECTORS=4194304\nRVM_VOLUME_SECTORS=4194304\n"))
 
 		g.rootBytes = 2 * defaultImageSize
 		_, err = disksFile(g)
@@ -596,9 +605,9 @@ var _ = Describe("the guest's /rvm/disks", func() {
 	DescribeTable("rejects a volume image whose size is not a whole number of sectors",
 		func(volumeBytes int64) {
 			g := taskGuest("true")
-			g.vol, g.volumeBytes = vol, volumeBytes
+			g.vol, g.drives.volumes = vol, qemuImageDrives(volumeBytes)
 			_, err := disksFile(g)
-			Expect(err).To(MatchError(fmt.Sprintf("the volume image of %d bytes is not a positive whole number of 512-byte sectors", volumeBytes)))
+			Expect(err).To(MatchError(fmt.Sprintf("the volume image of %d bytes on drive vol0 is not a positive whole number of 512-byte sectors", volumeBytes)))
 		},
 		Entry("an unset size", int64(0)),
 		Entry("a negative size", int64(-512)),

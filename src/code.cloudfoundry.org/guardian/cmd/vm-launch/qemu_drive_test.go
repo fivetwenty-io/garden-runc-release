@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -228,6 +230,38 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 		Expect(stderr).To(ContainSubstring("detect-zeroes"))
 	})
 
+	It("accepts the serial on every volume device and on the root device of a microvm machine", func() {
+		qemu := realQEMU()
+		requireMicrovm(qemu)
+		argv, err := hypervisorArgv(backend.VMQemu, goldenArt, "/unused", procSelfFD(3+maxVolumes), goldenMemMiB, taskNetwork(), drivePathsFor(maxVolumes), procSelfFD(4+maxVolumes), 0)
+		Expect(err).NotTo(HaveOccurred())
+		var files []*os.File
+		var args []string
+		for i := range maxVolumes {
+			files = append(files, openSizedFile(1<<20))
+			id := volumeDriveID(i)
+			args = append(args, "-drive", optionAfter(argv, "-drive", "id="+id+","), "-device", optionAfter(argv, "-device", "drive="+id+","))
+		}
+		// The initramfs's descriptor comes before the root image's, as in
+		// vm-launch, and nothing here reads it.
+		files = append(files, openSizedFile(1<<20), openSizedFile(1<<20))
+		args = append(args, "-drive", rootDriveOption(argv), "-device", rootDeviceOption(argv))
+		Expect(strings.Count(strings.Join(args, " "), ",serial=")).To(Equal(maxVolumes + 1))
+		code, _, stderr := runRealQEMU(append([]string{qemu, "-S", "-display", "none", "-M", "microvm,accel=tcg", "-nodefaults", "-no-user-config", "-monitor", "stdio"}, args...),
+			files, "quit\n", 30*time.Second)
+		Expect(code).To(Equal(0), "QEMU rejected %q: %s", args, stderr)
+	})
+
+	It("rejects a serial property that the device does not have, so the serial check above can fail", func() {
+		qemu := realQEMU()
+		requireMicrovm(qemu)
+		argv := qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), []string{volumeDrivePath(0)}, 0)
+		device := strings.Replace(deviceOption(argv), ",serial=", ",serial-number=", 1)
+		code, stderr := parseDrive(qemu, microvm, "-drive", driveOption(argv), "-device", device)
+		Expect(code).NotTo(Equal(0))
+		Expect(stderr).To(ContainSubstring("serial-number"))
+	})
+
 	It("rejects the unprefixed locking option, so the check above can fail", func() {
 		qemu := realQEMU()
 		drive := strings.Replace(driveOption(qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), []string{volumeDrivePath(0)}, 0)), "file.locking=off", "locking=off", 1)
@@ -332,6 +366,42 @@ var _ = Describe("the initramfs memfd against a real QEMU", func() {
 		code, stderr := stoppedQEMU(qemu, filepath.Join(art, artBzImage), procSelfFD(9), files)
 		Expect(code).NotTo(Equal(0))
 		Expect(stderr).To(ContainSubstring(procSelfFD(9)))
+	})
+
+	It("boots a guest that reads from each drive the identity vm-launch gives it, and the drive's own size", func() {
+		art := realArtifacts()
+		qemu := realQEMU()
+		requireMicrovm(qemu)
+		// Every drive has a size of its own, so a serial on the wrong drive
+		// shows. The guest's /rvm/disks names none of them, so /init leaves
+		// them alone and the command reads them raw.
+		sizes := []int64{1 << 20, 2 << 20, 3 << 20, 4 << 20}
+		vols := make([]*os.File, len(sizes))
+		for i, size := range sizes {
+			vols[i] = openSizedFile(size)
+		}
+		root := openSizedFile(8 << 20)
+		drives, err := newGuestDrives(backend.VMQemu, preparedFiles(vols...), root)
+		Expect(err).NotTo(HaveOccurred())
+		want := map[string]string{drives.rootID: strconv.Itoa(8 << 20 / sectorBytes)}
+		for i, d := range drives.volumes {
+			want[d.id] = strconv.FormatInt(sizes[i]/sectorBytes, 10)
+		}
+		Expect(want).To(HaveLen(len(sizes) + 1))
+
+		f := memfdInitramfs(guestBusybox(), `for d in /sys/block/vd*; do echo "drive=$(cat "$d/serial"):$(cat "$d/size")"; done`, noGuestEnv)
+		files, drivePaths, initrdPath, _, rootPath := hypervisorFiles(vols, withUserspaceMark(f), nil, root)
+		argv := markedArgv(tcgArgv(qemu, withRealRootDrive(qemuArgv(art, initrdPath, minGuestMemoryMiB, taskNetwork(), drivePaths, 0), rootPath)))
+		code, stdout, stderr := bootRealQEMU(argv, files)
+		Expect(code).To(Equal(0), "QEMU failed: %s\n%s", stderr, stdout)
+		Expect(stdout).To(ContainSubstring(exitTag(testNonce)+"0"), stdout)
+
+		got := map[string]string{}
+		for _, m := range regexp.MustCompile(`(?m)^drive=([^:\r\n]*):([0-9]+)\r?$`).FindAllStringSubmatch(stdout, -1) {
+			Expect(got).NotTo(HaveKey(m[1]), "two drives with the serial %q:\n%s", m[1], stdout)
+			got[m[1]] = m[2]
+		}
+		Expect(got).To(Equal(want), stdout)
 	})
 
 	It("boots a guest from the memfd initramfs under TCG and runs the command with the guest environment", func() {

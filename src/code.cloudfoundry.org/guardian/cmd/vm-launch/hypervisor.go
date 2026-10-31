@@ -156,7 +156,9 @@ func checkArtifacts(kind backend.Kind, root string) error {
 //
 // drivePaths names the volume images in volume order, and the guest gets
 // each one as a virtio-blk drive, volumeDriveID(i) for the image at index i,
-// after the NIC and in the same order. The format is pinned to raw, so QEMU
+// after the NIC and in the same order. Each drive's device carries the serial
+// qemuVolumeSerial(i), which the guest reads as the drive's identity (see
+// newGuestDrives). The format is pinned to raw, so QEMU
 // never probes the guest-written image for a format header such as a qcow2
 // backing file. I/O errors, ENOSPC and EDQUOT included, reach the guest as
 // errors instead of pausing the VM. QEMU's own image locking is off because
@@ -190,7 +192,7 @@ func qemuArgv(root, initrd string, memMiB int, nw *network, drivePaths []string,
 		argv = append(argv,
 			"-drive", "if=none,id="+id+",file="+drivePath+
 				",format=raw,cache=writeback,aio=threads,file.locking=off,werror=report,rerror=report,discard=ignore",
-			"-device", "virtio-blk-device,drive="+id,
+			"-device", "virtio-blk-device,drive="+id+",serial="+qemuVolumeSerial(i),
 		)
 	}
 	if monitorFD > 0 {
@@ -269,7 +271,8 @@ func hypervisorFiles(imgs []*os.File, initrd, monitor, root *os.File) (files []*
 }
 
 // qemuRootDrive returns the QEMU options that attach the guest root image,
-// which the hypervisor opens as rootPath. The drive is raw for the reasons
+// which the hypervisor opens as rootPath, with the serial qemuRootSerial as
+// its identity (see newGuestDrives). The drive is raw for the reasons
 // the volume's is (see qemuArgv). Unsafe caching drops the guest's flushes,
 // which costs nothing because the data never outlives the VM, and
 // discard=unmap turns the guest's discards into holes in the image, so that
@@ -281,7 +284,7 @@ func qemuRootDrive(rootPath string) []string {
 	return []string{
 		"-drive", "if=none,id=" + rootDriveID + ",file=" + rootPath +
 			",format=raw,cache=unsafe,aio=threads,file.locking=off,werror=report,rerror=report,discard=unmap,detect-zeroes=unmap",
-		"-device", "virtio-blk-device,drive=" + rootDriveID,
+		"-device", "virtio-blk-device,drive=" + rootDriveID + ",serial=" + qemuRootSerial,
 	}
 }
 
@@ -343,7 +346,9 @@ type firecrackerNetworkInterface struct {
 // device, which Garden creates for every Firecracker container, with or
 // without a port, a drive for each volume image in drivePaths, in volume
 // order and named as on QEMU, and the guest root image as a drive after them
-// when rootPath is set. nw must be set; the port does not change the
+// when rootPath is set. Firecracker takes no serial, and the identity it
+// gives each drive comes from the file it opens, which newGuestDrives
+// predicts. nw must be set; the port does not change the
 // configuration, because vm-launch itself, not Firecracker, forwards PORT.
 func newFirecrackerConfig(root, initrd string, memMiB int, nw *network, drivePaths []string, rootPath string) firecrackerConfig {
 	cfg := firecrackerConfig{

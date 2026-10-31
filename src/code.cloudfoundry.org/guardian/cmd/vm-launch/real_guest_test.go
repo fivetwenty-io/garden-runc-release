@@ -66,6 +66,7 @@ const realRootBytes = 64 << 20
 // get it before its initramfs is built, because /rvm/disks names it.
 func withRealRoot(g *guestContents) {
 	g.rootBytes = realRootBytes
+	g.drives.rootID = qemuRootSerial
 	g.rootInodeRatio = inodeRatioFor(realRootBytes)
 }
 

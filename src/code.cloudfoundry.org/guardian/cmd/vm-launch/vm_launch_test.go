@@ -201,7 +201,7 @@ func buildInitramfsWithEnv(busybox []byte, command string, nw *network, guestEnv
 	Expect(os.WriteFile(bb, busybox, 0o755)).To(Succeed())
 	g := guestContents{command: command, nonce: testNonce, nw: nw, env: guestEnv, vol: vol, nofile: testNofile}
 	if vol != nil {
-		g.volumeBytes = defaultImageSize
+		g.drives.volumes = qemuImageDrives(defaultImageSize)
 	}
 	f, err := newInitramfs(bb, g)
 	Expect(err).NotTo(HaveOccurred())
@@ -307,7 +307,7 @@ var _ = Describe("initramfs", func() {
 		Expect(byName["rvm/init"].mode).To(Equal(uint32(0o100755)))
 		Expect(string(byName["rvm/init"].data)).To(Equal(initScript(testNonce, false)))
 		Expect(byName["rvm/disks"].mode).To(Equal(uint32(0o100644)))
-		Expect(byName["rvm/disks"].data).To(BeEmpty())
+		Expect(string(byName["rvm/disks"].data)).To(Equal("RVM_VOLUMES=0\n"))
 	})
 
 	It("writes an /init that brackets the command with nonce markers and reboots", func() {

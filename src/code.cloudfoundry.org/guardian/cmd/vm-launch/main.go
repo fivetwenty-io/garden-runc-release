@@ -669,13 +669,22 @@ func run(argv []string, logger *log.Logger) int {
 		}
 	}
 
+	// Every drive carries an identity, which /rvm/disks gives the guest. On
+	// Firecracker it comes from the open files the hypervisor gets, so it is
+	// taken once every one of them exists. Drives that would share an
+	// identity are refused before the hypervisor starts.
+	drives, err := newGuestDrives(cfg.backend, prepared, rootImg)
+	if err != nil {
+		logger.Print(err)
+		return exitLaunchError
+	}
 	initrd, err = newInitramfs(filepath.Join(cfg.artifacts, artBusybox), guestContents{
 		command:        cfg.command,
 		nonce:          nonce,
 		nw:             nw,
 		env:            envFile,
 		vol:            vol,
-		volumeBytes:    volumeBytes,
+		drives:         drives,
 		caBundle:       caBundle,
 		nofile:         nofile,
 		rootBytes:      rootSize,

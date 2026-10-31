@@ -360,7 +360,8 @@ stat -L -c %s /proc/self/fd/3 /proc/self/fd/5 >`+shellQuote(sizesFile)+` || exit
 		initrd, err := os.ReadFile(initrdCopy)
 		Expect(err).NotTo(HaveOccurred())
 		_, byName := archiveEntries(initrd)
-		Expect(string(byName["rvm/disks"].data)).To(Equal(fmt.Sprintf("RVM_ROOT_SECTORS=%d\nRVM_ROOT_INODE_RATIO=%d\nRVM_VOLUME_SECTORS=%d\n", root/512, inodeRatioFor(root), defaultImageSize/512)))
+		Expect(string(byName["rvm/disks"].data)).To(Equal(fmt.Sprintf("RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=%d\nRVM_ROOT_INODE_RATIO=%d\nRVM_VOLUMES=1\nRVM_VOL0_KIND=image\nRVM_VOL0_ID=rvm-vol0\nRVM_VOL0_SECTORS=%d\nRVM_VOLUME_SECTORS=%d\n",
+			root/512, inodeRatioFor(root), defaultImageSize/512, defaultImageSize/512)))
 		Expect(string(byName["rvm/mounts"].data)).NotTo(ContainSubstring("RVM_VOLUME_DEVICE"))
 		noWorkDirs()
 	})
@@ -683,6 +684,8 @@ var _ = Describe("run with several volumes", func() {
 		_, byName := archiveEntries(initrd)
 		Expect(string(byName["rvm/disks"].data)).To(HaveSuffix(fmt.Sprintf("RVM_VOLUME_SECTORS=%d\n", defaultImageSize/512)))
 		Expect(strings.Count(string(byName["rvm/disks"].data), "RVM_VOLUME_SECTORS=")).To(Equal(1))
+		Expect(string(byName["rvm/disks"].data)).To(ContainSubstring("RVM_VOLUMES=3\n"))
+		Expect(string(byName["rvm/disks"].data)).To(ContainSubstring("RVM_VOL2_KIND=image\nRVM_VOL2_ID=rvm-vol2\n"))
 		Expect(string(byName["rvm/mounts"].data)).To(Equal(mountsFile(&guestVolume{ContainerDir: dirs[0], ImageName: imageName})))
 		Expect(string(byName["rvm/mounts"].data)).NotTo(ContainSubstring(dirs[1]))
 	})

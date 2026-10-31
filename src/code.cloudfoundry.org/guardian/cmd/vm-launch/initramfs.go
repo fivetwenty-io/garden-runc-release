@@ -728,19 +728,29 @@ func mountsFile(v *guestVolume) string {
 const sectorBytes = 512
 
 // disksFile returns the guest /rvm/disks, which stage 1 sources to find the
-// guest's drives by their size in sectors (see guestRootInit): the guest
-// root image's size and inode ratio when g has one, and the volume image's
-// size, which openVolumeImage opened, when g has a volume. A guest with
-// neither gets an empty file. Sizes that the guest could not
-// tell apart, or that are not whole sectors, are an error, because stage 1
+// guest's drives (see guestRootInit). It names every drive by its identity
+// (see newGuestDrives) and its size in sectors: the guest root image as
+// RVM_ROOT_ID and RVM_ROOT_SECTORS, with RVM_ROOT_INODE_RATIO, when g has one,
+// the number of volumes as RVM_VOLUMES, which is always there, and each
+// volume, in volume order, as RVM_VOLn_KIND, RVM_VOLn_ID, and
+// RVM_VOLn_SECTORS. The sizes are those of the files the hypervisor gets,
+// as the providers opened them. Until stage 1 finds drives by identity, it
+// finds them by size, so the first volume's size is RVM_VOLUME_SECTORS too.
+// Drives that the guest could not tell apart, by identity or, until then,
+// by size, an identity the guest could not match, a size that is not whole
+// sectors, and a drive without an identity are an error, because stage 1
 // would then refuse to boot, and a guess could format the volume.
 func disksFile(g guestContents) (string, error) {
 	var b strings.Builder
+	d := g.drives
+	var named []namedDriveID
 	switch {
 	case g.rootBytes < 0 || g.rootInodeRatio < 0:
 		return "", fmt.Errorf("the guest root image of %d bytes at %d bytes per inode has a negative size", g.rootBytes, g.rootInodeRatio)
 	case g.rootBytes == 0 && g.rootInodeRatio != 0:
 		return "", fmt.Errorf("an inode ratio of %d bytes per inode for no guest root image", g.rootInodeRatio)
+	case g.rootBytes == 0 && d.rootID != "":
+		return "", fmt.Errorf("a drive identity %q for no guest root image", d.rootID)
 	case g.rootBytes > 0:
 		if g.rootBytes%sectorBytes != 0 {
 			return "", fmt.Errorf("the guest root image of %d bytes is not a whole number of %d-byte sectors", g.rootBytes, sectorBytes)
@@ -748,16 +758,39 @@ func disksFile(g guestContents) (string, error) {
 		if g.rootInodeRatio == 0 {
 			return "", fmt.Errorf("the guest root image of %d bytes has no inode ratio", g.rootBytes)
 		}
-		if g.vol != nil && g.rootBytes == g.volumeBytes {
-			return "", fmt.Errorf("the guest root image and the volume image are both %d bytes, so the guest could not tell them apart", g.rootBytes)
+		for _, v := range d.volumes {
+			if g.rootBytes == v.bytes {
+				return "", fmt.Errorf("the guest root image and the volume image are both %d bytes, so the guest could not tell them apart", g.rootBytes)
+			}
 		}
-		fmt.Fprintf(&b, "RVM_ROOT_SECTORS=%d\nRVM_ROOT_INODE_RATIO=%d\n", g.rootBytes/sectorBytes, g.rootInodeRatio)
+		named = append(named, namedDriveID{name: "the guest root image", id: d.rootID})
+		fmt.Fprintf(&b, "RVM_ROOT_ID=%s\nRVM_ROOT_SECTORS=%d\nRVM_ROOT_INODE_RATIO=%d\n", d.rootID, g.rootBytes/sectorBytes, g.rootInodeRatio)
 	}
-	if g.vol != nil {
-		if g.volumeBytes <= 0 || g.volumeBytes%sectorBytes != 0 {
-			return "", fmt.Errorf("the volume image of %d bytes is not a positive whole number of %d-byte sectors", g.volumeBytes, sectorBytes)
+	switch {
+	case len(d.volumes) > maxVolumes:
+		return "", fmt.Errorf("%d volume drives, over the %d a guest can have", len(d.volumes), maxVolumes)
+	case g.vol == nil && len(d.volumes) > 0:
+		return "", fmt.Errorf("%d volume drives for a guest without a volume", len(d.volumes))
+	case g.vol != nil && len(d.volumes) == 0:
+		return "", errors.New("a guest volume without a volume drive")
+	}
+	fmt.Fprintf(&b, "RVM_VOLUMES=%d\n", len(d.volumes))
+	for i, v := range d.volumes {
+		drive := volumeDriveID(i)
+		if v.kind != driveImage {
+			return "", fmt.Errorf("drive %s holds a %q, and the guest supports only %q volume drives", drive, v.kind, driveImage)
 		}
-		fmt.Fprintf(&b, "RVM_VOLUME_SECTORS=%d\n", g.volumeBytes/sectorBytes)
+		if v.bytes <= 0 || v.bytes%sectorBytes != 0 {
+			return "", fmt.Errorf("the volume image of %d bytes on drive %s is not a positive whole number of %d-byte sectors", v.bytes, drive, sectorBytes)
+		}
+		named = append(named, namedDriveID{name: "drive " + drive, id: v.id})
+		fmt.Fprintf(&b, "RVM_VOL%d_KIND=%s\nRVM_VOL%d_ID=%s\nRVM_VOL%d_SECTORS=%d\n", i, v.kind, i, v.id, i, v.bytes/sectorBytes)
+	}
+	if err := checkDriveIDs(named, ""); err != nil {
+		return "", err
+	}
+	if len(d.volumes) > 0 {
+		fmt.Fprintf(&b, "RVM_VOLUME_SECTORS=%d\n", d.volumes[0].bytes/sectorBytes)
 	}
 	return b.String(), nil
 }
@@ -804,11 +837,13 @@ type guestContents struct {
 	nw *network
 	// env is the guest environment, /rvm/env (see buildGuestEnv).
 	env string
-	// vol is the guest volume, or nil without one, and volumeBytes is the
-	// size of its image as openVolumeImage opened it, which the guest looks
-	// for by size (see disksFile).
-	vol         *guestVolume
-	volumeBytes int64
+	// vol is the first guest volume, which stage 2 mounts, or nil without a
+	// volume.
+	vol *guestVolume
+	// drives are the drives the guest formats or mounts, with their
+	// identities and, for the volumes, their sizes as the providers opened
+	// them, for /rvm/disks (see disksFile).
+	drives guestDrives
 	// caBundle is the guest's CA bundle (see guestCABundle), or nil when
 	// there is no certificate to trust.
 	caBundle []byte

@@ -71,17 +71,18 @@ var (
 		"-netdev", "user,id=n0,net=10.0.2.0/24",
 		"-device", "virtio-net-device,netdev=n0",
 	}
-	// goldenQEMUDrive is what a volume adds to the QEMU command line.
+	// goldenQEMUDrive is what a volume adds to the QEMU command line. The
+	// serial is the drive's identity.
 	goldenQEMUDrive = []string{
 		"-drive", "if=none,id=vol0,file=/proc/self/fd/3,format=raw,cache=writeback,aio=threads,file.locking=off,werror=report,rerror=report,discard=ignore",
-		"-device", "virtio-blk-device,drive=vol0",
+		"-device", "virtio-blk-device,drive=vol0,serial=rvm-vol0",
 	}
 	// goldenQEMURootDrive is what a guest root image adds to the QEMU command
 	// line, for the image on file descriptor fd.
 	goldenQEMURootDrive = func(fd string) []string {
 		return []string{
 			"-drive", "if=none,id=root0,file=/proc/self/fd/" + fd + ",format=raw,cache=unsafe,aio=threads,file.locking=off,werror=report,rerror=report,discard=unmap,detect-zeroes=unmap",
-			"-device", "virtio-blk-device,drive=root0",
+			"-device", "virtio-blk-device,drive=root0,serial=rvm-root",
 		}
 	}
 )
@@ -346,12 +347,12 @@ var _ = Describe("hypervisor guest root drive", func() {
 
 // goldenQEMUVolumeDrive is what the volume at index i of volume order adds
 // to the QEMU command line, with its image on file descriptor fd: the drive
-// of goldenQEMUDrive under the volume's own name.
+// of goldenQEMUDrive under the volume's own name and serial.
 func goldenQEMUVolumeDrive(i int, fd string) []string {
 	id := "vol" + strconv.Itoa(i)
 	return []string{
 		"-drive", "if=none,id=" + id + ",file=/proc/self/fd/" + fd + ",format=raw,cache=writeback,aio=threads,file.locking=off,werror=report,rerror=report,discard=ignore",
-		"-device", "virtio-blk-device,drive=" + id,
+		"-device", "virtio-blk-device,drive=" + id + ",serial=rvm-vol" + strconv.Itoa(i),
 	}
 }
 
@@ -609,7 +610,7 @@ var _ = Describe("hypervisor drives for several volumes against a real QEMU", fu
 		vols := []*os.File{sparseImage(defaultImageSize), sparseImage(defaultImageSize)}
 		root := realRootImage()
 		g := taskGuest("echo the-command-ran\n")
-		g.vol, g.volumeBytes = &guestVolume{ContainerDir: "/home/vcap/data", ImageName: "volume.img"}, defaultImageSize
+		g.vol, g.drives.volumes = &guestVolume{ContainerDir: "/home/vcap/data", ImageName: "volume.img"}, qemuImageDrives(defaultImageSize, defaultImageSize)
 		withRealRoot(&g)
 
 		art := realArtifacts()
