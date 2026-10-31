@@ -32,7 +32,7 @@ var _ = Describe("volumes numbered by volume index beside a share", func() {
 		}
 		mounts, err := mountsFile(g)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(mounts).To(Equal("RVM_VOLUMES=4\n" +
+		Expect(mounts).To(Equal("RVM_VOLUMES=4\nRVM_SYNC_MOUNTS=true\n" +
 			"RVM_VOL0_KIND=image\nRVM_VOL0_PATH='/data'\nRVM_VOL0_IMAGE='a.img'\n" +
 			"RVM_VOL1_KIND=share\nRVM_VOL1_PATH='/shared'\n" +
 			"RVM_VOL2_KIND=block\nRVM_VOL2_PATH='/disk'\n" +
@@ -58,7 +58,7 @@ var _ = Describe("volumes numbered by volume index beside a share", func() {
 		g.vols = []guestVolume{share("/shared")}
 		mounts, err := mountsFile(g)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(mounts).To(Equal("RVM_VOLUMES=1\nRVM_VOL0_KIND=share\nRVM_VOL0_PATH='/shared'\n"))
+		Expect(mounts).To(Equal("RVM_VOLUMES=1\nRVM_SYNC_MOUNTS=true\nRVM_VOL0_KIND=share\nRVM_VOL0_PATH='/shared'\n"))
 		disks, err := disksFile(g)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(disks).To(Equal("RVM_VOLUMES=1\nRVM_VOL0_KIND=share\n"))
