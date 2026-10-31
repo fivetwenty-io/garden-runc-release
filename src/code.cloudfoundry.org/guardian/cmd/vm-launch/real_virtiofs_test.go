@@ -3,10 +3,13 @@
 package main
 
 import (
+	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -54,7 +57,8 @@ func realSeccompMode(vfs string) string {
 			return
 		}
 		defer os.RemoveAll(dir)
-		cmd := exec.Command(vfs, "--socket-path="+filepath.Join(dir, "p.sock"), "--sandbox=none", "--seccomp=kill", "--shared-dir="+dir)
+		argv := append(virtiofsdLauncher(vfs), "--socket-path="+filepath.Join(dir, "p.sock"), "--sandbox=none", "--seccomp=kill", "--shared-dir="+dir)
+		cmd := exec.Command(argv[0], argv[1:]...)
 		cmd.Env = []string{}
 		if err := cmd.Start(); err != nil {
 			return
@@ -70,6 +74,16 @@ func realSeccompMode(vfs string) string {
 		}
 	})
 	return realSeccompValue
+}
+
+// realSeccomp returns realSeccompMode for vfs, and says so in the spec's
+// output when the mode is not the one vm-launch runs virtiofsd with.
+func realSeccomp(vfs string) string {
+	mode := realSeccompMode(vfs)
+	if mode != virtiofsdSeccomp {
+		GinkgoWriter.Printf("virtiofsd cannot load its seccomp filter on this host, so the spec runs it with --seccomp=%s\n", mode)
+	}
+	return mode
 }
 
 // realVirtiofsdServer serves a directory with the real virtiofsd on a Unix
@@ -105,16 +119,7 @@ func serveRealShare(vfs, sock, dir string) *realVirtiofsdServer {
 			AddReportEntry("virtiofsd log", srv.log.String())
 		}
 	})
-	argv := virtiofsdArgv(vfs, dir)
-	if mode := realSeccompMode(vfs); mode != "kill" {
-		Expect(argv).To(ContainElement("--seccomp=kill"))
-		for i, a := range argv {
-			if a == "--seccomp=kill" {
-				argv[i] = "--seccomp=" + mode
-			}
-		}
-		GinkgoWriter.Printf("virtiofsd cannot load its seccomp filter on this host, so the spec runs it with --seccomp=%s\n", mode)
-	}
+	argv := virtiofsdArgv(virtiofsdLauncher(vfs), realSeccomp(vfs), dir)
 	go func() {
 		defer close(srv.done)
 		quick := 0
@@ -249,6 +254,69 @@ rm '`+guestDir+`/made/note'`)
 		Expect(out).To(MatchRegexp(`(?m)^later=added between boots\r?$`), out)
 		Expect(out).To(ContainSubstring(exitTag(testNonce)+"0"), out)
 		Expect(note).NotTo(BeAnExistingFile())
+	})
+
+	It("starts the bundled virtiofsd through the bundle's loader, with no shell, and sees it ready and then stops it", func() {
+		vfs := realShareVirtiofsd()
+		bundle := filepath.Dir(vfs)
+		launcher := virtiofsdLauncher(vfs)
+		Expect(launcher).To(Equal([]string{
+			filepath.Join(bundle, virtiofsdLoaderName), "--library-path", filepath.Join(bundle, virtiofsdLibDirName), filepath.Join(bundle, virtiofsdBinaryName),
+		}))
+		dir := GinkgoT().TempDir()
+		grant := []shareGrant{{Index: 0, Path: dir, Tag: shareTag(0), Mount: shareMountRecord(40, dir)}}
+		Expect(checkVirtiofsd(vfs, grant)).To(Succeed())
+		DeferCleanup(func(saved string) { mountInfoPath = saved }, mountInfoPath)
+		mountInfoPath = writeTempFile("mountinfo", mountinfoLine(40, dir, "fuse.juicefs"))
+
+		// A Unix socket path is short, so the work directory is too.
+		workDir, err := os.MkdirTemp("", "rvm-w")
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { os.RemoveAll(workDir) })
+		// vm-launch runs as the app's user, and virtiofsd run by a user other
+		// than root needs no capabilities. Run by root, as this suite is,
+		// virtiofsd drops its supplementary groups and sets its capability
+		// set when it starts, and both fail with none. So under root the spec
+		// leaves the thread's capabilities alone and keeps the rest of the
+		// start: no_new_privs, the loader, the listening socket, and the
+		// readiness line. The specs with a fake virtiofsd cover the dropped
+		// capabilities.
+		if os.Geteuid() == 0 {
+			saved := hypervisorCaps
+			DeferCleanup(func() { hypervisorCaps = saved })
+			hypervisorCaps = &fakeCaps{}
+		}
+		logBuf := &safeBuffer{}
+		s, err := newShareServers(vfs, workDir, grant, log.New(logBuf, "", 0))
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { s.stop(0) })
+		s.seccomp = realSeccomp(vfs)
+		Expect(s.start(nil)).To(Succeed(), logBuf.String())
+		Expect(s.servers[0].ready).To(BeClosed())
+
+		// The process is the loader running virtiofsd: no shell came
+		// between vm-launch and virtiofsd, and the wrapper never ran. On a
+		// host that runs x86-64 programs through a binfmt_misc translator,
+		// the process's exe is the translator and its command line keeps the
+		// loader's, so the spec reads the loader from the command line and
+		// requires only that the exe is no shell.
+		pid := s.servers[0].cmd.Process.Pid
+		exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(filepath.Base(exe)).NotTo(BeElementOf("sh", "dash", "bash", "busybox"))
+		cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+		Expect(err).NotTo(HaveOccurred())
+		args := strings.Split(strings.TrimSuffix(string(cmdline), "\x00"), "\x00")
+		Expect(args).To(ContainElements(launcher[0], filepath.Join(bundle, virtiofsdBinaryName), "--fd=3", "--shared-dir="+dir))
+		Expect(args).NotTo(ContainElement(vfs))
+		if filepath.Base(exe) == virtiofsdLoaderName {
+			Expect(args[0]).To(Equal(launcher[0]))
+		}
+		Expect(logBuf.String()).To(ContainSubstring(virtiofsdReadyText))
+
+		s.guestEnded()
+		Expect(processGone(pid)).To(BeTrue())
+		Expect(s.failureReason()).To(BeEmpty())
 	})
 
 	It("fails the boot before the start tag, with the share's path, when the guest has no device with the share's tag", func() {
