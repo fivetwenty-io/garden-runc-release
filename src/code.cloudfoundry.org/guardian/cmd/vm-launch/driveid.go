@@ -49,13 +49,27 @@ func qemuVolumeSerial(i int) string {
 	return qemuVolumeSerialPrefix + strconv.Itoa(i)
 }
 
-// driveKind is what a volume drive holds, as RVM_VOLn_KIND names it. Every
-// volume vm-launch attaches today is a disk image on a volume service's
-// filesystem; block devices and shares come with their own providers, and
-// until then disksFile refuses any other kind.
+// driveKind is what a volume drive holds, as RVM_VOLn_KIND names it: a disk
+// image on a volume service's filesystem, or a whole block device. It comes
+// from the attachment's mode (see driveKindOf). Shares come with their own
+// provider, and until then disksFile refuses any other kind.
 type driveKind string
 
-const driveImage driveKind = "image"
+const (
+	driveImage driveKind = "image"
+	driveBlock driveKind = "block"
+)
+
+// driveKindOf is the kind of the drive that an attachment in mode m becomes.
+func driveKindOf(m attachMode) (driveKind, error) {
+	switch m {
+	case attachFileImage:
+		return driveImage, nil
+	case attachBlock:
+		return driveBlock, nil
+	}
+	return "", fmt.Errorf("%s has no volume drive kind", m)
+}
 
 // guestDrive is one volume drive as the guest learns of it: its identity,
 // what it holds, and its size in bytes.
@@ -109,11 +123,16 @@ func firecrackerDriveID(f *os.File) (string, error) {
 // newGuestDrives returns the drives the hypervisor of kind gets, each with
 // the identity the guest will read from it: the volumes in volume order,
 // whose attachments are the files the hypervisor opens, and the guest root
-// image root, or nil without one. On QEMU the identities are the serials of
-// qemuArgv and qemuRootDrive. On Firecracker they are predicted from the open
-// files, so they must be the files the hypervisor gets. A drive without a
-// usable identity, and two drives that would share one, are an error, because
-// the guest could then not tell which drive is which.
+// image root, or nil without one. On QEMU the identities are the serials that
+// qemuArgv and qemuRootDrive pass. On Firecracker they are predicted from the
+// open files, so they must be the files the hypervisor gets; for a block
+// device that is the device node's own inode. Each volume's identity is
+// recorded on its attachment (attachment.ID), where hypervisorFiles takes it
+// for the hypervisor's arguments, and each volume's kind comes from its
+// attachment's mode. A drive without a usable identity or kind, and two
+// drives that would share an identity, are an error, because the guest could
+// then not tell which drive is which or how to treat it. The attachments are
+// left unchanged on an error.
 func newGuestDrives(kind backend.Kind, volumes preparedVolumes, root *os.File) (guestDrives, error) {
 	if len(volumes) > maxVolumes {
 		return guestDrives{}, fmt.Errorf("%d volume drives, over the %d a guest can have", len(volumes), maxVolumes)
@@ -135,11 +154,15 @@ func newGuestDrives(kind backend.Kind, volumes preparedVolumes, root *os.File) (
 		if v.Attachment == nil || v.Attachment.File == nil {
 			return guestDrives{}, fmt.Errorf("%s has no open disk to identify", name)
 		}
+		dk, err := driveKindOf(v.Attachment.Mode)
+		if err != nil {
+			return guestDrives{}, fmt.Errorf("%s: %w", name, err)
+		}
 		id, err := identify(v.Attachment.File, qemuVolumeSerial(i))
 		if err != nil {
 			return guestDrives{}, fmt.Errorf("predicting the %s drive identity of %s: %w", kind, name, err)
 		}
-		drives.volumes = append(drives.volumes, guestDrive{id: id, kind: driveImage, bytes: v.Bytes})
+		drives.volumes = append(drives.volumes, guestDrive{id: id, kind: dk, bytes: v.Bytes})
 		named = append(named, namedDriveID{name: name, id: id})
 	}
 	if root != nil {
@@ -152,6 +175,9 @@ func newGuestDrives(kind backend.Kind, volumes preparedVolumes, root *os.File) (
 	}
 	if err := checkDriveIDs(named, " on "+string(kind)); err != nil {
 		return guestDrives{}, err
+	}
+	for i, v := range volumes {
+		v.Attachment.ID = drives.volumes[i].id
 	}
 	return drives, nil
 }

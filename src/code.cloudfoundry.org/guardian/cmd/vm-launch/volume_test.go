@@ -83,7 +83,9 @@ var _ = Describe("volumesFromEnv", func() {
 		for index, name := range map[string]string{"0": "rvm-disk-" + testAppID + "-web-0.img", "3": "rvm-disk-" + testAppID + "-web-3.img", "65535": "rvm-disk-" + testAppID + "-web-65535.img"} {
 			vol, err := volumesFromEnv(lookup(map[string]string{"VCAP_SERVICES": vcap, "VCAP_APPLICATION": vcapApp, "CF_INSTANCE_INDEX": index}))
 			Expect(err).NotTo(HaveOccurred())
-			Expect(vol).To(Equal([]guestVolume{{ContainerDir: "/var/vcap/data/0d1e", ImageName: name}}))
+			n, err := strconv.Atoi(index)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(vol).To(Equal([]guestVolume{{ContainerDir: "/var/vcap/data/0d1e", ImageName: name, Index: n}}))
 		}
 	})
 
@@ -211,7 +213,7 @@ var _ = Describe("volumesFromEnv", func() {
 		volumesAt := func(dirs ...string) []guestVolume {
 			vols := make([]guestVolume, len(dirs))
 			for i, d := range dirs {
-				vols[i] = guestVolume{ContainerDir: d, ImageName: image}
+				vols[i] = guestVolume{ContainerDir: d, ImageName: image, Index: 1}
 			}
 			return vols
 		}
@@ -471,7 +473,7 @@ var _ = Describe("findVolumeProvider", func() {
 			err := findVolumeProviderErr(infoFile(mountinfoLine(40, "/data", fstype)), "/data")
 			Expect(err).To(HaveOccurred(), fstype)
 			Expect(err.Error()).To(ContainSubstring(strconv.Quote(fstype)), fstype)
-			Expect(err.Error()).To(ContainSubstring("VM backends support only JuiceFS and NFS volumes today"), fstype)
+			Expect(err.Error()).To(ContainSubstring("VM backends support only BOSH disk, JuiceFS, and NFS volumes today"), fstype)
 			Expect(err.Error()).To(ContainSubstring(`"/data"`), fstype)
 		}
 	})
@@ -489,7 +491,7 @@ var _ = Describe("findVolumeProvider", func() {
 			err := findVolumeProviderErr(infoFile(c.info), c.dir)
 			Expect(err).To(HaveOccurred(), name)
 			Expect(err.Error()).To(ContainSubstring("no mount"), name)
-			Expect(err.Error()).To(ContainSubstring("VM backends support only JuiceFS and NFS volumes today"), name)
+			Expect(err.Error()).To(ContainSubstring("VM backends support only BOSH disk, JuiceFS, and NFS volumes today"), name)
 		}
 	})
 
@@ -596,7 +598,7 @@ var _ = Describe("findVolumeProviders", func() {
 	It("stops at the first volume it refuses", func() {
 		_, err := findAll([]string{"/a", "/b", "/c"},
 			mountinfoLine(40, "/a", "fuse.juicefs"), mountinfoLine(41, "/b", "cifs"), mountinfoLine(42, "/c", "ext4"))
-		Expect(err).To(MatchError(`volume path "/b" is a "cifs" mount; VM backends support only JuiceFS and NFS volumes today`))
+		Expect(err).To(MatchError(`volume path "/b" is a "cifs" mount; VM backends support only BOSH disk, JuiceFS, and NFS volumes today`))
 	})
 
 	It("refuses two volumes that show one directory of one filesystem", func() {

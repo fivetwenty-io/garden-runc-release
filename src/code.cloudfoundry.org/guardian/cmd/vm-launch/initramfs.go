@@ -881,8 +881,8 @@ func disksFile(g guestContents) (string, error) {
 	fmt.Fprintf(&b, "RVM_VOLUMES=%d\n", len(d.volumes))
 	for i, v := range d.volumes {
 		drive := volumeDriveID(i)
-		if v.kind != driveImage {
-			return "", fmt.Errorf("drive %s holds a %q, and the guest supports only %q volume drives", drive, v.kind, driveImage)
+		if v.kind != driveImage && v.kind != driveBlock {
+			return "", fmt.Errorf("drive %s holds a %q, and the guest supports only %q and %q volume drives", drive, v.kind, driveImage, driveBlock)
 		}
 		if v.bytes <= 0 || v.bytes%sectorBytes != 0 {
 			return "", fmt.Errorf("the volume image of %d bytes on drive %s is not a positive whole number of %d-byte sectors", v.bytes, drive, sectorBytes)

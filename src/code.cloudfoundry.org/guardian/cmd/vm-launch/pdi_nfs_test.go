@@ -96,7 +96,7 @@ var _ = Describe("the NFS provider", func() {
 	})
 
 	It("registers its refusal with the registry, which asks it before any provider", func() {
-		Expect(mountRefusals).To(HaveLen(2), "the NFS refusal and the BOSH disk refusal")
+		Expect(mountRefusals).To(HaveLen(3), "the NFS refusal, the BOSH disk refusal, and the block-mode descriptor refusal")
 		// Every mount the NFS provider refuses is refused at selection, in its
 		// own words, whatever provider is registered and however it matches.
 		spy := &spyProvider{name: "Spy"}

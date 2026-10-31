@@ -47,7 +47,7 @@ func preparedFiles(files ...*os.File) preparedVolumes {
 	for i, f := range files {
 		info, err := f.Stat()
 		Expect(err).NotTo(HaveOccurred())
-		pv = append(pv, preparedVolume{Path: "/data" + strconv.Itoa(i), Attachment: &attachment{File: f, Release: func() error { return nil }}, Bytes: info.Size()})
+		pv = append(pv, preparedVolume{Path: "/data" + strconv.Itoa(i), Attachment: &attachment{File: f, Mode: attachFileImage, Release: func() error { return nil }}, Bytes: info.Size()})
 	}
 	return pv
 }
@@ -372,8 +372,8 @@ var _ = Describe("the drive identities in /rvm/disks", func() {
 			`drive vol0 and drive vol1 would both have the drive identity "rvm-vol0", so the guest could not tell them apart`),
 		Entry("a volume with the root's identity", guest("7123", guestDrive{id: "7123", kind: driveImage, bytes: defaultImageSize}),
 			`the guest root image and drive vol0 would both have the drive identity "7123", so the guest could not tell them apart`),
-		Entry("a volume of a kind the guest does not support", guest("rvm-root", guestDrive{id: "rvm-vol0", kind: "block", bytes: defaultImageSize}),
-			`drive vol0 holds a "block", and the guest supports only "image" volume drives`),
+		Entry("a volume of a kind the guest does not support", guest("rvm-root", guestDrive{id: "rvm-vol0", kind: "share", bytes: defaultImageSize}),
+			`drive vol0 holds a "share", and the guest supports only "image" and "block" volume drives`),
 		Entry("a later volume that is not whole sectors", guest("rvm-root", qemuImageDrives(defaultImageSize, defaultImageSize+1)...),
 			"the volume image of 1073741825 bytes on drive vol1 is not a positive whole number of 512-byte sectors"),
 		Entry("more volumes than a guest can have", guest("rvm-root", qemuImageDrives(1<<30, 1<<30, 1<<30, 1<<30, 1<<30)...),

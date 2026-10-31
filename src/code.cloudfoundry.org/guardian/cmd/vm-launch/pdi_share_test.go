@@ -341,7 +341,7 @@ var _ = Describe("run with a share request", func() {
 
 	It("lets a volume that no provider owns keep the registry's refusal", func() {
 		setMountInfo(mountinfoLine(40, volDir, "cifs"))
-		refused(`volume path `+quoteForLog(volDir)+` is a "cifs" mount; VM backends support only JuiceFS and NFS volumes today`,
+		refused(`volume path `+quoteForLog(volDir)+` is a "cifs" mount; VM backends support only BOSH disk, JuiceFS, and NFS volumes today`,
 			"--backend", "vm-qemu", "--allow-volume-shares")
 	})
 

@@ -71,6 +71,9 @@ var reservedGuestDirs = []string{"/bin", "/dev", "/etc", "/init", "/proc", "/rvm
 type guestVolume struct {
 	ContainerDir string
 	ImageName    string
+	// Index is the instance index the image name carries, which a provider
+	// that allows one instance checks.
+	Index int
 
 	// MountID is the ID of the mount that findVolumeProvider found
 	// ContainerDir on. When MountIDKnown is set, openVolumeImage refuses a
@@ -195,9 +198,15 @@ func volumesFromEnv(lookup func(string) (string, bool)) ([]guestVolume, error) {
 	if err != nil {
 		return nil, err
 	}
+	// imageNameFor accepted the index as canonical decimal up to
+	// maxInstanceIndex, so it parses.
+	n, err := strconv.ParseUint(index, 10, 16)
+	if err != nil {
+		return nil, fmt.Errorf("%s %s is not an instance index from 0 to %d", instanceIndexEnv, quoteForLog(index), maxInstanceIndex)
+	}
 	vols := make([]guestVolume, len(mounts))
 	for i, m := range mounts {
-		vols[i] = guestVolume{ContainerDir: m.dir, ImageName: name}
+		vols[i] = guestVolume{ContainerDir: m.dir, ImageName: name, Index: int(n)}
 	}
 	return vols, nil
 }
@@ -399,7 +408,9 @@ func findVolumeProviders(mountinfo string, vols []guestVolume) ([]selectedVolume
 type preparedVolume struct {
 	Path       string
 	Attachment *attachment
-	// Bytes is the size of the disk, which stage 1 checks the drive against.
+	// Bytes is the size of the disk, which stage 1 checks the drive against:
+	// the image's length from fstat in file-image mode, and the device's size
+	// from BLKGETSIZE64 in block mode, where fstat gives no size.
 	Bytes int64
 	// dev and ino name the disk's inode, so that no disk is attached twice.
 	dev, ino uint64
@@ -409,7 +420,11 @@ type preparedVolume struct {
 // attachments stay fenced until release.
 type preparedVolumes []preparedVolume
 
-// prepare asks v's provider for its disk, in file-image mode, and adds it.
+// prepare asks v's provider for its disk, in the mode privateMode picks from
+// the provider's capabilities, and adds it. The attachment must be in that
+// mode, and its file must be what the mode says: a regular file in
+// file-image mode and a block device in block mode, whose size comes from
+// the device itself.
 // An attachment without a usable disk is refused and cleaned up (see
 // checkAttachment), and so is a disk that an earlier volume already holds
 // open. The provider gets a BeforeLock function that makes this refusal before
@@ -425,8 +440,9 @@ type preparedVolumes []preparedVolume
 // hand back what it built along with the error. The volumes added before
 // keep their fences, and the caller releases them too.
 func (pv *preparedVolumes) prepare(v selectedVolume, signals <-chan os.Signal, budget *lockBudget, logger *log.Logger) (*attachment, error) {
+	mode := privateMode(v.Provider.Capabilities(v.Mount))
 	att, err := v.Provider.Prepare(prepareRequest{
-		Mount: v.Mount, ImageName: v.Volume.ImageName, Mode: attachFileImage, Signals: signals,
+		Mount: v.Mount, ImageName: v.Volume.ImageName, Index: v.Volume.Index, Mode: mode, Signals: signals,
 		LockBudget: budget,
 		BeforeLock: func(img *os.File) error {
 			_, dev, ino, err := inodeOf(img, v.Volume.ContainerDir)
@@ -446,14 +462,34 @@ func (pv *preparedVolumes) prepare(v selectedVolume, signals <-chan os.Signal, b
 	if err := checkAttachment(v.Provider, att, logger); err != nil {
 		return nil, err
 	}
+	switch att.Mode {
+	case 0:
+		att.Mode = mode
+	case mode:
+	default:
+		return att, fmt.Errorf("the %s volume provider was asked for %s for the volume at %s and prepared the disk in %s",
+			v.Provider.Name(), mode, quoteForLog(v.Volume.ContainerDir), att.Mode)
+	}
 	info, dev, ino, err := inodeOf(att.File, v.Volume.ContainerDir)
 	if err != nil {
 		return att, err
 	}
+	size := info.Size()
+	switch {
+	case mode == attachBlock:
+		if info.Mode().Type() != os.ModeDevice {
+			return att, fmt.Errorf("the %s volume provider prepared the disk for the volume at %s in %s, but its file is not a block device", v.Provider.Name(), quoteForLog(v.Volume.ContainerDir), mode)
+		}
+		if size, err = blockDeviceBytes(att.File); err != nil {
+			return att, fmt.Errorf("reading the size of the block device for the volume at %s: %w", quoteForLog(v.Volume.ContainerDir), err)
+		}
+	case !info.Mode().IsRegular():
+		return att, fmt.Errorf("the %s volume provider prepared the disk for the volume at %s in %s, but its file is not a regular file", v.Provider.Name(), quoteForLog(v.Volume.ContainerDir), mode)
+	}
 	if err := pv.checkNotHeld(v.Volume.ContainerDir, dev, ino); err != nil {
 		return att, err
 	}
-	*pv = append(*pv, preparedVolume{Path: v.Volume.ContainerDir, Attachment: att, Bytes: info.Size(), dev: dev, ino: ino})
+	*pv = append(*pv, preparedVolume{Path: v.Volume.ContainerDir, Attachment: att, Bytes: size, dev: dev, ino: ino})
 	return nil, nil
 }
 
@@ -484,13 +520,13 @@ func (pv preparedVolumes) checkNotHeld(dir string, dev, ino uint64) error {
 	return nil
 }
 
-// files returns the disks, in volume order, for hypervisorFiles.
-func (pv preparedVolumes) files() []*os.File {
-	files := make([]*os.File, len(pv))
+// files returns the attachments, in volume order, for hypervisorFiles.
+func (pv preparedVolumes) files() []*attachment {
+	atts := make([]*attachment, len(pv))
 	for i, v := range pv {
-		files[i] = v.Attachment.File
+		atts[i] = v.Attachment
 	}
-	return files
+	return atts
 }
 
 // release releases every attachment, last first, and logs each release that

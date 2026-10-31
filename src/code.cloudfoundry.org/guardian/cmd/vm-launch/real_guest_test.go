@@ -48,7 +48,7 @@ func bootRealGuestWith(g guestContents, vols []*os.File, root *os.File) string {
 	f, err := newInitramfs(guestBusybox(), g)
 	Expect(err).NotTo(HaveOccurred())
 	DeferCleanup(f.Close)
-	files, drivePaths, initrdPath, _, rootPath := hypervisorFiles(vols, withUserspaceMark(f), nil, root)
+	files, drivePaths, initrdPath, _, rootPath := hypervisorFiles(imageAttachments(vols...), withUserspaceMark(f), nil, root)
 	argv := markedArgv(tcgArgv(qemu, withRealRootDrive(qemuArgv(art, initrdPath, minGuestMemoryMiB, g.nw, drivePaths, 0), rootPath)))
 	code, stdout, stderr := bootRealQEMU(argv, files)
 	Expect(code).To(Equal(0), "QEMU failed: %s\n%s", stderr, stdout)

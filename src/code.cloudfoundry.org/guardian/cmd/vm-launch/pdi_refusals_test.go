@@ -28,9 +28,9 @@ func diskLine(fstype, source, root string) string {
 
 var _ = Describe("the mount refusals", func() {
 	It("registers the BOSH disk refusal and leaves the supported providers alone", func() {
-		Expect(mountRefusals).To(HaveLen(2), "the BOSH disk refusal and the NFS refusal")
-		Expect(providerNamesOf(diskProviders)).To(Equal([]string{"JuiceFS", "NFS"}))
-		Expect(diskProviders.supportedLine()).To(Equal("VM backends support only JuiceFS and NFS volumes today"))
+		Expect(mountRefusals).To(HaveLen(3), "the BOSH disk refusal, the NFS refusal, and the block-mode descriptor refusal")
+		Expect(providerNamesOf(diskProviders)).To(Equal([]string{"BOSH disk", "JuiceFS", "NFS"}))
+		Expect(diskProviders.supportedLine()).To(Equal("VM backends support only BOSH disk, JuiceFS, and NFS volumes today"))
 	})
 
 	It("panics on a nil refusal and keeps registration order", func() {
@@ -89,7 +89,7 @@ var _ = Describe("the mount refusals", func() {
 		func(line string, fstype string) {
 			_, m, err := findIn(writeTempFile("mountinfo", line), "/data")
 			Expect(m).To(Equal(mountRecord{}))
-			Expect(err).To(MatchError(`volume path "/data" is a ` + `"` + fstype + `"` + ` mount; VM backends support only JuiceFS and NFS volumes today`))
+			Expect(err).To(MatchError(`volume path "/data" is a ` + `"` + fstype + `"` + ` mount; VM backends support only BOSH disk, JuiceFS, and NFS volumes today`))
 		},
 		Entry("a partition", diskLine("ext4", "/dev/sdb1", "/"), "ext4"),
 		Entry("a partition of a virtio disk", diskLine("ext4", "/dev/vdb2", "/"), "ext4"),
@@ -105,7 +105,6 @@ var _ = Describe("the mount refusals", func() {
 		Entry("an XFS partition", diskLine("xfs", "/dev/sdb1", "/"), "xfs"),
 		Entry("ext3 on a disk", diskLine("ext3", "/dev/sdb", "/"), "ext3"),
 		Entry("btrfs on a disk", diskLine("btrfs", "/dev/sdb", "/"), "btrfs"),
-		Entry("a block-mode descriptor tmpfs", diskLine("tmpfs", "pdi:bosh-disk", "/"), "tmpfs"),
 		Entry("a tmpfs named for another device", diskLine("tmpfs", "/dev/sdb", "/"), "tmpfs"),
 	)
 
@@ -164,7 +163,7 @@ var _ = Describe("the mount refusals", func() {
 		withProviders(fake("NFS", "nfs4", strongMatch), fake("Block", "tmpfs", strongMatch))
 		for _, line := range []string{
 			nfsMountinfoLine(41, "/data", "nfs4", "10.0.0.5:/export", labNFSOptions),
-			diskLine("tmpfs", "pdi:bosh-disk", "/"),
+			strings.Replace(diskLine("tmpfs", "pdi:bosh-disk", "/"), " rw\n", " ro\n", 1),
 		} {
 			p, _, err := findIn(writeTempFile("mountinfo", line), "/data")
 			Expect(err).NotTo(HaveOccurred(), line)
