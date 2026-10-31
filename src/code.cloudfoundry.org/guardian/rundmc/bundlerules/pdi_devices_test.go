@@ -122,7 +122,15 @@ const (
 	pdiHostsFile = "/var/vcap/data/garden/depot/handle-1/hosts"
 	pdiUUID      = "bc20d783-6145-4623-86bb-35110042b24b"
 	pdiDiskSize  = 2147483648
+	// pdiDiskseqBase plus a disk's minor number is its sequence number in
+	// the fake sysfs.
+	pdiDiskseqBase = 1000
 )
+
+// pdiClaimContent is a claim file as Garden writes it.
+func pdiClaimContent(tag, handle string, diskseq int) string {
+	return fmt.Sprintf("%s\n%s\n%d\n", tag, handle, diskseq)
+}
 
 func pdiDescriptorData(major, minor int, size int64) []byte {
 	return []byte(fmt.Sprintf("version=1\nmajor=%d\nminor=%d\nsize=%d\nuuid=%s\ndisk_name=bosh-disk-01\n", major, minor, size, pdiUUID))
@@ -154,11 +162,14 @@ var _ = Describe("PDIDevices", func() {
 	}
 
 	// blockDevice adds a whole disk to the fake sysfs the way the kernel lays
-	// it out: /sys/dev/block/MAJ:MIN links to the device's directory.
+	// it out: /sys/dev/block/MAJ:MIN links to the device's directory. The
+	// disk's sequence number is pdiDiskseqBase plus its minor number, and a
+	// partition has none of its own.
 	blockDevice := func(name string, major, minor int, sectors uint64) string {
 		dir := filepath.Join(sysfs, "devices", "virtual", "block", name)
 		writeFile(filepath.Join(dir, "size"), fmt.Sprintf("%d\n", sectors))
 		writeFile(filepath.Join(dir, "dev"), fmt.Sprintf("%d:%d\n", major, minor))
+		writeFile(filepath.Join(dir, "diskseq"), fmt.Sprintf("%d\n", pdiDiskseqBase+minor))
 		Expect(os.MkdirAll(filepath.Join(dir, "queue"), 0o755)).To(Succeed())
 		Expect(os.MkdirAll(filepath.Join(sysfs, "dev", "block"), 0o755)).To(Succeed())
 		Expect(os.Symlink(dir, filepath.Join(sysfs, "dev", "block", fmt.Sprintf("%d:%d", major, minor)))).To(Succeed())
@@ -177,8 +188,8 @@ var _ = Describe("PDIDevices", func() {
 	nodePath := func(name string) string { return filepath.Join(volumes.NodeDir, name) }
 	claimPath := func(name string) string { return filepath.Join(volumes.ClaimDir, name) }
 
-	// readClaimFile returns a claim file as written: the tag, a newline, and
-	// the handle.
+	// readClaimFile returns a claim file as written: the tag, the handle, and
+	// the disk sequence number, each followed by a newline.
 	readClaimFile := func(name string) string {
 		data, err := os.ReadFile(claimPath(name))
 		Expect(err).NotTo(HaveOccurred())
@@ -186,8 +197,9 @@ var _ = Describe("PDIDevices", func() {
 	}
 
 	readClaim := func(name string) string {
-		_, handle, _ := strings.Cut(readClaimFile(name), "\n")
-		return handle
+		lines := strings.Split(readClaimFile(name), "\n")
+		Expect(len(lines)).To(BeNumerically(">=", 2))
+		return lines[1]
 	}
 
 	noNodesOrClaims := func() {
@@ -255,10 +267,13 @@ var _ = Describe("PDIDevices", func() {
 		newBndl, applyErr = rule.Apply(inputBndl, desiredSpec)
 	})
 
+	// expectRefused checks the refusal and that it leaves nothing behind. A
+	// refusal can reach the app, so it never names the bind mount's host path.
 	expectRefused := func(substring string) {
 		GinkgoHelper()
 		Expect(applyErr).To(MatchError(bundlerules.ErrBlockVolumeRefused))
 		Expect(applyErr).To(MatchError(ContainSubstring(substring)))
+		Expect(applyErr.Error()).NotTo(ContainSubstring(pdiVolume))
 		noNodesOrClaims()
 	}
 
@@ -301,7 +316,7 @@ var _ = Describe("PDIDevices", func() {
 		})
 
 		It("records the container as the device's owner under the Garden's empty tag", func() {
-			Expect(readClaimFile("8-16")).To(Equal("\nhandle-1"))
+			Expect(readClaimFile("8-16")).To(Equal(pdiClaimContent("", "handle-1", 1016)))
 		})
 
 		It("reads the descriptor only for the descriptor bind mount, and closes every source", func() {
@@ -312,8 +327,15 @@ var _ = Describe("PDIDevices", func() {
 			Expect(host.sources[pdiHostsFile].closed).To(BeTrue())
 		})
 
-		It("adds no mount, because the descriptor's bind mount is the Mounts rule's", func() {
-			Expect(newBndl.Mounts()).To(HaveLen(2))
+		It("adds the disk sequence record and no other mount, because the descriptor's bind mount is the Mounts rule's", func() {
+			mounts := newBndl.Mounts()
+			Expect(mounts).To(HaveLen(3))
+			Expect(mounts[2]).To(Equal(specs.Mount{
+				Destination: bundlerules.PDIDiskseqMountPath,
+				Source:      "garden-pdi-diskseq:8:16=1016",
+				Type:        "tmpfs",
+				Options:     []string{"ro", "nosuid", "nodev", "noexec", "size=4k", "mode=0555"},
+			}))
 		})
 
 		It("logs the claim", func() {
@@ -402,8 +424,8 @@ var _ = Describe("PDIDevices", func() {
 			It("writes each Garden's tag into its claims", func() {
 				_, err := other.Claim(otherDesired)
 				Expect(err).NotTo(HaveOccurred())
-				Expect(readClaimFile("8-16")).To(Equal("\nhandle-1"))
-				Expect(readClaimFile("8-32")).To(Equal("b2\nhandle-b"))
+				Expect(readClaimFile("8-16")).To(Equal(pdiClaimContent("", "handle-1", 1016)))
+				Expect(readClaimFile("8-32")).To(Equal(pdiClaimContent("b2", "handle-b", 1032)))
 			})
 
 			It("leaves the other Garden's claims and nodes alone when it sweeps at start-up", func() {
@@ -420,7 +442,7 @@ var _ = Describe("PDIDevices", func() {
 				Expect(err).NotTo(HaveOccurred())
 				Expect(volumes.ReleaseUnknown(logger, nil)).To(Succeed())
 				Expect(claimPath("8-16")).NotTo(BeAnExistingFile())
-				Expect(readClaimFile("8-32")).To(Equal("b2\nhandle-b"))
+				Expect(readClaimFile("8-32")).To(Equal(pdiClaimContent("b2", "handle-b", 1032)))
 				Expect(nodePath("8-32")).To(BeARegularFile())
 			})
 
@@ -437,10 +459,11 @@ var _ = Describe("PDIDevices", func() {
 					BindMounts:       []garden.BindMount{{SrcPath: pdiVolume, DstPath: "/var/vcap/data/disk", Mode: garden.BindMountModeRW}},
 				})
 				Expect(err).To(MatchError(bundlerules.ErrBlockVolumeRefused))
-				Expect(err).To(MatchError(ContainSubstring(`already given to container "handle-1" of the Garden tagged ""`)))
+				Expect(err).To(MatchError("block volume refused: device 8:16 for the volume at /var/vcap/data/disk is already in use on this cell, and Garden waited 0s for it to be released"))
+				Expect(logger).To(gbytes.Say(`"holder-handle":"handle-1"`))
 
 				Expect(other.Release(logger, "handle-b")).To(Succeed())
-				Expect(readClaimFile("8-16")).To(Equal("\nhandle-1"))
+				Expect(readClaimFile("8-16")).To(Equal(pdiClaimContent("", "handle-1", 1016)))
 				Expect(nodePath("8-16")).To(BeARegularFile())
 			})
 		})
@@ -491,6 +514,7 @@ var _ = Describe("PDIDevices", func() {
 			It("holds the new create back until the release has finished the node and the claim", func() {
 				blocker := &blockingRemove{fakePDIHost: host, entered: make(chan struct{}), proceed: make(chan struct{})}
 				volumes.Host = blocker
+				volumes.ClaimWait = 10 * time.Second
 
 				released := make(chan error, 1)
 				go func() { released <- volumes.Release(logger, "handle-1") }()
@@ -547,7 +571,7 @@ var _ = Describe("PDIDevices", func() {
 							if _, err := volumes.Claim(racer); err != nil {
 								continue
 							}
-							if data, err := os.ReadFile(claimPath("8-16")); err != nil || string(data) != "\n"+handle {
+							if data, err := os.ReadFile(claimPath("8-16")); err != nil || string(data) != pdiClaimContent("", handle, 1016) {
 								note("%s lost its claim: %q, %v", handle, data, err)
 							}
 							if _, err := os.Stat(nodePath("8-16")); err != nil {
@@ -616,7 +640,9 @@ var _ = Describe("PDIDevices", func() {
 				second.Handle = "handle-2"
 				_, err := rule.Apply(inputBndl, second)
 				Expect(err).To(MatchError(bundlerules.ErrBlockVolumeRefused))
-				Expect(err).To(MatchError(ContainSubstring(`already given to container "handle-1"`)))
+				Expect(err).To(MatchError(ContainSubstring("device 8:16 for the volume at /var/vcap/data/disk is already in use on this cell")))
+				Expect(err.Error()).NotTo(ContainSubstring("handle-1"))
+				Expect(err.Error()).NotTo(ContainSubstring(pdiVolume))
 
 				Expect(readClaim("8-16")).To(Equal("handle-1"))
 				Expect(nodePath("8-16")).To(BeARegularFile())
@@ -643,7 +669,9 @@ var _ = Describe("PDIDevices", func() {
 				})
 
 				It("refuses the container", func() {
-					expectRefused("device 8:16 (from " + pdiVolume + ") is mounted on the host at /mnt")
+					expectRefused("device 8:16, for the volume at /var/vcap/data/disk, is mounted on the host")
+					Expect(applyErr.Error()).NotTo(ContainSubstring("/mnt"))
+					Expect(logger).To(gbytes.Say(`"mount-point":"/mnt"`))
 				})
 			})
 		})
@@ -697,6 +725,296 @@ var _ = Describe("PDIDevices", func() {
 		})
 	})
 
+	Context("while another container holds the device", func() {
+		var second spec.DesiredContainerSpec
+
+		BeforeEach(func() {
+			second = desiredSpec
+			second.Handle = "handle-2"
+		})
+
+		It("waits for the holder's release and then gives the device", func() {
+			Expect(applyErr).NotTo(HaveOccurred())
+			volumes.ClaimWait = 10 * time.Second
+			created := make(chan error, 1)
+			go func() {
+				_, err := volumes.Claim(second)
+				created <- err
+			}()
+			Consistently(created, 300*time.Millisecond).ShouldNot(Receive())
+
+			Expect(volumes.Release(logger, "handle-1")).To(Succeed())
+			Eventually(created, 5*time.Second).Should(Receive(BeNil()))
+			Expect(readClaim("8-16")).To(Equal("handle-2"))
+			Expect(nodePath("8-16")).To(BeARegularFile())
+		})
+
+		It("refuses the container once the wait runs out, and names the holder only in the log", func() {
+			Expect(applyErr).NotTo(HaveOccurred())
+			volumes.Tag = "g1"
+			volumes.ClaimWait = 200 * time.Millisecond
+			start := time.Now()
+			_, err := volumes.Claim(second)
+			Expect(time.Since(start)).To(BeNumerically(">=", 200*time.Millisecond))
+			Expect(err).To(MatchError("block volume refused: device 8:16 for the volume at /var/vcap/data/disk is already in use on this cell, and Garden waited 200ms for it to be released"))
+			Expect(logger).To(gbytes.Say(`"holder-handle":"handle-1"`))
+			Expect(readClaim("8-16")).To(Equal("handle-1"))
+		})
+
+		It("logs a holder whose claim names another disk than the device has now", func() {
+			Expect(applyErr).NotTo(HaveOccurred())
+			writeFile(filepath.Join(sysfs, "devices", "virtual", "block", "sdb", "diskseq"), "2000\n")
+			_, err := volumes.Claim(second)
+			Expect(err).To(MatchError(bundlerules.ErrBlockVolumeRefused))
+			Expect(logger).To(gbytes.Say("pdi-claimed-device-replaced"))
+		})
+
+		It("never waits on a claim whose probe hangs to release another container or claim another device", func() {
+			Expect(volumes.Release(logger, "handle-1")).To(Succeed())
+			hung := &blockingProbe{fakePDIHost: host, node: nodePath("8-16"), entered: make(chan struct{}), proceed: make(chan struct{})}
+			volumes.Host = hung
+			volumes.ClaimWait = 10 * time.Second
+
+			first := make(chan error, 1)
+			go func() {
+				_, err := volumes.Claim(second)
+				first <- err
+			}()
+			Eventually(hung.entered).Should(BeClosed())
+
+			released := make(chan error, 1)
+			go func() { released <- volumes.Release(logger, "handle-3") }()
+			Eventually(released, time.Second).Should(Receive(BeNil()))
+
+			mountInfo = append(mountInfo, `201 100 0:56 / /var/vcap/data/volumes/bosh-disk/vol-2 ro,nosuid,nodev,noexec - tmpfs pdi:bosh-disk ro`)
+			writeFile(volumes.MountInfoPath, strings.Join(mountInfo, "\n")+"\n")
+			host.sources[pdiVolume2] = &fakePDISource{mountID: 201, file: pdiRegularFile(pdiDescriptorData(8, 32, pdiDiskSize))}
+			other := make(chan error, 1)
+			go func() {
+				_, err := volumes.Claim(spec.DesiredContainerSpec{
+					Handle:           "handle-4",
+					ExecutionBackend: string(backend.VMQemu),
+					BindMounts:       []garden.BindMount{{SrcPath: pdiVolume2, DstPath: "/var/vcap/data/disk", Mode: garden.BindMountModeRW}},
+				})
+				other <- err
+			}()
+			Eventually(other, time.Second).Should(Receive(BeNil()))
+			Expect(readClaim("8-32")).To(Equal("handle-4"))
+
+			close(hung.proceed)
+			Eventually(first, 5*time.Second).Should(Receive(BeNil()))
+			Expect(readClaim("8-16")).To(Equal("handle-2"))
+		})
+
+		It("releases a claim whose probe hangs once the probe returns, when the destroy comes while it hangs", func() {
+			Expect(volumes.Release(logger, "handle-1")).To(Succeed())
+			hung := &blockingProbe{fakePDIHost: host, node: nodePath("8-16"), entered: make(chan struct{}), proceed: make(chan struct{})}
+			volumes.Host = hung
+
+			first := make(chan error, 1)
+			go func() {
+				_, err := volumes.Claim(second)
+				first <- err
+			}()
+			Eventually(hung.entered).Should(BeClosed())
+
+			released := make(chan error, 1)
+			go func() { released <- volumes.Release(logger, "handle-2") }()
+			Consistently(released, 200*time.Millisecond).ShouldNot(Receive())
+
+			close(hung.proceed)
+			Eventually(first, 5*time.Second).Should(Receive(BeNil()))
+			Eventually(released, 5*time.Second).Should(Receive(BeNil()))
+			noNodesOrClaims()
+		})
+	})
+
+	Context("with the disk sequence number", func() {
+		It("refuses a device whose disk changed while Garden checked it, and leaves nothing behind", func() {
+			Expect(volumes.Release(logger, "handle-1")).To(Succeed())
+			volumes.Host = &reattachingProbe{fakePDIHost: host, seqFile: filepath.Join(sysfs, "devices", "virtual", "block", "sdb", "diskseq"), write: writeFile}
+			_, err := volumes.Claim(desiredSpec)
+			Expect(err).To(MatchError("block volume refused: device 8:16 for the volume at /var/vcap/data/disk changed while Garden checked it: another disk now has that device number"))
+			Expect(logger).To(gbytes.Say(`"diskseq-after":2000`))
+			noNodesOrClaims()
+		})
+
+		When("sysfs reports no disk sequence number, as before Linux 5.15", func() {
+			BeforeEach(func() {
+				Expect(os.Remove(filepath.Join(sysfs, "devices", "virtual", "block", "sdb", "diskseq"))).To(Succeed())
+			})
+
+			It("refuses the container before creating anything", func() {
+				expectRefused("reading the disk sequence number of device 8:16")
+				Expect(applyErr).To(MatchError(ContainSubstring("Linux 5.15 or later")))
+				Expect(host.mknods).To(BeEmpty())
+			})
+		})
+
+		When("the device is a partition", func() {
+			BeforeEach(func() {
+				host.sources[pdiVolume].file = pdiRegularFile(pdiDescriptorData(8, 17, 2048*512))
+			})
+
+			It("records its whole disk's number, as BLKGETDISKSEQ on the partition reports", func() {
+				Expect(applyErr).NotTo(HaveOccurred())
+				Expect(readClaimFile("8-17")).To(Equal(pdiClaimContent("", "handle-1", 1016)))
+				Expect(newBndl.Mounts()[2].Source).To(Equal("garden-pdi-diskseq:8:17=1016"))
+			})
+		})
+
+		When("a container has two block volumes", func() {
+			BeforeEach(func() {
+				mountInfo = append(mountInfo, `201 100 0:56 / /var/vcap/data/volumes/bosh-disk/vol-2 ro,nosuid,nodev,noexec - tmpfs pdi:bosh-disk ro`)
+				host.sources[pdiVolume2] = &fakePDISource{mountID: 201, file: pdiRegularFile(pdiDescriptorData(8, 32, pdiDiskSize))}
+				desiredSpec.BindMounts = append(desiredSpec.BindMounts, garden.BindMount{SrcPath: pdiVolume2, DstPath: "/var/vcap/data/disk2", Mode: garden.BindMountModeRW})
+			})
+
+			It("records both in one mount", func() {
+				Expect(applyErr).NotTo(HaveOccurred())
+				Expect(newBndl.Mounts()).To(HaveLen(3))
+				Expect(newBndl.Mounts()[2].Source).To(Equal("garden-pdi-diskseq:8:16=1016,8:32=1032"))
+			})
+		})
+
+		When("the container has no block volume", func() {
+			BeforeEach(func() {
+				desiredSpec.BindMounts = desiredSpec.BindMounts[1:]
+			})
+
+			It("adds no record", func() {
+				Expect(applyErr).NotTo(HaveOccurred())
+				Expect(newBndl.Mounts()).To(HaveLen(2))
+			})
+		})
+	})
+
+	Context("with a claim that an earlier Garden left empty when it was killed", func() {
+		BeforeEach(func() {
+			Expect(os.MkdirAll(filepath.Join(root, "run", "garden-pdi-claims"), 0o700)).To(Succeed())
+			writeFile(filepath.Join(root, "run", "garden-pdi-claims", "8-16"), "")
+		})
+
+		It("removes it and gives the device, because no node shows a container was given it", func() {
+			Expect(applyErr).NotTo(HaveOccurred())
+			Expect(readClaim("8-16")).To(Equal("handle-1"))
+			Expect(logger).To(gbytes.Say("pdi-claim-stale-removed"))
+		})
+
+		When("Garden starts before any container names the device", func() {
+			BeforeEach(func() {
+				desiredSpec.BindMounts = nil
+			})
+
+			It("removes it in the start-up sweep", func() {
+				Expect(volumes.ReleaseUnknown(logger, nil)).To(Succeed())
+				Expect(claimPath("8-16")).NotTo(BeAnExistingFile())
+				Expect(logger).To(gbytes.Say("pdi-claim-stale-removed"))
+			})
+
+			It("keeps it when the node exists, because a container may have the device", func() {
+				Expect(os.MkdirAll(volumes.NodeDir, 0o755)).To(Succeed())
+				writeFile(nodePath("8-16"), "b 8:16 gid=991")
+				Expect(volumes.ReleaseUnknown(logger, nil)).To(Succeed())
+				Expect(claimPath("8-16")).To(BeARegularFile())
+				Expect(logger).To(gbytes.Say("pdi-claim-malformed"))
+			})
+
+			It("removes an unparsable claim the same way, and keeps a claim of the earlier format", func() {
+				writeFile(claimPath("8-99"), "no newline")
+				writeFile(claimPath("8-98"), "\nhandle-7")
+				Expect(volumes.ReleaseUnknown(logger, []string{"handle-7"})).To(Succeed())
+				Expect(claimPath("8-99")).NotTo(BeAnExistingFile())
+				Expect(readClaimFile("8-98")).To(Equal("\nhandle-7"))
+			})
+		})
+	})
+
+	Context("with a mountinfo line that strings.Fields would split wrongly", func() {
+		When("a mount has an empty source", func() {
+			BeforeEach(func() {
+				mountInfo = append(mountInfo, `300 100 0:60 / /run/empty rw,relatime - tmpfs  rw`)
+			})
+
+			It("reads the line and gives the device", func() {
+				Expect(applyErr).NotTo(HaveOccurred())
+				Expect(newBndl.Devices()).To(HaveLen(2))
+			})
+		})
+
+		When("a mount point holds a no-break space", func() {
+			BeforeEach(func() {
+				mountInfo = append(mountInfo, "300 100 8:16 / /mnt/a b rw,relatime - ext4 /dev/sdb rw")
+			})
+
+			It("still sees that the device is mounted", func() {
+				expectRefused("device 8:16, for the volume at /var/vcap/data/disk, is mounted on the host")
+				Expect(logger).To(gbytes.Say("\"mount-point\":\"/mnt/a b\""))
+			})
+		})
+
+		When("a line has too few fields after the separator", func() {
+			BeforeEach(func() {
+				mountInfo = append(mountInfo, `300 100 0:60 / /run/x rw - tmpfs`)
+			})
+
+			It("refuses the container", func() {
+				expectRefused("is not a mountinfo line")
+			})
+		})
+	})
+
+	When("a descriptor tmpfs comes from another volume driver", func() {
+		BeforeEach(func() {
+			mountInfo[2] = `200 100 0:55 / /var/vcap/data/volumes/bosh-disk/vol-1 ro,nosuid,nodev,noexec - tmpfs pdi:ebs ro`
+		})
+
+		It("refuses the container without reading the descriptor", func() {
+			expectRefused(`the volume at /var/vcap/data/disk is a descriptor from "pdi:ebs", and Garden gives a device only for pdi:bosh-disk`)
+			Expect(host.sources[pdiVolume].reads).To(BeZero())
+		})
+	})
+
+	When("the container's handle holds a newline", func() {
+		BeforeEach(func() {
+			desiredSpec.Handle = "handle\n1"
+		})
+
+		It("refuses the container, because the claim could not record it", func() {
+			expectRefused("the container's handle holds a newline")
+		})
+	})
+
+	When("Garden runs with block volumes off", func() {
+		var releaser *bundlerules.PDIDevices
+
+		JustBeforeEach(func() {
+			releaser = &bundlerules.PDIDevices{
+				NodeDir:       volumes.NodeDir,
+				ClaimDir:      volumes.ClaimDir,
+				SysfsDir:      sysfs,
+				MountInfoPath: volumes.MountInfoPath,
+				Host:          host,
+				Logger:        logger,
+			}
+		})
+
+		It("still releases what a run with them on left, and refuses to claim", func() {
+			Expect(applyErr).NotTo(HaveOccurred())
+			_, err := releaser.Claim(desiredSpec)
+			Expect(err).To(MatchError(ContainSubstring("block volumes are not turned on in this Garden")))
+
+			Expect(releaser.Release(logger, "handle-1")).To(Succeed())
+			noNodesOrClaims()
+		})
+
+		It("sweeps the claims of containers it does not know at start-up", func() {
+			Expect(applyErr).NotTo(HaveOccurred())
+			Expect(releaser.ReleaseUnknown(logger, nil)).To(Succeed())
+			noNodesOrClaims()
+		})
+	})
+
 	Context("when the device fails a host check", func() {
 		When("the size in sysfs differs from the descriptor", func() {
 			BeforeEach(func() {
@@ -704,7 +1022,7 @@ var _ = Describe("PDIDevices", func() {
 			})
 
 			It("refuses the container", func() {
-				expectRefused("device 8:16 is 2147483648 bytes, and the descriptor in " + pdiVolume + " says 2147483136")
+				expectRefused("device 8:16 is 2147483648 bytes, and the descriptor of the volume at /var/vcap/data/disk says 2147483136")
 				Expect(host.mknods).To(BeEmpty())
 			})
 		})
@@ -715,7 +1033,7 @@ var _ = Describe("PDIDevices", func() {
 			})
 
 			It("refuses the container", func() {
-				expectRefused("device 8:48 named by " + pdiVolume + " is not a block device on this host")
+				expectRefused("device 8:48 named by the volume at /var/vcap/data/disk is not a block device on this host")
 			})
 		})
 
@@ -725,7 +1043,9 @@ var _ = Describe("PDIDevices", func() {
 			})
 
 			It("refuses the container", func() {
-				expectRefused("device 8:16 (from " + pdiVolume + ") is mounted on the host at /var/vcap/store")
+				expectRefused("device 8:16, for the volume at /var/vcap/data/disk, is mounted on the host")
+				Expect(applyErr.Error()).NotTo(ContainSubstring("/var/vcap/store"))
+				Expect(logger).To(gbytes.Say(`"mount-point":"/var/vcap/store"`))
 				Expect(host.mknods).To(BeEmpty())
 			})
 		})
@@ -736,7 +1056,8 @@ var _ = Describe("PDIDevices", func() {
 			})
 
 			It("refuses the container", func() {
-				expectRefused("device 8:17 (from " + pdiVolume + ") is mounted on the host at /mnt disk")
+				expectRefused("device 8:17, for the volume at /var/vcap/data/disk, is mounted on the host")
+				Expect(logger).To(gbytes.Say(`"mount-point":"/mnt disk"`))
 			})
 		})
 
@@ -746,7 +1067,7 @@ var _ = Describe("PDIDevices", func() {
 			})
 
 			It("refuses the container and removes the node and claim it made", func() {
-				expectRefused("device 8:16 named by " + pdiVolume + " failed the exclusive probe")
+				expectRefused("device 8:16 for the volume at /var/vcap/data/disk failed the exclusive probe")
 				Expect(applyErr).To(MatchError(ContainSubstring("device or resource busy")))
 				Expect(host.removes).To(Equal([]string{nodePath("8-16")}))
 			})
@@ -791,7 +1112,7 @@ var _ = Describe("PDIDevices", func() {
 			})
 
 			It("refuses the container", func() {
-				expectRefused("reading the descriptor in " + pdiVolume + ": device is a symbolic link")
+				expectRefused("reading the descriptor of the volume at /var/vcap/data/disk: device is a symbolic link")
 			})
 		})
 
@@ -854,6 +1175,18 @@ var _ = Describe("PDIDevices", func() {
 			{"has a zero size", strings.Replace(string(pdiDescriptorData(8, 16, pdiDiskSize)), "size=2147483648", "size=0", 1)},
 			{"has an upper-case uuid", strings.Replace(string(pdiDescriptorData(8, 16, pdiDiskSize)), pdiUUID, strings.ToUpper(pdiUUID), 1)},
 			{"has an empty disk name", strings.Replace(string(pdiDescriptorData(8, 16, pdiDiskSize)), "disk_name=bosh-disk-01", "disk_name=", 1)},
+			{"has major 0", strings.Replace(string(pdiDescriptorData(8, 16, pdiDiskSize)), "major=8", "major=0", 1)},
+			{"has the all-zero uuid", strings.Replace(string(pdiDescriptorData(8, 16, pdiDiskSize)), pdiUUID, "00000000-0000-0000-0000-000000000000", 1)},
+			{"has a right-to-left override in the disk name", strings.Replace(string(pdiDescriptorData(8, 16, pdiDiskSize)), "disk_name=bosh-disk-01", "disk_name=bosh\u202edisk", 1)},
+			{"has a zero-width space in the disk name", strings.Replace(string(pdiDescriptorData(8, 16, pdiDiskSize)), "disk_name=bosh-disk-01", "disk_name=bosh\u200bdisk", 1)},
+			{"has a non-ASCII letter in the disk name", strings.Replace(string(pdiDescriptorData(8, 16, pdiDiskSize)), "disk_name=bosh-disk-01", "disk_name=bösh", 1)},
+			{"has a space in the disk name", strings.Replace(string(pdiDescriptorData(8, 16, pdiDiskSize)), "disk_name=bosh-disk-01", "disk_name=bosh disk", 1)},
+			{"has an '=' in the disk name", strings.Replace(string(pdiDescriptorData(8, 16, pdiDiskSize)), "disk_name=bosh-disk-01", "disk_name=d=1", 1)},
+			{"has a DEL in the disk name", strings.Replace(string(pdiDescriptorData(8, 16, pdiDiskSize)), "disk_name=bosh-disk-01", "disk_name=bosh\x7f", 1)},
+			{"has a tab in the disk name", strings.Replace(string(pdiDescriptorData(8, 16, pdiDiskSize)), "disk_name=bosh-disk-01", "disk_name=bosh\tdisk", 1)},
+			{"has a disk name that starts with '-'", strings.Replace(string(pdiDescriptorData(8, 16, pdiDiskSize)), "disk_name=bosh-disk-01", "disk_name=-bosh", 1)},
+			{"has the disk name '.'", strings.Replace(string(pdiDescriptorData(8, 16, pdiDiskSize)), "disk_name=bosh-disk-01", "disk_name=.", 1)},
+			{"has the disk name '..'", strings.Replace(string(pdiDescriptorData(8, 16, pdiDiskSize)), "disk_name=bosh-disk-01", "disk_name=..", 1)},
 			{"has another version", strings.Replace(string(pdiDescriptorData(8, 16, pdiDiskSize)), "version=1", "version=2", 1)},
 			{"lacks the final newline", strings.TrimSuffix(string(pdiDescriptorData(8, 16, pdiDiskSize)), "\n")},
 			{"is not UTF-8", string(pdiDescriptorData(8, 16, pdiDiskSize)[:10]) + "\xff\n"},
@@ -865,7 +1198,7 @@ var _ = Describe("PDIDevices", func() {
 				})
 
 				It("refuses the container", func() {
-					expectRefused("the descriptor in " + pdiVolume + ": descriptor")
+					expectRefused("the descriptor of the volume at /var/vcap/data/disk: descriptor")
 					Expect(host.mknods).To(BeEmpty())
 				})
 			})
@@ -875,7 +1208,7 @@ var _ = Describe("PDIDevices", func() {
 			Expect(applyErr).NotTo(HaveOccurred())
 			Expect(volumes.Release(logger, "handle-1")).To(Succeed())
 
-			setFile(pdiRegularFile([]byte("disk_name=d=1\nuuid=" + pdiUUID + "\nsize=2147483648\nminor=16\nmajor=8\nversion=1\n")))
+			setFile(pdiRegularFile([]byte("disk_name=Bosh_disk.01-a\nuuid=" + pdiUUID + "\nsize=2147483648\nminor=16\nmajor=8\nversion=1\n")))
 			_, err := rule.Apply(inputBndl, desiredSpec)
 			Expect(err).NotTo(HaveOccurred())
 		})
@@ -943,7 +1276,7 @@ var _ = Describe("PDIDevices", func() {
 			})
 
 			It("refuses the container", func() {
-				expectRefused("mount 999 of " + pdiVolume + " is not in")
+				expectRefused("the mount of the volume at /var/vcap/data/disk is not in")
 			})
 		})
 
@@ -953,7 +1286,7 @@ var _ = Describe("PDIDevices", func() {
 			})
 
 			It("refuses the container", func() {
-				expectRefused("opening bind mount source " + pdiVolume)
+				expectRefused("the bind mount source of the volume at /var/vcap/data/disk cannot be opened")
 			})
 		})
 
@@ -984,7 +1317,7 @@ var _ = Describe("PDIDevices", func() {
 		})
 
 		It("refuses the container, because block mode needs the device read-write", func() {
-			expectRefused("bind mount " + pdiVolume + " is a device descriptor and is read-only, and block mode needs it read-write")
+			expectRefused("the volume at /var/vcap/data/disk is a device descriptor bind-mounted read-only, and block mode needs it read-write")
 			Expect(host.mknods).To(BeEmpty())
 		})
 	})
@@ -1115,4 +1448,36 @@ func (p *probeOnce) Probe(path string, major, minor uint32, size int64) error {
 		return fmt.Errorf("exclusive open: %w", syscall.EBUSY)
 	}
 	return nil
+}
+
+// blockingProbe wraps the fake host so that the probe of node announces
+// itself and then waits, which holds a claim in its probe.
+type blockingProbe struct {
+	*fakePDIHost
+	node    string
+	entered chan struct{}
+	proceed chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingProbe) Probe(path string, major, minor uint32, size int64) error {
+	if path == b.node {
+		b.once.Do(func() { close(b.entered) })
+		<-b.proceed
+	}
+	return b.fakePDIHost.Probe(path, major, minor, size)
+}
+
+// reattachingProbe wraps the fake host so that the probe finds another disk
+// attached under the device's number, as a detach and a new attach between
+// Garden's checks would leave it.
+type reattachingProbe struct {
+	*fakePDIHost
+	seqFile string
+	write   func(path, content string)
+}
+
+func (r *reattachingProbe) Probe(path string, major, minor uint32, size int64) error {
+	r.write(r.seqFile, "2000\n")
+	return r.fakePDIHost.Probe(path, major, minor, size)
 }

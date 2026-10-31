@@ -274,6 +274,15 @@ func (cmd *CommonCommand) createWiring(logger lager.Logger, metricsProvider *met
 		logger.Error("invalid-execution-backend-flags", err)
 		return nil, err
 	}
+	if backends.blockVolumes == nil {
+		// Devices that an earlier run with block volumes on gave to containers
+		// are still released when those containers go, and by the sweep.
+		backends.blockReleaser, err = bundlerules.NewPDILeftoverReleaser(logger.Session("block-volumes"), cmd.Server.Tag)
+		if err != nil {
+			logger.Error("block-volume-leftovers-unreadable", err)
+			return nil, err
+		}
+	}
 	cmd.wiredBackends = backends
 
 	factory := cmd.NewGardenFactory()
@@ -333,10 +342,10 @@ func (cmd *CommonCommand) createWiring(logger lager.Logger, metricsProvider *met
 		return nil, err
 	}
 
-	if backends.blockVolumes != nil {
+	if releaser := backends.releaser(); releaser != nil {
 		starters = append(starters, blockVolumeSweeper{
 			log:     logger.Session("block-volume-sweep"),
-			volumes: backends.blockVolumes,
+			volumes: releaser,
 			handles: containerizer.Handles,
 		})
 	}
@@ -839,6 +848,22 @@ type executionBackends struct {
 	// vm-* container gets. They are empty unless a vm-* backend is enabled and
 	// the operator turned on shares or turned on asynchronous image mounts.
 	vmLaunchFlags []string
+
+	// blockReleaser releases the devices that an earlier run with block
+	// volumes on left claimed, when blockVolumes is nil. It is nil when no
+	// claim directory exists.
+	blockReleaser *bundlerules.PDIDevices
+}
+
+// releaser returns the step that releases claimed block devices, or nil.
+func (b *executionBackends) releaser() *bundlerules.PDIDevices {
+	if b == nil {
+		return nil
+	}
+	if b.blockVolumes != nil {
+		return b.blockVolumes
+	}
+	return b.blockReleaser
 }
 
 // taskPidListerFactory is implemented by factories that can list the processes
@@ -870,12 +895,12 @@ func (b *executionBackends) peaBundleLoader(loader peas.BundleLoader) peas.Bundl
 // need. gVisor containers stream files through runtime exec, and with block
 // volumes on, a destroyed container's block nodes are released.
 func (b *executionBackends) containerizerOptions(runtime rundmc.OCIRuntime) []rundmc.Option {
-	if !b.dispatch() {
-		return nil
+	var opts []rundmc.Option
+	if b.dispatch() {
+		opts = append(opts, rundmc.WithBackendDispatch(rundmc.NewExecStreamer(runtime)))
 	}
-	opts := []rundmc.Option{rundmc.WithBackendDispatch(rundmc.NewExecStreamer(runtime))}
-	if b.blockVolumes != nil {
-		opts = append(opts, rundmc.WithDeviceReleaser(b.blockVolumes))
+	if releaser := b.releaser(); releaser != nil {
+		opts = append(opts, rundmc.WithDeviceReleaser(releaser))
 	}
 	return opts
 }
