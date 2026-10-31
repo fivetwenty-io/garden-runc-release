@@ -62,6 +62,13 @@ var reservedGuestDirs = []string{"/bin", "/dev", "/etc", "/init", "/proc", "/rvm
 type guestVolume struct {
 	ContainerDir string
 	ImageName    string
+
+	// MountID is the ID of the mount that findVolumeProvider found
+	// ContainerDir on. When MountIDKnown is set, openVolumeImage refuses a
+	// directory that is on another mount, so the directory it opens is the
+	// one that was inspected.
+	MountID      uint64
+	MountIDKnown bool
 }
 
 // vcapServices is the part of VCAP_SERVICES vm-launch reads: every label's
@@ -234,18 +241,29 @@ func quoteForLog(s string) string {
 // findVolumeProvider returns the provider in diskProviders that owns the
 // volume at dir, and what vm-launch learned about its mount, so that a volume
 // no provider supports is refused before anything boots. It asks the kernel
-// for the ID of the mount that holds dir (volumeMountID), finds the line with
-// that ID in the mount table at mountinfo, and lets the registry select a
-// provider from the whole record. A kernel that does not report the ID is a
-// refusal, since matching by path could be wrong. A mount ID with no line is
-// refused too. Every refusal that follows a lookup in the mount table ends by
-// naming the registered providers. Errors never repeat VCAP_SERVICES.
+// (volumeProbe) for the ID of the mount that holds dir and whether dir is the
+// root of that mount. A directory that is not a mount root is refused for
+// every provider, before the mount table is read and before any provider's
+// Prepare can run, because a volume service's disk lives in the root of its
+// mount. It then finds the line with that ID in the mount table at
+// mountinfo, and lets the registry select a provider from the whole record.
+// A kernel that does not report the answers is a refusal, since matching by
+// path could be wrong. A mount ID with no line is refused too. Every refusal
+// that follows a lookup in the mount table ends by naming the registered
+// providers. Errors never repeat VCAP_SERVICES.
+//
+// The returned record carries the mount ID, which the provider hands to
+// openVolumeImage so that the directory it opens is on the mount inspected
+// here.
 func findVolumeProvider(mountinfo, dir string) (diskProvider, mountRecord, error) {
-	id, err := volumeMountID(dir)
+	probe, err := volumeProbe(dir)
 	if err != nil {
 		return nil, mountRecord{}, err
 	}
-	m, err := volumeMount(mountinfo, dir, id)
+	if !probe.MountRoot {
+		return nil, mountRecord{}, notMountRootError(dir, nil)
+	}
+	m, err := volumeMount(mountinfo, dir, probe.MountID)
 	if err != nil {
 		return nil, mountRecord{}, fmt.Errorf("%w; %s", err, diskProviders.supportedLine())
 	}

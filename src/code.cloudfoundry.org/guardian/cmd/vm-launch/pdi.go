@@ -5,6 +5,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"slices"
 	"strings"
@@ -136,8 +137,8 @@ type diskProvider interface {
 // error but without a usable disk: no attachment, no file, or no Release.
 // The refusal names the provider. A half-built attachment is cleaned up with
 // whichever of its parts exists, so a bad provider does not leave the disk
-// fenced.
-func checkAttachment(p diskProvider, att *attachment) error {
+// fenced, and a cleanup that fails is logged.
+func checkAttachment(p diskProvider, att *attachment, logger *log.Logger) error {
 	var missing string
 	switch {
 	case att == nil:
@@ -149,15 +150,27 @@ func checkAttachment(p diskProvider, att *attachment) error {
 	default:
 		return nil
 	}
-	if att != nil {
-		switch {
-		case att.Release != nil:
-			_ = att.Release()
-		case att.File != nil:
-			_ = att.File.Close()
+	discardAttachment(att, logger)
+	return fmt.Errorf("the %s volume provider prepared the disk without an error but returned %s", p.Name(), missing)
+}
+
+// discardAttachment cleans up an attachment vm-launch will not use, with
+// whichever of its parts exists, and logs a cleanup that fails the way the
+// release at the end of a launch is logged. A nil attachment needs nothing.
+func discardAttachment(att *attachment, logger *log.Logger) {
+	if att == nil {
+		return
+	}
+	switch {
+	case att.Release != nil:
+		if err := att.Release(); err != nil {
+			logger.Printf("releasing the volume image: %v", err)
+		}
+	case att.File != nil:
+		if err := att.File.Close(); err != nil {
+			logger.Printf("closing the volume image: %v", err)
 		}
 	}
-	return fmt.Errorf("the %s volume provider prepared the disk without an error but returned %s", p.Name(), missing)
 }
 
 // providerRegistry is the set of providers compiled into vm-launch, kept in

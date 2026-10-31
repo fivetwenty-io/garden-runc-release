@@ -82,6 +82,7 @@ var defaultImageOptions = imageOptions{
 var (
 	errVolumeInUse     = errors.New("volume image in use")
 	errNotMountRoot    = errors.New("volume is not a mount point")
+	errMountChanged    = errors.New("volume mount changed during start")
 	errImageNotRegular = errors.New("volume image is not a regular file")
 	errImageOwner      = errors.New("volume image has the wrong owner")
 	errImageLinks      = errors.New("volume image has more than one link")
@@ -124,7 +125,10 @@ func (e *signalledError) Error() string {
 //
 // The volume path is resolved without following any symbolic link and must
 // be a mount point, so that the image cannot land on the container's
-// ephemeral disk or outside the volume. The image is opened beneath it on
+// ephemeral disk or outside the volume. When v carries the ID of the mount
+// that was inspected before (MountIDKnown), the directory opened here must be
+// on that mount, or the launch stops: the path was resolved a second time,
+// and a mount could have changed in between. The image is opened beneath it on
 // the same mount, again without following links, and must be a regular file
 // owned by vm-launch's effective uid, with one link, mode 0600, and exactly
 // Size bytes. vm-launch never repairs, resizes, or removes an image that
@@ -154,14 +158,27 @@ func openVolumeImage(v *guestVolume, o imageOptions, sigs <-chan os.Signal) (*os
 	}
 	defer unix.Close(dirfd)
 
+	// The directory opened here is a second resolution of the path that was
+	// inspected before. When the caller says which mount it inspected, the
+	// directory must be on that mount.
+	if v.MountIDKnown {
+		probe, err := dirProbe(dirfd, v.ContainerDir)
+		switch {
+		case err != nil:
+			return nil, fmt.Errorf("checking the mount of volume %s: %w", v.ContainerDir, err)
+		case probe.MountID != v.MountID:
+			return nil, &volumeError{kind: errMountChanged,
+				msg: fmt.Sprintf("the mount of volume %s changed during start: it was mount ID %d when vm-launch inspected it and is mount ID %d now",
+					v.ContainerDir, v.MountID, probe.MountID)}
+		}
+	}
+
 	root, err := o.IsMountRoot(dirfd)
 	switch {
 	case err != nil:
-		return nil, &volumeError{kind: errNotMountRoot, cause: err,
-			msg: fmt.Sprintf("volume %s is not a mount point: cannot tell: %v", v.ContainerDir, err)}
+		return nil, notMountRootError(v.ContainerDir, err)
 	case !root:
-		return nil, &volumeError{kind: errNotMountRoot,
-			msg: fmt.Sprintf("volume %s is not a mount point", v.ContainerDir)}
+		return nil, notMountRootError(v.ContainerDir, nil)
 	}
 
 	// The umask must not take the owner's bits away from a new image: the
@@ -585,6 +602,16 @@ func statxMountRoot(dirfd int) (bool, error) {
 		return false, errors.New("the kernel does not report mount points through statx")
 	}
 	return stx.Attributes&unix.STATX_ATTR_MOUNT_ROOT != 0, nil
+}
+
+// notMountRootError is the refusal of a volume directory that is not the
+// root of a mount. cause is why the check could not tell, when it could not.
+func notMountRootError(dir string, cause error) error {
+	if cause != nil {
+		return &volumeError{kind: errNotMountRoot, cause: cause,
+			msg: fmt.Sprintf("volume %s is not a mount point: cannot tell: %v", dir, cause)}
+	}
+	return &volumeError{kind: errNotMountRoot, msg: fmt.Sprintf("volume %s is not a mount point", dir)}
 }
 
 // stepExitCode is vm-launch's exit status for a failed step before the

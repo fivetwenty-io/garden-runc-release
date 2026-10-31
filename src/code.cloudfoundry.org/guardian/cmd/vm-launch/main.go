@@ -585,10 +585,13 @@ func run(argv []string, logger *log.Logger) int {
 	if vol != nil {
 		att, err := provider.Prepare(prepareRequest{Mount: volMount, ImageName: vol.ImageName, Mode: attachFileImage, Signals: sigs})
 		if err != nil {
+			// A provider that fails after it fenced the disk may hand back
+			// what it built along with the error.
 			logger.Print(err)
+			discardAttachment(att, logger)
 			return stepExitCode(err)
 		}
-		if err := checkAttachment(provider, att); err != nil {
+		if err := checkAttachment(provider, att, logger); err != nil {
 			logger.Print(err)
 			return exitLaunchError
 		}

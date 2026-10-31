@@ -47,7 +47,7 @@ var _ = Describe("stepExitCode", func() {
 	})
 
 	It("maps every other volume failure to 125", func() {
-		for _, kind := range []error{errVolumeInUse, errNotMountRoot, errImageNotRegular, errImageOwner, errImageLinks, errImageMode, errImageSize, errImageReplaced} {
+		for _, kind := range []error{errVolumeInUse, errNotMountRoot, errMountChanged, errImageNotRegular, errImageOwner, errImageLinks, errImageMode, errImageSize, errImageReplaced} {
 			err := &volumeError{kind: kind, msg: "x"}
 			Expect(errors.Is(err, kind)).To(BeTrue())
 			Expect(stepExitCode(err)).To(Equal(exitLaunchError), kind.Error())

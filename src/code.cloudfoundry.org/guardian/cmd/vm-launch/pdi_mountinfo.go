@@ -15,39 +15,59 @@ import (
 
 // The mount behind a volume is found by the kernel's own name for it. vm-launch
 // opens the volume directory without following links, asks statx for the ID of
-// the mount that holds it, and takes the /proc/self/mountinfo line with that
-// ID. A path match could pick the wrong line when mounts stack on one mount
-// point or a path needs escapes, and the kernel's answer is about the very
-// directory vm-launch goes on to use.
+// the mount that holds it and for whether the directory is that mount's root,
+// and takes the /proc/self/mountinfo line with that ID. A path match could pick
+// the wrong line when mounts stack on one mount point or a path needs escapes,
+// and the kernel's answer is about the very directory vm-launch goes on to
+// use. The provider's Prepare opens the directory again, so openVolumeImage
+// asks statx once more and refuses a directory that is on another mount.
 
 // mountInfoPath is the mount table findVolumeProvider reads. Tests point it
 // at a file.
 var mountInfoPath = "/proc/self/mountinfo"
 
-// volumeMountID returns the ID of the mount that holds dir. Tests replace it
-// to return the ID of a line in a fake mount table.
-var volumeMountID = statxMountID
+// mountProbe is what statx says about a directory: the ID of the mount that
+// holds it, and whether the directory is the root of that mount.
+type mountProbe struct {
+	MountID   uint64
+	MountRoot bool
+}
+
+// volumeProbe returns the mountProbe of dir. Tests replace it to answer from
+// a line in a fake mount table.
+var volumeProbe = probeVolume
+
+// dirProbe returns the mountProbe of an open directory. openVolumeImage asks
+// it about the directory it opened, to compare with what volumeProbe said
+// earlier. Tests replace it.
+var dirProbe = probeMountFD
 
 // statxCall is the statx system call, which tests replace to stand in for a
 // kernel that answers differently.
 var statxCall = unix.Statx
 
-// statxMountID returns the ID of the mount that holds dir, from statx. dir is
-// opened as an O_PATH descriptor without following links, as openVolumeImage
-// opens it, so the directory asked about is the one used afterwards. A kernel
-// that does not set STATX_MNT_ID in the returned mask (before Linux 5.8) is an
-// error, so the lookup fails closed.
-func statxMountID(dir string) (uint64, error) {
+// probeVolume returns the mountProbe of dir, from statx. dir is opened as an
+// O_PATH descriptor without following links, as openVolumeImage opens it, so
+// the directory asked about is the one used afterwards.
+func probeVolume(dir string) (mountProbe, error) {
 	fd, err := openat2Retry(unix.AT_FDCWD, dir, &unix.OpenHow{
 		Flags:   unix.O_PATH | unix.O_NOFOLLOW | unix.O_DIRECTORY | unix.O_CLOEXEC,
 		Resolve: unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS,
 	})
 	if err != nil {
-		return 0, fmt.Errorf("opening volume %s: %w%s", quoteForLog(dir), err, symlinkHint(err))
+		return mountProbe{}, fmt.Errorf("opening volume %s: %w%s", quoteForLog(dir), err, symlinkHint(err))
 	}
 	defer unix.Close(fd)
+	return probeMountFD(fd, dir)
+}
 
+// probeMountFD asks statx, on the open directory fd with an empty path, for
+// the ID of its mount and whether it is that mount's root. dir is the path
+// fd was opened from, for the error lines. A kernel that lacks either
+// answer (before Linux 5.8) is an error, so the lookup fails closed.
+func probeMountFD(fd int, dir string) (mountProbe, error) {
 	var st unix.Statx_t
+	var err error
 	for i := 0; ; i++ {
 		err = statxCall(fd, "", unix.AT_EMPTY_PATH, unix.STATX_MNT_ID, &st)
 		if err == nil || !errors.Is(err, unix.EINTR) || i >= openRetries {
@@ -55,18 +75,22 @@ func statxMountID(dir string) (uint64, error) {
 		}
 	}
 	if err != nil {
-		return 0, fmt.Errorf("reading the mount ID of volume %s: statx: %w", quoteForLog(dir), err)
+		return mountProbe{}, fmt.Errorf("reading the mount ID of volume %s: statx: %w", quoteForLog(dir), err)
 	}
 	if st.Mask&unix.STATX_MNT_ID == 0 {
-		return 0, fmt.Errorf("the kernel did not report a mount ID through statx for volume %s (STATX_MNT_ID needs Linux 5.8 or later), so vm-launch cannot tell which mount holds it", quoteForLog(dir))
+		return mountProbe{}, fmt.Errorf("the kernel did not report a mount ID through statx for volume %s (STATX_MNT_ID needs Linux 5.8 or later), so vm-launch cannot tell which mount holds it", quoteForLog(dir))
 	}
-	return st.Mnt_id, nil
+	if st.Attributes_mask&unix.STATX_ATTR_MOUNT_ROOT == 0 {
+		return mountProbe{}, fmt.Errorf("the kernel did not report mount points through statx for volume %s (STATX_ATTR_MOUNT_ROOT needs Linux 5.8 or later), so vm-launch cannot tell whether it is a mount point", quoteForLog(dir))
+	}
+	return mountProbe{MountID: st.Mnt_id, MountRoot: st.Attributes&unix.STATX_ATTR_MOUNT_ROOT != 0}, nil
 }
 
 // volumeMount returns the record of the mount with ID id in the mount table
 // at mountinfo, for the volume at dir. Mount IDs are unique, so a table that
-// has the ID on two lines, or has it only on a line that does not parse, is
-// refused rather than guessed at.
+// has the ID on two lines, or on any line that does not parse, is refused
+// rather than guessed at, even when another line with the ID does parse.
+// Malformed lines with other IDs are ignored.
 func volumeMount(mountinfo, dir string, id uint64) (mountRecord, error) {
 	f, err := os.Open(mountinfo)
 	if err != nil {
@@ -101,13 +125,13 @@ func volumeMount(mountinfo, dir string, id uint64) (mountRecord, error) {
 		return mountRecord{}, fmt.Errorf("reading %s to find the filesystem of volume path %s: %w", mountinfo, quoteForLog(dir), err)
 	}
 	switch {
+	case malformed != nil:
+		return mountRecord{}, malformed
 	case matches > 1:
 		return mountRecord{}, fmt.Errorf("mount ID %d of volume path %s is on %d lines in %s", id, quoteForLog(dir), matches, mountinfo)
 	case matches == 1:
 		found.ContainerDir = dir
 		return found, nil
-	case malformed != nil:
-		return mountRecord{}, malformed
 	}
 	return mountRecord{}, fmt.Errorf("volume path %s has no mount entry for its mount ID %d in %s", quoteForLog(dir), id, mountinfo)
 }

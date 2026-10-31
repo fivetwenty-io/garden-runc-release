@@ -359,6 +359,68 @@ var _ = Describe("openVolumeImage", func() {
 		Expect(img).NotTo(BeAnExistingFile())
 	})
 
+	Describe("the mount that was inspected", func() {
+		var asked []string
+
+		BeforeEach(func() {
+			asked = nil
+			vol.MountID, vol.MountIDKnown = 40, true
+			dirProbe = func(fd int, name string) (mountProbe, error) {
+				target, err := os.Readlink("/proc/self/fd/" + strconv.Itoa(fd))
+				Expect(err).NotTo(HaveOccurred())
+				Expect(target).To(Equal(dir), "the descriptor is the volume directory")
+				asked = append(asked, name)
+				return mountProbe{MountID: 40, MountRoot: true}, nil
+			}
+		})
+
+		It("opens the image when the directory is on that mount", func() {
+			f, err := open()
+			Expect(err).NotTo(HaveOccurred())
+			defer f.Close()
+			Expect(asked).To(Equal([]string{dir}))
+		})
+
+		It("refuses a directory that is on another mount, with one line, and creates nothing", func() {
+			dirProbe = func(int, string) (mountProbe, error) { return mountProbe{MountID: 41, MountRoot: true}, nil }
+			_, err := open()
+			Expect(errors.Is(err, errMountChanged)).To(BeTrue(), "%v", err)
+			Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+			Expect(err).To(MatchError("the mount of volume " + dir + " changed during start: it was mount ID 40 when vm-launch inspected it and is mount ID 41 now"))
+			Expect(err.Error()).NotTo(ContainSubstring("\n"))
+			Expect(os.ReadDir(dir)).To(BeEmpty())
+		})
+
+		It("refuses when the mount cannot be read, and creates nothing", func() {
+			dirProbe = func(int, string) (mountProbe, error) { return mountProbe{}, errors.New("no mount ID here") }
+			_, err := open()
+			Expect(err).To(MatchError("checking the mount of volume " + dir + ": no mount ID here"))
+			Expect(os.ReadDir(dir)).To(BeEmpty())
+		})
+
+		It("asks before the mount root check and before it creates anything", func() {
+			dirProbe = func(int, string) (mountProbe, error) { return mountProbe{MountID: 41}, nil }
+			opts.IsMountRoot = func(int) (bool, error) { Fail("the mount root check ran first"); return true, nil }
+			_, err := open()
+			Expect(errors.Is(err, errMountChanged)).To(BeTrue(), "%v", err)
+		})
+
+		It("keeps the mount root check as a second line of defence", func() {
+			opts.IsMountRoot = func(int) (bool, error) { return false, nil }
+			_, err := open()
+			Expect(errors.Is(err, errNotMountRoot)).To(BeTrue(), "%v", err)
+			Expect(os.ReadDir(dir)).To(BeEmpty())
+		})
+
+		It("does not ask when the caller names no mount", func() {
+			vol.MountID, vol.MountIDKnown = 0, false
+			dirProbe = func(int, string) (mountProbe, error) { Fail("the mount was asked"); return mountProbe{}, nil }
+			f, err := open()
+			Expect(err).NotTo(HaveOccurred())
+			f.Close()
+		})
+	})
+
 	It("reports an image it cannot size, removes its temp file, and creates the image on the next launch", func() {
 		opts.Size = 1 << 62
 		_, err := open()

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -17,16 +18,19 @@ import (
 // noSuchMountID is a mount ID no fake mount table uses.
 const noSuchMountID = uint64(1) << 62
 
-// mountIDByPath returns a volumeMountID that answers as a kernel would for a
+// mountIDByPath returns a volumeProbe that answers as a kernel would for a
 // directory that is the mount point of a line in the mount table at table():
-// the ID of the last such line. Most specs describe a volume by its path in a
-// fake table, and this is how they reach its line by ID. A directory with no
-// such line, or a table that cannot be read, gets an ID no line has.
-func mountIDByPath(table func() string) func(string) (uint64, error) {
-	return func(dir string) (uint64, error) {
+// the ID of the last such line, and a mount root. Most specs describe a
+// volume by its path in a fake table, and this is how they reach its line by
+// ID. A directory with no such line, or a table that cannot be read, gets an
+// ID no line has, and is a mount root so that the lookup of its line is what
+// refuses it. Specs of a directory that is not a mount root set volumeProbe
+// themselves.
+func mountIDByPath(table func() string) func(string) (mountProbe, error) {
+	return func(dir string) (mountProbe, error) {
 		data, err := os.ReadFile(table())
 		if err != nil {
-			return noSuchMountID, nil
+			return mountProbe{MountID: noSuchMountID, MountRoot: true}, nil
 		}
 		id := noSuchMountID
 		for _, line := range strings.Split(string(data), "\n") {
@@ -34,25 +38,36 @@ func mountIDByPath(table func() string) func(string) (uint64, error) {
 				id = rec.MountID
 			}
 		}
-		return id, nil
+		return mountProbe{MountID: id, MountRoot: true}, nil
 	}
+}
+
+// probeByPath returns a dirProbe that finds the path an open directory was
+// opened from and asks volumeProbe about it, so that the second look at a
+// volume gives the answer the first look did unless a spec says otherwise.
+func probeByPath(fd int, dir string) (mountProbe, error) {
+	target, err := os.Readlink("/proc/self/fd/" + strconv.Itoa(fd))
+	if err != nil {
+		return mountProbe{}, err
+	}
+	return volumeProbe(target)
 }
 
 // findIn is findVolumeProvider with the kernel's answer taken from the mount
 // table at info, by the dir's path.
 func findIn(info, dir string) (diskProvider, mountRecord, error) {
-	saved := volumeMountID
-	defer func() { volumeMountID = saved }()
-	volumeMountID = mountIDByPath(func() string { return info })
+	saved := volumeProbe
+	defer func() { volumeProbe = saved }()
+	volumeProbe = mountIDByPath(func() string { return info })
 	return findVolumeProvider(info, dir)
 }
 
 // findWithID is findVolumeProvider with the kernel answering id for any
 // directory.
 func findWithID(info, dir string, id uint64) (diskProvider, mountRecord, error) {
-	saved := volumeMountID
-	defer func() { volumeMountID = saved }()
-	volumeMountID = func(string) (uint64, error) { return id, nil }
+	saved := volumeProbe
+	defer func() { volumeProbe = saved }()
+	volumeProbe = func(string) (mountProbe, error) { return mountProbe{MountID: id, MountRoot: true}, nil }
 	return findVolumeProvider(info, dir)
 }
 
@@ -60,9 +75,10 @@ func findWithID(info, dir string, id uint64) (diskProvider, mountRecord, error) 
 // the mount table at mountInfoPath, so the specs that write a one-line table
 // for a volume directory need not know a mount ID.
 var _ = BeforeEach(func() {
-	savedID, savedStatx := volumeMountID, statxCall
-	DeferCleanup(func() { volumeMountID, statxCall = savedID, savedStatx })
-	volumeMountID = mountIDByPath(func() string { return mountInfoPath })
+	savedProbe, savedDir, savedStatx := volumeProbe, dirProbe, statxCall
+	DeferCleanup(func() { volumeProbe, dirProbe, statxCall = savedProbe, savedDir, savedStatx })
+	volumeProbe = mountIDByPath(func() string { return mountInfoPath })
+	dirProbe = probeByPath
 })
 
 var _ = DescribeTable("parseMountInfoRecord",
@@ -178,6 +194,36 @@ var _ = Describe("selecting the volume's mountinfo line by mount ID", func() {
 		Expect(m.MountPoint).To(Equal("/my data"))
 	})
 
+	It("refuses a directory that is not a mount root for every provider, before the mount table is read or Prepare runs", func() {
+		prepared := 0
+		strong := fake("Strong", "fuse.juicefs", strongMatch)
+		strong.prepare = func(prepareRequest) (*attachment, error) { prepared++; return nil, errors.New("Prepare ran") }
+		weak := fake("Weak", "ext4", weakMatch)
+		weak.prepare = strong.prepare
+		withProviders(strong, weak)
+		volumeProbe = func(string) (mountProbe, error) { return mountProbe{MountID: 41, MountRoot: false}, nil }
+
+		for _, info := range []string{
+			table(otherFS, volume),
+			table(otherFS, "41 30 0:41 / /data rw - ext4 /dev/vdb rw"),
+			filepath.Join(GinkgoT().TempDir(), "absent"),
+		} {
+			p, m, err := findVolumeProvider(info, "/data/vol")
+			Expect(p).To(BeNil())
+			Expect(m).To(Equal(mountRecord{}))
+			Expect(errors.Is(err, errNotMountRoot)).To(BeTrue(), "%v", err)
+			Expect(err).To(MatchError("volume /data/vol is not a mount point"))
+		}
+		Expect(prepared).To(BeZero())
+
+		// The same table with a mount root is accepted.
+		volumeProbe = func(string) (mountProbe, error) { return mountProbe{MountID: 41, MountRoot: true}, nil }
+		p, _, err := findVolumeProvider(table(otherFS, volume), "/data")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(p.Name()).To(Equal("Strong"))
+		Expect(prepared).To(BeZero())
+	})
+
 	It("refuses an ID with no line, whatever mounts share its path, and names the providers", func() {
 		_, _, err := findWithID(table(otherFS, volume, shadow), "/data", 99)
 		Expect(err).To(MatchError(ContainSubstring(`volume path "/data" has no mount entry for its mount ID 99 in `)))
@@ -205,10 +251,23 @@ var _ = Describe("selecting the volume's mountinfo line by mount ID", func() {
 		Expect(m.MountID).To(Equal(uint64(41)))
 	})
 
-	It("takes the one good line when a malformed line has the same ID", func() {
-		_, m, err := findWithID(table("41 broken", volume), "/data", 41)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(m.FSType).To(Equal("fuse.juicefs"))
+	It("refuses a malformed line with the ID even when a good line has it too, in either order", func() {
+		for name, lines := range map[string][]string{
+			"malformed first": {"41 broken", volume},
+			"malformed last":  {volume, "41 broken"},
+			"between":         {otherFS, "41 30 0:41 / /data rw - fuse.juicefs", volume, shadow},
+		} {
+			_, m, err := findWithID(table(lines...), "/data", 41)
+			Expect(err).To(MatchError(ContainSubstring("the line for mount ID 41 in ")), name)
+			Expect(err).To(MatchError(ContainSubstring("is malformed")), name)
+			Expect(err).To(MatchError(HaveSuffix("; VM backends support only JuiceFS volumes today")), name)
+			Expect(m).To(Equal(mountRecord{}), name)
+		}
+	})
+
+	It("refuses a malformed line with the ID when the ID is also on two good lines", func() {
+		_, _, err := findWithID(table(volume, volume, "41 broken"), "/data", 41)
+		Expect(err).To(MatchError(ContainSubstring("is malformed")))
 	})
 
 	It("refuses a mount table that cannot be read, with the cause", func() {
@@ -218,18 +277,16 @@ var _ = Describe("selecting the volume's mountinfo line by mount ID", func() {
 	})
 
 	It("does not read the mount table when the kernel gives no mount ID", func() {
-		saved := volumeMountID
-		DeferCleanup(func() { volumeMountID = saved })
-		volumeMountID = func(string) (uint64, error) { return 0, errors.New("no mount ID here") }
+		volumeProbe = func(string) (mountProbe, error) { return mountProbe{}, errors.New("no mount ID here") }
 		_, _, err := findVolumeProvider(filepath.Join(GinkgoT().TempDir(), "absent"), "/data")
 		Expect(err).To(MatchError("no mount ID here"))
 	})
 })
 
-var _ = Describe("statxMountID", func() {
+var _ = Describe("probeVolume", func() {
 	BeforeEach(requireOpenat2)
 
-	It("asks statx on the open directory, with an empty path, for the mount ID", func() {
+	It("asks statx on the open directory, with an empty path, for the mount ID and the mount root attribute", func() {
 		dir := GinkgoT().TempDir()
 		var gotPath string
 		var gotFlags, gotMask int
@@ -240,11 +297,12 @@ var _ = Describe("statxMountID", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(target).To(Equal(dir))
 			st.Mask, st.Mnt_id = unix.STATX_MNT_ID|unix.STATX_TYPE, 77
+			st.Attributes_mask, st.Attributes = unix.STATX_ATTR_MOUNT_ROOT, unix.STATX_ATTR_MOUNT_ROOT
 			return nil
 		}
-		id, err := statxMountID(dir)
+		probe, err := probeVolume(dir)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(id).To(Equal(uint64(77)))
+		Expect(probe).To(Equal(mountProbe{MountID: 77, MountRoot: true}))
 		Expect(gotPath).To(BeEmpty())
 		Expect(gotFlags).To(Equal(unix.AT_EMPTY_PATH))
 		Expect(gotMask).To(Equal(unix.STATX_MNT_ID))
@@ -255,15 +313,35 @@ var _ = Describe("statxMountID", func() {
 			st.Mask, st.Mnt_id = unix.STATX_TYPE, 77
 			return nil
 		}
-		id, err := statxMountID(GinkgoT().TempDir())
-		Expect(id).To(BeZero())
+		probe, err := probeVolume(GinkgoT().TempDir())
+		Expect(probe).To(Equal(mountProbe{}))
 		Expect(err).To(MatchError(ContainSubstring("the kernel did not report a mount ID through statx for volume ")))
 		Expect(err).To(MatchError(ContainSubstring("STATX_MNT_ID needs Linux 5.8 or later")))
 	})
 
+	It("refuses a kernel that does not report the mount root attribute, and reads a directory that is not a mount root", func() {
+		statxCall = func(_ int, _ string, _ int, _ int, st *unix.Statx_t) error {
+			st.Mask, st.Mnt_id = unix.STATX_MNT_ID, 77
+			return nil
+		}
+		probe, err := probeVolume(GinkgoT().TempDir())
+		Expect(probe).To(Equal(mountProbe{}))
+		Expect(err).To(MatchError(ContainSubstring("the kernel did not report mount points through statx for volume ")))
+		Expect(err).To(MatchError(ContainSubstring("STATX_ATTR_MOUNT_ROOT needs Linux 5.8 or later")))
+
+		statxCall = func(_ int, _ string, _ int, _ int, st *unix.Statx_t) error {
+			st.Mask, st.Mnt_id = unix.STATX_MNT_ID, 77
+			st.Attributes_mask = unix.STATX_ATTR_MOUNT_ROOT
+			return nil
+		}
+		probe, err = probeVolume(GinkgoT().TempDir())
+		Expect(err).NotTo(HaveOccurred())
+		Expect(probe).To(Equal(mountProbe{MountID: 77, MountRoot: false}))
+	})
+
 	It("refuses through findVolumeProvider before it reads the mount table", func() {
 		statxCall = func(_ int, _ string, _ int, _ int, st *unix.Statx_t) error { return nil }
-		volumeMountID = statxMountID
+		volumeProbe = probeVolume
 		dir := GinkgoT().TempDir()
 		_, _, err := findVolumeProvider(filepath.Join(GinkgoT().TempDir(), "absent"), dir)
 		Expect(err).To(MatchError(ContainSubstring("the kernel did not report a mount ID")))
@@ -273,7 +351,7 @@ var _ = Describe("statxMountID", func() {
 
 	It("keeps a statx failure's cause", func() {
 		statxCall = func(int, string, int, int, *unix.Statx_t) error { return unix.ENOSYS }
-		_, err := statxMountID(GinkgoT().TempDir())
+		_, err := probeVolume(GinkgoT().TempDir())
 		Expect(errors.Is(err, unix.ENOSYS)).To(BeTrue())
 		Expect(err).To(MatchError(ContainSubstring("reading the mount ID of volume ")))
 	})
@@ -286,14 +364,15 @@ var _ = Describe("statxMountID", func() {
 				return unix.EINTR
 			}
 			st.Mask, st.Mnt_id = unix.STATX_MNT_ID, 5
+			st.Attributes_mask = unix.STATX_ATTR_MOUNT_ROOT
 			return nil
 		}
-		id, err := statxMountID(GinkgoT().TempDir())
+		probe, err := probeVolume(GinkgoT().TempDir())
 		Expect(err).NotTo(HaveOccurred())
-		Expect(id).To(Equal(uint64(5)))
+		Expect(probe.MountID).To(Equal(uint64(5)))
 
 		statxCall = func(int, string, int, int, *unix.Statx_t) error { return unix.EINTR }
-		_, err = statxMountID(GinkgoT().TempDir())
+		_, err = probeVolume(GinkgoT().TempDir())
 		Expect(errors.Is(err, unix.EINTR)).To(BeTrue())
 	})
 
@@ -308,24 +387,27 @@ var _ = Describe("statxMountID", func() {
 		link := filepath.Join(dir, "link")
 		Expect(os.Symlink(dir, link)).To(Succeed())
 
-		_, err := statxMountID(filepath.Join(dir, "absent"))
+		_, err := probeVolume(filepath.Join(dir, "absent"))
 		Expect(errors.Is(err, unix.ENOENT)).To(BeTrue())
-		_, err = statxMountID(file)
+		_, err = probeVolume(file)
 		Expect(errors.Is(err, unix.ENOTDIR)).To(BeTrue())
 		// The last component is a link: O_DIRECTORY with O_NOFOLLOW refuses it.
-		_, err = statxMountID(link)
+		_, err = probeVolume(link)
 		Expect(err).To(HaveOccurred())
 		Expect(errors.Is(err, unix.ENOTDIR) || errors.Is(err, unix.ELOOP)).To(BeTrue(), err.Error())
 		// A link on the way is refused with the hint.
 		Expect(os.Mkdir(filepath.Join(dir, "x"), 0o700)).To(Succeed())
-		_, err = statxMountID(filepath.Join(link, "x"))
+		_, err = probeVolume(filepath.Join(link, "x"))
 		Expect(errors.Is(err, unix.ELOOP)).To(BeTrue())
 		Expect(err).To(MatchError(ContainSubstring("follows no symbolic links")))
 	})
 })
 
 var _ = Describe("the real kernel's mount ID and the real mount table", func() {
-	BeforeEach(requireOpenat2)
+	BeforeEach(func() {
+		requireOpenat2()
+		volumeProbe, dirProbe = probeVolume, probeMountFD
+	})
 
 	realTable := "/proc/self/mountinfo"
 
@@ -345,13 +427,25 @@ var _ = Describe("the real kernel's mount ID and the real mount table", func() {
 		}
 	})
 
+	// mountTmpfs mounts a tmpfs on dir for the rest of the spec, and skips the
+	// spec when the process may not mount.
+	mountTmpfs := func(dir string) {
+		if err := unix.Mount("pdi-test", dir, "tmpfs", 0, "size=1m"); err != nil {
+			if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+				Skip("mounting needs CAP_SYS_ADMIN; run these specs privileged")
+			}
+			Expect(err).NotTo(HaveOccurred())
+		}
+		DeferCleanup(func() { Expect(unix.Unmount(dir, 0)).To(Succeed()) })
+	}
+
 	It("finds the line of /proc by the ID statx gives", func() {
-		volumeMountID = statxMountID
-		id, err := statxMountID("/proc")
+		probe, err := probeVolume("/proc")
 		Expect(err).NotTo(HaveOccurred())
-		m, err := volumeMount(realTable, "/proc", id)
+		Expect(probe.MountRoot).To(BeTrue(), "/proc is the root of its mount")
+		m, err := volumeMount(realTable, "/proc", probe.MountID)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(m.MountID).To(Equal(id))
+		Expect(m.MountID).To(Equal(probe.MountID))
 		Expect(m.MountPoint).To(Equal("/proc"))
 		Expect(m.FSType).To(Equal("proc"))
 		Expect(m.ContainerDir).To(Equal("/proc"))
@@ -359,34 +453,22 @@ var _ = Describe("the real kernel's mount ID and the real mount table", func() {
 
 	It("finds the line that holds a temporary directory", func() {
 		dir := GinkgoT().TempDir()
-		id, err := statxMountID(dir)
+		probe, err := probeVolume(dir)
 		Expect(err).NotTo(HaveOccurred())
-		m, err := volumeMount(realTable, dir, id)
+		m, err := volumeMount(realTable, dir, probe.MountID)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(m.MountID).To(Equal(id))
+		Expect(m.MountID).To(Equal(probe.MountID))
 		Expect(m.FSType).NotTo(BeEmpty())
 		Expect(m.MountPoint == "/" || strings.HasPrefix(dir, m.MountPoint+"/")).To(BeTrue(), "%q is not under %q", dir, m.MountPoint)
 	})
 
 	It("takes the top of two stacked mounts, which share a mount point in the real table", func() {
 		dir := GinkgoT().TempDir()
-		for i := 0; i < 2; i++ {
-			if err := unix.Mount("pdi-test", dir, "tmpfs", 0, "size=1m"); err != nil {
-				if i == 1 {
-					Expect(unix.Unmount(dir, 0)).To(Succeed())
-				}
-				if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
-					Skip("mounting needs CAP_SYS_ADMIN; run these specs privileged")
-				}
-				Expect(err).NotTo(HaveOccurred())
-			}
-		}
-		DeferCleanup(func() {
-			Expect(unix.Unmount(dir, 0)).To(Succeed())
-			Expect(unix.Unmount(dir, 0)).To(Succeed())
-		})
-		id, err := statxMountID(dir)
+		mountTmpfs(dir)
+		mountTmpfs(dir)
+		probe, err := probeVolume(dir)
 		Expect(err).NotTo(HaveOccurred())
+		id := probe.MountID
 
 		data, err := os.ReadFile(realTable)
 		Expect(err).NotTo(HaveOccurred())
@@ -407,14 +489,63 @@ var _ = Describe("the real kernel's mount ID and the real mount table", func() {
 		Expect(m.Source).To(Equal("pdi-test"))
 	})
 
-	It("tells a subdirectory of a mount from the mount point by the same ID", func() {
+	It("tells a subdirectory of a mount from the mount point: the same ID, and not a mount root", func() {
 		dir := GinkgoT().TempDir()
 		sub := filepath.Join(dir, "sub")
 		Expect(os.Mkdir(sub, 0o700)).To(Succeed())
-		a, err := statxMountID(dir)
+		a, err := probeVolume(dir)
 		Expect(err).NotTo(HaveOccurred())
-		b, err := statxMountID(sub)
+		b, err := probeVolume(sub)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(b).To(Equal(a))
+		Expect(b.MountRoot).To(BeFalse())
+	})
+
+	It("refuses a subdirectory of a mount for any provider before Prepare, and accepts the mount point", func() {
+		dir := GinkgoT().TempDir()
+		mountTmpfs(dir)
+		sub := filepath.Join(dir, "sub")
+		Expect(os.Mkdir(sub, 0o700)).To(Succeed())
+		prepared := false
+		p := fake("Tmp", "tmpfs", strongMatch)
+		p.prepare = func(prepareRequest) (*attachment, error) {
+			prepared = true
+			return nil, errors.New("Prepare ran")
+		}
+		withProviders(p)
+
+		got, m, err := findVolumeProvider(realTable, dir)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got.Name()).To(Equal("Tmp"))
+		Expect(m.MountPoint).To(Equal(dir))
+
+		_, _, err = findVolumeProvider(realTable, sub)
+		Expect(errors.Is(err, errNotMountRoot)).To(BeTrue(), "%v", err)
+		Expect(err).To(MatchError("volume " + sub + " is not a mount point"))
+		Expect(prepared).To(BeFalse())
+	})
+
+	It("refuses a directory whose mount changed since it was inspected", func() {
+		dir := GinkgoT().TempDir()
+		before, err := probeVolume(dir)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(before.MountRoot).To(BeFalse())
+
+		mountTmpfs(dir)
+		now, err := probeVolume(dir)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(now.MountRoot).To(BeTrue())
+		Expect(now.MountID).NotTo(Equal(before.MountID))
+
+		opts := imageOptions{Size: defaultImageSize, LockWait: time.Millisecond, LockPoll: time.Millisecond, IsMountRoot: alwaysMountRoot}
+		_, err = openVolumeImage(&guestVolume{ContainerDir: dir, ImageName: "rvm-disk-0.img", MountID: before.MountID, MountIDKnown: true}, opts, nil)
+		Expect(errors.Is(err, errMountChanged)).To(BeTrue(), "%v", err)
+		entries, err := os.ReadDir(dir)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(entries).To(BeEmpty())
+
+		img, err := openVolumeImage(&guestVolume{ContainerDir: dir, ImageName: "rvm-disk-0.img", MountID: now.MountID, MountIDKnown: true}, opts, nil)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(img.Close()).To(Succeed())
 	})
 })

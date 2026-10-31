@@ -212,10 +212,12 @@ var _ = Describe("the JuiceFS provider's Prepare", func() {
 		defaultImageOptions.IsMountRoot = alwaysMountRoot
 		defaultImageOptions.LockWait = 100 * time.Millisecond
 		defaultImageOptions.LockPoll = 10 * time.Millisecond
+		// The directory is on mount 40, as the request says.
+		dirProbe = func(int, string) (mountProbe, error) { return mountProbe{MountID: 40, MountRoot: true}, nil }
 	})
 
 	request := func() prepareRequest {
-		return prepareRequest{Mount: mountRecord{ContainerDir: dir, FSType: juicefsFSType}, ImageName: name, Mode: attachFileImage}
+		return prepareRequest{Mount: mountRecord{ContainerDir: dir, MountID: 40, FSType: juicefsFSType}, ImageName: name, Mode: attachFileImage}
 	}
 
 	It("returns the image locked, and Release unlocks it", func() {
@@ -254,6 +256,14 @@ var _ = Describe("the JuiceFS provider's Prepare", func() {
 		req.Signals = sigs
 		_, err = juicefsProvider{}.Prepare(req)
 		Expect(stepExitCode(err)).To(Equal(128 + int(syscall.SIGTERM)))
+	})
+
+	It("opens the directory only on the mount it was given, and creates nothing on another", func() {
+		dirProbe = func(int, string) (mountProbe, error) { return mountProbe{MountID: 41, MountRoot: true}, nil }
+		_, err := juicefsProvider{}.Prepare(request())
+		Expect(errors.Is(err, errMountChanged)).To(BeTrue(), "%v", err)
+		Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+		Expect(os.ReadDir(dir)).To(BeEmpty())
 	})
 
 	It("refuses an attach mode other than file image and creates nothing", func() {
@@ -398,7 +408,7 @@ p=; for a in "$@"; do [ "$p" = --config-file ] && { cp "$a" `+shellQuote(filepat
 	})
 
 	It("exits 125 before it creates anything when the kernel does not report the mount ID", func() {
-		volumeMountID = statxMountID
+		volumeProbe = probeVolume
 		statxCall = func(_ int, _ string, _ int, _ int, st *unix.Statx_t) error {
 			st.Mask = unix.STATX_TYPE
 			return nil
@@ -412,13 +422,114 @@ p=; for a in "$@"; do [ "$p" = --config-file ] && { cp "$a" `+shellQuote(filepat
 		Expect(argvFile).NotTo(BeAnExistingFile())
 	})
 
+	It("exits 125 before it creates anything when the volume is a subdirectory of a JuiceFS mount", func() {
+		// The real probe reads the attributes from statx, which answers that
+		// the directory is on mount 40, a JuiceFS line of the mount table,
+		// and is not that mount's root. alwaysMountRoot is in force, so only
+		// the check before Prepare can refuse it.
+		volumeProbe = probeVolume
+		statxCall = func(_ int, _ string, _ int, _ int, st *unix.Statx_t) error {
+			st.Mask, st.Mnt_id = unix.STATX_MNT_ID, 40
+			st.Attributes_mask = unix.STATX_ATTR_MOUNT_ROOT
+			return nil
+		}
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(Equal("volume " + volDir + " is not a mount point\n"))
+		Expect(os.ReadDir(tmp)).To(BeEmpty())
+		Expect(os.ReadDir(volDir)).To(BeEmpty())
+		Expect(argvFile).NotTo(BeAnExistingFile())
+
+		// With the attribute set, the same volume starts.
+		statxCall = func(_ int, _ string, _ int, _ int, st *unix.Statx_t) error {
+			st.Mask, st.Mnt_id = unix.STATX_MNT_ID, 40
+			st.Attributes_mask, st.Attributes = unix.STATX_ATTR_MOUNT_ROOT, unix.STATX_ATTR_MOUNT_ROOT
+			return nil
+		}
+		dirProbe = probeByPath
+		logBuf.Reset()
+		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
+	})
+
+	It("exits 125 with one line and creates nothing when the volume's mount changes between the inspection and Prepare", func() {
+		dirProbe = func(int, string) (mountProbe, error) { return mountProbe{MountID: 99, MountRoot: true}, nil }
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(HaveSuffix("the mount of volume " + volDir + " changed during start: it was mount ID 40 when vm-launch inspected it and is mount ID 99 now\n"))
+		Expect(strings.Count(logBuf.String(), "changed during start")).To(Equal(1))
+		Expect(os.ReadDir(tmp)).To(BeEmpty())
+		Expect(os.ReadDir(volDir)).To(BeEmpty())
+		Expect(argvFile).NotTo(BeAnExistingFile())
+	})
+
+	It("releases an attachment that Prepare returns along with an error, and exits as the error says", func() {
+		for name, c := range map[string]struct {
+			err  error
+			code int
+		}{
+			"an ordinary error": {errors.New("the fake disk failed after its fence"), exitLaunchError},
+			"a signal":          {&signalledError{Sig: syscall.SIGTERM, during: "waiting for the fake disk"}, 128 + int(syscall.SIGTERM)},
+		} {
+			released := 0
+			p := fake("Fake", "fuse.juicefs", strongMatch)
+			p.prepare = func(prepareRequest) (*attachment, error) {
+				return &attachment{Release: func() error { released++; return errors.New("the fake fence would not let go") }}, c.err
+			}
+			withProviders(p)
+			logBuf.Reset()
+			argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+			Expect(runVM(backend.VMQemu)).To(Equal(c.code), name)
+			Expect(released).To(Equal(1), name)
+			Expect(logBuf.String()).To(HaveSuffix(c.err.Error()+"\nreleasing the volume image: the fake fence would not let go\n"), name)
+			Expect(argvFile).NotTo(BeAnExistingFile(), name)
+			Expect(os.ReadDir(tmp)).To(BeEmpty(), name)
+		}
+	})
+
+	It("closes the file of an attachment that Prepare returns along with an error and no Release", func() {
+		f, err := os.CreateTemp(out, "disk")
+		Expect(err).NotTo(HaveOccurred())
+		p := fake("Fake", "fuse.juicefs", strongMatch)
+		p.prepare = func(prepareRequest) (*attachment, error) {
+			return &attachment{File: f}, errors.New("the fake disk failed")
+		}
+		withProviders(p)
+		writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(HaveSuffix("the fake disk failed\n"))
+		Expect(f.Close()).NotTo(Succeed(), "the file was closed")
+	})
+
+	It("logs a cleanup that fails when it refuses an unusable attachment", func() {
+		f, err := os.CreateTemp(out, "disk")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(f.Close()).To(Succeed())
+		for name, c := range map[string]struct {
+			att  *attachment
+			want string
+		}{
+			"no file, Release fails": {&attachment{Release: func() error { return errors.New("the fake fence would not let go") }},
+				"releasing the volume image: the fake fence would not let go\nthe Fake volume provider prepared the disk without an error but returned no disk file\n"},
+			"no Release, close fails": {&attachment{File: f}, "closing the volume image: close " + f.Name() + ": file already closed\nthe Fake volume provider prepared the disk without an error but returned no Release function\n"},
+		} {
+			p := fake("Fake", "fuse.juicefs", strongMatch)
+			att := c.att
+			p.prepare = func(prepareRequest) (*attachment, error) { return att, nil }
+			withProviders(p)
+			logBuf.Reset()
+			writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+			Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError), name)
+			Expect(logBuf.String()).To(HaveSuffix(c.want), name)
+		}
+	})
+
 	It("selects the volume's mount by the kernel's mount ID when a later mount shares its mount point", func() {
-		volumeMountID = func(string) (uint64, error) { return 40, nil }
+		volumeProbe = func(string) (mountProbe, error) { return mountProbe{MountID: 40, MountRoot: true}, nil }
 		mountInfoPath = writeTempFile("mountinfo", mountinfoLine(40, volDir, "fuse.juicefs")+mountinfoLine(41, volDir, "ext4"))
 		writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
 		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
 
-		volumeMountID = func(string) (uint64, error) { return 41, nil }
+		volumeProbe = func(string) (mountProbe, error) { return mountProbe{MountID: 41, MountRoot: true}, nil }
 		logBuf.Reset()
 		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
 		Expect(logBuf.String()).To(ContainSubstring(`is a "ext4" mount`))
