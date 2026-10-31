@@ -132,7 +132,9 @@
 // hypervisor as the volume's drive.
 // The volume service attaches a BOSH disk to one VM at a time, so only
 // instance 0 of an app can use one, and any other instance fails the launch
-// with exit 125. The guest finds
+// with exit 125. A BOSH disk is as large as its plan, so a size for it in
+// VM_VOLUMES fails the launch with exit 125, before any volume is opened.
+// The guest finds
 // the drive by its identity and size as it finds an image's, and it mounts
 // the disk as ext4 with noatime and errors=remount-ro. It never formats a
 // block volume: a disk that does not mount fails the boot.
@@ -549,6 +551,11 @@ func run(argv []string, logger *log.Logger) int {
 	var selected []selectedVolume
 	if err == nil && len(vols) > 0 {
 		selected, err = findVolumeProviders(mountInfoPath, vols)
+	}
+	// A size on a BOSH disk is refused here, with the providers known and
+	// before any volume is opened (see refuseBlockSize).
+	if err == nil {
+		err = refuseBlockSizes(selected)
 	}
 	// A share is granted or refused here, with the providers known and
 	// still before CredHub, the ports, and the work directory. A grant is
