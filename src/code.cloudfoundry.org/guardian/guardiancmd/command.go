@@ -212,6 +212,7 @@ type CommonCommand struct {
 		VMArtifactsDir string   `long:"vm-artifacts-dir" default:"/var/vcap/data/vm-runtime/artifacts" description:"Host directory with the VM kernels and hypervisors, bound read-only into vm-* containers at /opt/garden-vm/artifacts."`
 		VMLaunchBin    string   `long:"vm-launch-bin" description:"Host path of the static vm-launch binary, bound read-only into vm-* containers at /opt/garden-vm/vm-launch. Required when a vm-* backend is enabled."`
 		VMKVMGid       uint32   `long:"vm-kvm-gid" description:"Host gid that owns /dev/kvm, added to the vm-launch process. Resolved from the host kvm group when not set."`
+		VMBlockVolumes bool     `long:"vm-block-volumes" description:"Give a vm-* container the block device named by each bind mount whose source is a read-only pdi: descriptor tmpfs, as a root:kvm 0660 node at /dev/pdi/MAJOR-MINOR with a read-write device cgroup rule. A device that is the wrong size, mounted, held, or busy on the host refuses the container. Off by default."`
 	} `group:"Execution Backends"`
 
 	CPUThrottling struct {
@@ -312,7 +313,6 @@ func (cmd *CommonCommand) createWiring(logger lager.Logger, metricsProvider *met
 		starters = append(starters, iptablesStarter)
 	}
 
-	var bulkStarter gardener.BulkStarter = gardener.NewBulkStarter(starters)
 	sysInfoProvider := sysinfo.NewResourcesProvider(cmd.Containers.Dir)
 
 	cpuEntitlementPerShare := cmd.Metrics.CPUEntitlementPerShare
@@ -330,6 +330,15 @@ func (cmd *CommonCommand) createWiring(logger lager.Logger, metricsProvider *met
 		logger.Error("failed-to-wire-containerizer", err)
 		return nil, err
 	}
+
+	if backends.blockVolumes != nil {
+		starters = append(starters, blockVolumeSweeper{
+			log:     logger.Session("block-volume-sweep"),
+			volumes: backends.blockVolumes,
+			handles: containerizer.Handles,
+		})
+	}
+	var bulkStarter gardener.BulkStarter = gardener.NewBulkStarter(starters)
 
 	return &commandWiring{
 		Containerizer:                   containerizer,
@@ -638,7 +647,9 @@ func (cmd *CommonCommand) wireContainerizer(
 	// additions, and only when a backend other than oci-runc is enabled so
 	// that a cell without backend flags builds the same bundles as before.
 	if backends.dispatch() {
-		bundleRules = append(bundleRules, bundlerules.NewExecutionBackend(cmd.ExecutionBackends.VMArtifactsDir, cmd.ExecutionBackends.VMLaunchBin, backends.kvmGid))
+		executionBackendRule := bundlerules.NewExecutionBackend(cmd.ExecutionBackends.VMArtifactsDir, cmd.ExecutionBackends.VMLaunchBin, backends.kvmGid)
+		executionBackendRule.BlockVolumes = backends.blockVolumes
+		bundleRules = append(bundleRules, executionBackendRule)
 	}
 
 	template := &rundmc.BundleTemplate{Rules: bundleRules}
@@ -814,6 +825,10 @@ type executionBackends struct {
 	// kvmGid is the host gid to add to vm-launch processes, or 0 when no vm-*
 	// backend is enabled.
 	kvmGid uint32
+
+	// blockVolumes is the block volume step of vm-* containers. It is nil
+	// unless --vm-block-volumes is set and a vm-* backend is enabled.
+	blockVolumes *bundlerules.PDIDevices
 }
 
 // taskPidListerFactory is implemented by factories that can list the processes
@@ -842,12 +857,17 @@ func (b *executionBackends) peaBundleLoader(loader peas.BundleLoader) peas.Bundl
 }
 
 // containerizerOptions returns the Containerizer options the enabled backends
-// need. gVisor containers stream files through runtime exec.
+// need. gVisor containers stream files through runtime exec, and with block
+// volumes on, a destroyed container's block nodes are released.
 func (b *executionBackends) containerizerOptions(runtime rundmc.OCIRuntime) []rundmc.Option {
 	if !b.dispatch() {
 		return nil
 	}
-	return []rundmc.Option{rundmc.WithBackendDispatch(rundmc.NewExecStreamer(runtime))}
+	opts := []rundmc.Option{rundmc.WithBackendDispatch(rundmc.NewExecStreamer(runtime))}
+	if b.blockVolumes != nil {
+		opts = append(opts, rundmc.WithDeviceReleaser(b.blockVolumes))
+	}
+	return opts
 }
 
 // runContainerdOptions returns the RunContainerd options the enabled backends
@@ -902,6 +922,7 @@ func (cmd *CommonCommand) wireExecutionBackends(log lager.Logger) (*executionBac
 	}
 
 	if len(kinds) == 0 {
+		cmd.logUnusedBlockVolumes(log)
 		return &executionBackends{}, nil
 	}
 
@@ -938,6 +959,7 @@ func (cmd *CommonCommand) wireExecutionBackends(log lager.Logger) (*executionBac
 	}
 
 	if len(kinds) == 0 {
+		cmd.logUnusedBlockVolumes(log)
 		return &executionBackends{}, nil
 	}
 
@@ -946,9 +968,50 @@ func (cmd *CommonCommand) wireExecutionBackends(log lager.Logger) (*executionBac
 		return nil, err
 	}
 
-	log.Info("enabled", lager.Data{"backends": kinds, "kvm-gid": kvmGid})
+	var blockVolumes *bundlerules.PDIDevices
+	if cmd.ExecutionBackends.VMBlockVolumes {
+		if kvmGid == 0 {
+			cmd.logUnusedBlockVolumes(log)
+		} else {
+			blockVolumes, err = bundlerules.NewPDIDevices(log.Session("block-volumes"), kvmGid)
+			if err != nil {
+				return nil, fmt.Errorf("--vm-block-volumes: %w", err)
+			}
+		}
+	}
 
-	return &executionBackends{registry: registry, kvmGid: kvmGid}, nil
+	log.Info("enabled", lager.Data{"backends": kinds, "kvm-gid": kvmGid, "block-volumes": blockVolumes != nil})
+
+	return &executionBackends{registry: registry, kvmGid: kvmGid, blockVolumes: blockVolumes}, nil
+}
+
+// logUnusedBlockVolumes notes that --vm-block-volumes has no effect because no
+// vm-* backend is enabled.
+func (cmd *CommonCommand) logUnusedBlockVolumes(log lager.Logger) {
+	if cmd.ExecutionBackends.VMBlockVolumes {
+		log.Info("block-volumes-unused-without-a-vm-backend")
+	}
+}
+
+// blockVolumeSweeper releases, at start-up and before Garden serves requests,
+// the block devices that a crash left claimed by containers Garden no longer
+// knows. Every container it does know releases its own on destroy.
+type blockVolumeSweeper struct {
+	log     lager.Logger
+	volumes *bundlerules.PDIDevices
+	handles func() ([]string, error)
+}
+
+func (s blockVolumeSweeper) Start() error {
+	handles, err := s.handles()
+	if err != nil {
+		return fmt.Errorf("listing containers to release unowned block devices: %w", err)
+	}
+	if err := s.volumes.ReleaseUnknown(s.log, handles); err != nil {
+		// A claim left in place refuses only its own device, so Garden starts.
+		s.log.Error("release-unowned-block-devices-failed", err)
+	}
+	return nil
 }
 
 func (cmd *CommonCommand) resolveKVMGid() (uint32, error) {

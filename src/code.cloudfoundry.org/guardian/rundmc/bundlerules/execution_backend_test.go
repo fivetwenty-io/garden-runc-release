@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"code.cloudfoundry.org/garden"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/opencontainers/runtime-spec/specs-go"
@@ -367,6 +368,20 @@ var _ = Describe("ExecutionBackendRule", func() {
 				Expect(caps.Inheritable).To(Equal([]string{"CAP_CHOWN", "CAP_SETUID", "CAP_KILL"}))
 				Expect(caps.Permitted).To(Equal([]string{"CAP_CHOWN", "CAP_SETUID", "CAP_KILL"}))
 				Expect(caps.Ambient).To(BeEmpty())
+			})
+
+			It("ignores bind mounts while block volumes are off, which is the default", func() {
+				Expect(applyErr).NotTo(HaveOccurred())
+				Expect(rule.BlockVolumes).To(BeNil())
+
+				withDescriptor := desiredSpec
+				withDescriptor.Handle = "handle-1"
+				withDescriptor.BindMounts = []garden.BindMount{
+					{SrcPath: "/var/vcap/data/volumes/bosh-disk/vol-1", DstPath: "/var/vcap/data/disk", Mode: garden.BindMountModeRW},
+				}
+				bndl, err := rule.Apply(inputBndl, withDescriptor)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(bndl).To(Equal(newBndl))
 			})
 
 			It("sets NoNewPrivileges so a setgid binary cannot change the effective gid", func() {

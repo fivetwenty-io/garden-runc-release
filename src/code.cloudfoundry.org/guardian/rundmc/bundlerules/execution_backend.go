@@ -23,24 +23,28 @@ const (
 	miscMajor int64 = 10
 )
 
-// deviceNode describes a character device node to add to a bundle together
-// with the cgroup rule that allows the container to use it.
+// deviceNode describes a device node to add to a bundle together with the
+// cgroup rule that allows the container to use it.
 type deviceNode struct {
-	path  string
-	major int64
-	minor int64
-	mode  os.FileMode
-	gid   uint32
+	path string
+	// devType is "c" for a character device or "b" for a block device.
+	devType string
+	major   int64
+	minor   int64
+	mode    os.FileMode
+	gid     uint32
+	// access is the cgroup rule's access, such as "rwm".
+	access string
 }
 
 var (
 	// kvmNode is /dev/kvm, a misc device with a fixed minor number.
-	kvmNode = deviceNode{path: "/dev/kvm", major: miscMajor, minor: 232, mode: 0660}
+	kvmNode = deviceNode{path: "/dev/kvm", devType: "c", major: miscMajor, minor: 232, mode: 0660, access: "rwm"}
 
 	// tunNode is /dev/net/tun, which Firecracker needs to attach its guest NIC to a tap device.
 	// Mode 0666 matches the usual host node; opening it grants nothing without CAP_NET_ADMIN or a pre-created tap.
 	// Its group stays root, because a world-accessible node does not depend on it.
-	tunNode = deviceNode{path: "/dev/net/tun", major: miscMajor, minor: 200, mode: 0666}
+	tunNode = deviceNode{path: "/dev/net/tun", devType: "c", major: miscMajor, minor: 200, mode: 0666, access: "rwm"}
 )
 
 // DefaultVMArtifacts lists, per VM backend, the files that must exist under
@@ -64,7 +68,8 @@ var DefaultVMArtifacts = map[backend.Kind][]string{
 // vm-firecracker), mounts the VM artifacts, and confines the container so that
 // no process can give itself the kvm gid: CAP_SETGID is removed from every
 // capability set of the bundle process and NoNewPrivileges is set, which stops
-// setgid binaries from changing the effective gid.
+// setgid binaries from changing the effective gid. With BlockVolumes set, a VM
+// container also gets the block device that each descriptor bind mount names.
 type ExecutionBackend struct {
 	// ArtifactsDir is the host directory holding the VM artifacts.
 	ArtifactsDir string
@@ -81,6 +86,11 @@ type ExecutionBackend struct {
 	// has no user namespace and so gets a fresh node rather than the host's.
 	// A VM backend is unavailable while it is 0.
 	KVMGid uint32
+
+	// BlockVolumes gives a VM container a block node and a read-write cgroup
+	// rule for each device that a descriptor bind mount names. It is nil
+	// unless block volumes are turned on, and then no bind mount is inspected.
+	BlockVolumes *PDIDevices
 }
 
 // NewExecutionBackend returns the rule with the default required artifact table.
@@ -117,6 +127,16 @@ func (r ExecutionBackend) Apply(bndl goci.Bndl, spec spec.DesiredContainerSpec) 
 		nodes := []deviceNode{kvm}
 		if kind == backend.VMFirecracker {
 			nodes = append(nodes, tunNode)
+		}
+		// Claimed last, because it creates host nodes. Nothing below can fail,
+		// and a failure later in the create is cleaned up by the destroy that
+		// follows it, which releases the claim.
+		if r.BlockVolumes != nil {
+			blockNodes, err := r.BlockVolumes.Claim(spec)
+			if err != nil {
+				return goci.Bndl{}, err
+			}
+			nodes = append(nodes, blockNodes...)
 		}
 		bndl = withDeviceNodes(bndl, nodes...)
 		bndl = bndl.WithMounts(
@@ -191,7 +211,7 @@ func withDeviceNodes(bndl goci.Bndl, nodes ...deviceNode) goci.Bndl {
 		uid, gid := uint32(0), node.gid
 		devices = append(devices, specs.LinuxDevice{
 			Path:     node.path,
-			Type:     "c",
+			Type:     node.devType,
 			Major:    node.major,
 			Minor:    node.minor,
 			FileMode: &fileMode,
@@ -202,10 +222,10 @@ func withDeviceNodes(bndl goci.Bndl, nodes ...deviceNode) goci.Bndl {
 		major, minor := node.major, node.minor
 		rules = append(rules, specs.LinuxDeviceCgroup{
 			Allow:  true,
-			Type:   "c",
+			Type:   node.devType,
 			Major:  &major,
 			Minor:  &minor,
-			Access: "rwm",
+			Access: node.access,
 		})
 	}
 	resources.Devices = rules

@@ -1,0 +1,178 @@
+package bundlerules_test
+
+import (
+	"bufio"
+	"errors"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	"golang.org/x/sys/unix"
+
+	"code.cloudfoundry.org/guardian/rundmc/bundlerules"
+)
+
+var _ = Describe("LinuxPDIHost", func() {
+	var (
+		host bundlerules.LinuxPDIHost
+		dir  string
+	)
+
+	BeforeEach(func() {
+		dir = GinkgoT().TempDir()
+	})
+
+	readDescriptor := func(path string) (bundlerules.PDIDescriptorFile, error) {
+		src, err := host.OpenSource(path)
+		Expect(err).NotTo(HaveOccurred())
+		defer src.Close()
+		return src.ReadDescriptor()
+	}
+
+	Describe("OpenSource", func() {
+		It("reports the mount ID that mountinfo lists for the source", func() {
+			src, err := host.OpenSource(dir)
+			Expect(err).NotTo(HaveOccurred())
+			defer src.Close()
+
+			id, err := src.MountID()
+			Expect(err).NotTo(HaveOccurred())
+
+			f, err := os.Open("/proc/self/mountinfo")
+			Expect(err).NotTo(HaveOccurred())
+			defer f.Close()
+			var ids []uint64
+			scanner := bufio.NewScanner(f)
+			for scanner.Scan() {
+				v, err := strconv.ParseUint(strings.Fields(scanner.Text())[0], 10, 64)
+				Expect(err).NotTo(HaveOccurred())
+				ids = append(ids, v)
+			}
+			Expect(ids).To(ContainElement(id))
+		})
+
+		It("fails for a missing source", func() {
+			_, err := host.OpenSource(filepath.Join(dir, "missing"))
+			Expect(errors.Is(err, syscall.ENOENT)).To(BeTrue())
+		})
+	})
+
+	Describe("ReadDescriptor", func() {
+		It("reads a regular file with its owner and size", func() {
+			Expect(os.WriteFile(filepath.Join(dir, "device"), []byte("version=1\n"), 0o444)).To(Succeed())
+
+			file, err := readDescriptor(dir)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(file.Mode.IsRegular()).To(BeTrue())
+			Expect(file.UID).To(BeEquivalentTo(os.Getuid()))
+			Expect(file.Size).To(BeEquivalentTo(10))
+			Expect(file.Data).To(Equal([]byte("version=1\n")))
+		})
+
+		It("reads at most one byte past the size limit", func() {
+			Expect(os.WriteFile(filepath.Join(dir, "device"), make([]byte, 10000), 0o444)).To(Succeed())
+
+			file, err := readDescriptor(dir)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(file.Size).To(BeEquivalentTo(10000))
+			Expect(file.Data).To(HaveLen(bundlerules.PDIDescriptorSizeLimit + 1))
+		})
+
+		It("refuses a symbolic link, even to a regular file", func() {
+			Expect(os.WriteFile(filepath.Join(dir, "target"), []byte("version=1\n"), 0o444)).To(Succeed())
+			Expect(os.Symlink("target", filepath.Join(dir, "device"))).To(Succeed())
+
+			_, err := readDescriptor(dir)
+			Expect(err).To(MatchError(ContainSubstring("device is a symbolic link")))
+		})
+
+		It("returns a FIFO's type without reading or blocking on it", func() {
+			Expect(unix.Mkfifo(filepath.Join(dir, "device"), 0o444)).To(Succeed())
+
+			file, err := readDescriptor(dir)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(file.Mode & os.ModeNamedPipe).NotTo(BeZero())
+			Expect(file.Data).To(BeEmpty())
+		})
+
+		It("fails when there is no descriptor", func() {
+			_, err := readDescriptor(dir)
+			Expect(err).To(MatchError(ContainSubstring("opening device")))
+		})
+
+		It("fails when the source is a file rather than a directory", func() {
+			path := filepath.Join(dir, "hosts")
+			Expect(os.WriteFile(path, []byte("127.0.0.1 localhost\n"), 0o644)).To(Succeed())
+
+			_, err := readDescriptor(path)
+			Expect(errors.Is(err, syscall.ENOTDIR)).To(BeTrue())
+		})
+	})
+
+	Describe("block nodes", func() {
+		var node string
+
+		BeforeEach(func() {
+			node = filepath.Join(dir, "7-250")
+		})
+
+		It("probes and refuses a node that is not a block device", func() {
+			Expect(os.WriteFile(node, nil, 0o600)).To(Succeed())
+			Expect(host.Probe(node, 7, 250)).To(MatchError(ContainSubstring("not block device 7:250")))
+		})
+
+		It("fails the probe for a missing node", func() {
+			Expect(host.Probe(node, 7, 250)).To(MatchError(ContainSubstring("exclusive open")))
+		})
+
+		It("does not remove something that is not the named block device", func() {
+			Expect(os.WriteFile(node, nil, 0o600)).To(Succeed())
+			Expect(host.RemoveNode(node, 7, 250)).To(MatchError(ContainSubstring("not block device 7:250")))
+			Expect(node).To(BeARegularFile())
+		})
+
+		It("treats a missing node as removed", func() {
+			Expect(host.RemoveNode(node, 7, 250)).To(Succeed())
+		})
+
+		When("running as root, which mknod needs", func() {
+			BeforeEach(func() {
+				if os.Getuid() != 0 {
+					Skip("mknod of a block device needs root")
+				}
+			})
+
+			It("creates a root:gid 0660 node whatever the umask, refuses to replace it, and removes only the named device", func() {
+				old := unix.Umask(0o077)
+				defer unix.Umask(old)
+
+				Expect(host.Mknod(node, 7, 250, 991)).To(Succeed())
+
+				var st unix.Stat_t
+				Expect(unix.Lstat(node, &st)).To(Succeed())
+				Expect(st.Mode & unix.S_IFMT).To(BeEquivalentTo(unix.S_IFBLK))
+				Expect(st.Mode & 0o7777).To(BeEquivalentTo(0o660))
+				Expect(st.Rdev).To(Equal(unix.Mkdev(7, 250)))
+				Expect(st.Uid).To(BeZero())
+				Expect(st.Gid).To(BeEquivalentTo(991))
+
+				Expect(errors.Is(host.Mknod(node, 7, 250, 991), os.ErrExist)).To(BeTrue())
+
+				Expect(host.RemoveNode(node, 7, 251)).To(MatchError(ContainSubstring("not block device 7:251")))
+				Expect(unix.Lstat(node, &st)).To(Succeed())
+
+				Expect(host.RemoveNode(node, 7, 250)).To(Succeed())
+				Expect(unix.Lstat(node, &st)).To(MatchError(unix.ENOENT))
+				Expect(host.RemoveNode(node, 7, 250)).To(Succeed())
+			})
+
+			It("leaves no node behind when it cannot finish one", func() {
+				Expect(host.Mknod(filepath.Join(dir, "missing", "7-250"), 7, 250, 991)).To(MatchError(ContainSubstring("mknod")))
+			})
+		})
+	})
+})

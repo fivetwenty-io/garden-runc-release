@@ -5,9 +5,11 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"runtime"
 
 	"code.cloudfoundry.org/guardian/backend"
 	"code.cloudfoundry.org/guardian/rundmc"
+	"code.cloudfoundry.org/guardian/rundmc/bundlerules"
 	"code.cloudfoundry.org/guardian/rundmc/goci"
 	"code.cloudfoundry.org/guardian/rundmc/runcontainerd"
 	"code.cloudfoundry.org/guardian/rundmc/runcontainerd/runcontainerdfakes"
@@ -16,7 +18,25 @@ import (
 	flags "github.com/jessevdk/go-flags"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/onsi/gomega/gbytes"
 )
+
+// removeOnlyHost removes nodes as plain files, which is all the start-up
+// sweep asks of the host.
+type removeOnlyHost struct{ bundlerules.PDIHost }
+
+func (removeOnlyHost) RemoveNode(path string, _, _ uint32) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+type failingRemoveHost struct{ bundlerules.PDIHost }
+
+func (failingRemoveHost) RemoveNode(string, uint32, uint32) error {
+	return errors.New("unlink failed")
+}
 
 var _ = Describe("execution backend flags", func() {
 	var (
@@ -491,6 +511,138 @@ var _ = Describe("execution backend flags", func() {
 			Expect(backends.runContainerdOptions(new(runcontainerdfakes.FakeStatser))).To(BeEmpty())
 			_, ok := backends.tapGroup()
 			Expect(ok).To(BeFalse())
+		})
+	})
+
+	Describe("block volumes", func() {
+		It("are off unless --vm-block-volumes is given", func() {
+			parsed := &CommonCommand{}
+			_, err := flags.NewParser(parsed, flags.None).ParseArgs([]string{})
+			if err != nil {
+				Skip("host lacks a default binary: " + err.Error())
+			}
+			Expect(parsed.ExecutionBackends.VMBlockVolumes).To(BeFalse())
+
+			parsed = &CommonCommand{}
+			_, err = flags.NewParser(parsed, flags.IgnoreUnknown).ParseArgs([]string{"--vm-block-volumes"})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(parsed.ExecutionBackends.VMBlockVolumes).To(BeTrue())
+		})
+
+		Context("with a vm-* backend", func() {
+			BeforeEach(func() {
+				cmd.ExecutionBackends.Enabled = []string{"vm-qemu"}
+				cmd.ExecutionBackends.VMLaunchBin = launchBin
+			})
+
+			It("wires no block volume step and no device releaser when the flag is off", func() {
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.blockVolumes).To(BeNil())
+				Expect(backends.containerizerOptions(new(rundmcfakes.FakeOCIRuntime))).To(HaveLen(1))
+			})
+
+			It("wires the step for the host paths and the kvm gid, and releases devices on destroy, when the flag is on", func() {
+				cmd.ExecutionBackends.VMBlockVolumes = true
+
+				backends, err := cmd.wireExecutionBackends(log)
+				if runtime.GOOS != "linux" {
+					Expect(err).To(MatchError(ContainSubstring("--vm-block-volumes")))
+					return
+				}
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.blockVolumes).NotTo(BeNil())
+				Expect(backends.blockVolumes.KVMGid).To(BeEquivalentTo(993))
+				Expect(backends.blockVolumes.NodeDir).To(Equal("/dev/pdi"))
+				Expect(backends.blockVolumes.ClaimDir).To(Equal("/run/garden-pdi-claims"))
+				Expect(backends.blockVolumes.SysfsDir).To(Equal("/sys"))
+				Expect(backends.blockVolumes.MountInfoPath).To(Equal("/proc/self/mountinfo"))
+				Expect(backends.blockVolumes.DescriptorOwner).To(BeZero())
+				Expect(backends.containerizerOptions(new(rundmcfakes.FakeOCIRuntime))).To(HaveLen(2))
+			})
+
+			It("ignores the flag when the vm-* backends were dropped for want of a kvm gid", func() {
+				cmd.ExecutionBackends.VMBlockVolumes = true
+				lookupKVMGroup = func(name string) (*user.Group, error) { return nil, user.UnknownGroupError(name) }
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.blockVolumes).To(BeNil())
+				Expect(log).To(gbytes.Say("block-volumes-unused-without-a-vm-backend"))
+			})
+		})
+
+		It("ignores the flag when only oci-gvisor is enabled", func() {
+			cmd.ExecutionBackends.VMBlockVolumes = true
+			cmd.ExecutionBackends.Enabled = []string{"oci-gvisor"}
+			cmd.Containerd.Socket = "/run/containerd.sock"
+
+			backends, err := cmd.wireExecutionBackends(log)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(backends.blockVolumes).To(BeNil())
+			Expect(backends.containerizerOptions(new(rundmcfakes.FakeOCIRuntime))).To(HaveLen(1))
+			Expect(log).To(gbytes.Say("block-volumes-unused-without-a-vm-backend"))
+		})
+
+		It("ignores the flag when no backend is enabled", func() {
+			cmd.ExecutionBackends.VMBlockVolumes = true
+
+			backends, err := cmd.wireExecutionBackends(log)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(backends.blockVolumes).To(BeNil())
+			Expect(backends.containerizerOptions(new(rundmcfakes.FakeOCIRuntime))).To(BeEmpty())
+		})
+
+		Describe("the start-up sweep", func() {
+			var (
+				claimDir string
+				nodeDir  string
+				sweeper  blockVolumeSweeper
+				handles  []string
+				listErr  error
+			)
+
+			BeforeEach(func() {
+				root := GinkgoT().TempDir()
+				claimDir = filepath.Join(root, "claims")
+				nodeDir = filepath.Join(root, "nodes")
+				Expect(os.Mkdir(claimDir, 0o700)).To(Succeed())
+				Expect(os.Mkdir(nodeDir, 0o755)).To(Succeed())
+				Expect(os.WriteFile(filepath.Join(claimDir, "8-16"), []byte("gone"), 0o600)).To(Succeed())
+				Expect(os.WriteFile(filepath.Join(claimDir, "8-32"), []byte("running"), 0o600)).To(Succeed())
+
+				handles, listErr = []string{"running"}, nil
+				sweeper = blockVolumeSweeper{
+					log: log,
+					volumes: &bundlerules.PDIDevices{
+						NodeDir:  nodeDir,
+						ClaimDir: claimDir,
+						Host:     removeOnlyHost{},
+						Logger:   log,
+					},
+					handles: func() ([]string, error) { return handles, listErr },
+				}
+			})
+
+			It("releases the devices of containers Garden does not know and keeps the rest", func() {
+				Expect(sweeper.Start()).To(Succeed())
+				Expect(filepath.Join(claimDir, "8-16")).NotTo(BeAnExistingFile())
+				Expect(filepath.Join(claimDir, "8-32")).To(BeARegularFile())
+			})
+
+			It("fails the start when the containers cannot be listed", func() {
+				listErr = errors.New("containerd down")
+				Expect(sweeper.Start()).To(MatchError(ContainSubstring("containerd down")))
+				Expect(filepath.Join(claimDir, "8-16")).To(BeARegularFile())
+			})
+
+			It("logs a release that fails and lets Garden start", func() {
+				sweeper.volumes.Host = failingRemoveHost{}
+
+				Expect(sweeper.Start()).To(Succeed())
+				Expect(filepath.Join(claimDir, "8-16")).To(BeARegularFile())
+				Expect(log).To(gbytes.Say("release-unowned-block-devices-failed"))
+			})
 		})
 	})
 
