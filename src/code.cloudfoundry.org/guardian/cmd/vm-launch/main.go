@@ -117,13 +117,13 @@
 // mounts it synchronously; a non-blank image that does not mount is never
 // formatted. Every volume image has the same size, so a guest with more than
 // one volume finds two drives of that size and fails its boot before it
-// formats anything. Each volume must be a JuiceFS mount. Cloud Controller
-// strips the driver name from volume_mounts, so vm-launch reads the
+// formats anything. Each volume must be a JuiceFS or NFS mount. Cloud
+// Controller strips the driver name from volume_mounts, so vm-launch reads the
 // filesystem type of the mount at each volume path from /proc/self/mountinfo
 // and lets the registry of volume providers (see pdi.go) pick the provider
-// that owns it. JuiceFS, which owns fuse.juicefs, is the only provider, so
-// any other type, or a path with no mount entry, fails the launch with exit
-// 125 before anything boots.
+// that owns it. JuiceFS owns fuse.juicefs, and NFS owns nfs4 mounted with
+// local_lock=none. Any other type, an NFSv3 or mapfs mount, or a path with no
+// mount entry fails the launch with exit 125 before anything boots.
 //
 // Environment: the guest command sees the container's environment after the
 // changes the CF launcher would have made to it. vm-launch reads its
