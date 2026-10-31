@@ -427,36 +427,3 @@ var _ = Describe("checkVolumeProvider", func() {
 		Expect(err.Error()).NotTo(ContainSubstring("VCAP_SERVICES"))
 	})
 })
-
-var _ = Describe("volumeProviders", func() {
-	It("registers JuiceFS and only JuiceFS", func() {
-		Expect(volumeProviders).To(HaveLen(1))
-		p, ok := providerForFSType("fuse.juicefs")
-		Expect(ok).To(BeTrue())
-		Expect(p.Name).To(Equal("JuiceFS"))
-		for _, other := range []string{"", "nfs", "fuse.mapfs", "ext4"} {
-			_, ok := providerForFSType(other)
-			Expect(ok).To(BeFalse(), other)
-		}
-	})
-
-	It("names every provider in the table when it refuses a volume", func() {
-		original := volumeProviders
-		DeferCleanup(func() { volumeProviders = original })
-		for _, table := range []struct {
-			providers []volumeProvider
-			names     string
-		}{
-			{nil, "no"},
-			{[]volumeProvider{{Name: "A", FSType: "fuse.a"}}, "A"},
-			{[]volumeProvider{{Name: "A", FSType: "fuse.a"}, {Name: "B", FSType: "fuse.b"}}, "A and B"},
-			{[]volumeProvider{{Name: "A", FSType: "fuse.a"}, {Name: "B", FSType: "fuse.b"}, {Name: "C", FSType: "fuse.c"}}, "A, B, and C"},
-		} {
-			volumeProviders = table.providers
-			err := checkVolumeProvider(writeTempFile("mountinfo", mountinfoLine(40, "/data", "nfs4")), "/data")
-			Expect(err).To(MatchError(HaveSuffix("; VM backends support only "+table.names+" volumes today")), table.names)
-		}
-		volumeProviders = []volumeProvider{{Name: "A", FSType: "fuse.a"}, {Name: "B", FSType: "fuse.b"}}
-		Expect(checkVolumeProvider(writeTempFile("mountinfo", mountinfoLine(40, "/data", "fuse.b")), "/data")).To(Succeed())
-	})
-})

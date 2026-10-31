@@ -105,8 +105,10 @@
 // VM app supports one read-write volume mount, and it must be a JuiceFS
 // mount. Cloud Controller strips the driver name from volume_mounts,
 // so vm-launch reads the filesystem type of the mount at the volume path from
-// /proc/self/mountinfo, and any type other than fuse.juicefs, or a path with
-// no mount entry, fails the launch with exit 125 before anything boots.
+// /proc/self/mountinfo and lets the registry of volume providers (see pdi.go)
+// pick the provider that owns it. JuiceFS, which owns fuse.juicefs, is the
+// only provider, so any other type, or a path with no mount entry, fails the
+// launch with exit 125 before anything boots.
 //
 // Environment: the guest command sees the container's environment after the
 // changes the CF launcher would have made to it. vm-launch reads its
@@ -492,9 +494,13 @@ func run(argv []string, logger *log.Logger) int {
 			return exitLaunchError
 		}
 	}
+	// The registry refuses a volume no provider owns here, before the work
+	// directory exists and before CredHub is asked anything.
 	vol, err := volumeFromEnv(lookupEnv)
+	var provider diskProvider
+	var volMount mountRecord
 	if err == nil && vol != nil {
-		err = checkVolumeProvider(mountInfoPath, vol.ContainerDir)
+		provider, volMount, err = findVolumeProvider(mountInfoPath, vol.ContainerDir)
 	}
 	if err != nil {
 		logger.Print(err)
@@ -571,16 +577,23 @@ func run(argv []string, logger *log.Logger) int {
 		return exitLaunchError
 	}
 
-	// The image stays open, and so locked, until the hypervisor is reaped.
+	// The provider's attachment stays fenced until the hypervisor is reaped:
+	// its Release runs on the way out of run, after sup.run has waited for
+	// the hypervisor, which shares the open file and with it the lock.
 	var img *os.File
 	var volumeBytes int64
 	if vol != nil {
-		img, err = openVolumeImage(vol, defaultImageOptions, sigs)
+		att, err := provider.Prepare(prepareRequest{Mount: volMount, ImageName: vol.ImageName, Mode: attachFileImage, Signals: sigs})
 		if err != nil {
 			logger.Print(err)
 			return stepExitCode(err)
 		}
-		defer img.Close()
+		defer func() {
+			if err := att.Release(); err != nil {
+				logger.Printf("releasing the volume image: %v", err)
+			}
+		}()
+		img = att.File
 		info, err := img.Stat()
 		if err != nil {
 			logger.Printf("reading the size of the volume image: %v", err)

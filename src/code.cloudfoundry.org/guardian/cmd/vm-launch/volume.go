@@ -233,72 +233,40 @@ func quoteForLog(s string) string {
 	return strconv.Quote(s)
 }
 
-// mountInfoPath is the mount table checkVolumeProvider reads. Tests point it
+// mountInfoPath is the mount table findVolumeProvider reads. Tests point it
 // at a file.
 var mountInfoPath = "/proc/self/mountinfo"
 
-// volumeProvider is a storage provider whose volumes a VM backend supports.
-// Cloud Controller removes the driver name from volume_mounts, so a provider
-// is recognised by the filesystem type its mount shows in the mount table.
-type volumeProvider struct {
-	// Name is how an error line names the provider.
-	Name string
-	// FSType is the filesystem type of the provider's mounts.
-	FSType string
-}
-
-// volumeProviders is the table of supported providers. JuiceFS mounts
-// itself as fuse.juicefs (juicefs cmd/mount_unix.go, and the juicefs-broker
-// ctl script matches the same type in findmnt output).
-var volumeProviders = []volumeProvider{
-	{Name: "JuiceFS", FSType: "fuse.juicefs"},
-}
-
-// providerForFSType returns the provider whose mounts have the filesystem
-// type fstype.
-func providerForFSType(fstype string) (volumeProvider, bool) {
-	for _, p := range volumeProviders {
-		if p.FSType == fstype {
-			return p, true
-		}
+// findVolumeProvider returns the provider in diskProviders that owns the
+// volume at dir, and what vm-launch learned about its mount, so that a volume
+// no provider supports is refused before anything boots. It finds the mount
+// at exactly dir in the mount table at mountinfo and lets the registry select
+// a provider by its filesystem type. A path with no mount entry is refused
+// too. Every refusal ends by naming the registered providers. Errors never
+// repeat VCAP_SERVICES.
+func findVolumeProvider(mountinfo, dir string) (diskProvider, mountRecord, error) {
+	m, err := volumeMount(mountinfo, dir)
+	if err != nil {
+		return nil, mountRecord{}, fmt.Errorf("%w; %s", err, diskProviders.supportedLine())
 	}
-	return volumeProvider{}, false
+	p, err := diskProviders.selectProvider(m)
+	if err != nil {
+		return nil, mountRecord{}, err
+	}
+	return p, m, nil
 }
 
-// providerNames names the providers in volumeProviders, for an error line:
-// "JuiceFS", "JuiceFS and NFS", or "JuiceFS, NFS, and SMB".
-func providerNames() string {
-	names := make([]string, 0, len(volumeProviders))
-	for _, p := range volumeProviders {
-		names = append(names, p.Name)
-	}
-	switch len(names) {
-	case 0:
-		return "no"
-	case 1:
-		return names[0]
-	case 2:
-		return names[0] + " and " + names[1]
-	default:
-		return strings.Join(names[:len(names)-1], ", ") + ", and " + names[len(names)-1]
-	}
-}
-
-// checkVolumeProvider refuses a volume that no provider supports, before
-// anything boots. It finds the mount at exactly dir in the mount table at
-// mountinfo and looks its filesystem type up in volumeProviders. A path with
-// no mount entry is refused too. When mounts shadow one another at dir, the
-// last entry in the table is the one the process sees. Errors never repeat
-// VCAP_SERVICES.
-func checkVolumeProvider(mountinfo, dir string) error {
-	only := "VM backends support only " + providerNames() + " volumes today"
+// volumeMount returns the mount record of the mount at exactly dir in the
+// mount table at mountinfo. When mounts shadow one another at dir, the last
+// entry in the table is the one the process sees.
+func volumeMount(mountinfo, dir string) (mountRecord, error) {
 	f, err := os.Open(mountinfo)
 	if err != nil {
 		var pathErr *os.PathError
 		if errors.As(err, &pathErr) {
 			err = pathErr.Err
 		}
-		return fmt.Errorf("reading %s to find the filesystem of volume path %s: %w; %s", mountinfo, quoteForLog(dir), err, only)
+		return mountRecord{}, fmt.Errorf("reading %s to find the filesystem of volume path %s: %w", mountinfo, quoteForLog(dir), err)
 	}
 	defer f.Close()
 
@@ -313,15 +281,12 @@ func checkVolumeProvider(mountinfo, dir string) error {
 		}
 	}
 	if err := sc.Err(); err != nil {
-		return fmt.Errorf("reading %s to find the filesystem of volume path %s: %w; %s", mountinfo, quoteForLog(dir), err, only)
+		return mountRecord{}, fmt.Errorf("reading %s to find the filesystem of volume path %s: %w", mountinfo, quoteForLog(dir), err)
 	}
 	if !found {
-		return fmt.Errorf("volume path %s has no mount entry in %s; %s", quoteForLog(dir), mountinfo, only)
+		return mountRecord{}, fmt.Errorf("volume path %s has no mount entry in %s", quoteForLog(dir), mountinfo)
 	}
-	if _, ok := providerForFSType(fstype); !ok {
-		return fmt.Errorf("volume path %s is a %s mount; %s", quoteForLog(dir), quoteForLog(fstype), only)
-	}
-	return nil
+	return mountRecord{ContainerDir: dir, FSType: fstype}, nil
 }
 
 // parseMountInfoLine returns the mount point and filesystem type of one
