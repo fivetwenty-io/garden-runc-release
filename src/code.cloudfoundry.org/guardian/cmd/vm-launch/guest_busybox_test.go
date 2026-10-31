@@ -196,6 +196,67 @@ var _ = Describe("stage 1's tools in the guest's busybox", func() {
 		}
 	})
 
+	// backupCheck runs stage 2's backup superblock check in the guest's
+	// busybox, with its dd and od, against image as the volume's device, and
+	// returns what it printed.
+	backupCheck := func(image string) string {
+		bb := guestBusybox()
+		info, err := os.Stat(image)
+		Expect(err).NotTo(HaveOccurred())
+		dir := GinkgoT().TempDir()
+		bin := filepath.Join(dir, "bin")
+		Expect(os.Mkdir(bin, 0o755)).To(Succeed())
+		for _, applet := range []string{"dd", "od", "rm"} {
+			Expect(os.Symlink(bb, filepath.Join(bin, applet))).To(Succeed())
+		}
+		script := strings.Replace(guestFailFunc, "reboot -nf", "echo REBOOT", 1) +
+			"rvm_vdev=" + shellQuote(image) + " rvm_vimage=rvm-disk-0.img rvm_vpath=/home/vcap/data rvm_vsectors=" + strconv.FormatInt(info.Size()/512, 10) + "\n" +
+			strings.ReplaceAll(guestVolumeBackupCheck, guestVolumeBackup, shellQuote(filepath.Join(dir, "volume-backup"))) +
+			"echo BLANK\n"
+		cmd := exec.Command(bb, "sh", "-c", script)
+		cmd.Env = []string{"PATH=" + bin}
+		// The check fails the boot through rvm_fail, which exits non-zero
+		// after the line and the stand-in for its reboot.
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			_, ok := err.(*exec.ExitError)
+			Expect(ok).To(BeTrue(), "%v: %s", err, out)
+			Expect(string(out)).To(HaveSuffix("\nREBOOT\n"))
+			return string(out)
+		}
+		Expect(filepath.Join(dir, "volume-backup")).NotTo(BeAnExistingFile())
+		return string(out)
+	}
+
+	DescribeTable("finds the backup superblock that busybox mke2fs writes for each block size once the image's first 64 KiB are zeroed, and none in an image of zeros",
+		func(blockSize, groupBlock int, size int64) {
+			bb := guestBusybox()
+			image := filepath.Join(GinkgoT().TempDir(), "rvm-disk-0.img")
+			Expect(os.WriteFile(image, nil, 0o600)).To(Succeed())
+			Expect(os.Truncate(image, size)).To(Succeed())
+			Expect(backupCheck(image)).To(Equal("BLANK\n"))
+
+			out, err := exec.Command(bb, "mke2fs", "-F", "-b", strconv.Itoa(blockSize), "-L", "rvm-volume", image).CombinedOutput()
+			Expect(err).NotTo(HaveOccurred(), string(out))
+			f, err := os.OpenFile(image, os.O_RDWR, 0)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = f.WriteAt(make([]byte, 64<<10), 0)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(f.Close()).To(Succeed())
+			at := groupBlock * blockSize
+			Expect(backupCheck(image)).To(Equal("vm-launch guest setup: the volume image rvm-disk-0.img for /home/vcap/data reads as zero in its first 64 KiB but holds the magic of an ext2, ext3, or ext4 superblock at byte " + strconv.Itoa(at) + ", where a backup superblock is kept, so it looks like a damaged filesystem, and vm-launch never formats it; repair it by hand on the volume with e2fsck -b from a backup superblock (e2fsck -b " + strconv.Itoa(groupBlock) + " -B " + strconv.Itoa(blockSize) + " for " + strconv.Itoa(blockSize) + "-byte blocks)\nREBOOT\n"))
+		},
+		Entry("1024-byte blocks", 1024, 8193, int64(64<<20)),
+		Entry("2048-byte blocks", 2048, 16384, int64(128<<20)),
+		Entry("4096-byte blocks", 4096, 32768, int64(256<<20)),
+	)
+
+	It("reads no backup superblock place past the end of a small image", func() {
+		image := filepath.Join(GinkgoT().TempDir(), "rvm-disk-0.img")
+		Expect(os.WriteFile(image, make([]byte, 8193*1024+1023), 0o600)).To(Succeed())
+		Expect(backupCheck(image)).To(Equal("BLANK\n"))
+	})
+
 	It("syncs the filesystem of a directory with sync -f, and fails for a path that is missing", func() {
 		bb := guestBusybox()
 		dir := GinkgoT().TempDir()
