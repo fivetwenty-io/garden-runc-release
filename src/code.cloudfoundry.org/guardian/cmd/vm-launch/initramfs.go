@@ -247,16 +247,23 @@ const virtioBlockIDBytesText = "20"
 // which it hands to stage 2. It checks every drive /rvm/disks names before
 // it looks at any device: each identity must be one rvm_ident accepts and no
 // other drive's, each size a positive number of sectors, and the volume
-// count from 0 to maxVolumes. Volumes are numbered by volume index, and a
-// volume of another kind than an image has no drive, so its index is skipped
-// and its argument is empty; a vd device is still one of the drives
-// /rvm/disks names or the boot fails. A volume without a kind is an error,
-// since a cut-short table would otherwise read as volumes without drives.
-// Every drive is built into the guest kernel and normally ready before /init
-// runs; the wait covers a late probe. A drive that has not appeared after six checks fails the boot
-// with a line that names it and its identity.
+// count from 0 to maxVolumes. Volumes are numbered by volume index across
+// every volume, shares included. An image volume and a block volume each
+// have a drive, which stage 1 finds in the same way, by identity and size. A
+// share has no drive, so its index is skipped and its argument is empty; a
+// vd device is still one of the drives /rvm/disks names or the boot fails. A
+// volume without a kind is an error, since a cut-short table would otherwise
+// read as volumes without drives, and so is a kind the guest does not know.
+// A share that /rvm/disks gives a drive identity or size fails the boot too,
+// since a share has no drive. Every drive is built into the guest kernel and
+// normally ready before /init runs; the wait covers a late probe. A drive
+// that has not appeared after six checks fails the boot with a line that
+// names it and its identity. rvm_dev_root is cleared with the drive list, so
+// that a variable the kernel left in init's environment can never stand in
+// for a root drive that /rvm/disks does not name.
 const guestDiskFind = guestDiskFunc + `. /rvm/disks
 rvm_drives=
+rvm_dev_root=
 if [ -n "${RVM_ROOT_ID:-}${RVM_ROOT_SECTORS:-}" ]; then
 	rvm_number "${RVM_ROOT_SECTORS:-}" && rvm_number "${RVM_ROOT_INODE_RATIO:-}" || rvm_fail "the guest root size or inode ratio in /rvm/disks is not a positive number"
 	rvm_ident "${RVM_ROOT_ID:-}" || rvm_fail "the guest root drive's identity in /rvm/disks is not 1 to ` + virtioBlockIDBytesText + ` letters, digits, and hyphens"
@@ -274,13 +281,15 @@ while [ "$rvm_i" -lt "$RVM_VOLUMES" ]; do
 	rvm_l="volume drive vol$rvm_i"
 	eval "rvm_k=\${RVM_VOL${rvm_i}_KIND:-} rvm_w=\${RVM_VOL${rvm_i}_ID:-} rvm_s=\${RVM_VOL${rvm_i}_SECTORS:-}"
 	case "$rvm_k" in
-	` + string(driveImage) + `) ;;
-	'') rvm_fail "the $rvm_l in /rvm/disks has no kind" ;;
-	*)
+	` + string(driveImage) + ` | ` + string(driveBlock) + `) ;;
+	` + volumeKindShare + `)
+		[ -z "$rvm_w$rvm_s" ] || rvm_fail "the volume vol$rvm_i in /rvm/disks is a share, which has no drive, yet it has a drive identity or size"
 		eval "rvm_dev_vol$rvm_i="
 		rvm_i=$((rvm_i + 1))
 		continue
 		;;
+	'') rvm_fail "the $rvm_l in /rvm/disks has no kind" ;;
+	*) rvm_fail "the $rvm_l in /rvm/disks has the kind $rvm_k, which the guest does not know" ;;
 	esac
 	rvm_ident "$rvm_w" || rvm_fail "the $rvm_l's identity in /rvm/disks is not 1 to ` + virtioBlockIDBytesText + ` letters, digits, and hyphens"
 	rvm_number "$rvm_s" || rvm_fail "the $rvm_l's size in /rvm/disks is not a positive number"
@@ -306,6 +315,10 @@ while [ "$rvm_i" -lt "$RVM_VOLUMES" ]; do
 	rvm_i=$((rvm_i + 1))
 done
 `
+
+// volumeKindShare is the kind /rvm/disks gives a volume that is served as a
+// share, which has no drive.
+const volumeKindShare = "share"
 
 // maxVolumesText is maxVolumes in decimal, as the guest's shell matches it
 // with a one-digit pattern. A spec keeps the two equal.
@@ -362,28 +375,28 @@ fi
 `
 
 // initScript is the guest /rvm/init, stage 2 of the guest's boot, which
-// stage 1 runs on the guest root once it has mounted it (see
-// guestRootInit), with each volume's device as an argument, in volume
-// order. It runs the
-// command with stdin from /dev/null (the serial console never delivers
-// EOF), reports its status on the console, and reboots: with -no-reboot
-// (QEMU) or reboot=k (Firecracker) that ends the hypervisor. poweroff -f
-// hangs Firecracker, so it is not used. The reboot is reboot -nf: without -n,
+// stage 1 runs on the guest root once it has mounted it (see guestRootInit),
+// with each volume's device as an argument, in volume order. It runs the
+// command with stdin from /dev/null (the serial console never delivers EOF),
+// reports its status on the console, and reboots: with -no-reboot (QEMU) or
+// reboot=k (Firecracker) that ends the hypervisor. poweroff -f hangs
+// Firecracker, so it is not used. The reboot is reboot -nf: without -n,
 // busybox calls sync(2) first, which writes every dirty page of the guest
 // root to the root image, data that is discarded at once and that could keep
 // the hypervisor up past its grace period. Each volume has its own flush
-// (see guestVolumeTeardown), and its mount is synchronous.
+// (see guestVolumeTeardown), and an image volume's mount is synchronous.
 //
 // First, stage 2 defines rvm_fail, which every setup step uses, and turns
 // off console echo. It then mounts /dev/shm, brings up lo and eth0 from
 // /rvm/net (in every guest, a task's included), prepares the open-files
 // limit from /rvm/limits, and checks that /rvm/env sources. A guest with
-// volumes then formats each volume image that is blank and mounts it. When
-// a setup step fails, stage 2 reboots before the start tag, so vm-launch
-// reports a guest that never started its command and shows the console
-// output, which ends with the failed step. Last before the start tag, stage
-// 2 starts the stop reader (see guestStopReader), which it stops again once
-// the command has ended.
+// volumes then mounts each one by its kind, formatting only a blank volume
+// image and never a block volume (see guestVolumeSetup). When a setup step
+// fails, stage 2 reboots before the start tag, so vm-launch reports a guest
+// that never started its command and shows the console output, which ends
+// with the failed step. Last before the start tag, stage 2 starts the stop
+// reader (see guestStopReader), which it stops again once the command has
+// ended.
 //
 // The command runs in a subshell that records its pid, sets its open-files
 // limit, sources /rvm/env, and then becomes the shell that runs /rvm/cmd
@@ -758,25 +771,41 @@ const (
 	guestVolumeUsed = "/rvm/volume-used"
 )
 
-// guestVolumeSetup formats and mounts every volume image, in volume order,
-// each on the device that stage 1 found by the drive's identity and passed
-// as stage 2's argument in the same place (see guestRootInit), at the path
-// and with the image name that /rvm/mounts gives it (see mountsFile). A
-// count of arguments other than the volume count in /rvm/mounts, a volume
-// without a path, and an argument that names no block device are setup
-// failures. It formats only an image whose first 64 KiB the guest itself
-// reads as all zero, which is a new image or one whose creator died before
-// the first boot; the host never tells it an image is new. A read error is a
-// setup failure, never a blank image. An image that is not blank and does
-// not mount is never formatted: that is a setup failure for an operator to
-// look at. busybox mke2fs makes ext2, which the kernel's ext4 driver mounts.
-// The sync and dirsync options put every completed write on the image
-// before the syscall returns, because the hypervisors stop at once on
-// SIGTERM, without a guest shutdown, so a failure that reboots after some
-// volumes are mounted loses nothing on them. The mount points are created on
-// the guest root, which is the overlay when the guest has a root disk.
-// vm-launch refuses a volume path under another (see checkNotNested), so
-// the mounts never depend on their order.
+// guestVolumeSetup mounts every volume, in volume order, each on the device
+// that stage 1 found by the drive's identity and passed as stage 2's argument
+// in the same place (see guestRootInit), at the path and as the kind that
+// /rvm/mounts gives it (see mountsFile). A count of arguments other than the
+// volume count in /rvm/mounts, a volume without a path, and a kind stage 2
+// does not know are setup failures. The kind decides everything else, and
+// only the image arm can format.
+//
+// An image volume must have a block device. Stage 2 formats only an image
+// whose first 64 KiB it reads itself as all zero, which is a new image or
+// one whose creator died before the first boot; the host never tells it an
+// image is new. A read error is a setup failure, never a blank image. An
+// image that is not blank and does not mount is never formatted: that is a
+// setup failure for an operator to look at. busybox mke2fs makes ext2, which
+// the kernel's ext4 driver mounts. The sync and dirsync options put every
+// completed write on the image before the syscall returns, because the
+// hypervisors stop at once on SIGTERM, without a guest shutdown, so a
+// failure that reboots after some volumes are mounted loses nothing on them.
+//
+// A block volume is a whole disk that holds the app's data, and stage 2
+// never reads its start, formats it, or checks it. It must have a block
+// device, which stage 2 mounts as ext4 with noatime and errors=remount-ro
+// and without sync or dirsync, so the disk keeps the speed of a local disk;
+// the teardown's sync -f flushes it after the command. A disk that does not
+// mount, a blank one included, fails the boot with a line that names the
+// volume's disk, never an image file, and says vm-launch never formats a
+// block volume.
+//
+// A share has no drive, so stage 1 passes it an empty argument, and any
+// other argument is a setup failure. Stage 2 does not mount shares; the code
+// that serves them adds their mount.
+//
+// The mount points are created on the guest root, which is the overlay when
+// the guest has a root disk. vm-launch refuses a volume path under another
+// (see checkNotNested), so the mounts never depend on their order.
 const guestVolumeSetup = `. /rvm/mounts
 case "${RVM_VOLUMES:-}" in
 [1-` + maxVolumesText + `]) ;;
@@ -785,37 +814,52 @@ esac
 [ "$#" -eq "$RVM_VOLUMES" ] || rvm_fail "stage 1 passed $# volume devices for the $RVM_VOLUMES volumes in /rvm/mounts"
 rvm_vi=0
 for rvm_vdev in "$@"; do
-	eval "rvm_vpath=\${RVM_VOL${rvm_vi}_PATH:-} rvm_vimage=\${RVM_VOL${rvm_vi}_IMAGE:-}"
+	eval "rvm_vkind=\${RVM_VOL${rvm_vi}_KIND:-} rvm_vpath=\${RVM_VOL${rvm_vi}_PATH:-} rvm_vimage=\${RVM_VOL${rvm_vi}_IMAGE:-}"
 	[ -n "$rvm_vpath" ] || rvm_fail "/rvm/mounts gives volume $rvm_vi no path"
-	[ -b "$rvm_vdev" ] || rvm_fail "no block device for the volume image $rvm_vimage at $rvm_vpath"
-	mkdir -p "$rvm_vpath" || rvm_fail "creating $rvm_vpath failed"
-	dd if="$rvm_vdev" of=` + guestVolumeHead + ` bs=4096 count=16 || rvm_fail "reading the start of $rvm_vdev failed"
-	tr -d '\000' <` + guestVolumeHead + ` >` + guestVolumeUsed + ` || rvm_fail "checking whether $rvm_vdev is blank failed"
-	rvm_blank=
-	[ -s ` + guestVolumeHead + ` ] && [ ! -s ` + guestVolumeUsed + ` ] && rvm_blank=1
-	rm -f ` + guestVolumeHead + ` ` + guestVolumeUsed + `
-	if [ -n "$rvm_blank" ]; then
-		mke2fs -F -m 0 -L rvm-volume "$rvm_vdev" || rvm_fail "formatting the blank volume image $rvm_vimage for $rvm_vpath failed"
-		mount -t ext4 -o sync,dirsync,noatime,errors=remount-ro "$rvm_vdev" "$rvm_vpath" || rvm_fail "mounting the newly formatted volume image $rvm_vimage at $rvm_vpath failed"
-	else
-		mount -t ext4 -o sync,dirsync,noatime,errors=remount-ro "$rvm_vdev" "$rvm_vpath" || rvm_fail "mounting the volume image $rvm_vimage at $rvm_vpath failed; it is not blank, so vm-launch will not format it; inspect or delete $rvm_vimage on the volume"
-	fi
+	case "$rvm_vkind" in
+	` + string(driveImage) + `)
+		[ -b "$rvm_vdev" ] || rvm_fail "no block device for the volume image $rvm_vimage at $rvm_vpath"
+		mkdir -p "$rvm_vpath" || rvm_fail "creating $rvm_vpath failed"
+		dd if="$rvm_vdev" of=` + guestVolumeHead + ` bs=4096 count=16 || rvm_fail "reading the start of $rvm_vdev failed"
+		tr -d '\000' <` + guestVolumeHead + ` >` + guestVolumeUsed + ` || rvm_fail "checking whether $rvm_vdev is blank failed"
+		rvm_blank=
+		[ -s ` + guestVolumeHead + ` ] && [ ! -s ` + guestVolumeUsed + ` ] && rvm_blank=1
+		rm -f ` + guestVolumeHead + ` ` + guestVolumeUsed + `
+		if [ -n "$rvm_blank" ]; then
+			mke2fs -F -m 0 -L rvm-volume "$rvm_vdev" || rvm_fail "formatting the blank volume image $rvm_vimage for $rvm_vpath failed"
+			mount -t ext4 -o sync,dirsync,noatime,errors=remount-ro "$rvm_vdev" "$rvm_vpath" || rvm_fail "mounting the newly formatted volume image $rvm_vimage at $rvm_vpath failed"
+		else
+			mount -t ext4 -o sync,dirsync,noatime,errors=remount-ro "$rvm_vdev" "$rvm_vpath" || rvm_fail "mounting the volume image $rvm_vimage at $rvm_vpath failed; it is not blank, so vm-launch will not format it; inspect or delete $rvm_vimage on the volume"
+		fi
+		;;
+	` + string(driveBlock) + `)
+		[ -b "$rvm_vdev" ] || rvm_fail "no block device for volume $rvm_vi's disk at $rvm_vpath"
+		mkdir -p "$rvm_vpath" || rvm_fail "creating $rvm_vpath failed"
+		mount -t ext4 -o noatime,errors=remount-ro "$rvm_vdev" "$rvm_vpath" || rvm_fail "mounting volume $rvm_vi's disk $rvm_vdev at $rvm_vpath failed; vm-launch never formats a block volume, so the guest will not boot with it"
+		;;
+	` + volumeKindShare + `)
+		[ -z "$rvm_vdev" ] || rvm_fail "stage 1 passed the device $rvm_vdev for the share at $rvm_vpath, which has no drive"
+		;;
+	'') rvm_fail "/rvm/mounts gives the volume at $rvm_vpath no kind" ;;
+	*) rvm_fail "/rvm/mounts gives the volume at $rvm_vpath the kind $rvm_vkind, which the guest does not know" ;;
+	esac
 	rvm_vi=$((rvm_vi + 1))
 done
 `
 
 // guestVolumeTeardown follows the command, once its status is kept in
-// rvm_status: it flushes and unmounts every volume, last first. sync -f
-// flushes the volume's filesystem only, so that the guest root's dirty pages
-// never take up the time the guest has to stop, and the reboot that follows
-// is reboot -nf, which makes no global sync of its own. The volumes are
-// therefore flushed here, before the reboot. A failed unmount loses nothing,
-// because the mount is synchronous and the sync has run, so it is reported
-// and the status stays the command's.
+// rvm_status: it flushes and unmounts every volume that stage 2 mounted, last
+// first, and leaves the shares, which it did not mount. sync -f flushes the
+// volume's filesystem only, so that the guest root's dirty pages never take
+// up the time the guest has to stop, and the reboot that follows is reboot
+// -nf, which makes no global sync of its own. The volumes are therefore
+// flushed here, before the reboot. A failed unmount loses nothing, because
+// the sync has run, so it is reported and the status stays the command's.
 const guestVolumeTeardown = `rvm_vi=$RVM_VOLUMES
 while [ "$rvm_vi" -gt 0 ]; do
 	rvm_vi=$((rvm_vi - 1))
-	eval "rvm_vpath=\$RVM_VOL${rvm_vi}_PATH"
+	eval "rvm_vkind=\$RVM_VOL${rvm_vi}_KIND rvm_vpath=\$RVM_VOL${rvm_vi}_PATH"
+	[ "$rvm_vkind" = ` + volumeKindShare + ` ] && continue
 	sync -f "$rvm_vpath"
 	umount "$rvm_vpath" 2>/dev/null || echo "vm-launch guest: unmounting $rvm_vpath failed; data was already synced"
 done
@@ -823,15 +867,31 @@ done
 
 // mountsFile returns the guest /rvm/mounts, which stage 2 sources before it
 // mounts the volumes: their number as RVM_VOLUMES and, for each volume in
-// volume order, its quoted path as RVM_VOLn_PATH and its image name as
-// RVM_VOLn_IMAGE.
-func mountsFile(vols []guestVolume) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "RVM_VOLUMES=%d\n", len(vols))
-	for i, v := range vols {
-		fmt.Fprintf(&b, "RVM_VOL%d_PATH=%s\nRVM_VOL%d_IMAGE=%s\n", i, shellQuote(v.ContainerDir), i, shellQuote(v.ImageName))
+// volume order, its kind as RVM_VOLn_KIND and its quoted path as
+// RVM_VOLn_PATH, and for an image volume its image name as RVM_VOLn_IMAGE.
+// The kind is the one disksFile gives the volume's drive in /rvm/disks, taken
+// from the same entry of g.drives, so the two stages never disagree on which
+// volume is an image that stage 2 may format. Volume drives that do not match
+// the guest's volumes one for one, and a kind other than image or block, are
+// an error, because stage 2 could then treat a disk as the wrong kind.
+func mountsFile(g guestContents) (string, error) {
+	d := g.drives.volumes
+	if len(d) != len(g.vols) {
+		return "", fmt.Errorf("%d volume drives for %d guest volumes", len(d), len(g.vols))
 	}
-	return b.String()
+	var b strings.Builder
+	fmt.Fprintf(&b, "RVM_VOLUMES=%d\n", len(g.vols))
+	for i, v := range g.vols {
+		switch d[i].kind {
+		case driveImage:
+			fmt.Fprintf(&b, "RVM_VOL%d_KIND=%s\nRVM_VOL%d_PATH=%s\nRVM_VOL%d_IMAGE=%s\n", i, d[i].kind, i, shellQuote(v.ContainerDir), i, shellQuote(v.ImageName))
+		case driveBlock:
+			fmt.Fprintf(&b, "RVM_VOL%d_KIND=%s\nRVM_VOL%d_PATH=%s\n", i, d[i].kind, i, shellQuote(v.ContainerDir))
+		default:
+			return "", fmt.Errorf("drive %s holds a %q, and the guest mounts only %q and %q volume drives", volumeDriveID(i), d[i].kind, driveImage, driveBlock)
+		}
+	}
+	return b.String(), nil
 }
 
 // sectorBytes is the unit in which sysfs gives a block device's size.
@@ -1065,7 +1125,11 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, g 
 		steps = append(steps, func() error { return cw.FIFO(strings.TrimPrefix(guestListenTick, "/"), 0o600) })
 	}
 	if len(g.vols) > 0 {
-		steps = append(steps, file("rvm/mounts", 0o644, mountsFile(g.vols)))
+		mounts, err := mountsFile(g)
+		if err != nil {
+			return err
+		}
+		steps = append(steps, file("rvm/mounts", 0o644, mounts))
 	}
 	if len(g.caBundle) > 0 {
 		bundle := strings.TrimPrefix(guestCABundlePath, "/")

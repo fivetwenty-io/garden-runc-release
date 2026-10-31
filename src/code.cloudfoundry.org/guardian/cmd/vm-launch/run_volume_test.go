@@ -689,9 +689,9 @@ var _ = Describe("run with several volumes", func() {
 			"RVM_VOL2_KIND=image\nRVM_VOL2_ID=rvm-vol2\nRVM_VOL2_SECTORS=%d\n", sectors, sectors, sectors)))
 		Expect(string(byName["rvm/disks"].data)).NotTo(ContainSubstring("RVM_VOLUME_"))
 		Expect(string(byName["rvm/mounts"].data)).To(Equal("RVM_VOLUMES=3\n" +
-			"RVM_VOL0_PATH=" + shellQuote(dirs[0]) + "\nRVM_VOL0_IMAGE=" + shellQuote(imageName) + "\n" +
-			"RVM_VOL1_PATH=" + shellQuote(dirs[1]) + "\nRVM_VOL1_IMAGE=" + shellQuote(imageName) + "\n" +
-			"RVM_VOL2_PATH=" + shellQuote(dirs[2]) + "\nRVM_VOL2_IMAGE=" + shellQuote(imageName) + "\n"))
+			"RVM_VOL0_KIND=image\nRVM_VOL0_PATH=" + shellQuote(dirs[0]) + "\nRVM_VOL0_IMAGE=" + shellQuote(imageName) + "\n" +
+			"RVM_VOL1_KIND=image\nRVM_VOL1_PATH=" + shellQuote(dirs[1]) + "\nRVM_VOL1_IMAGE=" + shellQuote(imageName) + "\n" +
+			"RVM_VOL2_KIND=image\nRVM_VOL2_PATH=" + shellQuote(dirs[2]) + "\nRVM_VOL2_IMAGE=" + shellQuote(imageName) + "\n"))
 	})
 
 	It("prepares the volumes in the order of the paths and, when one fails, releases every one it prepared, last first, after the failure's line", func() {

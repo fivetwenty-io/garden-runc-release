@@ -83,6 +83,7 @@ rvm_scan() {
 }
 . /rvm/disks
 rvm_drives=
+rvm_dev_root=
 if [ -n "${RVM_ROOT_ID:-}${RVM_ROOT_SECTORS:-}" ]; then
 	rvm_number "${RVM_ROOT_SECTORS:-}" && rvm_number "${RVM_ROOT_INODE_RATIO:-}" || rvm_fail "the guest root size or inode ratio in /rvm/disks is not a positive number"
 	rvm_ident "${RVM_ROOT_ID:-}" || rvm_fail "the guest root drive's identity in /rvm/disks is not 1 to 20 letters, digits, and hyphens"
@@ -100,13 +101,15 @@ while [ "$rvm_i" -lt "$RVM_VOLUMES" ]; do
 	rvm_l="volume drive vol$rvm_i"
 	eval "rvm_k=\${RVM_VOL${rvm_i}_KIND:-} rvm_w=\${RVM_VOL${rvm_i}_ID:-} rvm_s=\${RVM_VOL${rvm_i}_SECTORS:-}"
 	case "$rvm_k" in
-	image) ;;
-	'') rvm_fail "the $rvm_l in /rvm/disks has no kind" ;;
-	*)
+	image | block) ;;
+	share)
+		[ -z "$rvm_w$rvm_s" ] || rvm_fail "the volume vol$rvm_i in /rvm/disks is a share, which has no drive, yet it has a drive identity or size"
 		eval "rvm_dev_vol$rvm_i="
 		rvm_i=$((rvm_i + 1))
 		continue
 		;;
+	'') rvm_fail "the $rvm_l in /rvm/disks has no kind" ;;
+	*) rvm_fail "the $rvm_l in /rvm/disks has the kind $rvm_k, which the guest does not know" ;;
 	esac
 	rvm_ident "$rvm_w" || rvm_fail "the $rvm_l's identity in /rvm/disks is not 1 to 20 letters, digits, and hyphens"
 	rvm_number "$rvm_s" || rvm_fail "the $rvm_l's size in /rvm/disks is not a positive number"
@@ -198,27 +201,54 @@ var _ = Describe("guest volume initramfs", func() {
 		Expect(maxVolumesText).To(HaveLen(1), "stage 1 matches the volume count with a one-digit pattern")
 	})
 
-	It("adds /rvm/mounts with the count, the quoted path, and the image name, and the volume's drive to /rvm/disks", func() {
+	It("adds /rvm/mounts with the count, the kind, the quoted path, and the image name, and the volume's drive to /rvm/disks", func() {
 		names, byName := archiveEntries(writeArchive(task, vol))
 		Expect(names).To(Equal([]string{"bin", "dev", "dev/console", "dev/null", "etc", "proc", "sys", "tmp", "rvm",
 			"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "rvm/limits", "etc/resolv.conf", "rvm/mounts", "rvm/disks", "rvm/init", "init", cpioTrailer}))
 		Expect(string(byName["rvm/mounts"].data)).To(Equal(
-			"RVM_VOLUMES=1\nRVM_VOL0_PATH='/data/it'\\''s $here'\nRVM_VOL0_IMAGE='rvm-disk-3.img'\n"))
+			"RVM_VOLUMES=1\nRVM_VOL0_KIND=image\nRVM_VOL0_PATH='/data/it'\\''s $here'\nRVM_VOL0_IMAGE='rvm-disk-3.img'\n"))
 		Expect(byName["rvm/mounts"].mode).To(Equal(uint32(0o100644)))
 		Expect(string(byName["rvm/disks"].data)).To(Equal("RVM_VOLUMES=1\nRVM_VOL0_KIND=image\nRVM_VOL0_ID=rvm-vol0\nRVM_VOL0_SECTORS=2097152\n"))
 		Expect(string(byName["rvm/init"].data)).To(Equal(initScript(testNonce, true)))
 	})
 
-	It("names every volume in /rvm/mounts by its index, in volume order, so that each sources back as it was", func() {
-		vols := []guestVolume{*vol, {ContainerDir: "/home/vcap/logs", ImageName: "rvm-disk-3.img"}, {ContainerDir: "/x y", ImageName: "z"}}
-		got := mountsFile(vols)
-		Expect(got).To(Equal("RVM_VOLUMES=3\n" +
-			"RVM_VOL0_PATH='/data/it'\\''s $here'\nRVM_VOL0_IMAGE='rvm-disk-3.img'\n" +
-			"RVM_VOL1_PATH='/home/vcap/logs'\nRVM_VOL1_IMAGE='rvm-disk-3.img'\n" +
-			"RVM_VOL2_PATH='/x y'\nRVM_VOL2_IMAGE='z'\n"))
-		out, err := exec.Command("/bin/sh", "-c", `. "$1"; printf '%s|' "${RVM_VOLUME_PATH-unset}" "$RVM_VOLUMES" "$RVM_VOL0_PATH" "$RVM_VOL0_IMAGE" "$RVM_VOL1_PATH" "$RVM_VOL2_PATH" "$RVM_VOL2_IMAGE"`, "sh", writeTempFile("mounts", got)).Output()
+	It("names every volume in /rvm/mounts by its index, in volume order, with its drive's kind, so that each sources back as it was", func() {
+		g := taskGuest("true")
+		g.vols = []guestVolume{*vol, {ContainerDir: "/home/vcap/logs", ImageName: "rvm-disk-3.img"}, {ContainerDir: "/x y", ImageName: "z"}}
+		g.drives.volumes = qemuImageDrives(defaultImageSize, defaultImageSize, defaultImageSize)
+		g.drives.volumes[1].kind = driveBlock
+		got, err := mountsFile(g)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(string(out)).To(Equal("unset|3|/data/it's $here|rvm-disk-3.img|/home/vcap/logs|/x y|z|"))
+		// A block volume has no image file, so /rvm/mounts names none for it.
+		Expect(got).To(Equal("RVM_VOLUMES=3\n" +
+			"RVM_VOL0_KIND=image\nRVM_VOL0_PATH='/data/it'\\''s $here'\nRVM_VOL0_IMAGE='rvm-disk-3.img'\n" +
+			"RVM_VOL1_KIND=block\nRVM_VOL1_PATH='/home/vcap/logs'\n" +
+			"RVM_VOL2_KIND=image\nRVM_VOL2_PATH='/x y'\nRVM_VOL2_IMAGE='z'\n"))
+		out, err := exec.Command("/bin/sh", "-c", `. "$1"; printf '%s|' "${RVM_VOLUME_PATH-unset}" "$RVM_VOLUMES" "$RVM_VOL0_KIND" "$RVM_VOL0_PATH" "$RVM_VOL0_IMAGE" "$RVM_VOL1_KIND" "$RVM_VOL1_PATH" "${RVM_VOL1_IMAGE-unset}" "$RVM_VOL2_PATH" "$RVM_VOL2_IMAGE"`, "sh", writeTempFile("mounts", got)).Output()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(out)).To(Equal("unset|3|image|/data/it's $here|rvm-disk-3.img|block|/home/vcap/logs|unset|/x y|z|"))
+
+		// /rvm/disks gives each drive the same kind, from the same entry.
+		disks, err := disksFile(g)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(disks).To(ContainSubstring("RVM_VOL0_KIND=image\n"))
+		Expect(disks).To(ContainSubstring("RVM_VOL1_KIND=block\n"))
+		Expect(disks).To(ContainSubstring("RVM_VOL2_KIND=image\n"))
+	})
+
+	It("refuses volume drives that do not match the volumes one for one, or a kind stage 2 cannot mount, so no initramfs is built", func() {
+		g := taskGuest("true")
+		g.vols = []guestVolume{*vol, {ContainerDir: "/home/vcap/logs", ImageName: "rvm-disk-3.img"}}
+		g.drives.volumes = qemuImageDrives(defaultImageSize)
+		_, err := mountsFile(g)
+		Expect(err).To(MatchError("1 volume drives for 2 guest volumes"))
+
+		g.drives.volumes = qemuImageDrives(defaultImageSize, defaultImageSize)
+		for _, kind := range []driveKind{"", volumeKindShare, "plain"} {
+			g.drives.volumes[1].kind = kind
+			_, err = mountsFile(g)
+			Expect(err).To(MatchError(fmt.Sprintf(`drive vol1 holds a %q, and the guest mounts only "image" and "block" volume drives`, kind)), "kind %q", kind)
+		}
 	})
 
 	It("adds /rvm/mounts after the network files of an LRP", func() {
@@ -262,6 +292,38 @@ var _ = Describe("guest volume initramfs", func() {
 		Expect(strings.Count(guestVolumeSetup, "mke2fs")).To(Equal(1))
 	})
 
+	// volumeArm returns the text of the arm of stage 2's kind case for kind,
+	// from its pattern to its ;;.
+	volumeArm := func(kind string) string {
+		GinkgoHelper()
+		start := strings.Index(guestVolumeSetup, "\n\t"+kind+")\n")
+		Expect(start).To(BeNumerically(">", 0), "no arm for %s", kind)
+		end := strings.Index(guestVolumeSetup[start:], "\n\t\t;;\n")
+		Expect(end).To(BeNumerically(">", 0), "no end for the %s arm", kind)
+		return guestVolumeSetup[start : start+end]
+	}
+
+	It("can format only in the image arm of its kind case, and never reads, formats, or mounts a block volume synchronously", func() {
+		image := volumeArm(string(driveImage))
+		block := volumeArm(string(driveBlock))
+		share := volumeArm(volumeKindShare)
+		for _, risky := range []string{"mke2fs", "dd ", "rvm_blank", guestVolumeHead} {
+			Expect(image).To(ContainSubstring(risky))
+			Expect(strings.Count(guestVolumeSetup, risky)).To(Equal(strings.Count(image, risky)), "%s outside the image arm", risky)
+			Expect(block).NotTo(ContainSubstring(risky))
+			Expect(share).NotTo(ContainSubstring(risky))
+		}
+		Expect(block).To(ContainSubstring(`mount -t ext4 -o noatime,errors=remount-ro "$rvm_vdev" "$rvm_vpath" || rvm_fail`))
+		Expect(block).NotTo(ContainSubstring("sync"))
+		Expect(block).NotTo(ContainSubstring("image"))
+		Expect(share).NotTo(ContainSubstring("mount"))
+		// The kinds come from the drive kinds, so a renamed kind cannot leave
+		// an arm behind.
+		Expect(string(driveImage)).To(Equal("image"))
+		Expect(string(driveBlock)).To(Equal("block"))
+		Expect(volumeKindShare).To(Equal("share"))
+	})
+
 	It("keeps its scratch files under /rvm, where no volume path can reach them", func() {
 		Expect(guestVolumeHead).To(Equal("/rvm/volume-head"))
 		Expect(guestVolumeUsed).To(Equal("/rvm/volume-used"))
@@ -294,14 +356,30 @@ var _ = Describe("guest volume initramfs", func() {
 			mnt     string
 		)
 
-		// writeMounts writes the test /rvm/mounts for mounts, the paths of
-		// the volumes in volume order, each with its own image name.
-		writeMounts := func(mounts ...string) {
-			var vols []guestVolume
+		// writeKinds writes the test /rvm/mounts, as mountsFile writes it,
+		// for mounts, the paths of the volumes in volume order, each of the
+		// kind at its place in kinds and each image with its own image name.
+		writeKinds := func(kinds []driveKind, mounts ...string) {
+			GinkgoHelper()
+			Expect(kinds).To(HaveLen(len(mounts)))
+			g := taskGuest("true")
 			for i, m := range mounts {
-				vols = append(vols, guestVolume{ContainerDir: m, ImageName: "rvm-disk-" + strconv.Itoa(i) + ".img"})
+				g.vols = append(g.vols, guestVolume{ContainerDir: m, ImageName: "rvm-disk-" + strconv.Itoa(i) + ".img"})
+				g.drives.volumes = append(g.drives.volumes, guestDrive{id: qemuVolumeSerial(i), kind: kinds[i], bytes: defaultImageSize})
 			}
-			Expect(os.WriteFile(filepath.Join(dir, "mounts"), []byte(mountsFile(vols)), 0o644)).To(Succeed())
+			content, err := mountsFile(g)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(os.WriteFile(filepath.Join(dir, "mounts"), []byte(content), 0o644)).To(Succeed())
+		}
+		// writeMounts writes the test /rvm/mounts for image volumes at
+		// mounts.
+		writeMounts := func(mounts ...string) {
+			GinkgoHelper()
+			kinds := make([]driveKind, len(mounts))
+			for i := range kinds {
+				kinds[i] = driveImage
+			}
+			writeKinds(kinds, mounts...)
 		}
 
 		BeforeEach(func() {
@@ -342,22 +420,28 @@ exit "${MOUNT_RC:-0}"`)
 			writeMounts(mnt)
 		})
 
-		// runWith executes rvm_fail and the volume setup under /bin/sh, with
-		// args as stage 2's arguments, the guest paths moved into the test
-		// directory, a regular file standing in for each block device, and
-		// reboot replaced by a marker.
-		runWith := func(args []string, env ...string) setupRun {
+		// runIn executes rvm_fail and the volume setup in shell, with args
+		// as stage 2's arguments, the guest paths moved into the test
+		// directory, a regular file standing in for each block device, the
+		// commands that would change the host called as the stubs by path,
+		// because the guest's busybox runs its own applets before anything
+		// on PATH, and reboot replaced by a marker.
+		runIn := func(shell guestShell, args []string, env ...string) setupRun {
 			script := strings.NewReplacer(
 				"/rvm/mounts", filepath.Join(dir, "mounts"),
 				"/rvm/volume-", filepath.Join(dir, "volume-"),
 				`[ -b "$rvm_vdev" ]`, `[ -f "$rvm_vdev" ]`,
+				"dd if=", filepath.Join(bin, "dd")+" if=",
+				"mke2fs -F", filepath.Join(bin, "mke2fs")+" -F",
+				"mount -t", filepath.Join(bin, "mount")+" -t",
 				"reboot -nf", "echo REBOOT",
 			).Replace(guestFailFunc+guestVolumeSetup) + "echo REACHED_START\n"
 			Expect(script).NotTo(ContainSubstring(guestVolumeHead))
 			Expect(script).NotTo(ContainSubstring(guestVolumeUsed))
 			Expect(script).NotTo(ContainSubstring("-b \""))
+			Expect(strings.Count(script, filepath.Join(bin, "mount")+" -t")).To(Equal(strings.Count(guestVolumeSetup, "mount -t")))
 
-			cmd := exec.Command("/bin/sh", append([]string{"-c", script, "sh"}, args...)...)
+			cmd := exec.Command(shell.argv[0], append(append(slices.Clone(shell.argv[1:]), "-c", script, "sh"), args...)...)
 			cmd.Env = append([]string{"PATH=" + bin + ":/usr/bin:/bin"}, env...)
 			out, _ := cmd.CombinedOutput()
 			calls, err := os.ReadFile(callLog)
@@ -367,6 +451,7 @@ exit "${MOUNT_RC:-0}"`)
 			Expect(err).NotTo(HaveOccurred())
 			return setupRun{out: string(out), calls: string(calls)}
 		}
+		runWith := func(args []string, env ...string) setupRun { return runIn(hostShell(), args, env...) }
 		run := func(env ...string) setupRun { return runWith([]string{device}, env...) }
 
 		// The stubs' expected argv lines, built once BeforeEach set the paths.
@@ -504,6 +589,123 @@ exit "${MOUNT_RC:-0}"`)
 			Expect(r.calls).NotTo(ContainSubstring("dd "))
 		})
 
+		// blockMountCall is the stub's argv line for a block volume's mount.
+		blockMountCall := func(device, mnt string) string {
+			return "mount -t ext4 -o noatime,errors=remount-ro " + device + " " + mnt + "\n"
+		}
+		// zeroDevice makes device a blank disk, as a block device whose first
+		// 64 KiB read as zero would be, and returns its content.
+		zeroDevice := func(device string) []byte {
+			blank := make([]byte, 128<<10)
+			Expect(os.WriteFile(device, blank, 0o600)).To(Succeed())
+			return blank
+		}
+
+		DescribeTable("never reads or formats a blank block volume, and fails the boot with a line that names the volume's disk",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				writeKinds([]driveKind{driveBlock}, mnt)
+				blank := zeroDevice(device)
+				// The dd stub reads every device as blank, and the mount of a
+				// blank disk fails, as it does in a guest.
+				r := runIn(shell, []string{device}, "DD_MODE=zeros", "MOUNT_RC=32")
+				Expect(r.out).To(Equal("vm-launch guest setup: mounting volume 0's disk " + device + " at " + mnt + " failed; vm-launch never formats a block volume, so the guest will not boot with it\nREBOOT\n"))
+				Expect(r.calls).To(Equal(blockMountCall(device, mnt)), "%s", shell.name)
+				Expect(os.ReadFile(device)).To(Equal(blank))
+				Expect(filepath.Join(dir, "volume-head")).NotTo(BeAnExistingFile())
+			},
+			shellEntries(""),
+		)
+
+		DescribeTable("mounts a block volume as ext4 with noatime and errors=remount-ro, without sync or dirsync",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				writeKinds([]driveKind{driveBlock}, mnt)
+				zeroDevice(device)
+				r := runIn(shell, []string{device}, "DD_MODE=zeros")
+				Expect(r.out).To(Equal("REACHED_START\n"), "%s", shell.name)
+				Expect(r.calls).To(Equal(blockMountCall(device, mnt)), "%s", shell.name)
+				Expect(r.calls).NotTo(ContainSubstring("sync"))
+				Expect(mnt).To(BeADirectory())
+			},
+			shellEntries(""),
+		)
+
+		DescribeTable("fails at once, touching nothing, on a block volume without a device, and names the volume's disk",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				writeKinds([]driveKind{driveBlock}, mnt)
+				for _, arg := range []string{"", filepath.Join(dir, "vdz")} {
+					r := runIn(shell, []string{arg}, "DD_MODE=zeros")
+					Expect(r.out).To(Equal("vm-launch guest setup: no block device for volume 0's disk at "+mnt+"\nREBOOT\n"), "%s, argument %q", shell.name, arg)
+					Expect(r.calls).To(BeEmpty(), "%s, argument %q", shell.name, arg)
+					Expect(mnt).NotTo(BeAnExistingFile())
+				}
+			},
+			shellEntries(""),
+		)
+
+		DescribeTable("mounts image and block volumes in volume order, and formats only the blank images",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				devices := []string{filepath.Join(dir, "vdc"), filepath.Join(dir, "vda"), filepath.Join(dir, "vdb")}
+				mounts := []string{filepath.Join(dir, "data"), filepath.Join(dir, "disk"), filepath.Join(dir, "cache dir")}
+				for _, d := range devices {
+					zeroDevice(d)
+				}
+				writeKinds([]driveKind{driveImage, driveBlock, driveImage}, mounts...)
+				r := runIn(shell, devices, "DD_MODE=zeros")
+				Expect(r.out).To(Equal("REACHED_START\n"), "%s", shell.name)
+				Expect(r.calls).To(Equal(
+					ddCall(devices[0])+"mke2fs -F -m 0 -L rvm-volume "+devices[0]+"\n"+mountCall(devices[0], mounts[0])+
+						blockMountCall(devices[1], mounts[1])+
+						ddCall(devices[2])+"mke2fs -F -m 0 -L rvm-volume "+devices[2]+"\n"+mountCall(devices[2], mounts[2])), "%s", shell.name)
+			},
+			shellEntries(""),
+		)
+
+		DescribeTable("leaves a share, which has no drive, to the code that serves it, and refuses a device for it",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				mounts := []string{filepath.Join(dir, "data"), filepath.Join(dir, "shared"), filepath.Join(dir, "logs")}
+				devices := []string{filepath.Join(dir, "vda"), "", filepath.Join(dir, "vdb")}
+				zeroDevice(devices[0])
+				zeroDevice(devices[2])
+				Expect(os.WriteFile(filepath.Join(dir, "mounts"), []byte("RVM_VOLUMES=3\n"+
+					"RVM_VOL0_KIND=image\nRVM_VOL0_PATH="+shellQuote(mounts[0])+"\nRVM_VOL0_IMAGE=a.img\n"+
+					"RVM_VOL1_KIND=share\nRVM_VOL1_PATH="+shellQuote(mounts[1])+"\n"+
+					"RVM_VOL2_KIND=block\nRVM_VOL2_PATH="+shellQuote(mounts[2])+"\n"), 0o644)).To(Succeed())
+				r := runIn(shell, devices, "DD_MODE=data")
+				Expect(r.out).To(Equal("REACHED_START\n"), "%s", shell.name)
+				Expect(r.calls).To(Equal(ddCall(devices[0])+mountCall(devices[0], mounts[0])+blockMountCall(devices[2], mounts[2])), "%s", shell.name)
+				Expect(mounts[1]).NotTo(BeAnExistingFile())
+
+				Expect(os.Remove(callLog)).To(Succeed())
+				devices[1] = devices[2]
+				r = runIn(shell, devices, "DD_MODE=data")
+				Expect(r.out).To(Equal("vm-launch guest setup: stage 1 passed the device "+devices[2]+" for the share at "+mounts[1]+", which has no drive\nREBOOT\n"), "%s", shell.name)
+			},
+			shellEntries(""),
+		)
+
+		DescribeTable("fails at once, touching nothing, on a volume without a kind or with a kind it does not know",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				zeroDevice(device)
+				for kind, line := range map[string]string{
+					"":      "/rvm/mounts gives the volume at " + mnt + " no kind",
+					"plain": "/rvm/mounts gives the volume at " + mnt + " the kind plain, which the guest does not know",
+					"Image": "/rvm/mounts gives the volume at " + mnt + " the kind Image, which the guest does not know",
+				} {
+					Expect(os.WriteFile(filepath.Join(dir, "mounts"), []byte("RVM_VOLUMES=1\nRVM_VOL0_KIND="+kind+"\nRVM_VOL0_PATH="+shellQuote(mnt)+"\nRVM_VOL0_IMAGE=a.img\n"), 0o644)).To(Succeed())
+					r := runIn(shell, []string{device}, "DD_MODE=zeros")
+					Expect(r.out).To(Equal(strings.ReplaceAll("vm-launch guest setup: "+line+"\nREBOOT\n", "/rvm/mounts", filepath.Join(dir, "mounts"))), "%s, kind %q", shell.name, kind)
+					Expect(r.calls).To(BeEmpty(), "%s, kind %q", shell.name, kind)
+				}
+			},
+			shellEntries(""),
+		)
+
 		Describe("the teardown", func() {
 			teardown := func(status string, env ...string) setupRun {
 				script := ". " + shellQuote(filepath.Join(dir, "mounts")) + "\n(exit " + status + ")\nrvm_status=$?\n" + guestVolumeTeardown + "echo \"status=$rvm_status\"\n"
@@ -529,6 +731,18 @@ exit "${MOUNT_RC:-0}"`)
 				Expect(r.out).To(Equal("status=3\n"))
 				Expect(r.calls).To(Equal("sync -f " + mounts[2] + "\numount " + mounts[2] + "\n" +
 					"sync -f " + mounts[1] + "\numount " + mounts[1] + "\n" +
+					"sync -f " + mounts[0] + "\numount " + mounts[0] + "\n"))
+			})
+
+			It("syncs and unmounts a block volume as it does an image, and leaves a share, which stage 2 never mounted", func() {
+				mounts := []string{filepath.Join(dir, "data"), filepath.Join(dir, "shared"), filepath.Join(dir, "disk")}
+				Expect(os.WriteFile(filepath.Join(dir, "mounts"), []byte("RVM_VOLUMES=3\n"+
+					"RVM_VOL0_KIND=image\nRVM_VOL0_PATH="+shellQuote(mounts[0])+"\nRVM_VOL0_IMAGE=a.img\n"+
+					"RVM_VOL1_KIND=share\nRVM_VOL1_PATH="+shellQuote(mounts[1])+"\n"+
+					"RVM_VOL2_KIND=block\nRVM_VOL2_PATH="+shellQuote(mounts[2])+"\n"), 0o644)).To(Succeed())
+				r := teardown("5")
+				Expect(r.out).To(Equal("status=5\n"))
+				Expect(r.calls).To(Equal("sync -f " + mounts[2] + "\numount " + mounts[2] + "\n" +
 					"sync -f " + mounts[0] + "\numount " + mounts[0] + "\n"))
 			})
 
@@ -1159,13 +1373,17 @@ exit 0`)
 				"RVM_VOLUMES=-1\n":        countLine,
 				"RVM_VOLUMES=x\n":         countLine,
 				root + "RVM_VOLUMES=1\n":  "the volume drive vol0 in " + disks + " has no kind",
-				root + "RVM_VOLUMES=1\nRVM_VOL0_KIND=image\nRVM_VOL0_SECTORS=" + volumeSectors + "\n": "the volume drive vol0's identity in " + disks + " is not 1 to " + virtioBlockIDBytesText + " letters, digits, and hyphens",
-				root + "RVM_VOLUMES=1\n" + volEntry(0, "rvm.vol0", volumeSectors):                     "the volume drive vol0's identity in " + disks + " is not 1 to " + virtioBlockIDBytesText + " letters, digits, and hyphens",
-				root + "RVM_VOLUMES=1\n" + volEntry(0, "rvm-vol0", "1GiB"):                            "the volume drive vol0's size in " + disks + " is not a positive number",
-				root + "RVM_VOLUMES=1\n" + volEntry(0, "rvm-vol0", "0"):                               "the volume drive vol0's size in " + disks + " is not a positive number",
-				root + "RVM_VOLUMES=1\n" + volEntry(0, "rvm-vol0", "'*'"):                             "the volume drive vol0's size in " + disks + " is not a positive number",
-				root + "RVM_VOLUMES=1\n" + volEntry(0, "rvm-root", volumeSectors):                     "the guest root drive and the volume drive vol0 have the one identity rvm-root in " + disks + ", so the guest cannot tell them apart",
-				"RVM_VOLUMES=2\n" + vol0 + volEntry(1, "rvm-vol0", volumeSectors):                     "the volume drive vol0 and the volume drive vol1 have the one identity rvm-vol0 in " + disks + ", so the guest cannot tell them apart",
+				root + "RVM_VOLUMES=1\nRVM_VOL0_KIND=plain\nRVM_VOL0_ID=rvm-vol0\nRVM_VOL0_SECTORS=" + volumeSectors + "\n": "the volume drive vol0 in " + disks + " has the kind plain, which the guest does not know",
+				root + "RVM_VOLUMES=1\nRVM_VOL0_KIND=Block\nRVM_VOL0_ID=rvm-vol0\nRVM_VOL0_SECTORS=" + volumeSectors + "\n": "the volume drive vol0 in " + disks + " has the kind Block, which the guest does not know",
+				root + "RVM_VOLUMES=1\nRVM_VOL0_KIND=share\nRVM_VOL0_ID=rvm-vol0\n":                                         "the volume vol0 in " + disks + " is a share, which has no drive, yet it has a drive identity or size",
+				root + "RVM_VOLUMES=1\nRVM_VOL0_KIND=share\nRVM_VOL0_SECTORS=" + volumeSectors + "\n":                       "the volume vol0 in " + disks + " is a share, which has no drive, yet it has a drive identity or size",
+				root + "RVM_VOLUMES=1\nRVM_VOL0_KIND=image\nRVM_VOL0_SECTORS=" + volumeSectors + "\n":                       "the volume drive vol0's identity in " + disks + " is not 1 to " + virtioBlockIDBytesText + " letters, digits, and hyphens",
+				root + "RVM_VOLUMES=1\n" + volEntry(0, "rvm.vol0", volumeSectors):                                           "the volume drive vol0's identity in " + disks + " is not 1 to " + virtioBlockIDBytesText + " letters, digits, and hyphens",
+				root + "RVM_VOLUMES=1\n" + volEntry(0, "rvm-vol0", "1GiB"):                                                  "the volume drive vol0's size in " + disks + " is not a positive number",
+				root + "RVM_VOLUMES=1\n" + volEntry(0, "rvm-vol0", "0"):                                                     "the volume drive vol0's size in " + disks + " is not a positive number",
+				root + "RVM_VOLUMES=1\n" + volEntry(0, "rvm-vol0", "'*'"):                                                   "the volume drive vol0's size in " + disks + " is not a positive number",
+				root + "RVM_VOLUMES=1\n" + volEntry(0, "rvm-root", volumeSectors):                                           "the guest root drive and the volume drive vol0 have the one identity rvm-root in " + disks + ", so the guest cannot tell them apart",
+				"RVM_VOLUMES=2\n" + vol0 + volEntry(1, "rvm-vol0", volumeSectors):                                           "the volume drive vol0 and the volume drive vol1 have the one identity rvm-vol0 in " + disks + ", so the guest cannot tell them apart",
 			} {
 				Expect(os.RemoveAll(callLog)).To(Succeed())
 				r := run(shell, table)
@@ -1174,6 +1392,50 @@ exit 0`)
 				Expect(r.calls).To(BeEmpty(), "%s: %q", shell.name, table)
 			}
 			Expect(os.ReadFile(dev("vda"))).To(Equal(formatted))
+		},
+		shellEntries(""),
+	)
+
+	// blockEntry is what /rvm/disks names the block volume at index i by.
+	blockEntry := func(i int, id, sectors string) string {
+		return strings.Replace(volEntry(i, id, sectors), "_KIND=image\n", "_KIND=block\n", 1)
+	}
+
+	DescribeTable("finds a block volume's drive by identity and size as it finds an image's, and hands its device to stage 2 in its place",
+		func(shellOf func() guestShell) {
+			shell := shellOf()
+			disks := "RVM_VOLUMES=2\n" + volEntry(0, "rvm-vol0", volumeSectors) + blockEntry(1, "rvm-vol1", rootSectors)
+			Expect(disks).To(ContainSubstring("RVM_VOL1_KIND=block\n"))
+			disk("vda", "rvm-vol1", rootSectors, blank)
+			disk("vdb", "rvm-vol0", volumeSectors, formatted)
+			r := run(shell, disks)
+			Expect(r.code).To(Equal(0), "%s: %s", shell.name, r.out)
+			Expect(r.calls).To(Equal(ramRoot(dev("vdb"), dev("vda"))), "%s", shell.name)
+			// Stage 1 never formats a volume, so the blank disk stays blank.
+			Expect(os.ReadFile(dev("vda"))).To(Equal(blank))
+
+			// A block drive of another size fails as an image's does.
+			reset()
+			disk("vda", "rvm-vol1", volumeSectors, blank)
+			disk("vdb", "rvm-vol0", volumeSectors, formatted)
+			failed(run(shell, disks), "the volume drive vol1 "+dev("vda")+" has "+volumeSectors+" sectors, and "+disksPath()+" gives it "+rootSectors+", so the guest will not use it", "")
+
+			// A block drive that never appears is waited for and named.
+			reset()
+			disk("vdb", "rvm-vol0", volumeSectors, formatted)
+			failed(run(shell, disks), "no block device with the identity rvm-vol1 for the volume drive vol1", strings.Repeat("sleep 1\n", 5))
+		},
+		shellEntries(""),
+	)
+
+	DescribeTable("never takes a root drive from init's environment when /rvm/disks names none",
+		func(shellOf func() guestShell) {
+			shell := shellOf()
+			disk("vda", "rvm-vol0", volumeSectors, blank)
+			r := run(shell, "RVM_VOLUMES=1\n"+volEntry(0, "rvm-vol0", volumeSectors), "rvm_dev_root="+dev("vda"), "RVM_ROOT_INODE_RATIO="+rootRatio)
+			Expect(r.code).To(Equal(0), "%s: %s", shell.name, r.out)
+			Expect(r.calls).To(Equal(ramRoot(dev("vda"))), "%s", shell.name)
+			Expect(os.ReadFile(dev("vda"))).To(Equal(blank))
 		},
 		shellEntries(""),
 	)

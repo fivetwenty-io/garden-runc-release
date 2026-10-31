@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -623,6 +624,71 @@ var _ = Describe("hypervisor drives for several volumes against a real QEMU", fu
 			"-drive", optionAfter(argv, "-drive", "id=vol0"), "-drive", second}, files, "quit\n", 30*time.Second)
 		Expect(code).NotTo(Equal(0))
 		Expect(stderr).To(ContainSubstring("vol0"))
+	})
+
+	// bootKinds boots a real guest that runs cmd with img as its one volume at
+	// /home/vcap/data, which /rvm/disks and /rvm/mounts give the kind kind,
+	// and returns the console output once QEMU has exited 0, which it does
+	// after a failed setup too, because the guest reboots. QEMU gets img as a
+	// file image whatever the kind, because the guest learns the kind from
+	// the initramfs alone, so a regular file can stand in for a block
+	// volume's disk.
+	bootKinds := func(img *os.File, kind driveKind, cmd string) string {
+		info, err := img.Stat()
+		Expect(err).NotTo(HaveOccurred())
+		g := taskGuest(cmd)
+		g.vols = []guestVolume{{ContainerDir: "/home/vcap/data", ImageName: "volume.img"}}
+		g.drives.volumes = qemuImageDrives(info.Size())
+		g.drives.volumes[0].kind = kind
+		withRealRoot(&g)
+
+		art := realArtifacts()
+		qemu := realQEMU()
+		requireMicrovm(qemu)
+		f, err := newInitramfs(guestBusybox(), g)
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(f.Close)
+		files, drivePaths, initrdPath, _, rootPath := hypervisorFiles(imageAttachments(img), withUserspaceMark(f), nil, realRootImage())
+		argv := markedArgv(tcgArgv(qemu, withRealRootDrive(qemuArgv(art, initrdPath, minGuestMemoryMiB, g.nw, drivePaths, 0), rootPath)))
+		code, stdout, stderr := bootRealQEMU(argv, files)
+		Expect(code).To(Equal(0), "QEMU failed: %s\n%s", stderr, stdout)
+		return stdout
+	}
+
+	It("never formats a blank block volume, fails the boot instead, and mounts a block volume with data as ext4 with noatime and without sync", func() {
+		const size = 32 << 20
+		img := sparseImage(size)
+
+		// A blank disk of the block kind fails the boot before the command,
+		// with the line that names the volume's disk, and stays blank.
+		stdout := bootKinds(img, driveBlock, "echo never-ran")
+		Expect(stdout).To(MatchRegexp(`vm-launch guest setup: mounting volume 0's disk /dev/vd[a-z]+ at /home/vcap/data failed; vm-launch never formats a block volume, so the guest will not boot with it`))
+		Expect(stdout).NotTo(ContainSubstring(startTag(testNonce)), stdout)
+		Expect(stdout).NotTo(ContainSubstring("never-ran"), stdout)
+		head := make([]byte, 1<<20)
+		_, err := img.ReadAt(head, 0)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(bytes.Count(head, []byte{0})).To(Equal(len(head)), "the guest wrote to the blank block volume")
+
+		// The same disk as an image is formatted, and the command leaves a
+		// file on it.
+		stdout = bootKinds(img, driveImage, "echo kept >/home/vcap/data/mark && sync -f /home/vcap/data")
+		Expect(stdout).To(ContainSubstring(exitTag(testNonce)+"0"), stdout)
+		Expect(extLabel(img)).To(Equal("rvm-volume"))
+
+		// As a block volume the disk now mounts as it is, with noatime and
+		// without sync or dirsync, and keeps the file.
+		stdout = bootKinds(img, driveBlock, `grep " /home/vcap/data ext4 " /proc/mounts | sed 's/^/mount=/'; echo "mark=$(cat /home/vcap/data/mark)"`)
+		Expect(stdout).NotTo(ContainSubstring("vm-launch guest setup"), stdout)
+		Expect(stdout).To(ContainSubstring(exitTag(testNonce)+"0"), stdout)
+		Expect(stdout).To(MatchRegexp(`(?m)^mark=kept\r?$`))
+		m := regexp.MustCompile(`(?m)^mount=/dev/vd[a-z]+ /home/vcap/data ext4 (\S+) `).FindStringSubmatch(stdout)
+		Expect(m).NotTo(BeNil(), stdout)
+		options := strings.Split(m[1], ",")
+		Expect(options).To(ContainElement("noatime"), m[1])
+		Expect(options).NotTo(ContainElement("sync"), m[1])
+		Expect(options).NotTo(ContainElement("dirsync"), m[1])
+		Expect(extLabel(img)).To(Equal("rvm-volume"))
 	})
 
 	It("boots a guest with two volume images of one size and mounts each at its own path from the drive with its identity", func() {

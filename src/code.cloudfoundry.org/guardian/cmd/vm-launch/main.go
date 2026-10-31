@@ -116,13 +116,32 @@
 // each image's drive by the identity vm-launch gives the drive, checks its
 // size, formats it as ext2 when its first 64 KiB are all zero, and mounts it
 // synchronously at its own path; a non-blank image that does not mount is
-// never formatted. Each volume must be a JuiceFS or NFS mount. Cloud
-// Controller strips the driver name from volume_mounts, so vm-launch reads the
-// filesystem type of the mount at each volume path from /proc/self/mountinfo
-// and lets the registry of volume providers (see pdi.go) pick the provider
-// that owns it. JuiceFS owns fuse.juicefs, and NFS owns nfs4 mounted with
-// local_lock=none. Any other type, an NFSv3 or mapfs mount, or a path with no
-// mount entry fails the launch with exit 125 before anything boots.
+// never formatted.
+//
+// A BOSH disk volume is a whole block device rather than an image. Its
+// volume path is a read-only tmpfs from pdi:bosh-disk that holds a
+// descriptor of the disk, and vm-launch opens the device node that the
+// descriptor names under /dev/pdi with O_EXCL, which no mount or other
+// exclusive open on the cell can share. It checks that the node is the
+// device the descriptor names, that the device has the descriptor's size,
+// and that it holds an ext4 filesystem with a journal and the descriptor's
+// UUID, and it passes the device to the hypervisor as the volume's drive.
+// The volume service attaches a BOSH disk to one VM at a time, so only
+// instance 0 of an app can use one, and any other instance fails the launch
+// with exit 125. The guest finds
+// the drive by its identity and size as it finds an image's, and it mounts
+// the disk as ext4 with noatime and errors=remount-ro. It never formats a
+// block volume: a disk that does not mount fails the boot.
+//
+// Each volume must be a BOSH disk, JuiceFS, or NFS volume. Cloud Controller
+// strips the driver name from volume_mounts, so vm-launch reads the
+// filesystem type and source of the mount at each volume path from
+// /proc/self/mountinfo and lets the registry of volume providers (see
+// pdi.go) pick the provider that owns it. The BOSH disk provider owns a
+// read-only tmpfs whose source is pdi:bosh-disk, JuiceFS owns fuse.juicefs,
+// and NFS owns nfs4 mounted with local_lock=none. Any other type, an NFSv3
+// or mapfs mount, or a path with no mount entry fails the launch with exit
+// 125 before anything boots.
 //
 // Environment: the guest command sees the container's environment after the
 // changes the CF launcher would have made to it. vm-launch reads its
@@ -215,17 +234,17 @@
 //
 // The guest's /init finds the image's drive by its identity, checks its size
 // in sectors, both of which vm-launch writes in the initramfs, formats it as
-// ext2 with online discard, and
-// mounts an overlay with the initramfs as its lower layer and the image as
-// its upper. It moves /proc, /sys, and /dev into the overlay, moves the
-// overlay onto /, and runs the rest of its setup and the command inside it,
-// so everything the guest writes outside /dev and the volume lands on
-// the image and counts against the quota. Every boot formats a fresh image,
-// as every start of a runc app gets a fresh container. /init formats only
-// the one device with the image's identity, and only when it reads as blank,
-// so it never formats a volume; when it cannot find, check, format, or mount
-// the image, the guest reboots before it starts the command, and vm-launch
-// exits 123 with the console output, which ends with the step that failed.
+// ext2 with online discard, and mounts an overlay with the initramfs as its
+// lower layer and the image as its upper. It moves /proc, /sys, and /dev
+// into the overlay, moves the overlay onto /, and runs the rest of its setup
+// and the command inside it, so everything the guest writes outside /dev and
+// the volumes lands on the image and counts against the quota. Every boot
+// formats a fresh image, as every start of a runc app gets a fresh
+// container. /init formats only the one device with the image's identity,
+// and only when it reads as blank, so it never formats a volume; when it
+// cannot find, check, format, or mount the image, the guest reboots before
+// it starts the command, and vm-launch exits 123 with the console output,
+// which ends with the step that failed.
 //
 // The initramfs that holds the guest's /init, busybox, command, and
 // environment is built in a sealed memfd and never written to disk. The
