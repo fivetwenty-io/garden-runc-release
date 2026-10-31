@@ -273,7 +273,9 @@
 //	       directory, a read-only mount, a bad volume path,
 //	       CF_INSTANCE_INDEX, application_id, or process_type, a task with
 //	       a volume, an image that fails a check or cannot be created,
-//	       volume images of different sizes, or
+//	       volume images of different sizes, a VM_VOLUMES value that is not
+//	       a JSON object of volume paths, names a path no volume mounts, or
+//	       sets a mode or size it does not allow, or
 //	       an image another instance still holds after 30 seconds, a
 //	       guest environment that is too large, with one entry over
 //	       131071 bytes or more than 1 MiB in all, or a value that holds a
@@ -515,6 +517,9 @@ func run(argv []string, logger *log.Logger) int {
 	// directory exists and before CredHub is asked anything. Every volume
 	// is checked before any of them is prepared.
 	vols, err := volumesFromEnv(lookupEnv)
+	if err == nil {
+		err = applyVolumeSettings(lookupEnv, vols)
+	}
 	var selected []selectedVolume
 	if err == nil && len(vols) > 0 {
 		selected, err = findVolumeProviders(mountInfoPath, vols)

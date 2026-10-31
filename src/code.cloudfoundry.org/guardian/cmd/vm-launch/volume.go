@@ -78,6 +78,11 @@ type guestVolume struct {
 	// one that was inspected.
 	MountID      uint64
 	MountIDKnown bool
+
+	// Settings are the mode and size the app chose for the volume in
+	// VM_VOLUMES. The zero value is private at the default size, which is
+	// what a volume gets when the app sets nothing.
+	Settings volumeSettings
 }
 
 // vcapServices is the part of VCAP_SERVICES vm-launch reads: every label's
