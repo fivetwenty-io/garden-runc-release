@@ -492,7 +492,7 @@ var _ = Describe("run with VM_VOLUMES", func() {
 			{`not json`, `VM_VOLUMES is not a JSON object of volume paths`},
 			{`{"/x":{}}`, `VM_VOLUMES names "/x", which no volume binding of this app mounts`},
 			{`{"` + volDir + `":{"size":"32M"}}`, `VM_VOLUMES ` + quoteForLog(volDir) + ` size "32M" is below the 64M minimum`},
-			{`{"` + volDir + `":{"mode":"share"}}`, `VM_VOLUMES ` + quoteForLog(volDir) + ` mode "share" is not supported by this vm-launch yet; shares need a later release`},
+			{`{"` + volDir + `":{"mode":"share"}}`, `VM_VOLUMES ` + quoteForLog(volDir) + ` mode "share" is not allowed on this cell; the operator has not turned on volume shares`},
 		} {
 			refusedBeforeAnything(c.value, c.line)
 			Expect(logBuf.String()).NotTo(ContainSubstring("reserving port"), c.value)
