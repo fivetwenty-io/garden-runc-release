@@ -57,6 +57,23 @@ const (
 	// asked to repeat because of a concurrent rename.
 	openRetries = 8
 
+	// tempOrphanAge is how long a temp file with one link must have gone
+	// without a change before the sweep opens it to try its lock. A launch
+	// that is creating an image changes the file with every write and with
+	// the truncate just before it closes the file, so a file this old is not
+	// in the window in which that launch unlinks its name. Opening a name that
+	// another process unlinks makes an NFS client rename it to a hidden .nfs
+	// file instead (see sweepTempImages).
+	tempOrphanAge = 60 * time.Second
+
+	// linkSettleAttempts and linkSettleInterval bound how long a launch waits,
+	// after it published an image, for the image's second link to go. The
+	// second link is the temp name, and an NFS client that another process on
+	// the cell held open while this launch unlinked it renames it to a hidden
+	// .nfs file, which goes when that process closes it.
+	linkSettleAttempts = 10
+	linkSettleInterval = 100 * time.Millisecond
+
 	// zeroChunk is the size of one write when preallocation has to write
 	// zeros, and syncInterval is how many bytes it writes between fsyncs.
 	zeroChunk    = 1 << 20
@@ -109,6 +126,14 @@ type imageOptions struct {
 	// pwrite, when set, replaces pwriteFull as the step that writes one chunk
 	// of zeros. Tests use it to fail a write part way through the range.
 	pwrite func(fd int, b []byte, off int64) error
+
+	// identify, when set, replaces statxFD as the step that reads the device
+	// and inode of the new temp file. Tests use it to fail that step.
+	identify func(fd int) (unix.Statx_t, error)
+
+	// settleInterval, when set, replaces linkSettleInterval as the wait
+	// between looks at a published image's link count.
+	settleInterval time.Duration
 }
 
 // publishStrategy is how createImage moves a finished temp file to the
@@ -148,6 +173,7 @@ var (
 	renameat2Call = unix.Renameat2
 	linkatCall    = unix.Linkat
 	unlinkatCall  = unix.Unlinkat
+	fstatatCall   = unix.Fstatat
 )
 
 var defaultImageOptions = imageOptions{
@@ -466,7 +492,9 @@ func renameHint(err error) string {
 //     returns errImageAppeared, so the caller uses that launch's image.
 //  5. It unlinks the temp name. The file is closed by now, so an NFS client
 //     has no open name to turn into a silly rename.
-//  6. It opens the image by its name, and returns that file.
+//  6. It opens the image by its name, and waits briefly for the image's link
+//     count to show one (settleLinks), because a process of the cell may still
+//     have held the temp name open at step 5. It then returns that file.
 //
 // No step unlinks a name that this process still has open. A launch killed
 // before step 4 leaves a temp file with one link, and one killed between
@@ -478,21 +506,35 @@ func renameHint(err error) string {
 // A failure in steps 1 to 3 removes the temp file, after closing it. A signal
 // during preallocation does the same and returns the signal's error. A temp
 // file that a concurrent sweep removed between steps 1 and 4 returns
-// errCreateAgain.
+// errCreateAgain, and so does a temp name that another file has taken. Any
+// other failure to check the temp name fails the launch with its cause, after
+// removing the temp file.
 func createImageByLink(dirfd int, name, path string, o imageOptions, sigs <-chan os.Signal) (int, error) {
 	tempName, fd, err := createTempImage(dirfd)
 	if err != nil {
 		return -1, fmt.Errorf("creating volume image %s: %w%s", path, err, symlinkHint(err))
 	}
-	var id unix.Stat_t
-	if err := unix.Fstat(fd, &id); err != nil {
+	identify := o.identify
+	if identify == nil {
+		identify = statxFD
+	}
+	st, err := identify(fd)
+	if err != nil {
+		// Without the new file's identity, the temp name is removed only if it
+		// is still the file that was at the name while this process held it
+		// open, and still looks like the empty file this launch created.
+		ours, nameErr := newTempIdentity(dirfd, tempName)
 		unix.Close(fd)
+		if nameErr == nil {
+			removeTempByID(dirfd, tempName, ours)
+		}
 		return -1, fmt.Errorf("creating volume image %s: fstat of the new file: %w", path, err)
 	}
+	id := idOfStatx(&st)
 	// Whatever the outcome, the file is closed before its name is unlinked.
 	discard := func() {
 		unix.Close(fd)
-		removeTempByID(dirfd, tempName, &id)
+		removeTempByID(dirfd, tempName, id)
 	}
 	fail := func(err error) (int, error) {
 		discard()
@@ -507,9 +549,12 @@ func createImageByLink(dirfd int, name, path string, o imageOptions, sigs <-chan
 	case err != nil:
 		return fail(fmt.Errorf("creating volume image %s: locking the new file: %w", path, err))
 	}
-	if checkImageName(dirfd, fd, tempName, tempName) != nil {
-		unix.Close(fd)
-		return -1, errCreateAgain
+	if err := checkImageName(dirfd, fd, tempName, tempName); err != nil {
+		if tempNameTaken(err) {
+			unix.Close(fd)
+			return -1, errCreateAgain
+		}
+		return fail(fmt.Errorf("creating volume image %s: checking the new file's temp name: %w", path, err))
 	}
 	if err := sizeNewImage(fd, path, o, sigs); err != nil {
 		return fail(err)
@@ -521,7 +566,7 @@ func createImageByLink(dirfd int, name, path string, o imageOptions, sigs <-chan
 		o.afterTempCreate(dirfd, tempName)
 	}
 	if err := unix.Close(fd); err != nil {
-		removeTempByID(dirfd, tempName, &id)
+		removeTempByID(dirfd, tempName, id)
 		return -1, fmt.Errorf("creating volume image %s: closing the new file: %w%s", path, err, quotaHint(err))
 	}
 
@@ -532,12 +577,12 @@ func createImageByLink(dirfd int, name, path string, o imageOptions, sigs <-chan
 	switch err := publish(dirfd, tempName, name); {
 	case err == nil:
 	case errors.Is(err, unix.EEXIST):
-		removeTempByID(dirfd, tempName, &id)
+		removeTempByID(dirfd, tempName, id)
 		return -1, errImageAppeared
 	case errors.Is(err, unix.ENOENT):
 		return -1, errCreateAgain
 	default:
-		removeTempByID(dirfd, tempName, &id)
+		removeTempByID(dirfd, tempName, id)
 		return -1, fmt.Errorf("creating volume image %s: publishing it: %w%s", path, err, linkHint(err))
 	}
 
@@ -552,7 +597,53 @@ func createImageByLink(dirfd int, name, path string, o imageOptions, sigs <-chan
 	case err != nil:
 		return -1, fmt.Errorf("opening volume image %s: %w%s", path, err, symlinkHint(err))
 	}
+	if err := settleLinks(img, o, sigs); err != nil {
+		unix.Close(img)
+		return -1, err
+	}
 	return img, nil
+}
+
+// tempNameTaken reports whether err from checkImageName says that the temp
+// name is gone (ENOENT) or refers to a different file. Any other failure, such
+// as ESTALE or EIO, says nothing about the name, so it is not a reason to
+// create the image again.
+func tempNameTaken(err error) bool {
+	var ve *volumeError
+	if !errors.As(err, &ve) || !errors.Is(ve, errImageReplaced) {
+		return false
+	}
+	return ve.cause == nil || errors.Is(ve.cause, unix.ENOENT)
+}
+
+// settleLinks looks at the link count of the image img, which this launch has
+// just published, and while it shows more than one link, looks again after
+// the settle interval, up to linkSettleAttempts times. The extra link is the
+// temp name this launch unlinked. When another process on the cell held that
+// name open, an NFS client renames it to a hidden .nfs file, which goes when
+// the other process closes it, so the second link normally goes within a few
+// round trips. When it stays, settleLinks returns without an error and
+// checkImage refuses the image with the link count. A failed look is not
+// waited on either, because checkImage fails with the same cause. A signal on
+// sigs ends the wait and returns a *signalledError.
+func settleLinks(fd int, o imageOptions, sigs <-chan os.Signal) error {
+	interval := o.settleInterval
+	if interval <= 0 {
+		interval = linkSettleInterval
+	}
+	for i := 0; i < linkSettleAttempts; i++ {
+		if links, err := freshLinkCount(fd); err != nil || links < 2 {
+			return nil
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case sig := <-sigs:
+			timer.Stop()
+			return &signalledError{Sig: syscall.Signal(signalNumber(sig)), during: "waiting for the volume image's second link to go"}
+		case <-timer.C:
+		}
+	}
+	return nil
 }
 
 // lockTempImage takes an exclusive flock on the new temp file without
@@ -603,17 +694,84 @@ func unlinkTempName(dirfd int, tempName string) error {
 	}
 }
 
-// removeTempByID unlinks tempName in dirfd when it still refers to the file
-// with the device and inode of id, which the caller has closed, and does
-// nothing otherwise. It compares without following a symbolic link, so a file
-// that another party moved to the name stays. A failure is ignored: the launch
-// is already failing, or the sweep will try again.
-func removeTempByID(dirfd int, tempName string, id *unix.Stat_t) {
-	var byName unix.Stat_t
-	if err := unix.Fstatat(dirfd, tempName, &byName, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return
+// tempID is the identity of a file as statx reports it: the device and the
+// inode.
+type tempID struct {
+	devMajor, devMinor uint32
+	ino                uint64
+}
+
+func idOfStatx(st *unix.Statx_t) tempID {
+	return tempID{devMajor: st.Dev_major, devMinor: st.Dev_minor, ino: st.Ino}
+}
+
+// tempStatxMask is what the sweep and the cleanup need from a temp name: its
+// type, owner, link count, size, modification time, and inode.
+const tempStatxMask = unix.STATX_TYPE | unix.STATX_UID | unix.STATX_NLINK | unix.STATX_SIZE | unix.STATX_MTIME | unix.STATX_INO
+
+// statxTemp reads the attributes of the name beneath dirfd with statx, without
+// following a link and without opening the name, asking the filesystem for
+// fresh attributes, because an NFS client may otherwise answer from a cache
+// that another cell's link or unlink has made stale.
+func statxTemp(dirfd int, name string) (unix.Statx_t, error) {
+	var st unix.Statx_t
+	for {
+		err := unix.Statx(dirfd, name, unix.AT_SYMLINK_NOFOLLOW|unix.AT_STATX_FORCE_SYNC, tempStatxMask, &st)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if err != nil {
+			return st, err
+		}
+		return st, checkTempStatx(&st)
 	}
-	if byName.Dev != id.Dev || byName.Ino != id.Ino {
+}
+
+// statxFD is statxTemp for an open file.
+func statxFD(fd int) (unix.Statx_t, error) {
+	var st unix.Statx_t
+	for {
+		err := unix.Statx(fd, "", unix.AT_EMPTY_PATH|unix.AT_STATX_FORCE_SYNC, tempStatxMask, &st)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if err != nil {
+			return st, err
+		}
+		return st, checkTempStatx(&st)
+	}
+}
+
+func checkTempStatx(st *unix.Statx_t) error {
+	if st.Mask&tempStatxMask != tempStatxMask {
+		return errors.New("the filesystem did not report the file's type, owner, links, size, modification time, and inode")
+	}
+	return nil
+}
+
+// newTempIdentity returns the identity of the file at tempName, which a
+// launch has just created and holds open, when that file is a regular file of
+// this uid with one link and no data, as the new file is. It fails otherwise.
+func newTempIdentity(dirfd int, tempName string) (tempID, error) {
+	st, err := statxTemp(dirfd, tempName)
+	switch {
+	case err != nil:
+		return tempID{}, err
+	case st.Mode&unix.S_IFMT != unix.S_IFREG, int64(st.Uid) != int64(os.Geteuid()), st.Nlink != 1, st.Size != 0:
+		return tempID{}, errors.New("the temp name does not refer to the file this launch created")
+	}
+	return idOfStatx(&st), nil
+}
+
+// removeTempByID unlinks tempName in dirfd when it still refers to the file
+// with the identity id, which the caller has closed, and does nothing
+// otherwise. It looks at the name without following a symbolic link and
+// without opening it, so a file that another party moved to the name stays. A
+// failure is ignored: the launch is already failing, or the sweep will try
+// again.
+func removeTempByID(dirfd int, tempName string, id tempID) {
+	byName, err := statxTemp(dirfd, tempName)
+	if err != nil || idOfStatx(&byName) != id {
 		return
 	}
 	_ = unlinkatCall(dirfd, tempName, 0)
@@ -626,17 +784,25 @@ func removeTempByID(dirfd int, tempName string, id *unix.Stat_t) {
 // image that a launch published and was killed before it removed the name.
 // The second case would fail checkImage on the image until the name is gone.
 //
-// It touches only a name that matches tempNamePattern exactly, that is a
-// regular file owned by vm-launch's effective uid, and that it opens without
-// following a link. It removes a temp file with one link only when it can take
-// an exclusive flock on it, because a launch that is creating an image holds
-// that lock on its temp file until it has closed it (createImageByLink). The
-// lock is released before the name is removed, so that an NFS client does not
-// silly-rename a name that is open here, and the name is removed only while it
-// still refers to the file that was checked. Removing a second name never
-// removes the image, because the image keeps its own name. The sweep is best
-// effort: a name it cannot open, lock, or remove stays, and the next launch
-// tries again.
+// The sweep never opens a name that another process may be unlinking. A
+// launch on the same cell that is publishing an image unlinks its temp name at
+// step 5 of createImageByLink, and an NFS client turns the unlink of a name
+// that any process of the cell holds open into a silly rename to a hidden
+// .nfs file, which leaves the published image with a second link until the
+// client deletes it. So the sweep decides from statx on the name alone
+// (sweepTempName), and it opens a name for no other purpose than to try its
+// lock, and only when the name has not changed for tempOrphanAge.
+//
+// It touches only a name that matches tempNamePattern exactly and that is a
+// regular file owned by vm-launch's effective uid. It removes a temp file with
+// two or more links without opening it. It removes a temp file with one link
+// that is old enough only when it can take an exclusive flock on it, because a
+// launch that is creating an image holds that lock on its temp file until it
+// has closed it (createImageByLink). The lock is released before the name is
+// removed, and the name is removed only while it still refers to the file that
+// was checked. Removing a second name never removes the image, because the
+// image keeps its own name. The sweep is best effort: a name it cannot read,
+// open, lock, or remove stays, and the next launch tries again.
 func sweepTempImages(dirfd int) {
 	dfd, err := openat2Retry(dirfd, ".", &unix.OpenHow{
 		Flags: unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC, Resolve: imageOpenResolve,
@@ -674,28 +840,41 @@ func freshLinkCount(fd int) (uint32, error) {
 // sweepTempName removes one temp name for sweepTempImages when it is an
 // orphan or a second link, and leaves it otherwise.
 func sweepTempName(dirfd int, name string) {
+	st, err := statxTemp(dirfd, name)
+	if err != nil || st.Mode&unix.S_IFMT != unix.S_IFREG || int64(st.Uid) != int64(os.Geteuid()) {
+		return
+	}
+	id := idOfStatx(&st)
+	if st.Nlink >= 2 {
+		// The second name of a published image. Nothing needs the name, and
+		// opening it could turn a creator's unlink into a silly rename.
+		removeTempByID(dirfd, name, id)
+		return
+	}
+	// A temp file with one link that changed within tempOrphanAge may belong
+	// to a launch that is creating an image. An mtime in the future, from a
+	// server clock that runs ahead, counts as recent.
+	mtime := time.Unix(st.Mtime.Sec, int64(st.Mtime.Nsec))
+	if time.Since(mtime) < tempOrphanAge {
+		return
+	}
 	fd, err := openat2Retry(dirfd, name, &unix.OpenHow{Flags: imageOpenFlags, Resolve: imageOpenResolve})
 	if err != nil {
 		return
 	}
-	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil || st.Mode&unix.S_IFMT != unix.S_IFREG || int64(st.Uid) != int64(os.Geteuid()) {
+	opened, err := statxFD(fd)
+	if err != nil || idOfStatx(&opened) != id || opened.Nlink >= 2 {
+		// The name was swapped, or a launch published the file after the first
+		// look. Leave it to the next sweep.
 		unix.Close(fd)
 		return
 	}
-	links, err := freshLinkCount(fd)
-	if err != nil {
+	if err := lockTempImage(fd); err != nil {
 		unix.Close(fd)
 		return
-	}
-	if links < 2 {
-		if err := lockTempImage(fd); err != nil {
-			unix.Close(fd)
-			return
-		}
 	}
 	unix.Close(fd)
-	removeTempByID(dirfd, name, &st)
+	removeTempByID(dirfd, name, id)
 }
 
 // createTempImage creates a new empty file in dirfd under a unique temp name,
@@ -929,7 +1108,7 @@ func newImageCheckError(path string, err error) error {
 // comparing device and inode without following a symbolic link at the name.
 func checkImageName(dirfd, fd int, name, path string) error {
 	var byName, byFD unix.Stat_t
-	if err := unix.Fstatat(dirfd, name, &byName, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+	if err := fstatatCall(dirfd, name, &byName, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		return &volumeError{kind: errImageReplaced, cause: err,
 			msg: fmt.Sprintf("volume image %s: cannot tell whether the name still refers to the locked file: %v", path, err)}
 	}

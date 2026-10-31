@@ -293,6 +293,7 @@ var _ = Describe("the NFS provider's Prepare", func() {
 	It("removes a temp name an earlier launch left, whether an orphan or a second link to the image, without touching the image", func() {
 		orphan := filepath.Join(dir, ".rvm-disk-0123456789abcdef.tmp")
 		writeImage(orphan, 4<<20, []byte("orphan"))
+		ageTemp(orphan)
 		writeImage(img, 4<<20, []byte("image"))
 		second := filepath.Join(dir, ".rvm-disk-fedcba9876543210.tmp")
 		Expect(os.Link(img, second)).To(Succeed())
@@ -432,6 +433,7 @@ var _ = Describe("the NFS provider's Prepare", func() {
 		It("sweeps nothing on a mount it refuses", func() {
 			leftover := filepath.Join(dir, ".rvm-disk-0123456789abcdef.tmp")
 			writeImage(leftover, 4096, []byte("stale"))
+			ageTemp(leftover)
 			_, err := nfsProvider{}.Prepare(request("fuse.mapfs", "rw"))
 			Expect(err).To(HaveOccurred())
 			Expect(os.ReadFile(leftover)).To(HavePrefix("stale"))

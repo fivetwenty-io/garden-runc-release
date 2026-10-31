@@ -4,6 +4,8 @@ package main
 
 import (
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -115,14 +117,21 @@ var _ = Describe("an image on the directory named by "+imageDirEnv, func() {
 		other := filepath.Join(dir, "other")
 		Expect(os.WriteFile(other, nil, 0o600)).To(Succeed())
 		GinkgoWriter.Printf("renameat2 RENAME_NOREPLACE onto an existing name: %v\n", unix.Renameat2(unix.AT_FDCWD, probe, unix.AT_FDCWD, other, unix.RENAME_NOREPLACE))
-		third := filepath.Join(dir, "third")
-		GinkgoWriter.Printf("renameat2 RENAME_NOREPLACE onto a free name: %v\n", unix.Renameat2(unix.AT_FDCWD, other, unix.AT_FDCWD, third, unix.RENAME_NOREPLACE))
+		// The two renames only report what the volume does. A volume that
+		// accepts the flag moves the file, so the checks below do not depend on
+		// the names these calls use.
+		movable := filepath.Join(dir, "movable")
+		Expect(os.WriteFile(movable, nil, 0o600)).To(Succeed())
+		GinkgoWriter.Printf("renameat2 RENAME_NOREPLACE onto a free name: %v\n", unix.Renameat2(unix.AT_FDCWD, movable, unix.AT_FDCWD, filepath.Join(dir, "moved"), unix.RENAME_NOREPLACE))
 
 		// What the link publish relies on: linkat fails with EEXIST when the
-		// name exists, and succeeds when it does not.
+		// name exists, and succeeds when it does not. The existing name is one
+		// that this spec made with a plain write.
 		fresh := filepath.Join(dir, "fresh")
 		Expect(os.WriteFile(fresh, nil, 0o600)).To(Succeed())
-		Expect(unix.Linkat(unix.AT_FDCWD, fresh, unix.AT_FDCWD, third, 0)).To(MatchError(unix.EEXIST), "linkat onto an existing name")
+		taken := filepath.Join(dir, "taken")
+		Expect(os.WriteFile(taken, nil, 0o600)).To(Succeed())
+		Expect(unix.Linkat(unix.AT_FDCWD, fresh, unix.AT_FDCWD, taken, 0)).To(MatchError(unix.EEXIST), "linkat onto an existing name")
 		fourth := filepath.Join(dir, "fourth")
 		Expect(unix.Linkat(unix.AT_FDCWD, fresh, unix.AT_FDCWD, fourth, 0)).To(Succeed(), "linkat onto a free name")
 		var st unix.Stat_t
@@ -138,8 +147,7 @@ var _ = Describe("an image on the directory named by "+imageDirEnv, func() {
 		baseProbe, err := probeVolume(base)
 		Expect(err).NotTo(HaveOccurred())
 		if !baseProbe.MountRoot {
-			GinkgoWriter.Printf("%s is not the root of a mount, so the provider selection is not tried; point %s at the mount's root directory to try it\n", base, imageDirEnv)
-			return
+			Skip(fmt.Sprintf("%s is not the root of a mount, so the provider selection is not tried; point %s at the mount's root directory to try it", base, imageDirEnv))
 		}
 		Expect(baseProbe.MountID).To(Equal(probe.MountID))
 		p, rec, err := findVolumeProvider("/proc/self/mountinfo", base)
@@ -187,7 +195,7 @@ var _ = Describe("an image on the directory named by "+imageDirEnv, func() {
 		Expect(err).NotTo(HaveOccurred(), "the second launch reopens the image as it is")
 		DeferCleanup(again.Release)
 		Expect(statOf(img).Ino).To(Equal(st.Ino))
-		Expect(os.ReadFile(img)).To(HavePrefix("kept"))
+		Expect(readPrefix(img, 4)).To(Equal("kept"))
 		noSillyRenames()
 	})
 
@@ -214,7 +222,28 @@ var _ = Describe("an image on the directory named by "+imageDirEnv, func() {
 				results[i] = err
 			}()
 		}
+		// Sweeps run while the launches create and publish, as other launches
+		// on the cell would. They may not make an NFS client rename a name
+		// that a launch unlinks (noSillyRenames below).
+		stop := make(chan struct{})
+		var sweeps sync.WaitGroup
+		sweeps.Add(1)
+		go func() {
+			defer GinkgoRecover()
+			defer sweeps.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					sweepTempImages(dirfd)
+					time.Sleep(time.Millisecond)
+				}
+			}
+		}()
 		wg.Wait()
+		close(stop)
+		sweeps.Wait()
 		for i, err := range results {
 			Expect(err).NotTo(HaveOccurred(), "launch %d", i)
 		}
@@ -230,6 +259,7 @@ var _ = Describe("an image on the directory named by "+imageDirEnv, func() {
 	It("removes a temp name that a killed launch left, an orphan or a second name of the image, and keeps the image", func() {
 		orphan := filepath.Join(dir, ".rvm-disk-0123456789abcdef.tmp")
 		writeImage(orphan, size, []byte("orphan"))
+		ageTemp(orphan)
 		writeImage(img, size, []byte("image"))
 		second := filepath.Join(dir, ".rvm-disk-fedcba9876543210.tmp")
 		Expect(os.Link(img, second)).To(Succeed())
@@ -244,7 +274,7 @@ var _ = Describe("an image on the directory named by "+imageDirEnv, func() {
 		after := statOf(img)
 		Expect(after.Ino).To(Equal(before.Ino))
 		Expect(int(after.Nlink)).To(Equal(1))
-		Expect(os.ReadFile(img)).To(HavePrefix("image"))
+		Expect(readPrefix(img, 5)).To(Equal("image"))
 	})
 
 	It("refuses a quota that cannot hold the image, leaving nothing behind, when the volume has one", func() {
@@ -262,6 +292,22 @@ var _ = Describe("an image on the directory named by "+imageDirEnv, func() {
 		Expect(entries).To(BeEmpty())
 	})
 })
+
+// readPrefix returns the first n bytes of the file at path, or all of it when
+// it is shorter. The specs read an image through it, because os.ReadFile
+// allocates a buffer as large as the file, which for an image of many GiB
+// exhausts memory.
+func readPrefix(path string, n int) string {
+	f, err := os.Open(path)
+	Expect(err).NotTo(HaveOccurred())
+	defer f.Close()
+	buf := make([]byte, n)
+	got, err := io.ReadFull(f, buf)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		Expect(err).NotTo(HaveOccurred())
+	}
+	return string(buf[:got])
+}
 
 // errText is err's text, or "ok" for no error.
 func errText(err error) string {

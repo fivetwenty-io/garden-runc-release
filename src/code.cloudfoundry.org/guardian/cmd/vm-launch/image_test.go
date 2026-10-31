@@ -12,6 +12,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -71,6 +72,43 @@ func writeImage(path string, size int64, data []byte) {
 	Expect(err).NotTo(HaveOccurred())
 	Expect(f.Truncate(size)).To(Succeed())
 	Expect(f.Close()).To(Succeed())
+}
+
+// ageTemp sets the modification time of path to well beyond tempOrphanAge ago,
+// as a temp file that a killed launch left has.
+func ageTemp(path string) {
+	old := time.Now().Add(-2 * tempOrphanAge)
+	Expect(os.Chtimes(path, old, old)).To(Succeed())
+}
+
+// watchOpens reports, through the function it returns, the names in dir that
+// any process opened since the call, as inotify saw them. The function may be
+// called once.
+func watchOpens(dir string) func() []string {
+	ifd, err := unix.InotifyInit1(unix.IN_NONBLOCK | unix.IN_CLOEXEC)
+	Expect(err).NotTo(HaveOccurred())
+	_, err = unix.InotifyAddWatch(ifd, dir, unix.IN_OPEN)
+	Expect(err).NotTo(HaveOccurred())
+	return func() []string {
+		defer unix.Close(ifd)
+		var names []string
+		buf := make([]byte, 64<<10)
+		for {
+			n, err := unix.Read(ifd, buf)
+			if errors.Is(err, unix.EAGAIN) {
+				return names
+			}
+			Expect(err).NotTo(HaveOccurred())
+			for off := 0; off+unix.SizeofInotifyEvent <= n; {
+				ev := (*unix.InotifyEvent)(unsafe.Pointer(&buf[off]))
+				nameBytes := buf[off+unix.SizeofInotifyEvent : off+unix.SizeofInotifyEvent+int(ev.Len)]
+				if name := string(bytes.TrimRight(nameBytes, "\x00")); name != "" {
+					names = append(names, name)
+				}
+				off += unix.SizeofInotifyEvent + int(ev.Len)
+			}
+		}
+	}
 }
 
 var _ = Describe("openVolumeImage", func() {
@@ -1292,6 +1330,9 @@ var _ = Describe("publishing a new image by link", func() {
 		unlinked []string
 		// The flags of every renameat2 call the specs saw.
 		renames []uint
+		// hooks guards the two lists above, which the race specs fill from
+		// several goroutines.
+		hooks sync.Mutex
 	)
 
 	BeforeEach(func() {
@@ -1306,11 +1347,15 @@ var _ = Describe("publishing a new image by link", func() {
 			IsMountRoot: alwaysMountRoot, Publish: publishLink}
 		unlinked, renames = nil, nil
 
-		savedRename, savedLink, savedUnlink := renameat2Call, linkatCall, unlinkatCall
-		DeferCleanup(func() { renameat2Call, linkatCall, unlinkatCall = savedRename, savedLink, savedUnlink })
+		savedRename, savedLink, savedUnlink, savedFstatat := renameat2Call, linkatCall, unlinkatCall, fstatatCall
+		DeferCleanup(func() {
+			renameat2Call, linkatCall, unlinkatCall, fstatatCall = savedRename, savedLink, savedUnlink, savedFstatat
+		})
 		// Any renameat2 with a flag fails as it does on a kernel NFS mount.
 		renameat2Call = func(olddirfd int, oldpath string, newdirfd int, newpath string, flags uint) error {
+			hooks.Lock()
 			renames = append(renames, flags)
+			hooks.Unlock()
 			if flags != 0 {
 				return unix.EINVAL
 			}
@@ -1319,7 +1364,9 @@ var _ = Describe("publishing a new image by link", func() {
 		// No name is unlinked while this process still has it open, which on
 		// an NFS client would turn the unlink into a silly rename.
 		unlinkatCall = func(dirfd int, name string, flags int) error {
+			hooks.Lock()
 			unlinked = append(unlinked, name)
+			hooks.Unlock()
 			Expect(openPaths()).NotTo(ContainElement(filepath.Join(real, name)), "%s was open when it was unlinked", name)
 			return unix.Unlinkat(dirfd, name, flags)
 		}
@@ -1524,9 +1571,10 @@ var _ = Describe("publishing a new image by link", func() {
 		DeferCleanup(func() { unix.Close(dirfd) })
 		opts.Preallocate = true
 		opts.fallocate = func(fd int, mode uint32, off, length int64) error { return unix.Fallocate(fd, mode, off, length) }
-		// The races call the system calls from several goroutines, so the
-		// specs' recording hooks give way to the real calls.
-		renameat2Call, linkatCall, unlinkatCall = unix.Renameat2, unix.Linkat, unix.Unlinkat
+		// The recording hooks stay in place, so every unlink in the race fails
+		// the spec if any file of this process has the name open. The temp
+		// names are all new, so the sweeps may not open them.
+		opened := watchOpens(dir)
 
 		const launches = 6
 		var wg sync.WaitGroup
@@ -1566,6 +1614,16 @@ var _ = Describe("publishing a new image by link", func() {
 		for i, err := range results {
 			Expect(err).NotTo(HaveOccurred(), "launch %d", i)
 		}
+		opens := map[string]int{}
+		for _, n := range opened() {
+			if tempNamePattern.MatchString(n) {
+				opens[n]++
+			}
+		}
+		Expect(opens).NotTo(BeEmpty())
+		for n, count := range opens {
+			Expect(count).To(Equal(1), "%s was opened by more than the launch that made it", n)
+		}
 		sweepTempImages(dirfd)
 		entries, err := os.ReadDir(dir)
 		Expect(err).NotTo(HaveOccurred())
@@ -1573,6 +1631,155 @@ var _ = Describe("publishing a new image by link", func() {
 		st := statOf(img)
 		Expect(int(st.Nlink)).To(Equal(1))
 		Expect(st.Size).To(Equal(int64(1 << 20)))
+	})
+
+	DescribeTable("fails with the cause, and does not create the image again, when it cannot tell whether the temp name is its file",
+		func(cause unix.Errno) {
+			checks := 0
+			fstatatCall = func(dirfd int, name string, st *unix.Stat_t, flags int) error {
+				if tempNamePattern.MatchString(name) {
+					checks++
+					return cause
+				}
+				return unix.Fstatat(dirfd, name, st, flags)
+			}
+			_, err := open()
+			Expect(errors.Is(err, cause)).To(BeTrue(), "%v", err)
+			Expect(errors.Is(err, errCreateAgain)).To(BeFalse(), "%v", err)
+			Expect(err.Error()).To(ContainSubstring("checking the new file's temp name"))
+			Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+			Expect(checks).To(Equal(1), "one attempt, not eight")
+			Expect(os.ReadDir(dir)).To(BeEmpty(), "the temp file is removed")
+		},
+		Entry("a stale handle", unix.ESTALE),
+		Entry("an I/O error", unix.EIO),
+		Entry("a permission error", unix.EACCES),
+	)
+
+	It("creates the image again when the temp name is gone at the check", func() {
+		first := true
+		fstatatCall = func(dirfd int, name string, st *unix.Stat_t, flags int) error {
+			if first && tempNamePattern.MatchString(name) {
+				first = false
+				Expect(unix.Unlinkat(dirfd, name, 0)).To(Succeed())
+			}
+			return unix.Fstatat(dirfd, name, st, flags)
+		}
+		f, err := open()
+		Expect(err).NotTo(HaveOccurred())
+		defer f.Close()
+		Expect(first).To(BeFalse())
+		Expect(int(statOf(img).Nlink)).To(Equal(1))
+		Expect(tempFiles(dir)).To(BeEmpty())
+	})
+
+	It("creates the image again when another file has taken the temp name, and leaves that file alone", func() {
+		var theirs string
+		fstatatCall = func(dirfd int, name string, st *unix.Stat_t, flags int) error {
+			if theirs == "" && tempNamePattern.MatchString(name) {
+				theirs = filepath.Join(dir, name)
+				Expect(unix.Unlinkat(dirfd, name, 0)).To(Succeed())
+				writeImage(theirs, 4096, []byte("theirs"))
+			}
+			return unix.Fstatat(dirfd, name, st, flags)
+		}
+		f, err := open()
+		Expect(err).NotTo(HaveOccurred())
+		defer f.Close()
+		Expect(os.ReadFile(theirs)).To(HavePrefix("theirs"))
+		Expect(int(statOf(img).Nlink)).To(Equal(1))
+	})
+
+	Describe("when it cannot read the identity of the new file", func() {
+		BeforeEach(func() {
+			opts.identify = func(int) (unix.Statx_t, error) { return unix.Statx_t{}, unix.EIO }
+		})
+
+		It("closes the file, removes the temp name, and fails with the cause", func() {
+			_, err := open()
+			Expect(errors.Is(err, unix.EIO)).To(BeTrue(), "%v", err)
+			Expect(err.Error()).To(ContainSubstring("fstat of the new file"))
+			Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+			Expect(unlinked).To(HaveLen(1), "the temp name was unlinked, after its file was closed")
+			Expect(os.ReadDir(dir)).To(BeEmpty())
+		})
+
+		It("leaves the temp name alone when it is not the empty file this launch created", func() {
+			var theirs string
+			opts.identify = func(fd int) (unix.Statx_t, error) {
+				var err error
+				theirs, err = os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
+				Expect(err).NotTo(HaveOccurred())
+				Expect(os.Remove(theirs)).To(Succeed())
+				writeImage(theirs, 4096, []byte("theirs"))
+				return unix.Statx_t{}, unix.EIO
+			}
+			_, err := open()
+			Expect(errors.Is(err, unix.EIO)).To(BeTrue(), "%v", err)
+			Expect(os.ReadFile(theirs)).To(HavePrefix("theirs"))
+			Expect(unlinked).To(BeEmpty())
+		})
+	})
+
+	Describe("after it published the image", func() {
+		// The unlink leaves the temp name in place, as an NFS client does when
+		// another process of the cell has the name open, and the name goes
+		// after the delay, or never when the delay is negative.
+		leaveSecondLink := func(delay time.Duration) {
+			unlinkatCall = func(dirfd int, name string, flags int) error {
+				if !tempNamePattern.MatchString(name) {
+					return unix.Unlinkat(dirfd, name, flags)
+				}
+				if delay >= 0 {
+					p := filepath.Join(dir, name)
+					time.AfterFunc(delay, func() { _ = unix.Unlink(p) })
+				}
+				return nil
+			}
+		}
+
+		It("waits for the second link to go and then opens the image", func() {
+			leaveSecondLink(35 * time.Millisecond)
+			opts.settleInterval = 10 * time.Millisecond
+			f, err := open()
+			Expect(err).NotTo(HaveOccurred())
+			defer f.Close()
+			Expect(int(statOf(img).Nlink)).To(Equal(1))
+			Expect(tempFiles(dir)).To(BeEmpty())
+		})
+
+		It("refuses the image with its link count when the second link stays, after a bounded wait", func() {
+			leaveSecondLink(-1)
+			opts.settleInterval = 5 * time.Millisecond
+			start := time.Now()
+			_, err := open()
+			Expect(errors.Is(err, errImageLinks)).To(BeTrue(), "%v", err)
+			Expect(err.Error()).To(ContainSubstring("has 2 links, want 1"))
+			Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+			Expect(time.Since(start)).To(BeNumerically("<", 5*time.Second))
+			Expect(int(statOf(img).Nlink)).To(Equal(2), "the image is left as it is")
+		})
+
+		It("stops waiting at a signal", func() {
+			leaveSecondLink(-1)
+			opts.settleInterval = time.Minute
+			sigs := make(chan os.Signal, 1)
+			sigs <- syscall.SIGTERM
+			_, err := openVolumeImage(vol, opts, sigs)
+			Expect(stepExitCode(err)).To(Equal(128 + int(syscall.SIGTERM)))
+		})
+
+		It("does not wait for an image that another launch published, which has two links", func() {
+			opts.settleInterval = time.Minute
+			opts.afterTempCreate = func(_ int, _ string) {
+				writeImage(img, 1<<20, nil)
+				Expect(os.Link(img, filepath.Join(dir, "elsewhere"))).To(Succeed())
+			}
+			start := time.Now()
+			_, err := open()
+			Expect(errors.Is(err, errImageLinks)).To(BeTrue(), "%v", err)
+			Expect(time.Since(start)).To(BeNumerically("<", 5*time.Second))
+		})
 	})
 
 	Describe("sweepTempImages", func() {
@@ -1592,17 +1799,52 @@ var _ = Describe("publishing a new image by link", func() {
 
 		It("removes a temp file of a launch that was killed before it published", func() {
 			writeImage(filepath.Join(dir, orphan), 1<<20, []byte("orphan"))
+			ageTemp(filepath.Join(dir, orphan))
 			sweepTempImages(dirfd)
 			Expect(fileExists(filepath.Join(dir, orphan))).To(BeFalse())
+		})
+
+		It("leaves a temp file with one link that changed within the orphan age, without opening it", func() {
+			p := filepath.Join(dir, orphan)
+			writeImage(p, 1<<20, []byte("live"))
+			recent := time.Now().Add(-tempOrphanAge + 20*time.Second)
+			Expect(os.Chtimes(p, recent, recent)).To(Succeed())
+			opened := watchOpens(dir)
+
+			sweepTempImages(dirfd)
+
+			Expect(opened()).NotTo(ContainElement(orphan), "a young temp name is a live launch's, and a launch unlinks it")
+			Expect(os.ReadFile(p)).To(HavePrefix("live"))
+		})
+
+		It("leaves a temp file whose modification time is in the future", func() {
+			p := filepath.Join(dir, orphan)
+			writeImage(p, 1<<20, []byte("skewed"))
+			future := time.Now().Add(time.Hour)
+			Expect(os.Chtimes(p, future, future)).To(Succeed())
+			sweepTempImages(dirfd)
+			Expect(os.ReadFile(p)).To(HavePrefix("skewed"))
+		})
+
+		It("removes an old temp file after it opened the name for the lock only", func() {
+			p := filepath.Join(dir, orphan)
+			writeImage(p, 1<<20, []byte("orphan"))
+			ageTemp(p)
+			opened := watchOpens(dir)
+			sweepTempImages(dirfd)
+			Expect(opened()).To(Equal([]string{orphan}), "one open, to try the lock")
+			Expect(fileExists(p)).To(BeFalse())
 		})
 
 		It("removes the second name of a published image and leaves the image whole", func() {
 			writeImage(img, 1<<20, []byte("image"))
 			Expect(os.Link(img, filepath.Join(dir, second))).To(Succeed())
 			before := statOf(img)
+			opened := watchOpens(dir)
 
 			sweepTempImages(dirfd)
 
+			Expect(opened()).NotTo(ContainElement(second), "a second name is removed without being opened")
 			Expect(fileExists(filepath.Join(dir, second))).To(BeFalse())
 			after := statOf(img)
 			Expect(after.Ino).To(Equal(before.Ino))
@@ -1614,6 +1856,7 @@ var _ = Describe("publishing a new image by link", func() {
 		It("never touches the published image when only its temp name is an orphan", func() {
 			writeImage(img, 1<<20, []byte("image"))
 			writeImage(filepath.Join(dir, orphan), 1<<20, []byte("orphan"))
+			ageTemp(filepath.Join(dir, orphan))
 			before := statOf(img)
 			sweepTempImages(dirfd)
 			Expect(statOf(img).Ino).To(Equal(before.Ino))
@@ -1624,6 +1867,7 @@ var _ = Describe("publishing a new image by link", func() {
 		It("leaves a temp file that a live launch has locked, and removes it once the lock is gone", func() {
 			p := filepath.Join(dir, orphan)
 			writeImage(p, 1<<20, []byte("live"))
+			ageTemp(p)
 			holder, err := os.OpenFile(p, os.O_RDWR, 0)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(unix.Flock(int(holder.Fd()), unix.LOCK_EX)).To(Succeed())
@@ -1638,6 +1882,7 @@ var _ = Describe("publishing a new image by link", func() {
 
 		It("closes a name before it unlinks it", func() {
 			writeImage(filepath.Join(dir, orphan), 1<<20, nil)
+			ageTemp(filepath.Join(dir, orphan))
 			writeImage(img, 1<<20, nil)
 			Expect(os.Link(img, filepath.Join(dir, second))).To(Succeed())
 			sweepTempImages(dirfd)
@@ -1648,6 +1893,7 @@ var _ = Describe("publishing a new image by link", func() {
 			func(name string) {
 				p := filepath.Join(dir, name)
 				writeImage(p, 4096, []byte("keep"))
+				ageTemp(p)
 				sweepTempImages(dirfd)
 				Expect(os.ReadFile(p)).To(HavePrefix("keep"))
 			},
@@ -1687,6 +1933,7 @@ var _ = Describe("publishing a new image by link", func() {
 			}
 			p := filepath.Join(dir, orphan)
 			writeImage(p, 4096, []byte("theirs"))
+			ageTemp(p)
 			Expect(os.Chown(p, 12345, 12345)).To(Succeed())
 			sweepTempImages(dirfd)
 			Expect(os.ReadFile(p)).To(HavePrefix("theirs"))
@@ -1700,6 +1947,7 @@ var _ = Describe("publishing a new image by link", func() {
 		It("is not run for the rename publish, which leaves a temp file from a killed launch alone", func() {
 			p := filepath.Join(dir, orphan)
 			writeImage(p, 4096, []byte("stale"))
+			ageTemp(p)
 			opts.Publish = publishRename
 			renameat2Call = unix.Renameat2
 			f, err := open()
@@ -1711,6 +1959,7 @@ var _ = Describe("publishing a new image by link", func() {
 		It("is run by a launch, so that a leftover temp file does not outlive the next one", func() {
 			p := filepath.Join(dir, orphan)
 			writeImage(p, 1<<20, []byte("stale"))
+			ageTemp(p)
 			f, err := open()
 			Expect(err).NotTo(HaveOccurred())
 			defer f.Close()
