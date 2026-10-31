@@ -20,9 +20,11 @@ import (
 // quietly gets a private disk. A volume that does not ask for a share is
 // never looked at here and stays private.
 //
-// This file only decides and records the grant. Starting virtiofsd and giving
-// QEMU its vhost-user device are other code's work, and they read the
-// shareGrants that grantShares returns.
+// This file decides and records the grant. A granted volume gets no image,
+// because preparedVolumes.prepare skips it. virtiofsd.go starts one virtiofsd
+// for it, and QEMU is to reach that virtiofsd over a vhost-user socket. Until
+// QEMU has that device and the guest mounts the share, refuseUnservedShares
+// ends a launch that holds a grant before anything starts.
 
 // allowVolumeSharesFlag names the vm-launch flag with which the operator
 // allows shares on this cell. Without it every share is refused.
@@ -34,15 +36,22 @@ const shareTagPrefix = "rvm-vol"
 
 // shareGrant is one share that grantShares allowed.
 type shareGrant struct {
-	// Index is the volume's position among the app's volumes, the N of
-	// RVM_VOLn and of the drive ID vol N.
+	// Index is the volume index: the volume's position among all of the
+	// app's volumes in path order, shares and private volumes alike. It is
+	// the N of RVM_VOLn and of the tag rvm-volN, and grantShares takes it
+	// from selectedVolume.Index, never from a place in a shorter list. A
+	// private volume beside a share keeps its own index, so with an image at
+	// index 0 and a share at index 1, the share's tag is rvm-vol1.
 	Index int
-	// Path is the volume's container_dir, which the guest mounts the share
-	// at.
+	// Path is the volume's container_dir. It is both the directory that the
+	// guest mounts the share at and the directory that virtiofsd serves,
+	// because virtiofsd runs in the container's mount namespace, where the
+	// volume is bound at that path.
 	Path string
-	// Dir is the host directory the share serves, which is the volume path
-	// the provider's mount check inspected.
-	Dir string
+	// Mount is the record of the mount that holds Path, as
+	// findVolumeProvider found it. checkShareMount compares the directory
+	// with it again just before virtiofsd starts.
+	Mount mountRecord
 	// Tag is the virtiofs tag the guest mounts by.
 	Tag string
 	// Provider names the volume service behind the share.
@@ -62,7 +71,7 @@ func shareTag(index int) string { return fmt.Sprintf("%s%d", shareTagPrefix, ind
 // volume asks for a share.
 func grantShares(kind backend.Kind, operatorAllows bool, selected []selectedVolume) ([]shareGrant, error) {
 	var grants []shareGrant
-	for i, v := range selected {
+	for _, v := range selected {
 		if v.Volume.Settings.Mode != volumeShare {
 			continue
 		}
@@ -79,10 +88,10 @@ func grantShares(kind backend.Kind, operatorAllows bool, selected []selectedVolu
 				volumeSettingsEnv, path, modeNameShare)
 		}
 		grants = append(grants, shareGrant{
-			Index:    i,
+			Index:    v.Index,
 			Path:     v.Volume.ContainerDir,
-			Dir:      v.Volume.ContainerDir,
-			Tag:      shareTag(i),
+			Mount:    v.Mount,
+			Tag:      shareTag(v.Index),
 			Provider: v.Provider.Name(),
 		})
 	}
@@ -106,15 +115,25 @@ func describeVolume(p diskProvider) string {
 	return "a " + p.Name() + " volume"
 }
 
-// refuseUnservedShares refuses a launch that holds any grant. A granted share
-// is decided but not yet served: nothing starts virtiofsd or hands QEMU a
-// vhost-user device, and the volume would otherwise get a private image in
-// place of the directory the app expects every instance to share. When the
-// code that serves shares lands, this call and this function go.
+// shareModeServed reports whether this vm-launch gives a granted share to the
+// guest. Serving a share takes three parts. virtiofsd serves the directory
+// (see virtiofsd.go), QEMU gets a vhost-user-fs device on each share's
+// socket, and the guest mounts each share by its tag. Only the first part is
+// built, so a granted share would boot a guest with no device for it, and
+// the app would write to the guest's own root, which the next start throws
+// away. The value stays false until the other two parts land, and the
+// change that lands them deletes it and refuseUnservedShares. Specs set it
+// to run the virtiofsd lifecycle through run.
+var shareModeServed = false
+
+// refuseUnservedShares refuses a launch that holds any grant while
+// shareModeServed is false. run calls it after grantShares and checkVirtiofsd,
+// so a refused or misconfigured share keeps its own line, and before CredHub,
+// the work directory, and any virtiofsd.
 func refuseUnservedShares(grants []shareGrant) error {
-	if len(grants) == 0 {
+	if len(grants) == 0 || shareModeServed {
 		return nil
 	}
-	return fmt.Errorf("%s %s is granted a share, but this vm-launch cannot serve shares yet; the volume would get a private disk instead",
+	return fmt.Errorf("%s %s is granted a share, but this vm-launch does not serve share mode yet, because the hypervisor's virtiofs device and the guest's mount of the share come in a later release; the app would otherwise write to the guest's own disk",
 		volumeSettingsEnv, quoteForLog(grants[0].Path))
 }

@@ -921,6 +921,11 @@ type supervisor struct {
 	// anything else. vm-launch uses it to close its copies of the files the
 	// hypervisor inherited.
 	started func()
+	// reaped, when set, runs as soon as the hypervisor has been reaped, in
+	// the goroutine that reaped it, and before the supervisor flushes the
+	// guest's last output. vm-launch uses it to tell the share servers at
+	// once that QEMU is gone. It must not block.
+	reaped func()
 	// listen, when set, gets the guest's listen lines (see serialFilter). It
 	// must not block.
 	listen func(port int, up bool)
@@ -1006,7 +1011,11 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 		// The filter writes to the queue, which never blocks, so this reads
 		// the console as fast as the guest writes it.
 		_, copyErr := io.Copy(filter, serial)
-		done <- ended{copyErr: copyErr, waitErr: cmd.Wait()}
+		waitErr := cmd.Wait()
+		if s.reaped != nil {
+			s.reaped()
+		}
+		done <- ended{copyErr: copyErr, waitErr: waitErr}
 	}()
 
 	var res runResult

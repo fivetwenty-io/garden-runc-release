@@ -370,6 +370,9 @@ func findVolumeProvider(mountinfo, dir string) (diskProvider, mountRecord, error
 // selectedVolume is a volume with the provider that owns it and the mount
 // behind it, as findVolumeProviders found them.
 type selectedVolume struct {
+	// Index is the volume index, the volume's position among all of the
+	// app's volumes in path order, shares included (see shareGrant.Index).
+	Index    int
 	Volume   guestVolume
 	Provider diskProvider
 	Mount    mountRecord
@@ -388,7 +391,7 @@ type selectedVolume struct {
 // mounts, and fails with the in-use line.
 func findVolumeProviders(mountinfo string, vols []guestVolume) ([]selectedVolume, error) {
 	selected := make([]selectedVolume, 0, len(vols))
-	for _, v := range vols {
+	for i, v := range vols {
 		p, m, err := findVolumeProvider(mountinfo, v.ContainerDir)
 		if err != nil {
 			return nil, err
@@ -399,13 +402,17 @@ func findVolumeProviders(mountinfo string, vols []guestVolume) ([]selectedVolume
 					quoteForLog(prev.Volume.ContainerDir), quoteForLog(v.ContainerDir), m.Major, m.Minor, quoteForLog(m.Root))
 			}
 		}
-		selected = append(selected, selectedVolume{Volume: v, Provider: p, Mount: m})
+		selected = append(selected, selectedVolume{Index: i, Volume: v, Provider: p, Mount: m})
 	}
 	return selected, nil
 }
 
 // preparedVolume is a volume whose provider prepared its disk.
 type preparedVolume struct {
+	// Index is the volume index of the volume (see selectedVolume.Index),
+	// which a share before it in path order keeps from being its position
+	// among the prepared volumes.
+	Index      int
 	Path       string
 	Attachment *attachment
 	// Bytes is the size of the disk, which stage 1 checks the drive against:
@@ -416,17 +423,18 @@ type preparedVolume struct {
 	dev, ino uint64
 }
 
-// preparedVolumes are the volumes of one launch, in volume order. Their
-// attachments stay fenced until release.
+// preparedVolumes are the private volumes of one launch, in volume order,
+// without the shares among them. Their attachments stay fenced until release.
 type preparedVolumes []preparedVolume
 
 // prepare asks v's provider for its disk, in the mode privateMode picks from
-// the provider's capabilities, and adds it. An instance index at or above the
-// provider's MaxInstances is refused first, without calling Prepare
-// (checkInstanceLimit). The attachment must be in that
-// mode, and its file must be what the mode says: a regular file in
-// file-image mode and a block device in block mode, whose size comes from
-// the device itself.
+// the provider's capabilities, and adds it. A share is skipped: its provider
+// is not asked, and nothing is added. A size setting on a block volume is
+// refused first (refuseBlockSize), and so is an instance index at or above
+// the provider's MaxInstances (checkInstanceLimit), both without calling
+// Prepare. The attachment must be in that mode, and its file must be what
+// the mode says: a regular file in file-image mode and a block device in
+// block mode, whose size comes from the device itself.
 // An attachment without a usable disk is refused and cleaned up (see
 // checkAttachment), and so is a disk that an earlier volume already holds
 // open. The provider gets a BeforeLock function that makes this refusal before
@@ -442,11 +450,21 @@ type preparedVolumes []preparedVolume
 // hand back what it built along with the error. The volumes added before
 // keep their fences, and the caller releases them too.
 func (pv *preparedVolumes) prepare(v selectedVolume, signals <-chan os.Signal, budget *lockBudget, logger *log.Logger) (*attachment, error) {
+	// A share has no image: its directory is served by virtiofsd (see
+	// virtiofsd.go). Asking its provider for a disk would give the instance
+	// a private image in place of the directory that every instance shares,
+	// so the provider is never asked.
+	if v.Volume.Settings.Mode == volumeShare {
+		return nil, nil
+	}
 	caps := v.Provider.Capabilities(v.Mount)
 	mode := privateMode(caps)
 	if err := refuseBlockSize(v); err != nil {
 		return nil, err
 	}
+	// v.Volume.Index is the app instance's index, which the instance limit
+	// and the provider read. v.Index is the volume index (see
+	// selectedVolume.Index), which is a different number.
 	if err := checkInstanceLimit(v.Provider, caps, v.Volume.ContainerDir, mode, v.Volume.Index); err != nil {
 		return nil, err
 	}
@@ -498,7 +516,7 @@ func (pv *preparedVolumes) prepare(v selectedVolume, signals <-chan os.Signal, b
 	if err := pv.checkNotHeld(v.Volume.ContainerDir, dev, ino); err != nil {
 		return att, err
 	}
-	*pv = append(*pv, preparedVolume{Path: v.Volume.ContainerDir, Attachment: att, Bytes: size, dev: dev, ino: ino})
+	*pv = append(*pv, preparedVolume{Index: v.Index, Path: v.Volume.ContainerDir, Attachment: att, Bytes: size, dev: dev, ino: ino})
 	return nil, nil
 }
 

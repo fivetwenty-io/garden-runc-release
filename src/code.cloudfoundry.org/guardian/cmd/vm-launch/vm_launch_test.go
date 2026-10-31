@@ -49,6 +49,9 @@ func TestMain(m *testing.M) {
 	if os.Getenv(helperUndumpable) != "" {
 		os.Exit(undumpable())
 	}
+	if os.Getenv(helperShareRun) != "" {
+		os.Exit(shareRun(os.Args[1:]))
+	}
 	markUndumpable = func() error { return nil }
 	os.Exit(m.Run())
 }
