@@ -236,6 +236,7 @@ func (cmd *ServerCommand) Run(signals <-chan os.Signal, ready chan<- struct{}) e
 	}
 
 	backend := cmd.createGardener(wiring)
+	cmd.wiredBackends.startVMStackWarmUp()
 
 	var listenNetwork, listenAddr string
 	if cmd.Server.BindIP != nil {

@@ -45,6 +45,7 @@ import (
 	"code.cloudfoundry.org/guardian/rundmc/stopper"
 	"code.cloudfoundry.org/guardian/rundmc/users"
 	"code.cloudfoundry.org/guardian/sysinfo"
+	"code.cloudfoundry.org/guardian/vmstack"
 	"code.cloudfoundry.org/lager/v3"
 	"code.cloudfoundry.org/localip"
 	"github.com/eapache/go-resiliency/retrier"
@@ -208,13 +209,16 @@ type CommonCommand struct {
 	} `group:"Containerd"`
 
 	ExecutionBackends struct {
-		Enabled             []string `long:"execution-backend" description:"Execution backend to enable: oci-gvisor, vm-qemu, or vm-firecracker. oci-runc is always enabled. Can be specified multiple times. Cannot be combined with an alternative --containerd-runtime-type."`
-		VMArtifactsDir      string   `long:"vm-artifacts-dir" default:"/var/vcap/data/vm-runtime/artifacts" description:"Host directory with the VM kernels and hypervisors, bound read-only into vm-* containers at /opt/garden-vm/artifacts."`
-		VMLaunchBin         string   `long:"vm-launch-bin" description:"Host path of the static vm-launch binary, bound read-only into vm-* containers at /opt/garden-vm/vm-launch. Required when a vm-* backend is enabled."`
-		VMKVMGid            uint32   `long:"vm-kvm-gid" description:"Host gid that owns /dev/kvm, added to the vm-launch process. Resolved from the host kvm group when not set."`
-		VMBlockVolumes      bool     `long:"vm-block-volumes" description:"Give a vm-* container the block device named by each bind mount whose source is a read-only pdi: descriptor tmpfs, as a root:kvm 0660 node at /dev/pdi/MAJOR-MINOR with a read-write device cgroup rule. A device that is the wrong size, mounted, held, or busy on the host refuses the container. The descriptor bind mount must be read-write. Off by default."`
-		VMVolumeShares      bool     `long:"vm-volume-shares" description:"Let an app on a vm-qemu container ask for a volume as a share in VM_VOLUMES. Garden passes --allow-volume-shares and the virtiofsd wrapper's path to vm-launch. Off by default, and a share is refused on vm-firecracker whatever its value."`
-		VMVolumeAsyncMounts bool     `long:"vm-volume-async-mounts" description:"Mount a journalled ext4 image volume of a vm-* container without sync and dirsync, which vm-launch otherwise uses. A legacy ext2 image without a journal keeps them. Garden passes --volume-sync-mounts=false to vm-launch only when this is set. Off by default."`
+		Enabled             []string      `long:"execution-backend" description:"Execution backend to enable: oci-gvisor, vm-qemu, or vm-firecracker. oci-runc is always enabled. Can be specified multiple times. Cannot be combined with an alternative --containerd-runtime-type."`
+		VMArtifactsDir      string        `long:"vm-artifacts-dir" default:"/var/vcap/data/vm-runtime/artifacts" description:"Host directory with the VM kernels and hypervisors, bound read-only into vm-* containers at /opt/garden-vm/artifacts."`
+		VMLaunchBin         string        `long:"vm-launch-bin" description:"Host path of the static vm-launch binary, bound read-only into vm-* containers at /opt/garden-vm/vm-launch. Required when a vm-* backend is enabled."`
+		VMKVMGid            uint32        `long:"vm-kvm-gid" description:"Host gid that owns /dev/kvm, added to the vm-launch process. Resolved from the host kvm group when not set."`
+		VMBlockVolumes      bool          `long:"vm-block-volumes" description:"Give a vm-* container the block device named by each bind mount whose source is a read-only pdi: descriptor tmpfs, as a root:kvm 0660 node at /dev/pdi/MAJOR-MINOR with a read-write device cgroup rule. A device that is the wrong size, mounted, held, or busy on the host refuses the container. The descriptor bind mount must be read-write. Off by default."`
+		VMVolumeShares      bool          `long:"vm-volume-shares" description:"Let an app on a vm-qemu container ask for a volume as a share in VM_VOLUMES. Garden passes --allow-volume-shares and the virtiofsd wrapper's path to vm-launch. Off by default, and a share is refused on vm-firecracker whatever its value."`
+		VMVolumeAsyncMounts bool          `long:"vm-volume-async-mounts" description:"Mount a journalled ext4 image volume of a vm-* container without sync and dirsync, which vm-launch otherwise uses. A legacy ext2 image without a journal keeps them. Garden passes --volume-sync-mounts=false to vm-launch only when this is set. Off by default."`
+		VMStackTarballs     []string      `long:"vm-stack-tarball" description:"Absolute path of a stack rootfs tarball to turn into a read-only squashfs image for vm-* containers, such as /var/vcap/packages/cflinuxfs4/rootfs.tar. A VM container whose rootfs is a listed tarball gets the image bound read-only at /opt/garden-vm/stack. Requires a vm-* backend. Can be specified multiple times."`
+		VMStackCacheDir     string        `long:"vm-stack-cache-dir" default:"/var/vcap/data/vm-runtime/stacks" description:"Host directory that caches the stack images, one directory for each tarball digest."`
+		VMStackWait         time.Duration `long:"vm-stack-wait" default:"20s" description:"How long a VM container create waits for a stack image that is still being built. When it is not ready in that time the container is created without it."`
 	} `group:"Execution Backends"`
 
 	CPUThrottling struct {
@@ -246,6 +250,7 @@ type commandWiring struct {
 	CpuEntitlementPerShare          float64
 	ContainerNetworkMetricsProvider gardener.ContainerNetworkMetricsProvider
 	Backends                        *backend.Registry
+	VMStacks                        *vmstack.Builder
 }
 
 func (cmd *CommonCommand) createGardener(wiring *commandWiring) *gardener.Gardener {
@@ -264,6 +269,9 @@ func (cmd *CommonCommand) createGardener(wiring *commandWiring) *gardener.Garden
 		wiring.ContainerNetworkMetricsProvider,
 	)
 	gdnr.Backends = wiring.Backends
+	if wiring.VMStacks != nil {
+		gdnr.VMStacks = wiring.VMStacks
+	}
 
 	return gdnr
 }
@@ -366,6 +374,7 @@ func (cmd *CommonCommand) createWiring(logger lager.Logger, metricsProvider *met
 		CpuEntitlementPerShare:          cpuEntitlementPerShare,
 		ContainerNetworkMetricsProvider: factory.WireContainerNetworkMetricsProvider(containerizer, propManager),
 		Backends:                        backends.registry,
+		VMStacks:                        backends.vmStacks,
 	}, nil
 }
 
@@ -853,6 +862,10 @@ type executionBackends struct {
 	// volumes on left claimed, when blockVolumes is nil. It is nil when no
 	// claim directory exists.
 	blockReleaser *bundlerules.PDIDevices
+
+	// vmStacks builds the stack images of VM containers. It is nil unless
+	// --vm-stack-tarball is set and a vm-* backend is enabled.
+	vmStacks *vmstack.Builder
 }
 
 // releaser returns the step that releases claimed block devices, or nil.
@@ -956,6 +969,10 @@ func (cmd *CommonCommand) wireExecutionBackends(log lager.Logger) (*executionBac
 		}
 	}
 
+	if err := cmd.checkVMStackFlags(kinds); err != nil {
+		return nil, err
+	}
+
 	if len(kinds) == 0 {
 		cmd.logUnusedBlockVolumes(log)
 		cmd.logUnusedVolumeFlags(log)
@@ -1024,9 +1041,60 @@ func (cmd *CommonCommand) wireExecutionBackends(log lager.Logger) (*executionBac
 		cmd.logUnusedVolumeFlags(log)
 	}
 
-	log.Info("enabled", lager.Data{"backends": kinds, "kvm-gid": kvmGid, "block-volumes": blockVolumes != nil, "vm-launch-flags": vmLaunchFlags})
+	var vmStacks *vmstack.Builder
+	if kvmGid != 0 && len(cmd.ExecutionBackends.VMStackTarballs) > 0 {
+		vmStacks = vmstack.New(vmstack.Config{
+			Sqfstar:  filepath.Join(cmd.ExecutionBackends.VMArtifactsDir, "sqfstar"),
+			CacheDir: cmd.ExecutionBackends.VMStackCacheDir,
+			Tarballs: cmd.ExecutionBackends.VMStackTarballs,
+			Wait:     cmd.ExecutionBackends.VMStackWait,
+			Logger:   log.Session("vm-stack"),
+		})
+	}
 
-	return &executionBackends{registry: registry, kvmGid: kvmGid, blockVolumes: blockVolumes, vmLaunchFlags: vmLaunchFlags}, nil
+	log.Info("enabled", lager.Data{"backends": kinds, "kvm-gid": kvmGid, "block-volumes": blockVolumes != nil, "vm-launch-flags": vmLaunchFlags, "vm-stacks": vmStacks != nil})
+
+	return &executionBackends{registry: registry, kvmGid: kvmGid, blockVolumes: blockVolumes, vmLaunchFlags: vmLaunchFlags, vmStacks: vmStacks}, nil
+}
+
+// checkVMStackFlags refuses stack flags that cannot work: a tarball without a
+// vm-* backend to use it, a tarball path that is not absolute, and a negative
+// wait.
+func (cmd *CommonCommand) checkVMStackFlags(kinds []backend.Kind) error {
+	tarballs := cmd.ExecutionBackends.VMStackTarballs
+	if len(tarballs) == 0 {
+		return nil
+	}
+
+	vmEnabled := false
+	for _, kind := range kinds {
+		vmEnabled = vmEnabled || backend.IsVM(kind)
+	}
+	if !vmEnabled {
+		return errors.New("--vm-stack-tarball requires a vm-* --execution-backend, because only a VM container gets a stack image")
+	}
+	for _, tarball := range tarballs {
+		if !filepath.IsAbs(tarball) {
+			return fmt.Errorf("--vm-stack-tarball must be an absolute path, got %q", tarball)
+		}
+	}
+	if cmd.ExecutionBackends.VMStackWait < 0 {
+		return fmt.Errorf("--vm-stack-wait must not be negative, got %s", cmd.ExecutionBackends.VMStackWait)
+	}
+	return nil
+}
+
+// startVMStackWarmUp builds the stack images and then removes the stale ones in
+// the background, so that Garden's start and its ping never wait for a build.
+// It does nothing when no stack builder is configured.
+func (b *executionBackends) startVMStackWarmUp() {
+	if b == nil || b.vmStacks == nil {
+		return
+	}
+	go func() {
+		b.vmStacks.WarmUp()
+		b.vmStacks.Clean()
+	}()
 }
 
 // logUnusedBlockVolumes notes that --vm-block-volumes has no effect because no

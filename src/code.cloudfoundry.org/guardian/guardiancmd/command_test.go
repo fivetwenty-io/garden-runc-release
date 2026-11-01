@@ -6,6 +6,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"code.cloudfoundry.org/guardian/backend"
 	"code.cloudfoundry.org/guardian/rundmc"
@@ -829,6 +830,160 @@ var _ = Describe("execution backend flags", func() {
 
 			gdnr := cmd.createGardener(&commandWiring{Logger: log, Backends: backends.registry})
 			Expect(gdnr.Backends).To(BeNil())
+		})
+	})
+})
+
+var _ = Describe("VM stack flags", func() {
+	var (
+		cmd         *CommonCommand
+		log         *lagertest.TestLogger
+		launchBin   string
+		originalGrp func(string) (*user.Group, error)
+	)
+
+	BeforeEach(func() {
+		log = lagertest.NewTestLogger("vm-stack")
+		cmd = &CommonCommand{}
+
+		launchBin = filepath.Join(GinkgoT().TempDir(), "vm-launch")
+		Expect(os.WriteFile(launchBin, []byte("#!/bin/sh\n"), 0o755)).To(Succeed())
+
+		originalGrp = lookupKVMGroup
+		lookupKVMGroup = func(name string) (*user.Group, error) {
+			return &user.Group{Name: name, Gid: "993"}, nil
+		}
+	})
+
+	AfterEach(func() {
+		lookupKVMGroup = originalGrp
+	})
+
+	Describe("flag parsing", func() {
+		It("has no tarballs and the documented defaults when no flag is given", func() {
+			parsed := &CommonCommand{}
+			_, err := flags.NewParser(parsed, flags.None).ParseArgs([]string{})
+			if err != nil {
+				Skip("host lacks a default binary: " + err.Error())
+			}
+
+			Expect(parsed.ExecutionBackends.VMStackTarballs).To(BeEmpty())
+			Expect(parsed.ExecutionBackends.VMStackCacheDir).To(Equal("/var/vcap/data/vm-runtime/stacks"))
+			Expect(parsed.ExecutionBackends.VMStackWait).To(Equal(20 * time.Second))
+		})
+
+		It("accepts every stack flag, with --vm-stack-tarball repeatable", func() {
+			parsed := &CommonCommand{}
+			_, err := flags.NewParser(parsed, flags.IgnoreUnknown).ParseArgs([]string{
+				"--vm-stack-tarball", "/var/vcap/packages/cflinuxfs4/rootfs.tar",
+				"--vm-stack-tarball", "/var/vcap/packages/cflinuxfs3/rootfs.tar",
+				"--vm-stack-cache-dir", "/cache",
+				"--vm-stack-wait", "5s",
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(parsed.ExecutionBackends.VMStackTarballs).To(Equal([]string{
+				"/var/vcap/packages/cflinuxfs4/rootfs.tar",
+				"/var/vcap/packages/cflinuxfs3/rootfs.tar",
+			}))
+			Expect(parsed.ExecutionBackends.VMStackCacheDir).To(Equal("/cache"))
+			Expect(parsed.ExecutionBackends.VMStackWait).To(Equal(5 * time.Second))
+		})
+
+		It("parses the lines that the garden job renders", func() {
+			ini := filepath.Join(GinkgoT().TempDir(), "config.ini")
+			Expect(os.WriteFile(ini, []byte("[server]\n  vm-stack-tarball = /a/rootfs.tar\n  vm-stack-tarball = /b/rootfs.tar\n  vm-stack-wait = 5s\n"), 0o644)).To(Succeed())
+
+			gdn := &GdnCommand{ServerCommand: &ServerCommand{CommonCommand: &CommonCommand{}}}
+			parser := flags.NewParser(gdn, flags.IgnoreUnknown)
+			parser.NamespaceDelimiter = "-"
+			Expect(flags.NewIniParser(parser).ParseFile(ini)).To(Succeed())
+
+			parsed := gdn.ServerCommand.ExecutionBackends
+			Expect(parsed.VMStackTarballs).To(Equal([]string{"/a/rootfs.tar", "/b/rootfs.tar"}))
+			Expect(parsed.VMStackWait).To(Equal(5 * time.Second))
+		})
+	})
+
+	Describe("wireExecutionBackends", func() {
+		It("leaves the stack builder nil when no tarball flag is given", func() {
+			cmd.ExecutionBackends.Enabled = []string{"vm-qemu"}
+			cmd.ExecutionBackends.VMLaunchBin = launchBin
+
+			backends, err := cmd.wireExecutionBackends(log)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(backends.vmStacks).To(BeNil())
+			Expect(cmd.createGardener(&commandWiring{Logger: log, Backends: backends.registry, VMStacks: backends.vmStacks}).VMStacks).To(BeNil())
+		})
+
+		It("builds a stack builder for a tarball flag with vm-qemu", func() {
+			cmd.ExecutionBackends.Enabled = []string{"vm-qemu"}
+			cmd.ExecutionBackends.VMLaunchBin = launchBin
+			cmd.ExecutionBackends.VMStackTarballs = []string{"/var/vcap/packages/cflinuxfs4/rootfs.tar"}
+			cmd.ExecutionBackends.VMStackCacheDir = GinkgoT().TempDir()
+			cmd.ExecutionBackends.VMStackWait = 20 * time.Second
+
+			backends, err := cmd.wireExecutionBackends(log)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(backends.vmStacks).NotTo(BeNil())
+			gdnr := cmd.createGardener(&commandWiring{Logger: log, Backends: backends.registry, VMStacks: backends.vmStacks})
+			Expect(gdnr.VMStacks).NotTo(BeNil())
+		})
+
+		It("fails with a named error for a tarball flag and no backend", func() {
+			cmd.ExecutionBackends.VMStackTarballs = []string{"/var/vcap/packages/cflinuxfs4/rootfs.tar"}
+
+			_, err := cmd.wireExecutionBackends(log)
+			Expect(err).To(MatchError(ContainSubstring("--vm-stack-tarball requires a vm-* --execution-backend")))
+		})
+
+		It("fails for a tarball flag with only oci-gvisor", func() {
+			cmd.ExecutionBackends.Enabled = []string{"oci-gvisor"}
+			cmd.Containerd.Socket = "/run/containerd.sock"
+			cmd.ExecutionBackends.VMStackTarballs = []string{"/var/vcap/packages/cflinuxfs4/rootfs.tar"}
+
+			_, err := cmd.wireExecutionBackends(log)
+			Expect(err).To(MatchError(ContainSubstring("--vm-stack-tarball requires a vm-* --execution-backend")))
+		})
+
+		It("fails for a relative tarball path", func() {
+			cmd.ExecutionBackends.Enabled = []string{"vm-qemu"}
+			cmd.ExecutionBackends.VMLaunchBin = launchBin
+			cmd.ExecutionBackends.VMStackTarballs = []string{"rootfs.tar"}
+
+			_, err := cmd.wireExecutionBackends(log)
+			Expect(err).To(MatchError(ContainSubstring("--vm-stack-tarball must be an absolute path")))
+		})
+
+		It("fails for a negative wait", func() {
+			cmd.ExecutionBackends.Enabled = []string{"vm-qemu"}
+			cmd.ExecutionBackends.VMLaunchBin = launchBin
+			cmd.ExecutionBackends.VMStackTarballs = []string{"/var/vcap/packages/cflinuxfs4/rootfs.tar"}
+			cmd.ExecutionBackends.VMStackWait = -time.Second
+
+			_, err := cmd.wireExecutionBackends(log)
+			Expect(err).To(MatchError(ContainSubstring("--vm-stack-wait must not be negative")))
+		})
+	})
+
+	Describe("startVMStackWarmUp", func() {
+		It("does nothing without a builder", func() {
+			var backends *executionBackends
+			backends.startVMStackWarmUp()
+			(&executionBackends{}).startVMStackWarmUp()
+		})
+
+		It("warms up in the background and returns at once", func() {
+			cmd.ExecutionBackends.Enabled = []string{"vm-qemu"}
+			cmd.ExecutionBackends.VMLaunchBin = launchBin
+			cmd.ExecutionBackends.VMStackTarballs = []string{filepath.Join(GinkgoT().TempDir(), "missing-rootfs.tar")}
+			cmd.ExecutionBackends.VMStackCacheDir = GinkgoT().TempDir()
+
+			backends, err := cmd.wireExecutionBackends(log)
+			Expect(err).NotTo(HaveOccurred())
+
+			backends.startVMStackWarmUp()
+			Eventually(log).Should(gbytes.Say("tarball-unavailable"))
 		})
 	})
 })
