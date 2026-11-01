@@ -39,9 +39,11 @@ while :; do /bin/busybox sleep 1; done
 `
 
 // realFramesSidecar is the sidecar's command. Once the app is ready, it
-// writes a line to each stream and exits 3, which stops the app.
+// writes a line to each stream and a line of 3000 bytes, which the guest
+// frames in four pieces, and exits 3, which stops the app.
 const realFramesSidecar = `while [ ! -e /tmp/app-ready ]; do /bin/busybox sleep 0.2; done
 echo side-out
+long=; i=0; while [ "$i" -lt 300 ]; do long="${long}0123456789"; i=$((i + 1)); done; echo "$long"
 echo side-err >&2
 exit 3
 `
@@ -166,7 +168,7 @@ func superviseRealFrames() realFramesRun {
 }
 
 var _ = Describe("a stack guest's framed output against a real QEMU", func() {
-	It("frames the app's and the sidecar's streams apart, keeps the console from the app, and names the sidecar's exit before it stops the app", func() {
+	It("frames the app's and the sidecar's streams apart, joins a line of several pieces, keeps the console from the app, and names the sidecar's exit before it stops the app", func() {
 		r := superviseRealFrames()
 		out := r.out
 
@@ -182,10 +184,11 @@ var _ = Describe("a stack guest's framed output against a real QEMU", func() {
 		Expect(out).To(ContainSubstring("vm-launch guest: sidecar 1 exited with status 3; stopping the app\n"), out)
 		Expect(out).To(MatchRegexp(`(?m)^app-got-term$`), out)
 
-		Expect(streamLines(r.events, 1, 'o')).To(Equal([]string{"side-out"}), out)
+		Expect(streamLines(r.events, 1, 'o')).To(Equal([]string{"side-out", strings.Repeat("0123456789", 300)}), out)
 		Expect(streamLines(r.events, 1, 'e')).To(Equal([]string{"side-err"}), out)
-		Expect(r.events).To(HaveLen(3), out)
-		Expect(r.events[2]).To(Equal(frameEvent{index: 1, first: true, status: 3}), out)
+		Expect(r.events).To(HaveLen(4), out)
+		Expect(r.events[3]).To(Equal(frameEvent{index: 1, first: true, status: 3}), out)
+		Expect(r.console).To(ContainSubstring(logTag(testNonce)+"1O "), "the 3000-byte line came in one frame")
 
 		// The app's descriptors name /dev/null and its own log FIFOs, and
 		// none names the console, the serial port, or the section's files.
