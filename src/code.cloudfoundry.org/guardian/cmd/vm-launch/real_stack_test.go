@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"io"
 	"os"
 	"os/exec"
@@ -289,7 +290,7 @@ func realDropletImage(art string) *os.File {
 	home := filepath.Join(GinkgoT().TempDir(), "home")
 	Expect(os.MkdirAll(filepath.Join(home, "app"), 0o755)).To(Succeed())
 	Expect(os.WriteFile(filepath.Join(home, "app/from-the-droplet"), []byte("droplet-file\n"), 0o644)).To(Succeed())
-	droplet, err := buildDropletImage(art, home, GinkgoT().TempDir())
+	droplet, err := buildDropletImage(context.Background(), art, home, GinkgoT().TempDir())
 	Expect(err).NotTo(HaveOccurred())
 	DeferCleanup(droplet.file.Close)
 	return droplet.file

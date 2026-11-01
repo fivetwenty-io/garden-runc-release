@@ -3,11 +3,15 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -65,7 +69,7 @@ var _ = Describe("the droplet image, built by the real QEMU artifacts mksquashfs
 		art := squashTool("mksquashfs")
 		squashTool("unsquashfs")
 
-		img, err := buildDropletImage(art, home, work)
+		img, err := buildDropletImage(context.Background(), art, home, work)
 		Expect(err).NotTo(HaveOccurred())
 		defer img.file.Close()
 		Expect(img.size).To(BeNumerically(">", 0))
@@ -95,7 +99,7 @@ var _ = Describe("the droplet image, built by the real QEMU artifacts mksquashfs
 	It("is an lz4 squashfs", func() {
 		art := squashTool("mksquashfs")
 
-		img, err := buildDropletImage(art, home, work)
+		img, err := buildDropletImage(context.Background(), art, home, work)
 		Expect(err).NotTo(HaveOccurred())
 		defer img.file.Close()
 
@@ -109,7 +113,7 @@ var _ = Describe("the droplet image, built by the real QEMU artifacts mksquashfs
 	It("is open read-only", func() {
 		art := squashTool("mksquashfs")
 
-		img, err := buildDropletImage(art, home, work)
+		img, err := buildDropletImage(context.Background(), art, home, work)
 		Expect(err).NotTo(HaveOccurred())
 		defer img.file.Close()
 
@@ -124,7 +128,7 @@ var _ = Describe("the droplet image, built by the real QEMU artifacts mksquashfs
 		Expect(os.Mkdir(work, 0o700)).To(Succeed())
 		Expect(os.WriteFile(filepath.Join(work, "scratch"), []byte("scratch"), 0o600)).To(Succeed())
 
-		img, err := buildDropletImage(art, home, work)
+		img, err := buildDropletImage(context.Background(), art, home, work)
 		Expect(err).NotTo(HaveOccurred())
 		defer img.file.Close()
 
@@ -137,7 +141,7 @@ var _ = Describe("the droplet image, built by the real QEMU artifacts mksquashfs
 	It("leaves nothing in the work directory", func() {
 		art := squashTool("mksquashfs")
 
-		img, err := buildDropletImage(art, home, work)
+		img, err := buildDropletImage(context.Background(), art, home, work)
 		Expect(err).NotTo(HaveOccurred())
 		defer img.file.Close()
 
@@ -149,7 +153,7 @@ var _ = Describe("the droplet image, built by the real QEMU artifacts mksquashfs
 	It("fails with the tool's output when the home is missing", func() {
 		art := squashTool("mksquashfs")
 
-		_, err := buildDropletImage(art, filepath.Join(home, "no-such-home"), work)
+		_, err := buildDropletImage(context.Background(), art, filepath.Join(home, "no-such-home"), work)
 		Expect(err).To(MatchError(ContainSubstring("mksquashfs")))
 		Expect(err.Error()).To(ContainSubstring("no-such-home"))
 		entries, _ := os.ReadDir(work)
@@ -161,7 +165,7 @@ var _ = Describe("the droplet image without the tool", func() {
 	It("names a missing binary in the error", func() {
 		art := GinkgoT().TempDir()
 
-		_, err := buildDropletImage(art, GinkgoT().TempDir(), GinkgoT().TempDir())
+		_, err := buildDropletImage(context.Background(), art, GinkgoT().TempDir(), GinkgoT().TempDir())
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring(filepath.Join(art, "mksquashfs")))
 	})
@@ -175,5 +179,89 @@ var _ = Describe("lastLines", func() {
 	It("is empty for no output", func() {
 		Expect(lastLines(" \n\n", 3)).To(Equal(""))
 		Expect(strings.TrimSpace(lastLines("x", 3))).To(Equal("x"))
+	})
+})
+
+// writeFakeSquashTool writes a mksquashfs into a new artifacts directory
+// that runs script, and returns the directory.
+func writeFakeSquashTool(script string) string {
+	art := GinkgoT().TempDir()
+	Expect(os.WriteFile(filepath.Join(art, artMksquashfs), []byte("#!/bin/sh\n"+script), 0o755)).To(Succeed())
+	return art
+}
+
+var _ = Describe("the droplet build under signals and a time limit", func() {
+	var home, work string
+	var sigs chan os.Signal
+
+	BeforeEach(func() {
+		home = GinkgoT().TempDir()
+		work = GinkgoT().TempDir()
+		sigs = make(chan os.Signal, 4)
+	})
+
+	It("kills a build that is still running at the first signal and returns the signal", func() {
+		art := writeFakeSquashTool("exec sleep 60\n")
+		time.AfterFunc(200*time.Millisecond, func() { sigs <- syscall.SIGTERM })
+
+		start := time.Now()
+		img, sig, err := buildDropletImageWatching(sigs, time.Hour, art, home, work)
+		Expect(time.Since(start)).To(BeNumerically("<", 10*time.Second))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(img).To(BeNil())
+		Expect(sig).To(Equal(syscall.SIGTERM))
+	})
+
+	It("takes only the first of several signals and leaves the rest for the supervisor", func() {
+		art := writeFakeSquashTool("exec sleep 60\n")
+		time.AfterFunc(200*time.Millisecond, func() {
+			sigs <- syscall.SIGINT
+			sigs <- syscall.SIGTERM
+		})
+
+		_, sig, _ := buildDropletImageWatching(sigs, time.Hour, art, home, work)
+		Expect(sig).To(Equal(syscall.SIGINT))
+		Expect(sigs).To(Receive(Equal(syscall.SIGTERM)))
+	})
+
+	It("loses no signal that arrives after the build finished", func() {
+		art := writeFakeSquashTool("printf image > \"$2\"\n")
+		img, sig, err := buildDropletImageWatching(sigs, time.Hour, art, home, work)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(sig).To(BeNil())
+		Expect(img).NotTo(BeNil())
+		DeferCleanup(img.file.Close)
+
+		sigs <- syscall.SIGTERM
+		Expect(sigs).To(Receive(Equal(syscall.SIGTERM)))
+	})
+
+	It("leaves a signal that was queued before the watcher ended on the channel when the build ends first", func() {
+		art := writeFakeSquashTool("printf image > \"$2\"\n")
+		for i := 0; i < 50; i++ {
+			img, sig, err := buildDropletImageWatching(sigs, time.Hour, art, home, work)
+			Expect(err).NotTo(HaveOccurred())
+			if img != nil {
+				Expect(sig).To(BeNil())
+				Expect(img.file.Close()).To(Succeed())
+			}
+		}
+		sigs <- syscall.SIGTERM
+		Expect(sigs).To(Receive(Equal(syscall.SIGTERM)))
+	})
+
+	It("fails a build that runs past its limit with the limit in the error, and consumes no signal", func() {
+		art := writeFakeSquashTool("exec sleep 60\n")
+
+		start := time.Now()
+		img, sig, err := buildDropletImageWatching(sigs, 300*time.Millisecond, art, home, work)
+		Expect(time.Since(start)).To(BeNumerically("<", 10*time.Second))
+		Expect(img).To(BeNil())
+		Expect(sig).To(BeNil())
+		Expect(err).To(MatchError(ContainSubstring("the build ran past its limit of 300ms")))
+		Expect(errors.Is(err, context.DeadlineExceeded)).To(BeTrue())
+
+		sigs <- syscall.SIGTERM
+		Expect(sigs).To(Receive())
 	})
 })

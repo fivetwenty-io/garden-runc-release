@@ -1542,6 +1542,16 @@ var _ = Describe("run with a stack image", func() {
 		expectTodaysGuest([]string{launcher, "app", "true", ""}, "building the droplet image with "+filepath.Join(art, artMksquashfs)+": exit status 1; cannot read the droplet")
 	})
 
+	It("keeps today's guest when the droplet image build runs past its limit", func() {
+		saved := dropletBuildTimeout
+		DeferCleanup(func() { dropletBuildTimeout = saved })
+		dropletBuildTimeout = 300 * time.Millisecond
+		Expect(os.WriteFile(filepath.Join(art, artMksquashfs), []byte("#!/bin/sh\nexec sleep 60\n"), 0o755)).To(Succeed())
+		_, argv := guestOf([]string{launcher, "app", "true", ""})
+		Expect(argv).NotTo(ContainSubstring("rvm-stack"))
+		Expect(logBuf.String()).To(ContainSubstring("busybox guest: the build ran past its limit of 300ms: building the droplet image with " + filepath.Join(art, artMksquashfs)))
+	})
+
 	It("keeps today's guest when the container's hostname is not one the stack guest accepts", func() {
 		containerHostname = func() (string, error) { return "web_1", nil }
 		_, argv := guestOf([]string{launcher, "app", "true", ""})
