@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -83,7 +84,13 @@ var _ = Describe("the firecracker balloon", func() {
 
 	It("serves the API on a socket and drops --no-api", func() {
 		argv := firecrackerAPIArgv("/art", "/work/fc.json", firecrackerAPISocket("/work"))
-		Expect(argv).To(Equal([]string{"/art/firecracker/firecracker", "--api-sock", "/work/fc.sock", "--config-file", "/work/fc.json"}))
+		Expect(argv).To(Equal([]string{"/art/firecracker/firecracker", "--level", "Warn", "--api-sock", "/work/fc.sock", "--config-file", "/work/fc.json"}))
+	})
+
+	It("keeps Firecracker's log at warnings, so that the API's lines for each statistics request stay out of the app's output", func() {
+		argv := firecrackerAPIArgv("/art", "/work/fc.json", firecrackerAPISocket("/work"))
+		Expect(argv).To(ContainElement("--level"))
+		Expect(argv[slices.Index(argv, "--level")+1:]).To(HaveExactElements("Warn", "--api-sock", "/work/fc.sock", "--config-file", "/work/fc.json"))
 	})
 
 	Describe("the statistics source", func() {

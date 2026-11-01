@@ -440,7 +440,7 @@ stat -L -c %d%r%i /proc/self/fd/3 /proc/self/fd/5 >`+shellQuote(filepath.Join(ou
 
 	It("gives Firecracker the configuration, /rvm/mounts, and /rvm/disks of before the registry, with the identities Firecracker derives from the files it opens", func() {
 		argv, config, mounts, disks := capture(backend.VMFirecracker, "firecracker/firecracker")
-		Expect(argv).To(Equal("--api-sock\n@WORK/fc.sock\n--config-file\n@WORK/fc.json\n"))
+		Expect(argv).To(Equal("--level\nWarn\n--api-sock\n@WORK/fc.sock\n--config-file\n@WORK/fc.json\n"))
 		Expect(config).To(Equal(goldenPDIFC))
 		Expect(mounts).To(Equal(goldenPDIMounts))
 		raw, err := os.ReadFile(filepath.Join(out, "ids"))
