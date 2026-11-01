@@ -192,13 +192,14 @@ func (req prepareRequest) fileImageOptions(base imageOptions) imageOptions {
 
 // attachment is a prepared, fenced disk. It stays fenced until Release.
 type attachment struct {
-	// File is the disk, open read-write, which the hypervisor reopens
-	// through /proc/self/fd: an image file in file-image mode, or the
-	// block device node in block mode. The reopen is a new open file
-	// description. On NFS, the client keeps its lost-lock EIO on the
-	// description that took the flock, so I/O through the reopen does not
-	// meet that EIO once a lease expires and the lock is lost, and the flock
-	// is no fence against a writer the client can no longer exclude.
+	// File is the disk, open read-write: an image file in file-image mode,
+	// or the block device node in block mode. QEMU takes this open file
+	// description itself through an fd set, so on NFS the client's lost-lock
+	// EIO, which it keeps on the description that took the flock, reaches
+	// QEMU's I/O once a lease expires and the lock is lost. Firecracker
+	// reopens the disk through /proc/self/fd, a new open file description
+	// that never meets that EIO, so on Firecracker the flock is no fence
+	// against a writer the client can no longer exclude.
 	//
 	// There is no Usage method yet. Reporting an attachment's usage and
 	// quota is deferred; the file-image providers could answer it with fstat
