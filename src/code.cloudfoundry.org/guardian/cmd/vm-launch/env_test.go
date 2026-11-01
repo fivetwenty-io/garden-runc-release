@@ -278,7 +278,7 @@ var _ = Describe("guest environment", func() {
 		It("never exports container paths, identities, platform options, the sidecars, or Garden's markers", func() {
 			envFile := build(container)
 			for _, name := range []string{"PATH", "HOME", "TMPDIR", "USER", "PWD", "OLDPWD", "CF_INSTANCE_CERT", "CF_INSTANCE_KEY", "CF_SYSTEM_CERT_PATH",
-				"VCAP_PLATFORM_OPTIONS", "SERVICE_BINDING_ROOT", "VCAP_SERVICES_FILE_PATH", "DEPS_DIR", "CF_VM_SIDECARS"} {
+				"VCAP_PLATFORM_OPTIONS", "SERVICE_BINDING_ROOT", "VCAP_SERVICES_FILE_PATH", "DEPS_DIR", "CF_VM_SIDECARS", "CF_VM_SIDECAR_RELAY"} {
 				Expect(exportedNames(envFile)).NotTo(ContainElement(name))
 			}
 			for _, text := range []string{"__GARDEN_", "credhub-uri"} {
@@ -353,6 +353,11 @@ var _ = Describe("guest environment", func() {
 				env := map[string]string{"A": "1", sidecarsEnvVar: `{"version":1,"sidecars":[{"args":["app","./side",""]}]}`}
 				Expect(buildStack(env)).To(Equal("export A='1'\n"))
 				Expect(buildStackWithIdentity(env)).NotTo(ContainSubstring(sidecarsEnvVar))
+			})
+
+			It("leaves out CF_VM_SIDECAR_RELAY", func() {
+				env := map[string]string{"A": "1", relayEnv: "1:" + strings.Repeat("ab", 16)}
+				Expect(buildStack(env)).To(Equal("export A='1'\n"))
 			})
 
 			It("leaves the guest environment's own denylist alone", func() {

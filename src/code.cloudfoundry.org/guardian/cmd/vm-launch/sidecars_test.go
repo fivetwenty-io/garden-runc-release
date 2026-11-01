@@ -3,6 +3,7 @@
 package main
 
 import (
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -66,13 +67,113 @@ var _ = Describe("sidecars", func() {
 				Expect(err).To(MatchError(ContainSubstring(message)))
 				Expect(got).To(BeNil())
 			},
-			Entry("another version", `{"version":2,"sidecars":[{"args":["x"]}]}`, "version 2"),
+			Entry("another version", `{"version":3,"sidecars":[{"args":["x"]}]}`, "version 3"),
+			Entry("version 2 with no key", `{"version":2,"sidecars":[{"args":["x"]}]}`, "relay_key"),
+			Entry("version 2 with an empty key", `{"version":2,"relay_key":"","sidecars":[{"args":["x"]}]}`, "relay_key"),
+			Entry("version 2 with a short key", `{"version":2,"relay_key":"abc","sidecars":[{"args":["x"]}]}`, "relay_key"),
+			Entry("version 2 with an upper-case key", `{"version":2,"relay_key":"`+strings.Repeat("A", 32)+`","sidecars":[{"args":["x"]}]}`, "relay_key"),
 			Entry("no version", `{"sidecars":[{"args":["x"]}]}`, "version 0"),
 			Entry("empty arguments", `{"version":1,"sidecars":[{"args":[]}]}`, "sidecar 1 in"),
 			Entry("missing arguments", `{"version":1,"sidecars":[{"args":["x"]},{"env":["A=b"]}]}`, "sidecar 2 in"),
 			Entry("malformed JSON", `{"version":1,`, "not valid JSON"),
 			Entry("a JSON string", `"x"`, "not valid JSON"),
 		)
+	})
+
+	Describe("parseSidecarsKeyed", func() {
+		key := strings.Repeat("ab", 16)
+		describe := func(json string) map[string]string {
+			return map[string]string{sidecarsEnvVar: json}
+		}
+
+		It("reads the relay key and every sidecar of a version 2 description, in order", func() {
+			got, gotKey, err := parseSidecarsKeyed(describe(`{"version":2,"relay_key":"` + key + `","sidecars":[
+				{"args":["/bin/envoy"],"log_source":"ENVOY"},
+				{"args":["sleep","1"]}]}`))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(gotKey).To(Equal(key))
+			Expect(got).To(Equal([]vmSidecar{
+				{Args: []string{"/bin/envoy"}, LogSource: "ENVOY"},
+				{Args: []string{"sleep", "1"}},
+			}))
+		})
+
+		It("returns no key for a version 1 description, whatever it carries", func() {
+			got, gotKey, err := parseSidecarsKeyed(describe(`{"version":1,"relay_key":"` + key + `","sidecars":[{"args":["x"]}]}`))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(gotKey).To(BeEmpty())
+			Expect(got).To(HaveLen(1))
+		})
+
+		It("returns no key and no sidecars when the variable is absent", func() {
+			got, gotKey, err := parseSidecarsKeyed(map[string]string{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(got).To(BeNil())
+			Expect(gotKey).To(BeEmpty())
+		})
+
+		It("is what parseSidecars reads, so parseSidecars accepts version 2", func() {
+			got, err := parseSidecars(describe(`{"version":2,"relay_key":"` + key + `","sidecars":[{"args":["x"]}]}`))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(got).To(HaveLen(1))
+		})
+
+		It("refuses nine sidecars in a version 2 description", func() {
+			nine := strings.TrimSuffix(strings.Repeat(`{"args":["x"]},`, 9), ",")
+			_, _, err := parseSidecarsKeyed(describe(`{"version":2,"relay_key":"` + key + `","sidecars":[` + nine + `]}`))
+			Expect(err).To(MatchError(ContainSubstring("9 sidecars")))
+		})
+	})
+
+	Describe("the relay hub wiring", func() {
+		key := strings.Repeat("cd", 16)
+		logger := func() *log.Logger { return log.New(GinkgoWriter, "", 0) }
+
+		It("makes no hub without a key", func() {
+			hub, err := newSidecarRelayHub(filepath.Join(GinkgoT().TempDir(), "r.sock"), "", 2, logger())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(hub).To(BeNil())
+		})
+
+		It("makes no hub without sidecars", func() {
+			hub, err := newSidecarRelayHub(filepath.Join(GinkgoT().TempDir(), "r.sock"), key, 0, logger())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(hub).To(BeNil())
+		})
+
+		It("makes a hub that listens when there is a key and a sidecar", func() {
+			path := filepath.Join(GinkgoT().TempDir(), "r.sock")
+			hub, err := newSidecarRelayHub(path, key, 1, logger())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(hub).NotTo(BeNil())
+			defer hub.close()
+			Expect(path).To(BeAnExistingFile())
+		})
+
+		It("leaves both callbacks nil without a hub", func() {
+			logs, first := relayCallbacks(nil)
+			Expect(logs).To(BeNil())
+			Expect(first).To(BeNil())
+		})
+
+		It("passes the hub's methods as the callbacks with a hub", func() {
+			hub, err := newSidecarRelayHub(filepath.Join(GinkgoT().TempDir(), "r.sock"), key, 1, logger())
+			Expect(err).NotTo(HaveOccurred())
+			defer hub.close()
+			logs, first := relayCallbacks(hub)
+			Expect(logs).NotTo(BeNil())
+			Expect(first).NotTo(BeNil())
+		})
+
+		It("sends relay to the relay and everything else to the launch", func() {
+			var logBuf strings.Builder
+			Expect(dispatch([]string{"relay", "extra"}, log.New(&logBuf, "", 0))).To(Equal(1))
+			Expect(logBuf.String()).To(BeEmpty(), "the relay logs to its own stderr, not to the launch's logger")
+
+			code := dispatch([]string{"--no-such-flag"}, log.New(&logBuf, "", 0))
+			Expect(code).NotTo(BeZero())
+			Expect(logBuf.String()).NotTo(BeEmpty())
+		})
 	})
 
 	Describe("sidecarGuestFiles", func() {
