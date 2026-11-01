@@ -41,6 +41,8 @@ const virtioBlockIDBytes = 20
 const (
 	qemuRootSerial         = "rvm-root"
 	qemuVolumeSerialPrefix = "rvm-vol"
+	qemuStackSerial        = "rvm-stack"
+	qemuDropletSerial      = "rvm-droplet"
 )
 
 // qemuVolumeSerial is the QEMU serial of the volume whose volume index is i
@@ -89,6 +91,17 @@ type guestDrives struct {
 	rootID string
 	// volumes are the volume drives in volume order.
 	volumes []guestDrive
+	// stackID and dropletID are the identities of the read-only stack and
+	// droplet images, or empty in a guest that has neither.
+	stackID, dropletID string
+}
+
+// stackDrives are the open files of the stack image and the droplet image,
+// which the hypervisor attaches as read-only drives after the guest root
+// image. A nil *stackDrives is a guest without them, and every function that
+// takes one then behaves exactly as it does without the parameter.
+type stackDrives struct {
+	stack, droplet *os.File
 }
 
 // driveFileStat returns the stat of the open file f. Specs replace it to
@@ -139,6 +152,16 @@ func firecrackerDriveID(f *os.File) (string, error) {
 // then not tell which drive is which or how to treat it. The attachments are
 // left unchanged on an error.
 func newGuestDrives(kind backend.Kind, volumes preparedVolumes, root *os.File) (guestDrives, error) {
+	return newGuestDrivesWithStack(kind, volumes, root, nil)
+}
+
+// newGuestDrivesWithStack is newGuestDrives for a guest that also has the
+// stack and droplet images in sd, or none when sd is nil. The stack gets the
+// serial rvm-stack on QEMU and the droplet rvm-droplet, and Firecracker's
+// identities are predicted from the two open files. Both files are required,
+// and either one sharing an identity with another drive is an error that
+// names both drives.
+func newGuestDrivesWithStack(kind backend.Kind, volumes preparedVolumes, root *os.File, sd *stackDrives) (guestDrives, error) {
 	if len(volumes) > maxVolumes {
 		return guestDrives{}, fmt.Errorf("%d volume drives, over the %d a guest can have", len(volumes), maxVolumes)
 	}
@@ -180,6 +203,26 @@ func newGuestDrives(kind backend.Kind, volumes preparedVolumes, root *os.File) (
 		}
 		drives.rootID = id
 		named = append(named, namedDriveID{name: "the guest root image", id: id})
+	}
+	if sd != nil {
+		for _, d := range []struct {
+			name, serial string
+			file         *os.File
+			id           *string
+		}{
+			{"the stack image", qemuStackSerial, sd.stack, &drives.stackID},
+			{"the droplet image", qemuDropletSerial, sd.droplet, &drives.dropletID},
+		} {
+			if d.file == nil {
+				return guestDrives{}, fmt.Errorf("%s has no open disk to identify", d.name)
+			}
+			id, err := identify(d.file, d.serial)
+			if err != nil {
+				return guestDrives{}, fmt.Errorf("predicting the %s drive identity of %s: %w", kind, d.name, err)
+			}
+			*d.id = id
+			named = append(named, namedDriveID{name: d.name, id: id})
+		}
 	}
 	if err := checkDriveIDs(named, " on "+string(kind)); err != nil {
 		return guestDrives{}, err

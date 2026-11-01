@@ -238,6 +238,82 @@ var _ = Describe("newGuestDrives", func() {
 		Expect(err).To(MatchError(`predicting the vm-firecracker drive identity of the guest root image: ` + syscall.EIO.Error()))
 	})
 
+	Describe("with the stack and droplet images", func() {
+		It("gives QEMU's stack and droplet their serials after the volumes and the root", func() {
+			sd := &stackDrives{stack: openSizedFile(1 << 20), droplet: openSizedFile(2 << 20)}
+			drives, err := newGuestDrivesWithStack(backend.VMQemu, preparedFiles(openSizedFile(1<<20)), openSizedFile(8<<20), sd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(drives).To(Equal(guestDrives{
+				rootID:    "rvm-root",
+				volumes:   qemuImageDrives(1 << 20),
+				stackID:   "rvm-stack",
+				dropletID: "rvm-droplet",
+			}))
+		})
+
+		It("predicts Firecracker's identity of each from its open file", func() {
+			sd := &stackDrives{stack: openSizedFile(1 << 20), droplet: openSizedFile(2 << 20)}
+			drives, err := newGuestDrivesWithStack(backend.VMFirecracker, nil, openSizedFile(8<<20), sd)
+			Expect(err).NotTo(HaveOccurred())
+			want := func(f *os.File) string {
+				id, err := firecrackerDriveID(f)
+				Expect(err).NotTo(HaveOccurred())
+				return id
+			}
+			Expect(drives.stackID).To(Equal(want(sd.stack)))
+			Expect(drives.dropletID).To(Equal(want(sd.droplet)))
+			Expect(drives.stackID).NotTo(Equal(drives.dropletID))
+		})
+
+		It("gives the same result as newGuestDrives for a nil stackDrives", func() {
+			for _, kind := range []backend.Kind{backend.VMQemu, backend.VMFirecracker} {
+				vols := preparedFiles(openSizedFile(1 << 20))
+				root := openSizedFile(8 << 20)
+				plain, err := newGuestDrives(kind, vols, root)
+				Expect(err).NotTo(HaveOccurred())
+				with, err := newGuestDrivesWithStack(kind, vols, root, nil)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(with).To(Equal(plain))
+				Expect(with.stackID).To(BeEmpty())
+				Expect(with.dropletID).To(BeEmpty())
+			}
+		})
+
+		It("refuses a stack that shares an identity with a volume, naming both", func() {
+			withDriveStats(syscall.Stat_t{Dev: 1, Ino: 23}, syscall.Stat_t{Dev: 1, Ino: 23}, syscall.Stat_t{Dev: 1, Ino: 24})
+			sd := &stackDrives{stack: openSizedFile(1 << 20), droplet: openSizedFile(1 << 20)}
+			_, err := newGuestDrivesWithStack(backend.VMFirecracker, preparedFiles(openSizedFile(1<<20)), nil, sd)
+			Expect(err).To(MatchError(`the volume at "/data0" and the stack image would both have the drive identity "1023" on vm-firecracker, so the guest could not tell them apart`))
+		})
+
+		It("refuses a droplet that shares an identity with the stack, naming both", func() {
+			withDriveStats(syscall.Stat_t{Dev: 1, Ino: 23}, syscall.Stat_t{Dev: 1, Ino: 23})
+			sd := &stackDrives{stack: openSizedFile(1 << 20), droplet: openSizedFile(1 << 20)}
+			_, err := newGuestDrivesWithStack(backend.VMFirecracker, nil, nil, sd)
+			Expect(err).To(MatchError(`the stack image and the droplet image would both have the drive identity "1023" on vm-firecracker, so the guest could not tell them apart`))
+		})
+
+		It("refuses a stack or a droplet without an open file", func() {
+			_, err := newGuestDrivesWithStack(backend.VMQemu, nil, nil, &stackDrives{droplet: openSizedFile(1 << 20)})
+			Expect(err).To(MatchError("the stack image has no open disk to identify"))
+			_, err = newGuestDrivesWithStack(backend.VMQemu, nil, nil, &stackDrives{stack: openSizedFile(1 << 20)})
+			Expect(err).To(MatchError("the droplet image has no open disk to identify"))
+		})
+
+		It("passes on a stat that fails, naming the drive", func() {
+			saved := driveFileStat
+			DeferCleanup(func() { driveFileStat = saved })
+			driveFileStat = func(*os.File) (*syscall.Stat_t, error) { return nil, syscall.EIO }
+			sd := &stackDrives{stack: openSizedFile(1 << 20), droplet: openSizedFile(1 << 20)}
+			_, err := newGuestDrivesWithStack(backend.VMFirecracker, nil, nil, sd)
+			Expect(err).To(MatchError(`predicting the vm-firecracker drive identity of the stack image: ` + syscall.EIO.Error()))
+		})
+
+		It("names valid serials", func() {
+			Expect(checkDriveIDs([]namedDriveID{{name: "stack", id: qemuStackSerial}, {name: "droplet", id: qemuDropletSerial}}, "")).To(Succeed())
+		})
+	})
+
 	It("refuses a volume without an open disk", func() {
 		_, err := newGuestDrives(backend.VMQemu, preparedVolumes{{Path: "/data"}}, nil)
 		Expect(err).To(MatchError(`the volume at "/data" has no open disk to identify`))
