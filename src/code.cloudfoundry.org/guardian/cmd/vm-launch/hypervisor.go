@@ -1159,7 +1159,7 @@ func (f *serialFilter) sendLine(index int, stream byte, line []byte) {
 		return
 	}
 	w := f.out
-	if stream == 'e' {
+	if stream == 'e' && !forgesVMLaunchLine(line) {
 		w = f.errOut
 	}
 	f.line = append(append(f.line[:0], line...), '\n')
@@ -1169,6 +1169,34 @@ func (f *serialFilter) sendLine(index int, stream byte, line []byte) {
 	if _, err := w.Write(f.line); err != nil {
 		f.writeErr = err
 	}
+}
+
+// vmLaunchLinePrefix starts every line that vm-launch writes to its own
+// stderr, and so every line that a guest must not be able to write there.
+// Garden's containerizer filters that stream: vm_metrics.go takes the
+// "vm-launch-metrics v1 " lines as the guest memory sample, and vm_oom.go takes
+// "vm-launch: the guest ran out of memory" as a guest OOM.
+const vmLaunchLinePrefix = "vm-launch"
+
+// forgesVMLaunchLine reports whether a guest line bound for vm-launch's
+// stderr begins as one of vm-launch's own lines. Such a line goes to stdout
+// instead, with its bytes unchanged.
+func forgesVMLaunchLine(line []byte) bool {
+	return bytes.HasPrefix(line, []byte(vmLaunchLinePrefix))
+}
+
+// guestStderr is the stderr that guest-origin lines reach when they bypass the
+// serial filter, such as the relay hub's fallback. It writes one whole line
+// at a time, and sends a line that forges one of vm-launch's own to out.
+type guestStderr struct {
+	out, err io.Writer
+}
+
+func (g guestStderr) Write(p []byte) (int, error) {
+	if forgesVMLaunchLine(p) {
+		return g.out.Write(p)
+	}
+	return g.err.Write(p)
 }
 
 // swallow drops a whole control line or frame, its line ending included,

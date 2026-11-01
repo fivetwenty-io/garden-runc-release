@@ -590,7 +590,9 @@ func newSidecarRelayHub(path, relayKey string, count int, logger *log.Logger) (*
 	if relayKey == "" || count == 0 {
 		return nil, nil
 	}
-	return newRelayHub(path, relayKey, count, os.Stdout, os.Stderr, logger)
+	// The hub's fallback writes sidecar lines, which the guest controls, to
+	// vm-launch's own stderr, so they get the same guard as the app's.
+	return newRelayHub(path, relayKey, count, os.Stdout, guestStderr{out: os.Stdout, err: os.Stderr}, logger)
 }
 
 // relayCallbacks returns the supervisor's callbacks for hub. They are nil
