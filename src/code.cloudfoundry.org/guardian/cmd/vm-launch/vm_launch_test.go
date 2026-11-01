@@ -1651,7 +1651,7 @@ var _ = Describe("run with a stack image", func() {
 			Expect(runWith(backend.VMQemu, launchArg)).To(Equal(0), logBuf.String())
 
 			Expect(built.stack).NotTo(BeNil())
-			sidecars, id := stackGuestExtras(built.stack)
+			sidecars, id := built.stack.sidecars, built.stack.identity
 			Expect(sidecars).To(Equal([]guestSidecar{
 				{argv: `'app' './side --port 8081' ''`},
 				{argv: `'app' './other '\''quoted'\'' $HOME' ''`, env: "export SIDE='1'\nunset LANG\n"},
@@ -1677,7 +1677,7 @@ var _ = Describe("run with a stack image", func() {
 			writeFakeHypervisor(qemu, "")
 			Expect(runWith(backend.VMQemu, launchArg)).To(Equal(0), logBuf.String())
 
-			sidecars, id := stackGuestExtras(built.stack)
+			sidecars, id := built.stack.sidecars, built.stack.identity
 			Expect(sidecars).To(Equal([]guestSidecar{{argv: `'app' './side' ''`}}))
 			Expect(id).To(BeNil())
 			Expect(built.env).NotTo(ContainSubstring("CF_INSTANCE_CERT"))
@@ -1742,7 +1742,7 @@ var _ = Describe("run with a stack image", func() {
 		It("gives the stack slice's guest byte for byte to a launch without the variable and without the files", func() {
 			initrd, argv := guestOf(launchArg)
 			Expect(built.stack).NotTo(BeNil())
-			sidecars, id := stackGuestExtras(built.stack)
+			sidecars, id := built.stack.sidecars, built.stack.identity
 			Expect(sidecars).To(BeNil())
 			Expect(id).To(BeNil())
 			Expect(built.env).NotTo(ContainSubstring("CF_INSTANCE_CERT"))

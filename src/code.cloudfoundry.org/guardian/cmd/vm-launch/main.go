@@ -899,7 +899,7 @@ func run(argv []string, logger *log.Logger) int {
 			logger.Print(err)
 			return exitLaunchError
 		}
-		setStackGuestExtras(stack, files, identity)
+		stack.sidecars, stack.identity = files, identity
 		guestMode += guestExtrasLine(len(sidecars), identity)
 	} else if len(sidecars) > 0 {
 		logger.Print(sidecarsRefusal(len(sidecars), "the stack guest has no app root"))
