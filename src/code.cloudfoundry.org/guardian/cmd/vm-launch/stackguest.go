@@ -155,19 +155,21 @@ func (s *guestStack) processes() []guestProcess {
 
 // stackExec is the stack guest's guestExec. It runs a process as
 // guestStackRunCommand runs the app: it sources the process's environment
-// files, sets its arguments from its argv file with eval, and execs busybox
+// files, sets its arguments from its argv file with eval, moves the loader
+// variables into the arguments (see guestLoaderHold), and execs busybox
 // chroot into the app root, where the stack's env enters the working
-// directory and the stack's setpriv drops to uid 2000 before it execs the
-// argv. The working directory is quoted into the line, and the run section
-// has already recorded the pid and set the open-files limit, so nothing after
-// the first source reads a shell variable.
+// directory and the stack's setpriv drops to uid 2000 before the stack's env
+// puts the loader variables back and execs the argv (see guestStackDrop).
+// The working directory is quoted into the line, and the run section has
+// already recorded the pid and set the open-files limit, so nothing after
+// the first source reads a shell variable that the environment files can
+// set.
 func stackExec(p guestProcess) string {
 	line := ""
 	for _, env := range p.envPaths {
 		line += ". " + env + " && "
 	}
-	return line + `eval "set -- $(cat ` + p.argvPath + `)" && exec chroot ` + guestAppRoot + ` ` + guestStackEnv + ` -C ` + shellQuote(p.dir) + ` ` +
-		guestStackSetpriv + ` --reuid=` + guestAppUID + ` --regid=` + guestAppUID + ` --init-groups --no-new-privs -- "$@"`
+	return line + `eval "set -- $(cat ` + p.argvPath + `)" && ` + guestLoaderHold + `exec chroot ` + guestAppRoot + ` ` + guestStackEnv + ` -C ` + shellQuote(p.dir) + ` ` + guestStackDrop
 }
 
 // guestSidecarChecks makes a broken sidecar argv or environment file a

@@ -662,7 +662,8 @@ var _ = Describe("the initramfs of a guest with a stack", func() {
 		line := strings.Replace(stackExec(app), "-C "+shellQuote(app.dir)+" ", `-C "$(cat `+guestCwd+`)" `, 1)
 		Expect(guestStackRunCommand).To(Equal(guestRunPrefix + strings.TrimPrefix(line, ". /rvm/env && ") + " ) </dev/null\n"))
 		Expect(stackExec(guestProcess{argvPath: "/rvm/sidecar/1/argv", envPaths: []string{"/rvm/env", "/rvm/sidecar/1/env"}, dir: "/home/vcap/it's"})).To(Equal(
-			`. /rvm/env && . /rvm/sidecar/1/env && eval "set -- $(cat /rvm/sidecar/1/argv)" && exec chroot /rvm/app /usr/bin/env -C '/home/vcap/it'\''s' /usr/bin/setpriv --reuid=2000 --regid=2000 --init-groups --no-new-privs -- "$@"`))
+			`. /rvm/env && . /rvm/sidecar/1/env && eval "set -- $(cat /rvm/sidecar/1/argv)" && ` + guestLoaderHold +
+				`exec chroot /rvm/app /usr/bin/env -C '/home/vcap/it'\''s' /usr/bin/setpriv --reuid=2000 --regid=2000 --init-groups --no-new-privs -- /usr/bin/env "$@"`))
 	})
 
 	DescribeTable("fails a sidecar whose files the guest cannot read as a setup step that names it",

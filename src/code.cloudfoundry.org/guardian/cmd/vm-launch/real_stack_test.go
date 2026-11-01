@@ -16,9 +16,13 @@ import (
 
 // realStackToolsSource is the program that stands in for the stack's GNU
 // env and util-linux setpriv in the test stack, built static for the guest.
-// Run as env, it takes only -C DIR PROG ARGS, and run as setpriv, only the
-// exact options stage 2 passes (see guestStackRunCommand), so a change to
-// that command line fails the boot instead of passing unnoticed. Its setpriv
+// Run as env, it takes only -C DIR PROG ARGS, as root, and NAME=value...
+// PROG ARGS, as uid 2000, and run as setpriv, only the exact options stage 2
+// passes (see guestStackRunCommand), so a change to that command line fails
+// the boot instead of passing unnoticed. Either one refuses to run as root
+// with a loader variable in its environment, because the stack's own,
+// dynamically linked, would load what the variable names (see
+// guestLoaderNames), so a guest that let one through fails the boot. Its setpriv
 // does what util-linux's does with those options: it sets the supplementary
 // groups to the gid and to every group in /etc/group that lists the user
 // /etc/passwd gives the uid, sets the real, effective, and saved gid and uid,
@@ -41,8 +45,18 @@ const prSetNoNewPrivs = 38
 // vcap is the uid and gid the app runs as.
 const vcap = 2000
 
+// loaderNames are variables that glibc's loader would act on in a
+// dynamically linked env or setpriv.
+var loaderNames = []string{"LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "GCONV_PATH"}
+
 func main() {
 	var err error
+	for _, name := range loaderNames {
+		if _, set := os.LookupEnv(name); set && os.Getuid() == 0 {
+			fmt.Fprintf(os.Stderr, "%s: %s reached it while it runs as root\n", filepath.Base(os.Args[0]), name)
+			os.Exit(125)
+		}
+	}
 	switch name := filepath.Base(os.Args[0]); name {
 	case "env":
 		err = env(os.Args[1:])
@@ -56,8 +70,21 @@ func main() {
 }
 
 func env(args []string) error {
+	if os.Getuid() != 0 {
+		for len(args) > 0 && strings.Contains(args[0], "=") {
+			name, value, _ := strings.Cut(args[0], "=")
+			if err := os.Setenv(name, value); err != nil {
+				return err
+			}
+			args = args[1:]
+		}
+		if len(args) == 0 {
+			return fmt.Errorf("want NAME=value... PROG [ARG...] as uid %d, got no PROG", os.Getuid())
+		}
+		return run(args)
+	}
 	if len(args) < 3 || args[0] != "-C" {
-		return fmt.Errorf("want -C DIR PROG [ARG...], got %q", args)
+		return fmt.Errorf("want -C DIR PROG [ARG...] as root, got %q", args)
 	}
 	if err := os.Chdir(args[1]); err != nil {
 		return err
@@ -154,8 +181,8 @@ func run(argv []string) error {
 // root at /tmp/lifecycle/launcher. It prints who it runs as, whether
 // no_new_privs is set, its working directory, and each of its arguments, and
 // writes a file under /home/vcap/tmp and reads it back. It also reads a file
-// from the droplet and one from the stack, and prints the guest's hostname
-// and the owner of the directory it made.
+// from the droplet and one from the stack, and prints the guest's hostname,
+// the owner of the directory it made, and three of the loader variables.
 const realStackLauncher = `#!/bin/sh
 echo "app-id=$(id)"
 echo "app-$(grep NoNewPrivs /proc/self/status | tr -d '[:space:]')"
@@ -168,6 +195,7 @@ echo "app-owner=$(stat -c %u:%g /home/vcap/tmp /home/vcap/tmp/proof | tr '\n' ' 
 echo "app-droplet=$(cat /home/vcap/app/from-the-droplet)"
 echo "app-stack=$(cat /etc/stack-name)"
 echo "app-hostname=$(hostname)"
+echo "app-loader=[${LD_PRELOAD-unset}] [${LD_LIBRARY_PATH-unset}] [${LD_AUDIT-unset}]"
 `
 
 // realStackApplets are the busybox applets the test stack has in /bin, the
@@ -258,10 +286,10 @@ func realDropletImage(art string) *os.File {
 
 // bootRealStackGuest boots a real guest under TCG with a stack, as vm-launch
 // boots one with QEMU: the test stack, a droplet, and the test launcher,
-// with the launcher argv argv and a guest root image when withRoot is set.
-// It returns the console output, with carriage returns removed, and fails
+// with the launcher argv argv, env as the guest environment, and a guest
+// root image when withRoot is set. It returns the console output, with carriage returns removed, and fails
 // the spec unless QEMU exits 0 and the guest started the launcher.
-func bootRealStackGuest(argv []string, withRoot bool) string {
+func bootRealStackGuest(argv []string, withRoot bool, env string) string {
 	art := realArtifacts()
 	qemu := realQEMU()
 	requireMicrovm(qemu)
@@ -272,6 +300,7 @@ func bootRealStackGuest(argv []string, withRoot bool) string {
 	Expect(err).NotTo(HaveOccurred())
 	DeferCleanup(lf.Close)
 	g := taskGuest("")
+	g.env = env
 	g.stack = &guestStack{
 		launcher: guestTool{name: "launcher", file: lf, size: int64(len(realStackLauncher))},
 		argv:     shellJoin(argv),
@@ -301,7 +330,7 @@ var _ = Describe("the stack guest against a real QEMU", func() {
 	DescribeTable("runs the launcher from the stack and the droplet as vcap with no_new_privs, in its working directory, with its argv in order, and lets it write under /home/vcap",
 		func(withRoot bool) {
 			argv := []string{stackLauncherPath, "/home/vcap/app", "", `{"start_command":"echo it's \"started\"","process_type":"web"}`}
-			out := bootRealStackGuest(argv, withRoot)
+			out := bootRealStackGuest(argv, withRoot, noGuestEnv)
 
 			Expect(out).To(MatchRegexp(`(?m)^app-id=uid=2000\(vcap\) gid=2000\(vcap\) groups=2000\(vcap\)$`), out)
 			Expect(out).To(MatchRegexp(`(?m)^app-NoNewPrivs:1$`), out)
@@ -321,4 +350,16 @@ var _ = Describe("the stack guest against a real QEMU", func() {
 		Entry("on a guest root disk", true),
 		Entry("with the app root's upper layer in RAM", false),
 	)
+
+	It("gives the launcher the app's loader variables only after setpriv has dropped to vcap, so a library that does not exist never reaches a program that runs as root", func() {
+		argv := []string{stackLauncherPath, "/home/vcap/app", "", `{"start_command":"./app","process_type":"web"}`}
+		out := bootRealStackGuest(argv, false, "export LD_PRELOAD='/home/vcap/app/no-such-preload.so'\nexport LD_LIBRARY_PATH=''\n")
+
+		Expect(out).NotTo(ContainSubstring("while it runs as root"), out)
+		Expect(out).To(MatchRegexp(`(?m)^app-id=uid=2000\(vcap\) gid=2000\(vcap\) groups=2000\(vcap\)$`), out)
+		Expect(out).To(MatchRegexp(`(?m)^app-NoNewPrivs:1$`), out)
+		Expect(out).To(MatchRegexp(`(?m)^app-cwd=/home/vcap$`), out)
+		Expect(out).To(MatchRegexp(`(?m)^app-loader=\[/home/vcap/app/no-such-preload.so\] \[\] \[unset\]$`), out)
+		Expect(out).To(ContainSubstring(exitTag(testNonce) + "0"))
+	})
 })

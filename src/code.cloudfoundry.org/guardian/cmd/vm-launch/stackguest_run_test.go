@@ -15,6 +15,19 @@ import (
 var _ = Describe("the stack guest's command", func() {
 	var dir, bin string
 
+	// show starts each stub, which prints its name, its pid, each argument
+	// in brackets, so that an argument with a newline shows as one, and
+	// each of three loader variables that it has. Of the stubs that
+	// BeforeEach writes, chroot runs the program it is given from the
+	// test's app root, env enters the directory -C names there or sets the
+	// NAME=value words in front of the program, and setpriv runs what
+	// follows --. The launcher prints its working directory, its open-files
+	// limit, a variable from /rvm/env, and then exits with LAUNCHER_RC.
+	const show = `echo "$(basename "$0") $$"
+for a; do printf '[%s]\n' "$a"; done
+for n in LD_PRELOAD LD_LIBRARY_PATH GCONV_PATH; do eval "[ -z \"\${$n+x}\" ] || printf '%s=[%s]\n' $n \"\$$n\""; done
+`
+
 	writeFile := func(name, content string, perm os.FileMode) {
 		GinkgoHelper()
 		p := filepath.Join(dir, name)
@@ -27,15 +40,6 @@ var _ = Describe("the stack guest's command", func() {
 		bin = filepath.Join(dir, "bin")
 		Expect(os.Mkdir(bin, 0o755)).To(Succeed())
 
-		// Each stub prints its name, its pid, and each argument in
-		// brackets, so that an argument with a newline shows as one. chroot
-		// runs the program it is given from the test's app root, env enters
-		// the directory -C names there, and setpriv runs what follows --.
-		// The launcher prints its working directory, its open-files limit,
-		// a variable from /rvm/env, and then exits with LAUNCHER_RC.
-		show := `echo "$(basename "$0") $$"
-for a; do printf '[%s]\n' "$a"; done
-`
 		writeFile("bin/chroot", "#!/bin/sh\n"+show+`root=$1
 shift
 prog=$1
@@ -43,9 +47,15 @@ shift
 export STUB_ROOT="$root"
 exec "$root$prog" "$@"
 `, 0o755)
-		writeFile("rvm/app/usr/bin/env", "#!/bin/sh\n"+show+`[ "$1" = -C ] || exit 125
-cd "$STUB_ROOT$2" || exit 125
-shift 2
+		writeFile("rvm/app/usr/bin/env", "#!/bin/sh\n"+show+`if [ "$1" = -C ]; then
+	cd "$STUB_ROOT$2" || exit 125
+	shift 2
+else
+	while case $1 in *=*) true ;; *) false ;; esac; do
+		export "$1"
+		shift
+	done
+fi
 prog=$1
 shift
 exec "$STUB_ROOT$prog" "$@"
@@ -103,15 +113,25 @@ exit "${LAUNCHER_RC:-0}"
 		return b.String()
 	}
 
-	// want is the output of a run of the launcher argv, whose pid is pid.
-	want := func(pid string, argv []string, status string) string {
-		launch := append([]string{"/usr/bin/setpriv", "--reuid=2000", "--regid=2000", "--init-groups", "--no-new-privs", "--"}, argv...)
+	// wantWith is the output of a run of the launcher argv, whose pid is
+	// pid, with the loader variables that guestLoaderHold moves as the
+	// NAME=value words held, in the order in which they stand in front of
+	// the argv, and shown as the launcher's stub prints them.
+	wantWith := func(pid string, argv []string, status string, held []string, shown string) string {
+		after := append(append([]string{"/usr/bin/env"}, held...), argv...)
+		launch := append([]string{"/usr/bin/setpriv", "--reuid=2000", "--regid=2000", "--init-groups", "--no-new-privs", "--"}, after...)
 		return "chroot " + pid + "\n" + bracketed(append([]string{dir + "/rvm/app", "/usr/bin/env", "-C", "/home/vcap"}, launch...)...) +
 			"env " + pid + "\n" + bracketed(append([]string{"-C", "/home/vcap"}, launch...)...) +
 			"setpriv " + pid + "\n" + bracketed(launch[1:]...) +
-			"launcher " + pid + "\n" + bracketed(argv[1:]...) +
+			"env " + pid + "\n" + bracketed(after[1:]...) +
+			"launcher " + pid + "\n" + bracketed(argv[1:]...) + shown +
 			"pwd=" + dir + "/rvm/app/home/vcap nofile=256 FROM_ENV=from /rvm/env\n" +
 			"status=" + status + "\n"
+	}
+
+	// want is wantWith for a guest environment without loader variables.
+	want := func(pid string, argv []string, status string) string {
+		return wantWith(pid, argv, status, nil, "")
 	}
 
 	It("runs the launcher's argv in the app root, through env and setpriv, as uid 2000, with the recorded pid that of every program it execs", func() {
@@ -139,6 +159,47 @@ exit "${LAUNCHER_RC:-0}"
 		writeFile("rvm/argv", shellJoin(argv), 0o644)
 		out, pid := run("LAUNCHER_RC=3")
 		Expect(out).To(Equal(want(pid, argv, "3")))
+	})
+
+	It("keeps the loader variables from chroot, env, and setpriv, which start as root, and gives them to the launcher after setpriv, an empty one and one with a newline included", func() {
+		argv := []string{"/tmp/lifecycle/launcher", "app", "", ""}
+		writeFile("rvm/argv", shellJoin(argv), 0o644)
+		writeFile("rvm/env", "export FROM_ENV='from /rvm/env'\nexport LD_PRELOAD='/no/such/preload.so'\nexport LD_LIBRARY_PATH=''\nexport GCONV_PATH='two\nlines'\n", 0o600)
+		out, pid := run()
+		Expect(out).To(Equal(wantWith(pid, argv, "0",
+			[]string{"LD_PRELOAD=/no/such/preload.so", "LD_LIBRARY_PATH=", "GCONV_PATH=two\nlines"},
+			"LD_PRELOAD=[/no/such/preload.so]\nLD_LIBRARY_PATH=[]\nGCONV_PATH=[two\nlines]\n")))
+	})
+
+	It("moves every loader variable it names and no other variable, and never evaluates a value", func() {
+		// The host's own loader would act on these variables in the
+		// launcher's stub, so env, after the drop, stops once it has shown
+		// what it was given.
+		writeFile("rvm/app/usr/bin/env", "#!/bin/sh\n"+show+`if [ "$1" = -C ]; then
+	cd "$STUB_ROOT$2" || exit 125
+	shift 2
+	prog=$1
+	shift
+	exec "$STUB_ROOT$prog" "$@"
+fi
+`, 0o755)
+		argv := []string{"/tmp/lifecycle/launcher", "app", "", ""}
+		writeFile("rvm/argv", shellJoin(argv), 0o644)
+		env := "export FROM_ENV='from /rvm/env'\nexport LD_NOT_A_LOADER_NAME='kept'\n"
+		var held []string
+		for _, name := range guestLoaderNames {
+			Expect(validEnvName(name)).To(BeTrue(), name)
+			value := "$(touch " + dir + "/pwned) `id` " + name
+			env += "export " + name + "=" + shellQuote(value) + "\n"
+			held = append([]string{name + "=" + value}, held...)
+		}
+		writeFile("rvm/env", env, 0o600)
+		out, pid := run()
+		after := "env " + pid + "\n" + bracketed(append(held, argv...)...) + "status=0\n"
+		Expect(out).To(HaveSuffix(after))
+		Expect(strings.TrimSuffix(out, after)).NotTo(ContainSubstring("=["))
+		Expect(out).NotTo(ContainSubstring("[LD_NOT_A_LOADER_NAME="))
+		Expect(filepath.Join(dir, "pwned")).NotTo(BeAnExistingFile())
 	})
 
 	It("starts as the rvm.6 guest's command does", func() {

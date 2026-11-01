@@ -36,6 +36,7 @@ creds=/etc/cf-instance-credentials
 echo "app-id=$(id)"
 echo "app-$(grep NoNewPrivs /proc/self/status | tr -d '[:space:]')"
 echo "app-cwd=$(pwd)"
+echo "app-loader=[${LD_PRELOAD-unset}] [${LD_LIBRARY_PATH-unset}]"
 echo "app-creds=$(stat -c '%n %a %u' $creds/instance.crt $creds/instance.key | tr '\n' ' ')"
 echo app-pair-begin
 cat $creds/instance.crt $creds/instance.key
@@ -53,13 +54,14 @@ done
 `
 
 // realSidecarScript is the sidecar's command, which the launcher runs. It
-// reports who it runs as, where, and the variable its own
-// environment sets, and a stop's SIGTERM makes it exit 0.
+// reports who it runs as, where, the variable its own environment sets,
+// and the loader variables it got, and a stop's SIGTERM makes it exit 0.
 const realSidecarScript = `trap 'echo sidecar-got-term; exit 0' TERM
 echo "sidecar-id=$(id)"
 echo "sidecar-$(grep NoNewPrivs /proc/self/status | tr -d '[:space:]')"
 echo "sidecar-cwd=$(pwd)"
 echo "sidecar-mark=$SIDECAR_MARK"
+echo "sidecar-loader=[${LD_PRELOAD-unset}] [${LD_LIBRARY_PATH-unset}]"
 echo sidecar-ready
 while :; do /bin/busybox sleep 1; done
 `
@@ -67,13 +69,14 @@ while :; do /bin/busybox sleep 1; done
 // realSidecarFiles returns the guest files of one sidecar that runs command,
 // as vm-launch makes them from the CF_VM_SIDECARS that rep sets: a Diego run
 // action whose path is the launcher and whose arguments are the app
-// directory, the command, and empty metadata, with one variable of its own.
+// directory, the command, and empty metadata, with two variables of its own,
+// one of them a loader variable.
 func realSidecarFiles(command string) []guestSidecar {
 	desc, err := json.Marshal(map[string]any{
 		"version": sidecarsVersion,
 		"sidecars": []map[string]any{{
 			"args":       []string{"app", command, ""},
-			"env":        []string{"SIDECAR_MARK=from the sidecar env"},
+			"env":        []string{"SIDECAR_MARK=from the sidecar env", "LD_LIBRARY_PATH=/home/vcap/sidecar-libs"},
 			"log_source": "APP/PROC/WEB/SIDECAR/PROBE",
 		}},
 	})
@@ -123,9 +126,11 @@ type realSidecarRun struct {
 // superviseRealSidecar boots a stack guest under TCG through the
 // supervisor, as vm-launch runs QEMU, with realSidecarLauncher as its
 // launcher, one sidecar from CF_VM_SIDECARS that runs realSidecarScript
-// through it, and initial as the identity pair in its initramfs. Once the
-// guest has started its command, it pushes next as push number 1. Once the output shows that the sidecar is ready and that
-// the app has seen the pushed pair, it sends the supervisor SIGTERM.
+// through it, LD_PRELOAD in the app's environment, and initial as the
+// identity pair in its initramfs. Once the guest has started its command, it
+// pushes next as push number 1. Once the output shows that the sidecar is
+// ready and that the app has seen the pushed pair, it sends the supervisor
+// SIGTERM.
 func superviseRealSidecar(initial, next testIdentityPair) realSidecarRun {
 	art := realArtifacts()
 	qemu := realQEMU()
@@ -137,6 +142,7 @@ func superviseRealSidecar(initial, next testIdentityPair) realSidecarRun {
 	Expect(err).NotTo(HaveOccurred())
 	DeferCleanup(lf.Close)
 	g := taskGuest("")
+	g.env = "export LD_PRELOAD='/home/vcap/app/no-such-preload.so'\n"
 	g.stack = &guestStack{
 		launcher: guestTool{name: "launcher", file: lf, size: int64(len(realSidecarLauncher))},
 		argv:     shellJoin([]string{stackLauncherPath, "/home/vcap/app", "", `{"start_command":"./app","process_type":"web"}`}),
@@ -257,7 +263,7 @@ var _ = Describe("a stack guest with a sidecar and an instance identity against 
 		next = newTestIdentityPair(2, "rsa")
 	})
 
-	It("runs the sidecar from the stack as vcap in the app's working directory, installs and replaces the pair at /etc/cf-instance-credentials, and stops both within the guest's timeout", func() {
+	It("runs the sidecar from the stack as vcap in the app's working directory, gives both their loader variables only after the drop, installs and replaces the pair at /etc/cf-instance-credentials, and stops both within the guest's timeout", func() {
 		r := superviseRealSidecar(initial, next)
 		out := r.out
 
@@ -268,6 +274,9 @@ var _ = Describe("a stack guest with a sidecar and an instance identity against 
 		Expect(out).To(MatchRegexp(`(?m)^sidecar-NoNewPrivs:1$`), out)
 		Expect(out).To(MatchRegexp(`(?m)^sidecar-cwd=/home/vcap$`), out)
 		Expect(out).To(MatchRegexp(`(?m)^sidecar-mark=from the sidecar env$`), out)
+		Expect(out).NotTo(ContainSubstring("while it runs as root"), out)
+		Expect(out).To(MatchRegexp(`(?m)^app-loader=\[/home/vcap/app/no-such-preload.so\] \[unset\]$`), out)
+		Expect(out).To(MatchRegexp(`(?m)^sidecar-loader=\[/home/vcap/app/no-such-preload.so\] \[/home/vcap/sidecar-libs\]$`), out)
 
 		Expect(out).To(MatchRegexp(`(?m)^app-creds=/etc/cf-instance-credentials/instance.crt 644 0 /etc/cf-instance-credentials/instance.key 644 0 $`), out)
 		Expect(pairBetween(out, "app-pair-begin", "app-pair-end")).To(Equal(string(initial.crt) + string(initial.key)))
