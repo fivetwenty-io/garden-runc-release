@@ -5,6 +5,7 @@ package main
 import (
 	"strconv"
 	"strings"
+	"time"
 )
 
 // guestProcess is one process that the run section starts in the app root.
@@ -30,10 +31,24 @@ func guestSidecarFile(index int, name string) string {
 	return "/rvm/sidecar/" + strconv.Itoa(index) + "/" + name
 }
 
-// guestTimeoutSeconds bounds the wind-down in the guest once one process
-// has exited or vm-launch has asked for a stop, as the host bounds it after
-// a signal.
-const guestTimeoutSeconds = "8"
+// guestWindDown bounds the wind-down in the guest once one process has
+// exited or vm-launch has asked for a stop, as stopDeadline bounds it on the
+// host after a signal. The guest's timer starts only once the stop line has
+// crossed the console and the event loop has read it, and the host kills the
+// hypervisor at stopDeadline whatever the guest is doing, so the timer has
+// to end well before the host's deadline. Otherwise the guest never sends
+// SIGKILL, never reports the app's status, and loses its OOM report. Six
+// seconds is the most grace that still leaves 2 seconds, as Diego leaves
+// vm-launch after stopDeadline, for the stop line's trip, the SIGKILL, which
+// can wait up to a second for a pid file that is still empty, the OOM
+// report, and the exit line's trip back. A stack guest runs no volume
+// teardown after the section, so nothing else shares that time.
+// guestTimeoutSeconds is the same time as the text the guest's shell takes,
+// and a spec keeps the two in step and the gap in place.
+const (
+	guestWindDown       = 6 * time.Second
+	guestTimeoutSeconds = "6"
+)
 
 // guestRunSection is the part of stage 2 that runs the app and its sidecars
 // once the app root is ready, in place of the single command subshell and

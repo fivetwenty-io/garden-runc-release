@@ -66,6 +66,14 @@ echo sidecar-ready
 while :; do /bin/busybox sleep 1; done
 `
 
+// realDeafSidecarScript is a sidecar's command that ignores SIGTERM, as a
+// proxy that drains its connections for longer than the stop allows does,
+// so that only the guest's SIGKILL ends it.
+const realDeafSidecarScript = `trap '' TERM
+echo sidecar-ready
+while :; do /bin/busybox sleep 1; done
+`
+
 // realSidecarFiles returns the guest files of one sidecar that runs command,
 // as vm-launch makes them from the CF_VM_SIDECARS that rep sets: a Diego run
 // action whose path is the launcher and whose arguments are the app
@@ -125,13 +133,12 @@ type realSidecarRun struct {
 
 // superviseRealSidecar boots a stack guest under TCG through the
 // supervisor, as vm-launch runs QEMU, with realSidecarLauncher as its
-// launcher, one sidecar from CF_VM_SIDECARS that runs realSidecarScript
-// through it, LD_PRELOAD in the app's environment, and initial as the
+// launcher, one sidecar from CF_VM_SIDECARS that runs script through it, LD_PRELOAD in the app's environment, and initial as the
 // identity pair in its initramfs. Once the guest has started its command, it
 // pushes next as push number 1. Once the output shows that the sidecar is
 // ready and that the app has seen the pushed pair, it sends the supervisor
 // SIGTERM.
-func superviseRealSidecar(initial, next testIdentityPair) realSidecarRun {
+func superviseRealSidecar(initial, next testIdentityPair, script string) realSidecarRun {
 	art := realArtifacts()
 	qemu := realQEMU()
 	requireMicrovm(qemu)
@@ -149,7 +156,7 @@ func superviseRealSidecar(initial, next testIdentityPair) realSidecarRun {
 		cwd:      "/home/vcap",
 		hostname: "stack-guest-0",
 		hosts:    []byte("127.0.0.1 localhost\n"),
-		sidecars: realSidecarFiles(realSidecarScript),
+		sidecars: realSidecarFiles(script),
 		identity: &instanceIdentity{cert: initial.crt, key: initial.key},
 	}
 	g.drives, err = newGuestDrivesWithStack(backend.VMQemu, nil, nil, sd)
@@ -264,7 +271,7 @@ var _ = Describe("a stack guest with a sidecar and an instance identity against 
 	})
 
 	It("runs the sidecar from the stack as vcap in the app's working directory, gives both their loader variables only after the drop, installs and replaces the pair at /etc/cf-instance-credentials, and stops both within the guest's timeout", func() {
-		r := superviseRealSidecar(initial, next)
+		r := superviseRealSidecar(initial, next, realSidecarScript)
 		out := r.out
 
 		Expect(out).To(MatchRegexp(`(?m)^app-id=uid=2000\(vcap\) gid=2000\(vcap\) groups=2000\(vcap\)$`), out)
@@ -289,6 +296,19 @@ var _ = Describe("a stack guest with a sidecar and an instance identity against 
 		Expect(out).To(MatchRegexp(`(?m)^app-got-term$`), out)
 		Expect(out).To(MatchRegexp(`(?m)^sidecar-got-term$`), out)
 		Expect(out).NotTo(ContainSubstring("did not all exit within"))
+		Expect(r.ended.Sub(r.signalled)).To(BeNumerically("<", stopDeadline))
+		Expect(r.log).To(Equal("received terminated, asking the guest command to stop\n"))
+	})
+
+	It("ends a sidecar that ignores SIGTERM once the guest's timeout has passed, and reports the app's status before the host's stop deadline", func() {
+		r := superviseRealSidecar(initial, next, realDeafSidecarScript)
+		out := r.out
+
+		Expect(r.res.markerFound).To(BeTrue(), r.log)
+		Expect(codeOf(r.res)).To(Equal(7), out)
+		Expect(out).To(MatchRegexp(`(?m)^app-got-term$`), out)
+		Expect(out).To(ContainSubstring("vm-launch guest: the app and its sidecars did not all exit within "+guestTimeoutSeconds+" seconds; ending the rest\n"), out)
+		Expect(r.ended.Sub(r.signalled)).To(BeNumerically(">=", guestWindDown))
 		Expect(r.ended.Sub(r.signalled)).To(BeNumerically("<", stopDeadline))
 		Expect(r.log).To(Equal("received terminated, asking the guest command to stop\n"))
 	})

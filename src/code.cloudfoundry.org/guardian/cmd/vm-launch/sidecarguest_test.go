@@ -321,7 +321,7 @@ var _ = Describe("the run section", func() {
 		shellEntries(""),
 	)
 
-	DescribeTable("ends the wait 8 seconds after the first exit or the stop when a process ignores SIGTERM",
+	DescribeTable("ends the wait 6 seconds after the first exit or the stop when a process ignores SIGTERM",
 		func(shellOf func() guestShell, scripts []string, stop bool, want string) {
 			shell := shellOf()
 			procs := sectionProcs(GinkgoT().TempDir(), scripts, appEnv)
@@ -335,17 +335,24 @@ var _ = Describe("the run section", func() {
 			}
 			began := time.Now()
 			Expect(r.finish(20*time.Second)).To(Equal(want), shell.name)
-			Expect(time.Since(began)).To(BeNumerically(">=", 7500*time.Millisecond))
-			Expect(time.Since(began)).To(BeNumerically("<", 11*time.Second))
+			Expect(time.Since(began)).To(BeNumerically(">=", guestWindDown-500*time.Millisecond))
+			Expect(time.Since(began)).To(BeNumerically("<", guestWindDown+3*time.Second))
 		},
 		append(
 			shellEntries("after a sidecar's exit, with the first status", []string{termScript(143), deafScript, exitAfterScript(3, 0, 1)}, false,
 				"vm-launch guest: sidecar 2 exited with status 3; stopping the app and the other sidecar\n"+
-					"vm-launch guest: the app and its sidecars did not all exit within 8 seconds; ending the rest\nstatus=3\n"),
+					"vm-launch guest: the app and its sidecars did not all exit within 6 seconds; ending the rest\nstatus=3\n"),
 			shellEntries("after a stop, with 137 for the app that SIGKILL ended", []string{deafScript, termScript(9)}, true,
-				"vm-launch guest: the app and its sidecars did not all exit within 8 seconds; ending the rest\nstatus=137\n")...,
+				"vm-launch guest: the app and its sidecars did not all exit within 6 seconds; ending the rest\nstatus=137\n")...,
 		),
 	)
+
+	It("ends its wind-down 2 seconds before the host's stop deadline, with a text that matches its duration", func() {
+		Expect(guestWindDown + 2*time.Second).To(BeNumerically("<=", stopDeadline))
+		Expect(guestTimeoutSeconds).To(Equal(strconv.Itoa(int(guestWindDown / time.Second))))
+		Expect(guestWindDown % time.Second).To(BeZero())
+		Expect(guestEventLoop(sectionProcs(GinkgoT().TempDir(), []string{"exit 0", "exit 0"}, appEnv))).To(ContainSubstring("sleep " + guestTimeoutSeconds + " &\n"))
+	})
 
 	DescribeTable("runs the app alone and gives its status",
 		func(shellOf func() guestShell) {
