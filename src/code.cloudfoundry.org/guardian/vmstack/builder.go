@@ -216,9 +216,12 @@ func (b *Builder) Image(log lager.Logger, tarball string) (string, bool) {
 
 // WarmUp builds the image of every listed tarball that exists and returns
 // when every build has finished or failed, so callers run it in a goroutine.
+// It goes through the same resolutions and entry locks as Image, so a create
+// that arrives during the warm-up waits on the build that the warm-up started.
 func (b *Builder) WarmUp() {
 	log := b.logger.Session("warm-up")
 	start := time.Now()
+	log.Info("started", lager.Data{"tarballs": b.tarballs})
 
 	type pending struct {
 		tarball string
@@ -241,6 +244,7 @@ func (b *Builder) WarmUp() {
 		}
 		log.Info("vm-stack-image-ready", lager.Data{"tarball": p.tarball, "dir": p.f.dir, "elapsed": time.Since(start).String()})
 	}
+	log.Info("finished", lager.Data{"elapsed": time.Since(start).String()})
 }
 
 // Clean removes every cache entry whose key matches no listed tarball's

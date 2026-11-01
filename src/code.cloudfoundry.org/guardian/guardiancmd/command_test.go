@@ -983,7 +983,9 @@ var _ = Describe("VM stack flags", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			backends.startVMStackWarmUp()
+			Eventually(log).Should(gbytes.Say("warm-up.started"))
 			Eventually(log).Should(gbytes.Say("tarball-unavailable"))
+			Eventually(log).Should(gbytes.Say("warm-up.finished"))
 		})
 	})
 })

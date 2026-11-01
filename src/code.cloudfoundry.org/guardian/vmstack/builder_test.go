@@ -538,6 +538,40 @@ fi
 			Expect(runCount()).To(Equal(1))
 		})
 
+		It("logs its start and its end", func() {
+			New(config).WarmUp()
+			messages := logger.LogMessages()
+			Expect(messages).To(ContainElement(HaveSuffix("warm-up.started")))
+			Expect(messages).To(ContainElement(HaveSuffix("warm-up.finished")))
+			Expect(messages[0]).To(HaveSuffix("warm-up.started"))
+			Expect(messages[len(messages)-1]).To(HaveSuffix("warm-up.finished"))
+		})
+
+		It("logs its end when no tarball exists", func() {
+			config.Tarballs = []string{filepath.Join(work, "missing.tar")}
+			New(config).WarmUp()
+			Expect(logger.LogMessages()).To(ContainElement(HaveSuffix("warm-up.finished")))
+		})
+
+		It("gives an Image call that arrives during the warm-up the same build", func() {
+			writeFake(500*time.Millisecond, "")
+			b := New(config)
+
+			done := make(chan struct{})
+			go func() {
+				defer GinkgoRecover()
+				defer close(done)
+				b.WarmUp()
+			}()
+			Eventually(runCount, 5*time.Second, 10*time.Millisecond).Should(Equal(1))
+
+			dir, ok := b.Image(logger, tarball)
+			Expect(ok).To(BeTrue())
+			Expect(dir).To(Equal(filepath.Join(cacheDir, keyOf(tarball))))
+			Eventually(done, 5*time.Second).Should(BeClosed())
+			Expect(runCount()).To(Equal(1))
+		})
+
 		It("shares a build that an Image call started", func() {
 			writeFake(500*time.Millisecond, "")
 			config.Wait = 0
