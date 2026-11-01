@@ -98,7 +98,7 @@ type sectionRun struct {
 	done        chan error
 }
 
-// sectionBusybox is the busybox whose tr and awk the run's framers run in
+// sectionBusybox is the busybox whose tr and sh the run's framers run in
 // place of the guest's /bin/busybox: the guest's own when guestBusyboxEnv
 // names it, and otherwise the one on PATH. The spec skips where there is
 // neither.

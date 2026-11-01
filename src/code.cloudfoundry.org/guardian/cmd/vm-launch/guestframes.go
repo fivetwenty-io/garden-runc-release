@@ -57,36 +57,38 @@ mkfifo -m 0600 ` + strings.Join(fifos, " ") + ` || rvm_fail "creating the log FI
 // console as standard output (see guestProcessWrapper). It sets its own
 // oom_score_adj to -1000, as the wrappers do, so the guest kernel never ends
 // a framer and leaves its process writing into a pipe that no one reads.
+// That is sound only because a framer's memory is bounded: it holds at most
+// one piece of a line, whatever its process writes.
 //
-// busybox tr drops each NUL byte, which busybox awk would otherwise take for
-// the end of a line. busybox awk then writes each line as one or more frames
-// of at most guestFramePayload bytes (see logTag), with the upper-case
-// letter on every frame but the last of a line, and flushes after each one,
-// so a frame leaves at once and in one write. Both programs pass data on as
-// soon as it comes. A line that has not ended yet stays in awk until its
-// newline comes, or until the end of the stream ends it as a line of its
-// own. busybox fold could bound the line that awk holds, but it buffers its
-// output into a pipe until a few KiB have come or the stream ends, which
-// would hold back the lines of a quiet process, and it takes no width above
-// 10000.
+// busybox tr drops each NUL byte, which no shell variable can hold. A busybox
+// sh then reads the stream with read -n, which stops at a newline or after
+// guestFramePayload bytes, whichever comes first, and writes each piece as
+// one frame (see logTag) as soon as it has it, with the upper-case letter on
+// a full piece, which a further piece continues, and the lower-case letter
+// on the last piece of a line. A line of exactly a multiple of
+// guestFramePayload bytes therefore ends with an empty last piece, and the
+// end of the stream ends a line that has no newline. The shell writes each
+// frame with one printf, which leaves in one write. LC_ALL=C makes ${#} count
+// bytes, as read -n does, where a UTF-8 locale would count characters.
 //
-// The tag, which holds the nonce and the index, reaches awk as RVM_TAG in
-// its environment, which only root can read, and never in an argv, which
+// The framer reads a byte at a time, so it passes on about 1.5 MB/s of one
+// stream. busybox awk passes on far more, but it holds a line until its
+// newline comes, so a process that writes one endless line would grow a
+// framer that the kernel never ends. busybox fold could bound the line, but
+// it buffers its output into a pipe until a few KiB have come or the stream
+// ends, which would hold back the lines of a quiet process, and head -c waits
+// for all its bytes in the same way.
+//
+// The tag, which holds the nonce and the index, reaches the shell as RVM_TAG
+// in its environment, which only root can read, and never in an argv, which
 // every process can read in /proc. Both programs are named by the busybox
-// binary's path, as guestRootCat names cat.
+// binary's path, as guestRootCat names cat, and the framer's script is one
+// line.
 func guestFrameFunc(nonce string) string {
+	n := strconv.Itoa(guestFramePayload)
 	return `rvm_frame() {
 	echo -1000 >/proc/self/oom_score_adj
-	/bin/busybox tr -d '\000' | RVM_TAG='` + logTag(nonce) + `'"$1" /bin/busybox awk -v rvm_s="$2" 'BEGIN { more = ENVIRON["RVM_TAG"] toupper(rvm_s) " "; last = ENVIRON["RVM_TAG"] rvm_s " " }
-{
-	n = length($0)
-	for (i = 1; n - i >= ` + strconv.Itoa(guestFramePayload) + `; i += ` + strconv.Itoa(guestFramePayload) + `) {
-		print more substr($0, i, ` + strconv.Itoa(guestFramePayload) + `)
-		fflush()
-	}
-	print last substr($0, i)
-	fflush()
-}'
+	/bin/busybox tr -d '\000' | LC_ALL=C RVM_TAG='` + logTag(nonce) + `'"$1" /bin/busybox sh -c 'case $1 in o) rvm_m=O ;; e) rvm_m=E ;; esac; rvm_more=; while IFS= read -r -n ` + n + ` rvm_l; do if [ "${#rvm_l}" -eq ` + n + ` ]; then rvm_s=$rvm_m rvm_more=1; else rvm_s=$1 rvm_more=; fi; printf "%s\n" "$RVM_TAG$rvm_s $rvm_l"; done; if [ -n "$rvm_l" ] || [ -n "$rvm_more" ]; then printf "%s\n" "$RVM_TAG$1 $rvm_l"; fi' rvm_frame "$2"
 }
 `
 }
