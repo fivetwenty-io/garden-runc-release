@@ -148,7 +148,7 @@ cp %[5]s "$out"
 		Expect(sqfstarArgs).To(Equal([]string{"-comp", "lz4", "-b", "128K", "-mem", "256M", "-processors", "1", "-no-progress", "-quiet"}))
 
 		cmd := b.sqfstarCommand(context.Background(), "/out")
-		Expect(cmd.Args[:4]).To(Equal([]string{"nice", "-n", "10", fake}))
+		Expect(cmd.Args[:4]).To(Equal([]string{niceBinary, "-n", "10", fake}))
 
 		info, err := os.Stat(filepath.Join(dir, imageName))
 		Expect(err).NotTo(HaveOccurred())
@@ -357,6 +357,63 @@ cp %[5]s "$out"
 			return ok
 		}, 5*time.Second, 50*time.Millisecond).Should(BeTrue())
 		Expect(runCount()).To(Equal(0))
+	})
+
+	Describe("the failure backoff", func() {
+		It("runs nice by absolute path, whatever PATH holds", func() {
+			Expect(niceBinary).To(Equal("/usr/bin/nice"))
+			cmd := New(config).sqfstarCommand(context.Background(), "/out")
+			Expect(cmd.Path).To(Equal("/usr/bin/nice"))
+		})
+
+		It("backs off after a failure that is not an sqfstar failure", func() {
+			config.CacheDir = filepath.Join(work, "file")
+			Expect(os.WriteFile(config.CacheDir, []byte("not a directory"), 0644)).To(Succeed())
+			b := New(config)
+
+			_, ok := b.Image(logger, tarball)
+			Expect(ok).To(BeFalse())
+			Expect(logger.LogMessages()).To(ContainElement(HaveSuffix("build-failed")))
+
+			Expect(os.Remove(config.CacheDir)).To(Succeed())
+			_, ok = b.Image(logger, tarball)
+			Expect(ok).To(BeFalse())
+			Expect(runCount()).To(Equal(0))
+			Expect(string(logger.Buffer().Contents())).To(ContainSubstring("the next try waits until"))
+		})
+
+		It("doubles the wait with each failure up to a cap", func() {
+			b := New(config)
+			var last failure
+			failed := false
+			var delays []time.Duration
+			for range 8 {
+				b.recordFailure("key", last, failed)
+				last, failed = b.failures["key"], true
+				delays = append(delays, last.delay)
+			}
+			Expect(delays).To(Equal([]time.Duration{
+				time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute,
+				15 * time.Minute, 15 * time.Minute, 15 * time.Minute, 15 * time.Minute,
+			}))
+		})
+
+		It("forgets the backoff after a build succeeds", func() {
+			config.CacheDir = filepath.Join(work, "file")
+			Expect(os.WriteFile(config.CacheDir, []byte("not a directory"), 0644)).To(Succeed())
+			b := New(config)
+			b.backoff = 100 * time.Millisecond
+
+			_, ok := b.Image(logger, tarball)
+			Expect(ok).To(BeFalse())
+			Expect(b.failures).To(HaveLen(1))
+			Expect(os.Remove(config.CacheDir)).To(Succeed())
+			Eventually(func() bool {
+				_, ok := b.Image(logger, tarball)
+				return ok
+			}, 5*time.Second, 50*time.Millisecond).Should(BeTrue())
+			Expect(b.failures).To(BeEmpty())
+		})
 	})
 
 	Describe("WarmUp", func() {

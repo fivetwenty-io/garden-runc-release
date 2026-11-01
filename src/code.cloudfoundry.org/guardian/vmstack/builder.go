@@ -29,10 +29,15 @@ const (
 	tempPrefix      = "." + imageName + "-"
 	lockSuffix      = ".lock"
 	failureBackoff  = 60 * time.Second
+	maxBackoff      = 15 * time.Minute
 	buildTimeout    = 30 * time.Minute
 	maxHashAttempts = 5
 	maxToolOutput   = 64 * 1024
 )
+
+// niceBinary is run by absolute path, because Garden runs as root and its PATH
+// must not decide which program a build starts.
+const niceBinary = "/usr/bin/nice"
 
 var errLocked = errors.New("another build holds the lock")
 
@@ -73,7 +78,9 @@ type Builder struct {
 	tarballs []string
 	listed   map[string]bool
 
-	// backoff is how long a failed build keeps the next one from starting.
+	// backoff is how long the first failed build keeps the next one from
+	// starting. Each further failure of the same key doubles it, up to
+	// maxBackoff.
 	backoff time.Duration
 	// timeout bounds one run of sqfstar, so a hung build cannot hold its
 	// entry's lock for good.
@@ -87,7 +94,14 @@ type Builder struct {
 	tool     hashed
 	resolves map[string]*flight
 	builds   map[string]*flight
-	failures map[string]time.Time
+	failures map[string]failure
+}
+
+// failure records the last failed build of a key and how long it keeps the
+// next try away.
+type failure struct {
+	at    time.Time
+	delay time.Duration
 }
 
 // fileID identifies a version of a tarball well enough to reuse its hash.
@@ -133,7 +147,7 @@ func New(config Config) *Builder {
 		hashes:   map[string]hashed{},
 		resolves: map[string]*flight{},
 		builds:   map[string]*flight{},
-		failures: map[string]time.Time{},
+		failures: map[string]failure{},
 	}
 	for _, tarball := range config.Tarballs {
 		path := filepath.Clean(tarball)
@@ -482,7 +496,9 @@ func (b *Builder) hash(log lager.Logger, path string) (string, error) {
 }
 
 // build returns the directory of the finished image for a key, building it
-// under the entry's lock when it is missing or damaged.
+// under the entry's lock when it is missing or damaged. Every failure after
+// the backoff check starts a backoff, so a cell that cannot finish a build
+// does not start a new one at every request.
 func (b *Builder) build(log lager.Logger, e entry, tarball string) (string, error) {
 	key := e.key
 	dir := filepath.Join(b.cacheDir, key)
@@ -492,48 +508,16 @@ func (b *Builder) build(log lager.Logger, e entry, tarball string) (string, erro
 	}
 
 	b.mu.Lock()
-	failedAt, failed := b.failures[key]
+	last, failed := b.failures[key]
 	b.mu.Unlock()
-	if failed && time.Since(failedAt) < b.backoff {
-		return "", fmt.Errorf("the last build of %s failed %s ago, so the next try waits until %s have passed", tarball, time.Since(failedAt).Round(time.Second), b.backoff)
-	}
-
-	if err := os.MkdirAll(b.cacheDir, 0755); err != nil {
-		return "", err
-	}
-	lock, err := lockEntry(b.lockPath(key), true)
-	if err != nil {
-		return "", err
-	}
-	defer lock.Close()
-
-	// Another Garden process may have finished the image while this one
-	// waited for the lock.
-	if err := checkImagePath(image); err == nil {
-		return dir, nil
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		log.Info("removing-bad-image", lager.Data{"image": image, "reason": err.Error()})
-		if err := os.Remove(image); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return "", err
-		}
-	}
-
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return "", err
-	}
-	if err := os.Chmod(dir, 0755); err != nil {
-		return "", err
-	}
-	if err := removeTemps(dir); err != nil {
-		return "", err
+	if failed && time.Since(last.at) < last.delay {
+		return "", fmt.Errorf("the last build of %s failed %s ago, so the next try waits until %s have passed", tarball, time.Since(last.at).Round(time.Second), last.delay)
 	}
 
 	start := time.Now()
-	log.Info("building", lager.Data{"tarball": tarball})
-	if err := b.runSqfstar(e.sum, tarball, dir); err != nil {
-		b.mu.Lock()
-		b.failures[key] = time.Now()
-		b.mu.Unlock()
+	err := b.buildLocked(log, e, tarball)
+	if err != nil {
+		b.recordFailure(key, last, failed)
 		log.Error("build-failed", err, lager.Data{"tarball": tarball, "elapsed": time.Since(start).String()})
 		return "", err
 	}
@@ -541,8 +525,66 @@ func (b *Builder) build(log lager.Logger, e entry, tarball string) (string, erro
 	b.mu.Lock()
 	delete(b.failures, key)
 	b.mu.Unlock()
-	log.Info("built", lager.Data{"tarball": tarball, "image": image, "build-time": time.Since(start).String()})
 	return dir, nil
+}
+
+// recordFailure starts or lengthens the backoff of a key.
+func (b *Builder) recordFailure(key string, last failure, failed bool) {
+	delay := b.backoff
+	if failed {
+		delay = min(max(last.delay*2, b.backoff), max(maxBackoff, b.backoff))
+	}
+
+	b.mu.Lock()
+	b.failures[key] = failure{at: time.Now(), delay: delay}
+	b.mu.Unlock()
+}
+
+// buildLocked builds the image under the entry's lock unless another process
+// finished it while this one waited.
+func (b *Builder) buildLocked(log lager.Logger, e entry, tarball string) error {
+	key := e.key
+	dir := filepath.Join(b.cacheDir, key)
+	image := filepath.Join(dir, imageName)
+
+	if err := os.MkdirAll(b.cacheDir, 0755); err != nil {
+		return err
+	}
+	lock, err := lockEntry(b.lockPath(key), true)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+
+	// Another Garden process may have finished the image while this one
+	// waited for the lock.
+	if err := checkImagePath(image); err == nil {
+		return nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		log.Info("removing-bad-image", lager.Data{"image": image, "reason": err.Error()})
+		if err := os.Remove(image); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
+
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	if err := os.Chmod(dir, 0755); err != nil {
+		return err
+	}
+	if err := removeTemps(dir); err != nil {
+		return err
+	}
+
+	start := time.Now()
+	log.Info("building", lager.Data{"tarball": tarball})
+	if err := b.runSqfstar(e.sum, tarball, dir); err != nil {
+		return err
+	}
+
+	log.Info("built", lager.Data{"tarball": tarball, "image": image, "build-time": time.Since(start).String()})
+	return nil
 }
 
 // runSqfstar builds the image into a temporary file in dir and renames it
@@ -625,7 +667,7 @@ func (b *Builder) runSqfstar(want, tarball, dir string) error {
 // whole tarball and compresses it while the cell runs apps.
 func (b *Builder) sqfstarCommand(ctx context.Context, out string) *exec.Cmd {
 	args := append([]string{"-n", "10", b.sqfstar}, sqfstarArgs...)
-	return exec.CommandContext(ctx, "nice", append(args, out)...)
+	return exec.CommandContext(ctx, niceBinary, append(args, out)...)
 }
 
 func finishImage(img *os.File) error {
