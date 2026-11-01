@@ -49,7 +49,9 @@ const (
 // CF_SYSTEM_CERT_PATH name container files, and SERVICE_BINDING_ROOT and
 // VCAP_SERVICES_FILE_PATH name file-based service bindings, which are in the
 // container and not in the guest. VCAP_PLATFORM_OPTIONS belongs to the
-// launcher, which unsets it before the app starts.
+// launcher, which unsets it before the app starts. CF_VM_SIDECARS is
+// vm-launch's own description of the sidecars, which the guest gets as files
+// (see sidecarGuestFiles).
 var guestEnvDenylist = map[string]bool{
 	"PATH":                    true,
 	"HOME":                    true,
@@ -64,6 +66,7 @@ var guestEnvDenylist = map[string]bool{
 	"SERVICE_BINDING_ROOT":    true,
 	"VCAP_SERVICES_FILE_PATH": true,
 	platformOptionsEnv:        true,
+	sidecarsEnvVar:            true,
 }
 
 // stackGuestEnvDenylist is guestEnvDenylist for a guest that runs the app on
@@ -80,6 +83,37 @@ var stackGuestEnvDenylist = func() map[string]bool {
 	}
 	return deny
 }()
+
+// Where a stack guest that holds the instance identity pair installs it, on
+// a tmpfs in the app root (see guestStack.identity). These are the paths
+// Diego gives CF_INSTANCE_CERT and CF_INSTANCE_KEY in a container.
+const (
+	guestInstanceCertPath = "/etc/cf-instance-credentials/instance.crt"
+	guestInstanceKeyPath  = "/etc/cf-instance-credentials/instance.key"
+)
+
+// stackGuestIdentityEnvDenylist is stackGuestEnvDenylist for a stack guest
+// that holds the instance identity pair. CF_INSTANCE_CERT and
+// CF_INSTANCE_KEY then name files in the guest, so they are kept.
+var stackGuestIdentityEnvDenylist = func() map[string]bool {
+	deny := make(map[string]bool, len(stackGuestEnvDenylist))
+	for name := range stackGuestEnvDenylist {
+		if name != instanceCertEnv && name != instanceKeyEnv {
+			deny[name] = true
+		}
+	}
+	return deny
+}()
+
+// stackGuestDenylist returns the denylist of a stack guest's environment,
+// which keeps the identity variables only when the guest holds the pair.
+// The app's /rvm/env and every sidecar's environment file share it.
+func stackGuestDenylist(identity bool) map[string]bool {
+	if identity {
+		return stackGuestIdentityEnvDenylist
+	}
+	return stackGuestEnvDenylist
+}
 
 // shellOwnedNames are the variables that the guest's busybox sh sets for
 // itself when it runs /rvm/cmd: it ignores an inherited IFS, OPTIND, and
@@ -184,9 +218,21 @@ func buildGuestEnv(env map[string]string, guestMiB int, logger *log.Logger) (str
 // buildStackGuestEnv is buildGuestEnv for a guest that runs the app on the
 // stack image. It keeps PATH, USER, and LANG, which the stack's own root file
 // system makes meaningful, and still leaves out HOME, TMPDIR, DEPS_DIR, PWD,
-// and OLDPWD (see stackGuestEnvDenylist).
-func buildStackGuestEnv(env map[string]string, guestMiB int, logger *log.Logger) (string, error) {
-	return buildGuestEnvDenying(env, guestMiB, logger, stackGuestEnvDenylist)
+// and OLDPWD (see stackGuestEnvDenylist). With identity, which says that the
+// guest holds the instance identity pair, it also exports CF_INSTANCE_CERT
+// and CF_INSTANCE_KEY with the paths where the guest installs the pair,
+// whatever the container's values were, so that both always name the files.
+func buildStackGuestEnv(env map[string]string, guestMiB int, identity bool, logger *log.Logger) (string, error) {
+	if !identity {
+		return buildGuestEnvDenying(env, guestMiB, logger, stackGuestEnvDenylist)
+	}
+	withPaths := make(map[string]string, len(env)+2)
+	for name, value := range env {
+		withPaths[name] = value
+	}
+	withPaths[instanceCertEnv] = guestInstanceCertPath
+	withPaths[instanceKeyEnv] = guestInstanceKeyPath
+	return buildGuestEnvDenying(withPaths, guestMiB, logger, stackGuestIdentityEnvDenylist)
 }
 
 // buildGuestEnvDenying is buildGuestEnv with deny in place of

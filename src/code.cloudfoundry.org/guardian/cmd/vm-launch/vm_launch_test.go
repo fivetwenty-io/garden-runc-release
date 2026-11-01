@@ -1602,4 +1602,202 @@ var _ = Describe("run with a stack image", func() {
 		Expect(heldFilesEndingIn("/launcher")).To(BeZero())
 		Expect(heldInitramfs()).To(BeZero())
 	})
+
+	Describe("with sidecars and the instance identity pair", func() {
+		const (
+			twoSidecars = `{"version":1,"sidecars":[` +
+				`{"args":["app","./side --port 8081",""],"log_source":"APP/PROC/WEB/SIDECAR/ONE"},` +
+				`{"args":["app","./other 'quoted' $HOME",""],"env":["SIDE=1","HOME=/elsewhere"],"unset":["LANG"],"log_source":"APP/PROC/WEB/SIDECAR/TWO"}]}`
+			oneSidecar = `{"version":1,"sidecars":[{"args":["app","./side",""]}]}`
+		)
+
+		var (
+			ca                *identityCA
+			certPath, keyPath string
+			certPEM, keyPEM   []byte
+			notAfter          time.Time
+			built             guestContents
+		)
+
+		BeforeEach(func() {
+			ca = newIdentityCA()
+			creds := filepath.Join(dir, "creds")
+			Expect(os.Mkdir(creds, 0o755)).To(Succeed())
+			certPath, keyPath = filepath.Join(creds, "instance.crt"), filepath.Join(creds, "instance.key")
+			notAfter = time.Now().Add(time.Hour).Truncate(time.Second)
+			certPEM, keyPEM = ca.issue(4242, notAfter)
+			Expect(os.WriteFile(certPath, certPEM, 0o644)).To(Succeed())
+			Expect(os.WriteFile(keyPath, keyPEM, 0o644)).To(Succeed())
+
+			saved := buildGuestInitramfs
+			DeferCleanup(func() { buildGuestInitramfs = saved })
+			built = guestContents{}
+			buildGuestInitramfs = func(busybox string, g guestContents) (*os.File, error) {
+				built = g
+				return saved(busybox, g)
+			}
+		})
+
+		withPair := func() {
+			GinkgoT().Setenv("CF_INSTANCE_CERT", certPath)
+			GinkgoT().Setenv("CF_INSTANCE_KEY", keyPath)
+		}
+
+		It("gives a launcher with two sidecars and a pair a guest that holds both, and keeps the two names", func() {
+			withPair()
+			GinkgoT().Setenv("LANG", "en_US.UTF-8")
+			GinkgoT().Setenv(sidecarsEnvVar, twoSidecars)
+			writeFakeHypervisor(qemu, "")
+			Expect(runWith(backend.VMQemu, launchArg)).To(Equal(0), logBuf.String())
+
+			Expect(built.stack).NotTo(BeNil())
+			sidecars, id := stackGuestExtras(built.stack)
+			Expect(sidecars).To(Equal([]guestSidecar{
+				{argv: `'app' './side --port 8081' ''`},
+				{argv: `'app' './other '\''quoted'\'' $HOME' ''`, env: "export SIDE='1'\nunset LANG\n"},
+			}))
+			Expect(id).NotTo(BeNil())
+			Expect(id.cert).To(Equal(certPEM))
+			Expect(id.key).To(Equal(keyPEM))
+			Expect(id.serial).To(Equal("4242"))
+
+			Expect(built.env).To(ContainSubstring("export CF_INSTANCE_CERT='/etc/cf-instance-credentials/instance.crt'\n"))
+			Expect(built.env).To(ContainSubstring("export CF_INSTANCE_KEY='/etc/cf-instance-credentials/instance.key'\n"))
+			Expect(built.env).NotTo(ContainSubstring(sidecarsEnvVar))
+			Expect(logBuf.String()).To(MatchRegexp(`(?m)^stack guest: the launcher runs on the stack image, with a droplet image of .* to build; ` +
+				`2 sidecars run beside the app; the instance identity has serial 4242 and expires ` + regexp.QuoteMeta(notAfter.UTC().Format(time.RFC3339)) + `$`))
+			Expect(strings.Count(logBuf.String(), "guest: ")).To(Equal(1), logBuf.String())
+			Expect(logBuf.String()).NotTo(ContainSubstring("BEGIN"))
+		})
+
+		It("leaves out the pair and its names when the files are missing, and still carries the sidecars", func() {
+			GinkgoT().Setenv("CF_INSTANCE_CERT", filepath.Join(dir, "none", "instance.crt"))
+			GinkgoT().Setenv("CF_INSTANCE_KEY", filepath.Join(dir, "none", "instance.key"))
+			GinkgoT().Setenv(sidecarsEnvVar, oneSidecar)
+			writeFakeHypervisor(qemu, "")
+			Expect(runWith(backend.VMQemu, launchArg)).To(Equal(0), logBuf.String())
+
+			sidecars, id := stackGuestExtras(built.stack)
+			Expect(sidecars).To(Equal([]guestSidecar{{argv: `'app' './side' ''`}}))
+			Expect(id).To(BeNil())
+			Expect(built.env).NotTo(ContainSubstring("CF_INSTANCE_CERT"))
+			Expect(built.env).NotTo(ContainSubstring("CF_INSTANCE_KEY"))
+			Expect(logBuf.String()).To(MatchRegexp(`(?m)^stack guest: .* to build; 1 sidecar runs beside the app$`))
+		})
+
+		It("exits 125 when the pair does not match, before the hypervisor starts", func() {
+			_, otherKey := ca.issue(7, notAfter)
+			Expect(os.WriteFile(keyPath, otherKey, 0o644)).To(Succeed())
+			withPair()
+			argvFile := writeFakeHypervisor(qemu, "")
+			Expect(runWith(backend.VMQemu, launchArg)).To(Equal(exitLaunchError))
+			Expect(logBuf.String()).To(ContainSubstring("the instance identity certificate and key do not make a pair"))
+			Expect(logBuf.String()).NotTo(ContainSubstring("BEGIN"))
+			Expect(argvFile).NotTo(BeAnExistingFile())
+			Expect(os.ReadDir(tmp)).To(BeEmpty())
+			Expect(heldFilesEndingIn("rootfs.squashfs")).To(BeZero())
+			Expect(heldFilesEndingIn("droplet.sqfs (deleted)")).To(BeZero())
+			Expect(heldFilesEndingIn("/launcher")).To(BeZero())
+		})
+
+		It("exits 125 with one line that names the sidecars and the reason when the guest would be the busybox guest", func() {
+			withPair()
+			GinkgoT().Setenv(sidecarsEnvVar, twoSidecars)
+			argvFile := writeFakeHypervisor(qemu, "")
+
+			stackImagePath = filepath.Join(dir, "none", "rootfs.squashfs")
+			Expect(runWith(backend.VMQemu, launchArg)).To(Equal(exitLaunchError))
+			Expect(logBuf.String()).To(Equal("this app has 2 sidecars, which run only in the stack guest; the stack image cannot be opened: open " + stackImagePath + ": no such file or directory\n"))
+			Expect(argvFile).NotTo(BeAnExistingFile())
+
+			logBuf.Reset()
+			stackImagePath = stackImg
+			Expect(os.WriteFile(filepath.Join(art, artMksquashfs), []byte("#!/bin/sh\necho 'cannot read the droplet' >&2\nexit 1\n"), 0o755)).To(Succeed())
+			Expect(runWith(backend.VMQemu, []string{launcher, "app", "true", ""})).To(Equal(exitLaunchError))
+			// The guest's memory is settled before the droplet image, so its
+			// line comes first.
+			Expect(logBuf.String()).To(HaveSuffix("\nthis app has 2 sidecars, which run only in the stack guest; building the droplet image with " + filepath.Join(art, artMksquashfs) + ": exit status 1; cannot read the droplet\n"))
+			Expect(logBuf.String()).NotTo(ContainSubstring("guest: "))
+			Expect(argvFile).NotTo(BeAnExistingFile())
+
+			logBuf.Reset()
+			GinkgoT().Setenv(sidecarsEnvVar, oneSidecar)
+			Expect(runWith(backend.VMQemu, []string{"/bin/sh", "-c", "echo hi"})).To(Equal(exitLaunchError))
+			Expect(logBuf.String()).To(Equal("this app has 1 sidecar, which runs only in the stack guest; the process is not the CF launcher\n"))
+			Expect(argvFile).NotTo(BeAnExistingFile())
+			Expect(os.ReadDir(tmp)).To(BeEmpty())
+			Expect(heldFilesEndingIn("rootfs.squashfs")).To(BeZero())
+			Expect(heldFilesEndingIn("/launcher")).To(BeZero())
+		})
+
+		It("exits 125 for a sidecar description it cannot read, before it chooses the guest", func() {
+			GinkgoT().Setenv(sidecarsEnvVar, `{"version":2,"sidecars":[]}`)
+			argvFile := writeFakeHypervisor(qemu, "")
+			Expect(runWith(backend.VMQemu, launchArg)).To(Equal(exitLaunchError))
+			Expect(logBuf.String()).To(Equal("CF_VM_SIDECARS has version 2, and this vm-launch reads only version 1\n"))
+			Expect(argvFile).NotTo(BeAnExistingFile())
+			Expect(heldFilesEndingIn("rootfs.squashfs")).To(BeZero())
+		})
+
+		It("gives the stack slice's guest byte for byte to a launch without the variable and without the files", func() {
+			initrd, argv := guestOf(launchArg)
+			Expect(built.stack).NotTo(BeNil())
+			sidecars, id := stackGuestExtras(built.stack)
+			Expect(sidecars).To(BeNil())
+			Expect(id).To(BeNil())
+			Expect(built.env).NotTo(ContainSubstring("CF_INSTANCE_CERT"))
+			Expect(logBuf.String()).To(MatchRegexp(`(?m)^stack guest: the launcher runs on the stack image, with a droplet image of .* bytes and took \S+ to build$`))
+
+			logBuf.Reset()
+			GinkgoT().Setenv("CF_INSTANCE_CERT", filepath.Join(dir, "none", "instance.crt"))
+			GinkgoT().Setenv("CF_INSTANCE_KEY", filepath.Join(dir, "none", "instance.key"))
+			GinkgoT().Setenv(sidecarsEnvVar, "")
+			again, againArgv := guestOf(launchArg)
+			Expect(again).To(Equal(initrd))
+			Expect(againArgv).To(Equal(argv))
+		})
+
+		It("pushes a rename of the pair after the start tag once, as frames on the guest's console input, and hears the guest's answer", func() {
+			savedInterval := credWatchInterval
+			DeferCleanup(func() { credWatchInterval = savedInterval })
+			credWatchInterval = 10 * time.Millisecond
+			withPair()
+			newCert, newKey := ca.issue(4343, notAfter.Add(time.Hour))
+			Expect(os.WriteFile(certPath+".tmp", newCert, 0o644)).To(Succeed())
+			Expect(os.WriteFile(keyPath+".tmp", newKey, 0o644)).To(Succeed())
+			console := filepath.Join(dir, "console-in")
+			// The fake guest renames the new pair into place after its start
+			// tag, key first as Diego does, and records its console input up
+			// to the end of the first push, which it then acknowledges.
+			script := `#!/bin/bash
+echo "RVM_START_` + testNonce + `"
+mv ` + shellQuote(keyPath+".tmp") + " " + shellQuote(keyPath) + `
+mv ` + shellQuote(certPath+".tmp") + " " + shellQuote(certPath) + `
+while IFS= read -r -t 20 line; do
+	printf '%s\n' "$line" >>` + shellQuote(console) + `
+	case "$line" in "` + credTag(testNonce) + `end "*) break ;; esac
+done
+echo "` + credOKTag(testNonce) + `1"
+sleep 0.5
+echo "RVM_EXIT_` + testNonce + `=0"
+`
+			Expect(os.Remove(qemu)).To(Succeed())
+			Expect(os.WriteFile(qemu, []byte(script), 0o755)).To(Succeed())
+			Expect(runWith(backend.VMQemu, launchArg)).To(Equal(0), logBuf.String())
+
+			pushed, err := readInstanceIdentity(certPath, keyPath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pushed.serial).To(Equal("4343"))
+			got, err := os.ReadFile(console)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(got)).To(Equal(strings.Join(credFrames(testNonce, 1, pushed), "\n") + "\n"))
+			Expect(strings.Count(string(got), credTag(testNonce)+"begin ")).To(Equal(1))
+
+			out := logBuf.String()
+			Expect(out).To(ContainSubstring("pushed instance identity 1 (serial 4343, expires " + notAfter.Add(time.Hour).UTC().Format(time.RFC3339) + ", try 1)\n"))
+			Expect(strings.Count(out, "pushed instance identity")).To(Equal(1), out)
+			Expect(out).To(ContainSubstring("the guest installed instance identity push 1\n"))
+			Expect(out).NotTo(ContainSubstring("BEGIN"))
+		})
+	})
 })

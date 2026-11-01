@@ -220,6 +220,7 @@ var _ = Describe("guest environment", func() {
 			"SERVICE_BINDING_ROOT":       "/etc/cf-service-bindings",
 			"VCAP_SERVICES_FILE_PATH":    "/etc/cf-service-bindings/vcap_services",
 			"VCAP_PLATFORM_OPTIONS":      `{"credhub-uri":"https://credhub.service.cf.internal:8844"}`,
+			"CF_VM_SIDECARS":             `{"version":1,"sidecars":[{"args":["app","./side",""]}]}`,
 			"__GARDEN_VM_LAUNCH_WRAPPED": "1",
 			"__GARDEN_OTHER":             "1",
 			"__GARDEN_not.an.identifier": "1",
@@ -274,10 +275,10 @@ var _ = Describe("guest environment", func() {
 			Expect(logBuf.String()).To(Equal("leaving out 4 environment variables that the guest shell sets for itself: IFS, OPTIND, PPID, SHLVL\n"))
 		})
 
-		It("never exports container paths, identities, platform options, or Garden's markers", func() {
+		It("never exports container paths, identities, platform options, the sidecars, or Garden's markers", func() {
 			envFile := build(container)
 			for _, name := range []string{"PATH", "HOME", "TMPDIR", "USER", "PWD", "OLDPWD", "CF_INSTANCE_CERT", "CF_INSTANCE_KEY", "CF_SYSTEM_CERT_PATH",
-				"VCAP_PLATFORM_OPTIONS", "SERVICE_BINDING_ROOT", "VCAP_SERVICES_FILE_PATH", "DEPS_DIR"} {
+				"VCAP_PLATFORM_OPTIONS", "SERVICE_BINDING_ROOT", "VCAP_SERVICES_FILE_PATH", "DEPS_DIR", "CF_VM_SIDECARS"} {
 				Expect(exportedNames(envFile)).NotTo(ContainElement(name))
 			}
 			for _, text := range []string{"__GARDEN_", "credhub-uri"} {
@@ -287,7 +288,12 @@ var _ = Describe("guest environment", func() {
 
 		Describe("buildStackGuestEnv", func() {
 			buildStack := func(env map[string]string) string {
-				envFile, err := buildStackGuestEnv(env, 320, logger)
+				envFile, err := buildStackGuestEnv(env, 320, false, logger)
+				Expect(err).NotTo(HaveOccurred())
+				return envFile
+			}
+			buildStackWithIdentity := func(env map[string]string) string {
+				envFile, err := buildStackGuestEnv(env, 320, true, logger)
 				Expect(err).NotTo(HaveOccurred())
 				return envFile
 			}
@@ -318,6 +324,35 @@ var _ = Describe("guest environment", func() {
 				Expect(buildStack(map[string]string{"PATH": "/usr/local/bin:/usr/bin:/bin", "USER": "vcap", "A": "1"})).To(Equal("export A='1'\nexport PATH='/usr/local/bin:/usr/bin:/bin'\nexport USER='vcap'\n"))
 				plain := map[string]string{"A": "1", "B": "two words", "HOME": "/home/vcap", "LANG": "en_US.UTF-8"}
 				Expect(buildStack(plain)).To(Equal(build(plain)))
+			})
+
+			It("keeps CF_INSTANCE_CERT and CF_INSTANCE_KEY, naming the files the guest installs, when the guest holds the pair", func() {
+				envFile := buildStackWithIdentity(container)
+				want := append(append([]string(nil), passed...), "PATH", "USER", "CF_INSTANCE_CERT", "CF_INSTANCE_KEY")
+				sort.Strings(want)
+				Expect(exportedNames(envFile)).To(Equal(want))
+				Expect(envFile).To(ContainSubstring("export CF_INSTANCE_CERT='/etc/cf-instance-credentials/instance.crt'\n"))
+				Expect(envFile).To(ContainSubstring("export CF_INSTANCE_KEY='/etc/cf-instance-credentials/instance.key'\n"))
+
+				moved := map[string]string{"CF_INSTANCE_CERT": "/elsewhere/cert.pem", "CF_INSTANCE_KEY": "/elsewhere/key.pem", "A": "1"}
+				Expect(buildStackWithIdentity(moved)).To(Equal("export A='1'\nexport CF_INSTANCE_CERT='/etc/cf-instance-credentials/instance.crt'\nexport CF_INSTANCE_KEY='/etc/cf-instance-credentials/instance.key'\n"))
+				Expect(moved).To(HaveKeyWithValue("CF_INSTANCE_CERT", "/elsewhere/cert.pem"))
+			})
+
+			It("still leaves out CF_SYSTEM_CERT_PATH and the rest of the stack denylist when the guest holds the pair", func() {
+				names := exportedNames(buildStackWithIdentity(container))
+				for _, name := range []string{"HOME", "TMPDIR", "DEPS_DIR", "PWD", "OLDPWD", "CF_SYSTEM_CERT_PATH", "VCAP_PLATFORM_OPTIONS", "SERVICE_BINDING_ROOT", "VCAP_SERVICES_FILE_PATH"} {
+					Expect(names).NotTo(ContainElement(name))
+				}
+				Expect(stackGuestDenylist(true)).NotTo(HaveKey("CF_INSTANCE_CERT"))
+				Expect(stackGuestDenylist(false)).To(HaveKey("CF_INSTANCE_CERT"))
+				Expect(stackGuestEnvDenylist).To(HaveKey("CF_INSTANCE_KEY"))
+			})
+
+			It("leaves out CF_VM_SIDECARS, with or without the pair", func() {
+				env := map[string]string{"A": "1", sidecarsEnvVar: `{"version":1,"sidecars":[{"args":["app","./side",""]}]}`}
+				Expect(buildStack(env)).To(Equal("export A='1'\n"))
+				Expect(buildStackWithIdentity(env)).NotTo(ContainSubstring(sidecarsEnvVar))
 			})
 
 			It("leaves the guest environment's own denylist alone", func() {

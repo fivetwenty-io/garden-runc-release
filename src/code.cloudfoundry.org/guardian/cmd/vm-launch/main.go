@@ -210,8 +210,11 @@
 // launcher derives it. MEMORY_LIMIT, when it is set, becomes the guest size.
 // The guest never gets PATH, HOME, TMPDIR, USER, PWD, OLDPWD, DEPS_DIR,
 // CF_INSTANCE_CERT, CF_INSTANCE_KEY, CF_SYSTEM_CERT_PATH,
-// SERVICE_BINDING_ROOT, VCAP_SERVICES_FILE_PATH, VCAP_PLATFORM_OPTIONS, or a
-// name that starts with __GARDEN_. It also never gets the variables that its
+// SERVICE_BINDING_ROOT, VCAP_SERVICES_FILE_PATH, VCAP_PLATFORM_OPTIONS,
+// CF_VM_SIDECARS, or a name that starts with __GARDEN_, except that the stack
+// guest keeps PATH and USER, and CF_INSTANCE_CERT and CF_INSTANCE_KEY when it
+// holds the instance identity pair (see Sidecars and instance identity
+// below). It also never gets the variables that its
 // busybox sh sets for itself, because the shell would replace a value from
 // the container before the command saw it: IFS, OPTIND, PPID, and SHLVL.
 // vm-launch names those that are set in one line. The guest's busybox sh
@@ -342,6 +345,22 @@
 // that failed for the busybox guest. A launcher with an empty start command
 // needs the stack guest, so without it vm-launch exits 125 after that line.
 //
+// Sidecars and instance identity: rep folds an app's sidecars into
+// CF_VM_SIDECARS on the launcher's environment, and the stack guest runs each
+// one beside the app, as uid 2000 from the same root. vm-launch reads the
+// variable before it chooses the guest, and an app with sidecars that would
+// get the busybox guest exits 125 with the line "this app has N sidecars,
+// which run only in the stack guest;" and the reason for the busybox guest.
+// The stack guest also gets the instance identity pair that CF_INSTANCE_CERT
+// and CF_INSTANCE_KEY name, when both files exist, checked as a pair and
+// each at most 64 KiB, and it installs the pair at
+// /etc/cf-instance-credentials in the app's root, where both variables then
+// point. A pair that does not match exits 125. The mode line adds the number
+// of sidecars and the pair's serial and expiry. Once the guest has started
+// its command, vm-launch looks at both files every 5 seconds, and it sends
+// each new pair that Diego writes to the guest on its console input, which
+// the guest installs and acknowledges. No line holds the pair itself.
+//
 // Core dumps: vm-launch sets its RLIMIT_CORE to zero, soft and hard, and its
 // coredump_filter to zero before it does anything else, and the hypervisor
 // inherits both. Then vm-launch makes itself non-dumpable, which also keeps
@@ -397,7 +416,10 @@
 //	       guest environment that is too large, with one entry over
 //	       131071 bytes or more than 1 MiB in all, or a value that holds a
 //	       NUL byte, trusted certificates over 2 MiB, VCAP_PLATFORM_OPTIONS
-//	       that is not valid JSON, a bad launcher CredHub flag, or CredHub
+//	       that is not valid JSON, a CF_VM_SIDECARS that does not parse, an
+//	       app with sidecars that gets the busybox guest, an instance
+//	       identity pair for the stack guest that does not match or has a
+//	       file over 64 KiB, a bad launcher CredHub flag, or CredHub
 //	       references that cannot be resolved: missing or unreadable
 //	       instance identity or CA files, a credhub-uri that is not an
 //	       https URL, or every attempt failing
@@ -637,6 +659,21 @@ func run(argv []string, logger *log.Logger) int {
 		fmt.Fprint(logger.Writer(), usage)
 		return exitLaunchError
 	}
+	// Every reader sees the same environment, so the volume and the guest
+	// can never disagree about VCAP_SERVICES. All of this happens before the
+	// work directory and the volume lock, so a bad environment exits before
+	// any image is opened or created.
+	env := lastWinsEnv(os.Environ(), logger)
+	lookupEnv := lookupIn(env)
+	// The sidecars that rep folded into the launcher's environment run
+	// beside the app, from the droplet, so only a guest with an app root can
+	// run them. They are read before the guest is chosen, so that every
+	// reason for the busybox guest refuses them.
+	sidecars, err := parseSidecars(env)
+	if err != nil {
+		logger.Print(err)
+		return exitLaunchError
+	}
 	// The guest runs the app on its stack only when the process is the CF
 	// launcher, Garden bound a usable stack image, the app has no volume,
 	// and the droplet image builds. Each condition is settled as soon as
@@ -649,11 +686,17 @@ func run(argv []string, logger *log.Logger) int {
 	guestMode := ""
 	// toBusybox settles on the busybox guest for the reason why. A launcher
 	// with an empty start command needs the stack guest, so it then gets the
-	// refusal that parseArgs held back, after the line that says why.
+	// refusal that parseArgs held back, after the line that says why. An app
+	// with sidecars needs the stack guest too, so it gets one line that
+	// names its sidecars and why.
 	toBusybox := func(why string) bool {
 		closeFile(stackImg, "the stack image", logger)
 		stackImg = nil
 		guestMode = "busybox guest: " + why
+		if len(sidecars) > 0 {
+			logger.Print(sidecarsRefusal(len(sidecars), why))
+			return false
+		}
 		if cfg.commandErr == nil {
 			return true
 		}
@@ -669,12 +712,6 @@ func run(argv []string, logger *log.Logger) int {
 		logger.Print(err)
 		return exitLaunchError
 	}
-	// Every reader sees the same environment, so the volume and the guest
-	// can never disagree about VCAP_SERVICES. All of this happens before the
-	// work directory and the volume lock, so a bad environment exits before
-	// any image is opened or created.
-	env := lastWinsEnv(os.Environ(), logger)
-	lookupEnv := lookupIn(env)
 	nw, err := networkFor(cfg.backend, lookupEnv, containerResolvConf, interfaceMTU, logger)
 	if err != nil {
 		logger.Print(err)
@@ -845,10 +882,33 @@ func run(argv []string, logger *log.Logger) int {
 			droplet = img.file
 			guestMode = fmt.Sprintf("stack guest: the launcher runs on the stack image, with a droplet image of %s that is %d bytes and took %s to build",
 				dropletHome, img.size, img.took.Round(time.Millisecond))
-			if envFile, err = buildStackGuestEnv(env, memMiB, logger); err != nil {
-				logger.Print(err)
-				return exitLaunchError
-			}
+		}
+	}
+	// The guest is settled here. One with an app root gets the sidecars and
+	// the instance identity pair, and its environment keeps CF_INSTANCE_CERT
+	// and CF_INSTANCE_KEY only when the pair was read. The busybox guest
+	// refused sidecars in toBusybox, and it gets no pair.
+	var identity *instanceIdentity
+	if stack.hasAppRoot() {
+		if identity, err = readInstanceIdentity(env[instanceCertEnv], env[instanceKeyEnv]); err != nil {
+			logger.Print(err)
+			return exitLaunchError
+		}
+		files, err := sidecarGuestFilesOf(sidecars, stackGuestDenylist(identity != nil))
+		if err != nil {
+			logger.Print(err)
+			return exitLaunchError
+		}
+		setStackGuestExtras(stack, files, identity)
+		guestMode += guestExtrasLine(len(sidecars), identity)
+	} else if len(sidecars) > 0 {
+		logger.Print(sidecarsRefusal(len(sidecars), "the stack guest has no app root"))
+		return exitLaunchError
+	}
+	if stack != nil {
+		if envFile, err = buildStackGuestEnv(env, memMiB, identity != nil, logger); err != nil {
+			logger.Print(err)
+			return exitLaunchError
 		}
 	}
 
@@ -940,7 +1000,7 @@ func run(argv []string, logger *log.Logger) int {
 		logger.Print(err)
 		return exitLaunchError
 	}
-	initrd, err = newInitramfs(filepath.Join(cfg.artifacts, artBusybox), guestContents{
+	initrd, err = buildGuestInitramfs(filepath.Join(cfg.artifacts, artBusybox), guestContents{
 		command:        cfg.command,
 		nonce:          nonce,
 		nw:             nw,
@@ -1062,7 +1122,16 @@ func run(argv []string, logger *log.Logger) int {
 		sup.closePorts = gates.shutDown
 		sup.listen = gates.set
 	}
+	// A guest that holds the identity pair gets each of Diego's rewrites of
+	// it once the guest has started its command. The watcher stops as soon
+	// as the supervisor returns, so its last lines come before the exit
+	// line.
+	stopWatch := func() {}
+	if identity != nil {
+		stopWatch = watchIdentity(&sup, nonce, env[instanceCertEnv], env[instanceKeyEnv], identity, logger)
+	}
 	res, err := sup.run(cmd, nonce)
+	stopWatch()
 	// QEMU has been reaped, or never started. Every virtiofsd has stopped,
 	// or stops now, and its last lines come before the exit line.
 	shareSrv.guestEnded()
@@ -1092,6 +1161,98 @@ func run(argv []string, logger *log.Logger) int {
 		logger.Printf("%s; exiting %d", reason, code)
 	}
 	return code
+}
+
+// sidecarsRefusal is the line with which vm-launch refuses an app with n
+// sidecars when the guest it gets has no app root, for the reason why.
+func sidecarsRefusal(n int, why string) string {
+	if n == 1 {
+		return "this app has 1 sidecar, which runs only in the stack guest; " + why
+	}
+	return fmt.Sprintf("this app has %d sidecars, which run only in the stack guest; %s", n, why)
+}
+
+// guestExtrasLine is what the stack guest's mode line adds for n sidecars
+// and the identity pair id, which may be nil. It adds nothing for a guest
+// with neither, so that guest's line stays as it was.
+func guestExtrasLine(n int, id *instanceIdentity) string {
+	var b strings.Builder
+	switch {
+	case n == 1:
+		b.WriteString("; 1 sidecar runs beside the app")
+	case n > 1:
+		fmt.Fprintf(&b, "; %d sidecars run beside the app", n)
+	}
+	if id != nil {
+		fmt.Fprintf(&b, "; the instance identity has serial %s and expires %s", id.serial, id.notAfter.UTC().Format(time.RFC3339))
+	}
+	return b.String()
+}
+
+// sidecarGuestFilesOf returns the guest files of each sidecar, in order,
+// with deny as the denylist of their environment files. It returns nil for
+// an app without sidecars.
+func sidecarGuestFilesOf(sidecars []vmSidecar, deny map[string]bool) ([]guestSidecar, error) {
+	if len(sidecars) == 0 {
+		return nil, nil
+	}
+	files := make([]guestSidecar, 0, len(sidecars))
+	for i, sc := range sidecars {
+		argv, env, err := sidecarGuestFiles(sc, deny)
+		if err != nil {
+			// The guest numbers the sidecars from 1, because the app is 0.
+			return nil, fmt.Errorf("sidecar %d: %w", i+1, err)
+		}
+		files = append(files, guestSidecar{argv: argv, env: env})
+	}
+	return files, nil
+}
+
+// buildGuestInitramfs is newInitramfs. Specs replace it to see the guest
+// that run builds.
+var buildGuestInitramfs = newInitramfs
+
+// credWatchInterval is how often the identity watcher looks at the pair.
+// Specs shorten it.
+var credWatchInterval = 5 * time.Second
+
+// watchIdentity wires a credWatcher for the pair at certPath and keyPath
+// into sup. sent is the pair the guest boots with. The watcher starts once
+// the supervisor hands over the console writer, which it does after the
+// guest has started its command, pushes every new pair as credFrames through
+// that writer, and hears the guest's acknowledgements through the serial
+// filter. The returned function stops the watcher and waits for it, and it
+// must be called once sup.run has returned.
+func watchIdentity(sup *supervisor, nonce, certPath, keyPath string, sent *instanceIdentity, logger *log.Logger) (stop func()) {
+	var console *consoleWriter
+	var w *credWatcher
+	// The watcher calls push only from its own goroutine, with its lock
+	// held, so push can read the number of the pair it sends from the
+	// watcher. A second try keeps the number, which is how the guest's
+	// answer finds its push.
+	w = newCredWatcher(certPath, keyPath, sent, credWatchInterval, func(id *instanceIdentity) error {
+		return console.push(credFrames(nonce, w.seq, id))
+	}, logger)
+	sup.credAck = w.acked
+	quit := make(chan struct{})
+	var done chan struct{}
+	// The supervisor calls onConsole from its own loop, which must not
+	// block, so the watcher runs in a goroutine of its own. console is set
+	// before that goroutine starts, so the watcher always sees it.
+	sup.onConsole = func(c *consoleWriter) {
+		console = c
+		done = make(chan struct{})
+		go func() {
+			defer close(done)
+			w.run(quit)
+		}()
+	}
+	return func() {
+		close(quit)
+		if done != nil {
+			<-done
+		}
+	}
 }
 
 // closeFile closes f, when it is set, and logs a failure as closing what.
