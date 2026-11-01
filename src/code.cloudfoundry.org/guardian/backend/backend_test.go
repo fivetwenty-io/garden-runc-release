@@ -291,3 +291,26 @@ var _ = Describe("CheckRootFS", func() {
 		Expect(err).To(MatchError(backend.ErrRootFSNotOperatorInstalled))
 	})
 })
+
+var _ = Describe("StackTarball", func() {
+	DescribeTable("the tarball path a spec names",
+		func(spec garden.ContainerSpec, expected string) {
+			Expect(backend.StackTarball(spec)).To(Equal(expected))
+		},
+		Entry("a plain path", garden.ContainerSpec{Image: garden.ImageRef{URI: "/var/vcap/packages/cflinuxfs4/rootfs.tar"}},
+			"/var/vcap/packages/cflinuxfs4/rootfs.tar"),
+		Entry("a preloaded layer URI", garden.ContainerSpec{
+			Image: garden.ImageRef{URI: "preloaded+layer:/var/vcap/packages/cflinuxfs4/rootfs.tar?layer=https%3A%2F%2Fblobstore%2Flayer.tgz&layer_path=%2Fhome%2Fvcap&layer_digest=abc"}},
+			"/var/vcap/packages/cflinuxfs4/rootfs.tar"),
+		Entry("RootFSPath alone", garden.ContainerSpec{RootFSPath: "/var/vcap/packages/cflinuxfs4/rootfs.tar"},
+			"/var/vcap/packages/cflinuxfs4/rootfs.tar"),
+		Entry("Image.URI ahead of RootFSPath", garden.ContainerSpec{
+			Image: garden.ImageRef{URI: "/var/vcap/packages/a/rootfs.tar"}, RootFSPath: "/var/vcap/packages/b/rootfs.tar"},
+			"/var/vcap/packages/a/rootfs.tar"),
+		Entry("a docker URI", garden.ContainerSpec{Image: garden.ImageRef{URI: "docker:///cloudfoundry/test"}}, ""),
+		Entry("a relative path", garden.ContainerSpec{Image: garden.ImageRef{URI: "some/relative/rootfs.tar"}}, ""),
+		Entry("a preloaded layer over a named stack", garden.ContainerSpec{Image: garden.ImageRef{URI: "preloaded+layer:cflinuxfs4?layer=x"}}, ""),
+		Entry("an unparseable URI", garden.ContainerSpec{Image: garden.ImageRef{URI: "/rootfs%zz"}}, ""),
+		Entry("an empty spec", garden.ContainerSpec{}, ""),
+	)
+})

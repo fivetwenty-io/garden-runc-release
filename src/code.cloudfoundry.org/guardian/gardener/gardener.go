@@ -43,6 +43,13 @@ const CleanupRetrySleep = 3 * time.Second
 
 const VolumizerSession = "volumizer"
 
+// VMStackImager returns the directory that holds rootfs.squashfs for a stack
+// tarball, after waiting at most its configured bound, or false when the image
+// is not ready.
+type VMStackImager interface {
+	Image(log lager.Logger, tarball string) (dir string, ok bool)
+}
+
 type SysInfoProvider interface {
 	TotalMemory() (uint64, error)
 	TotalDisk() (uint64, error)
@@ -184,6 +191,10 @@ type Gardener struct {
 	// Backends decides which execution backends this cell allows. A nil
 	// registry allows only oci-runc.
 	Backends *backend.Registry
+
+	// VMStacks builds the stack image of a VM container. A nil value turns
+	// the builder off.
+	VMStacks VMStackImager
 }
 
 func New(
@@ -222,6 +233,30 @@ func New(
 	return &gdnr
 }
 
+// vmStackDir asks the stack imager for the image directory of a VM container's
+// stack tarball. It returns an empty string when the builder is off, when the
+// backend is not a VM backend, when the spec names no tarball, or when the image
+// is not ready, and it never fails the create.
+func (g *Gardener) vmStackDir(log lager.Logger, k backend.Kind, containerSpec garden.ContainerSpec) string {
+	if g.VMStacks == nil || !backend.IsVM(k) {
+		return ""
+	}
+	tarball := backend.StackTarball(containerSpec)
+	if tarball == "" {
+		return ""
+	}
+
+	startedAt := time.Now()
+	dir, ok := g.VMStacks.Image(log, tarball)
+	data := lager.Data{"tarball": tarball, "dir": dir, "ready": ok, "elapsed": time.Since(startedAt).String()}
+	if !ok {
+		log.Info("vm-stack-image-not-ready", data)
+		return ""
+	}
+	log.Info("vm-stack-image-ready", data)
+	return dir
+}
+
 // Create creates a container by combining the results of networker.Network,
 // volumizer.Create and containzer.Create.
 func (g *Gardener) Create(containerSpec garden.ContainerSpec) (ctr garden.Container, err error) {
@@ -256,6 +291,8 @@ func (g *Gardener) Create(containerSpec garden.ContainerSpec) (ctr garden.Contai
 		log.Error("check-execution-backend-rootfs-failed", err)
 		return nil, err
 	}
+
+	vmStackDir := g.vmStackDir(log, executionBackend, containerSpec)
 
 	knownHandles, err := g.Containerizer.Handles()
 	if err != nil {
@@ -324,6 +361,7 @@ func (g *Gardener) Create(containerSpec garden.ContainerSpec) (ctr garden.Contai
 		BaseConfig: runtimeSpec,
 
 		ExecutionBackend: string(executionBackend),
+		VMStackDir:       vmStackDir,
 	}
 
 	if err := g.Containerizer.Create(log, desiredSpec); err != nil {

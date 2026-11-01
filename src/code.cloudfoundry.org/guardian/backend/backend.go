@@ -199,6 +199,27 @@ func CheckRootFS(k Kind, spec garden.ContainerSpec) error {
 	return nil
 }
 
+// StackTarball returns the absolute path of the stack tarball that a container
+// spec names, or an empty string when it names none. The path comes from
+// Image.URI first and RootFSPath second, and it is either a bare absolute path
+// or the base path of a preloaded+layer URI. Any other scheme, a relative path,
+// or an unparseable value yields an empty string.
+func StackTarball(spec garden.ContainerSpec) string {
+	for _, image := range []string{spec.Image.URI, spec.RootFSPath} {
+		if image == "" {
+			continue
+		}
+		u, err := url.Parse(image)
+		if err != nil || u.Host != "" || u.Opaque != "" || !path.IsAbs(u.Path) {
+			continue
+		}
+		if u.Scheme == "" || u.Scheme == preloadedLayerScheme {
+			return path.Clean(u.Path)
+		}
+	}
+	return ""
+}
+
 func checkOperatorImage(k Kind, image string) error {
 	u, err := url.Parse(image)
 	if err != nil {

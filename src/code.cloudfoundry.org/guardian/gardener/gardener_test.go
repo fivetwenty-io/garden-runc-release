@@ -21,6 +21,18 @@ import (
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
+type fakeVMStackImager struct {
+	dir string
+	ok  bool
+
+	tarballs []string
+}
+
+func (f *fakeVMStackImager) Image(_ lager.Logger, tarball string) (string, bool) {
+	f.tarballs = append(f.tarballs, tarball)
+	return f.dir, f.ok
+}
+
 var _ = Describe("Gardener", func() {
 	var (
 		networker              *fakes.FakeNetworker
@@ -337,6 +349,67 @@ var _ = Describe("Gardener", func() {
 					Entry("oci-runc with a docker image", "oci-runc", "docker:///some/image"),
 					Entry("oci-runc with an oci image", "oci-runc", "oci:///some/dir"),
 				)
+			})
+
+			Describe("the VM stack image", func() {
+				const stackURI = "preloaded+layer:/var/vcap/packages/cflinuxfs4/rootfs.tar?layer=https://blobstore/layer.tgz&layer_path=/home/vcap&layer_digest=abc"
+
+				var imager *fakeVMStackImager
+
+				createWith := func(kind string, uri string) {
+					_, err := gdnr.Create(garden.ContainerSpec{
+						Handle:     "some-ctr",
+						Image:      garden.ImageRef{URI: uri},
+						Properties: garden.Properties{backend.AnnotationKey: kind},
+					})
+					Expect(err).NotTo(HaveOccurred())
+				}
+
+				BeforeEach(func() {
+					var err error
+					gdnr.Backends, err = backend.NewRegistry(backend.VMQemu, backend.OCIGvisor)
+					Expect(err).NotTo(HaveOccurred())
+					imager = &fakeVMStackImager{dir: "/var/vcap/data/vm-runtime/stacks/abc", ok: true}
+					gdnr.VMStacks = imager
+				})
+
+				It("passes the tarball path to the imager and sets the stack directory", func() {
+					createWith("vm-qemu", stackURI)
+					Expect(imager.tarballs).To(Equal([]string{"/var/vcap/packages/cflinuxfs4/rootfs.tar"}))
+					Expect(createdSpec().VMStackDir).To(Equal("/var/vcap/data/vm-runtime/stacks/abc"))
+					Expect(logger).To(gbytes.Say("vm-stack-image-ready"))
+				})
+
+				It("creates the container with no stack directory when the image is not ready", func() {
+					imager.dir, imager.ok = "", false
+					createWith("vm-qemu", stackURI)
+					Expect(createdSpec().VMStackDir).To(BeEmpty())
+					Expect(logger).To(gbytes.Say("vm-stack-image-not-ready"))
+				})
+
+				It("does not call the imager when the spec names no tarball", func() {
+					createWith("vm-qemu", "")
+					Expect(imager.tarballs).To(BeEmpty())
+					Expect(createdSpec().VMStackDir).To(BeEmpty())
+				})
+
+				It("does not call the imager for oci-runc", func() {
+					createWith("oci-runc", "/var/vcap/packages/cflinuxfs4/rootfs.tar")
+					Expect(imager.tarballs).To(BeEmpty())
+					Expect(createdSpec().VMStackDir).To(BeEmpty())
+				})
+
+				It("does not call the imager for oci-gvisor", func() {
+					createWith("oci-gvisor", "/var/vcap/packages/cflinuxfs4/rootfs.tar")
+					Expect(imager.tarballs).To(BeEmpty())
+					Expect(createdSpec().VMStackDir).To(BeEmpty())
+				})
+
+				It("leaves the stack directory empty when VMStacks is nil", func() {
+					gdnr.VMStacks = nil
+					createWith("vm-qemu", stackURI)
+					Expect(createdSpec().VMStackDir).To(BeEmpty())
+				})
 			})
 
 			It("rejects every non-runc backend when no registry is set", func() {

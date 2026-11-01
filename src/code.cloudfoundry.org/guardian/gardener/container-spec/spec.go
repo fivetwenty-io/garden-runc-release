@@ -55,4 +55,8 @@ type DesiredContainerSpec struct {
 
 	// ExecutionBackend is the resolved execution backend kind (e.g. "oci-runc", "vm-qemu")
 	ExecutionBackend string
+
+	// VMStackDir is the host directory that holds the stack image of a VM
+	// container. Empty means the container gets no stack bind.
+	VMStackDir string
 }
