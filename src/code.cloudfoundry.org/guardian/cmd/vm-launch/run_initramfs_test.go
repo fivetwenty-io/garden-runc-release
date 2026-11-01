@@ -548,4 +548,210 @@ var _ = Describe("the initramfs of a guest with a stack", func() {
 		Expect(strings.Index(script, guestStackChecks)).To(BeNumerically("<", start))
 		Expect(strings.Index(script, guestStackRunCommand)).To(BeNumerically(">", start))
 	})
+
+	// withSidecars gives g two sidecars, the second with an environment of
+	// its own, and withIdentity gives it pair as its instance identity.
+	withSidecars := func(g *guestContents) {
+		g.stack.sidecars = []guestSidecar{
+			{argv: shellJoin([]string{stackLauncherPath, "app", "./envoy --config 'a b'", ""})},
+			{argv: shellJoin([]string{stackLauncherPath, "app", "./agent", ""}), env: "export AGENT_MODE='side car'\nunset VCAP_SERVICES\n"},
+		}
+	}
+	var pair testIdentityPair
+	BeforeEach(func() { pair = newTestIdentityPair(7, "ec") })
+	withIdentity := func(g *guestContents) { g.stack.identity = &instanceIdentity{cert: pair.crt, key: pair.key} }
+
+	It("holds each sidecar's argv and environment and the identity pair with mode 0600, after the stack's own files", func() {
+		g := stackGuest()
+		withSidecars(&g)
+		withIdentity(&g)
+		names, byName := archive(g)
+		Expect(names).To(Equal([]string{"bin", "dev", "dev/console", "dev/null", "etc", "proc", "sys", "tmp", "rvm",
+			"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "rvm/limits", "etc/resolv.conf",
+			"rvm/lifecycle", "rvm/lifecycle/launcher", "rvm/argv", "rvm/cwd", "rvm/hosts", "rvm/hostname",
+			"rvm/sidecar", "rvm/sidecar/1", "rvm/sidecar/1/argv", "rvm/sidecar/1/env", "rvm/sidecar/2", "rvm/sidecar/2/argv", "rvm/sidecar/2/env",
+			"rvm/identity", "rvm/identity/instance.crt", "rvm/identity/instance.key",
+			"rvm/disks", "rvm/init", "init", cpioTrailer}))
+		for name, mode := range map[string]uint32{"rvm/sidecar": 0o040755, "rvm/sidecar/1": 0o040755, "rvm/sidecar/2": 0o040755, "rvm/identity": 0o040700} {
+			Expect(byName[name].mode).To(Equal(mode), name)
+		}
+		want := map[string]string{
+			"rvm/sidecar/1/argv":        g.stack.sidecars[0].argv,
+			"rvm/sidecar/1/env":         "",
+			"rvm/sidecar/2/argv":        g.stack.sidecars[1].argv,
+			"rvm/sidecar/2/env":         g.stack.sidecars[1].env,
+			"rvm/identity/instance.crt": string(pair.crt),
+			"rvm/identity/instance.key": string(pair.key),
+		}
+		for name, content := range want {
+			Expect(string(byName[name].data)).To(Equal(content), name)
+			Expect(byName[name].mode).To(Equal(uint32(0o100600)), name)
+		}
+		Expect(string(byName["rvm/init"].data)).To(Equal(g.stack.initScript(testNonce)))
+		Expect(string(byName["init"].data)).To(Equal(guestStackInit))
+	})
+
+	It("holds only the sidecars' files for a guest without an identity, and only the pair for a guest without sidecars", func() {
+		g := stackGuest()
+		withSidecars(&g)
+		names, _ := archive(g)
+		Expect(names).To(ContainElement("rvm/sidecar/2/env"))
+		Expect(names).NotTo(ContainElement("rvm/identity"))
+		g = stackGuest()
+		withIdentity(&g)
+		names, _ = archive(g)
+		Expect(names).To(ContainElement("rvm/identity/instance.key"))
+		Expect(names).NotTo(ContainElement("rvm/sidecar"))
+	})
+
+	It("keeps the stack guest's stage 2 for a guest with neither sidecars nor an identity, with an empty list as with none", func() {
+		g := stackGuest()
+		Expect(g.stack.initScript(testNonce)).To(Equal(stackInitScript(testNonce)))
+		_, plain := archive(g)
+		g.stack.sidecars = []guestSidecar{}
+		_, empty := archive(g)
+		Expect(empty).To(Equal(plain))
+	})
+
+	DescribeTable("runs the app and its sidecars through the run section in place of the command and the stop reader, with the sidecars' checks before the start tag",
+		func(sidecars, identity bool) {
+			g := stackGuest()
+			if sidecars {
+				withSidecars(&g)
+			}
+			if identity {
+				withIdentity(&g)
+			}
+			script := g.stack.initScript(testNonce)
+			checks := guestSidecarChecks(len(g.stack.sidecars))
+			section := guestRunSection(testNonce, g.stack.processes(), identity, stackExec)
+			plain := stackInitScript(testNonce)
+			Expect(strings.Count(plain, guestStopReader(testNonce))).To(Equal(1))
+			Expect(strings.Count(plain, guestStackRunCommand+guestRunStatus+guestStopReaderStop)).To(Equal(1))
+			Expect(script).To(Equal(strings.NewReplacer(
+				guestStackChecks, guestStackChecks+checks,
+				guestStopReader(testNonce), "",
+				guestStackRunCommand+guestRunStatus+guestStopReaderStop, section,
+			).Replace(plain)))
+			Expect(strings.Contains(script, guestIdentitySetup)).To(Equal(identity))
+			Expect(strings.Contains(script, credTag(testNonce))).To(Equal(identity))
+			start := strings.Index(script, "\necho "+startTag(testNonce)+"\n")
+			Expect(strings.Index(script, guestStackChecks+checks)).To(BeNumerically("<", start))
+			Expect(strings.Index(script, section)).To(BeNumerically(">", start))
+			out, err := exec.Command("/bin/sh", "-n", "-c", script).CombinedOutput()
+			Expect(err).NotTo(HaveOccurred(), string(out))
+		},
+		Entry("with sidecars", true, false),
+		Entry("with an identity", false, true),
+		Entry("with both", true, true),
+	)
+
+	It("runs the app from /rvm/argv and the guest environment, and each sidecar from its own files over the guest environment, all in the app's working directory", func() {
+		g := stackGuest()
+		withSidecars(&g)
+		Expect(g.stack.processes()).To(Equal([]guestProcess{
+			{index: 0, argvPath: "/rvm/argv", envPaths: []string{"/rvm/env"}, dir: "/home/vcap/app", pidPath: "/rvm/app-pid"},
+			{index: 1, argvPath: "/rvm/sidecar/1/argv", envPaths: []string{"/rvm/env", "/rvm/sidecar/1/env"}, dir: "/home/vcap/app", pidPath: "/rvm/sidecar/1/pid"},
+			{index: 2, argvPath: "/rvm/sidecar/2/argv", envPaths: []string{"/rvm/env", "/rvm/sidecar/2/env"}, dir: "/home/vcap/app", pidPath: "/rvm/sidecar/2/pid"},
+		}))
+	})
+
+	It("runs a process as the stack guest runs the app alone, through chroot, the stack's env, and setpriv to uid 2000", func() {
+		g := stackGuest()
+		app := g.stack.processes()[0]
+		line := strings.Replace(stackExec(app), "-C "+shellQuote(app.dir)+" ", `-C "$(cat `+guestCwd+`)" `, 1)
+		Expect(guestStackRunCommand).To(Equal(guestRunPrefix + strings.TrimPrefix(line, ". /rvm/env && ") + " ) </dev/null\n"))
+		Expect(stackExec(guestProcess{argvPath: "/rvm/sidecar/1/argv", envPaths: []string{"/rvm/env", "/rvm/sidecar/1/env"}, dir: "/home/vcap/it's"})).To(Equal(
+			`. /rvm/env && . /rvm/sidecar/1/env && eval "set -- $(cat /rvm/sidecar/1/argv)" && exec chroot /rvm/app /usr/bin/env -C '/home/vcap/it'\''s' /usr/bin/setpriv --reuid=2000 --regid=2000 --init-groups --no-new-privs -- "$@"`))
+	})
+
+	DescribeTable("fails a sidecar whose files the guest cannot read as a setup step that names it",
+		func(shellOf func() guestShell, argv, env, want string) {
+			shell := shellOf()
+			dir := GinkgoT().TempDir()
+			argvPath, envPath := filepath.Join(dir, "argv"), filepath.Join(dir, "env")
+			Expect(os.WriteFile(argvPath, []byte(argv), 0o600)).To(Succeed())
+			Expect(os.WriteFile(envPath, []byte(env), 0o600)).To(Succeed())
+			// The files' paths change in the script and in the line it prints.
+			paths := strings.NewReplacer(guestSidecarFile(1, "argv"), argvPath, guestSidecarFile(1, "env"), envPath)
+			script := paths.Replace(strings.Replace(guestFailFunc+guestSidecarChecks(1), "reboot -nf", "true", 1) + "echo checked\n")
+			out, _ := exec.Command(shell.argv[0], append(shell.argv[1:], "-c", script)...).CombinedOutput()
+			Expect(string(out)).To(HaveSuffix(paths.Replace(want)), shell.name)
+		},
+		append(append(append(
+			shellEntries("good files", shellJoin([]string{"./agent", "a b"}), "export A='x y'\nunset B\n", "checked\n"),
+			shellEntries("an argv that does not parse", "'./agent", "", "vm-launch guest setup: reading the arguments of sidecar 1 from /rvm/sidecar/1/argv failed\n")...),
+			shellEntries("an empty argv", "", "", "vm-launch guest setup: reading the arguments of sidecar 1 from /rvm/sidecar/1/argv failed\n")...),
+			shellEntries("an environment that does not parse", "./agent", "export A='x\n", "vm-launch guest setup: reading the environment of sidecar 1 from /rvm/sidecar/1/env failed\n")...),
+	)
+
+	It("names whether the guest has an app root, which only a stack guest has", func() {
+		var none *guestStack
+		Expect(none.hasAppRoot()).To(BeFalse())
+		g := stackGuest()
+		Expect(g.stack.hasAppRoot()).To(BeTrue())
+	})
+
+	It("takes eight sidecars with an argv and an environment at their caps", func() {
+		g := stackGuest()
+		for i := 0; i < maxGuestSidecars; i++ {
+			g.stack.sidecars = append(g.stack.sidecars, guestSidecar{argv: shellQuote(strings.Repeat("a", maxGuestCommandBytes-2)), env: strings.Repeat("#", maxGuestEnvBytes)})
+		}
+		Expect(write(g)).To(Succeed())
+	})
+
+	DescribeTable("refuses sidecars and an identity pair the guest could not run, so no initramfs is built",
+		func(change func(*guestContents), want string) {
+			g := stackGuest()
+			withSidecars(&g)
+			change(&g)
+			Expect(write(g)).To(MatchError(want))
+		},
+		Entry("nine sidecars", func(g *guestContents) {
+			for len(g.stack.sidecars) < maxGuestSidecars+1 {
+				g.stack.sidecars = append(g.stack.sidecars, g.stack.sidecars[0])
+			}
+		}, "a guest runs at most 8 sidecars, and this one has 9"),
+		Entry("a sidecar without an argv", func(g *guestContents) { g.stack.sidecars[1].argv = "" },
+			"sidecar 2 has no argv"),
+		Entry("a sidecar argv over the cap", func(g *guestContents) {
+			g.stack.sidecars[0].argv = shellQuote(strings.Repeat("a", maxGuestCommandBytes-1))
+		}, "the argv of sidecar 1 is 131072 bytes quoted, over the 131071 bytes a guest takes"),
+		Entry("a sidecar environment over the cap", func(g *guestContents) { g.stack.sidecars[1].env = strings.Repeat("#", maxGuestEnvBytes+1) },
+			"the environment of sidecar 2 is 1048577 bytes, over the 1048576 bytes a guest takes"),
+		Entry("an identity without its key", func(g *guestContents) { g.stack.identity = &instanceIdentity{cert: pair.crt} },
+			"the instance identity pair for the guest lacks its certificate or its key"),
+		Entry("an identity without its certificate", func(g *guestContents) { g.stack.identity = &instanceIdentity{key: pair.key} },
+			"the instance identity pair for the guest lacks its certificate or its key"),
+	)
+})
+
+var _ = Describe("the frames vm-launch pushes", func() {
+	// The guest's reader specs push pairs in the form testPushFrames gives,
+	// so credFrames must give that very form for every kind of key Diego
+	// writes, and the guest must install what it gives.
+	DescribeTable("are the frames that the guest's reader installs, for each kind of key",
+		func(format string) {
+			pair := newTestIdentityPair(9, format)
+			id := &instanceIdentity{cert: pair.crt, key: pair.key}
+			Expect(credFrames(testNonce, 12, id)).To(Equal(testPushFrames(12, pair.crt, pair.key)))
+		},
+		Entry("an RSA key", "rsa"),
+		Entry("an EC key", "ec"),
+		Entry("a PKCS #8 key", "pkcs8"),
+	)
+
+	DescribeTable("install the pair in the guest's reader, which answers with the push's sequence number",
+		func(shellOf func() guestShell) {
+			shell := shellOf()
+			r := startControlRun(shell, nil, true, false)
+			pair := newTestIdentityPair(11, "ec")
+			r.write(consoleInput(credFrames(testNonce, 3, &instanceIdentity{cert: pair.crt, key: pair.key})))
+			Eventually(r.answers, 10*time.Second, 10*time.Millisecond).Should(Equal(credOKTag(testNonce) + "3\n"))
+			expectInstalled(r, pair)
+			r.write(stopTag(testNonce) + "\n")
+			r.finish()
+		},
+		shellEntries(""),
+	)
 })

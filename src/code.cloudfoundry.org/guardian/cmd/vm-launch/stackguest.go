@@ -116,3 +116,72 @@ if [ -e ` + guestCABundlePath + ` ]; then
 fi
 hostname -F ` + guestHostname + ` || rvm_fail "setting the guest's hostname failed"
 `
+
+// hasAppRoot reports whether the guest that the launch chose has an app root
+// at guestAppRoot, which is where sidecars and the instance identity live. A
+// nil stack is the busybox guest, which has none.
+func (s *guestStack) hasAppRoot() bool { return s != nil }
+
+// initScript is the stack guest's stage 2. A guest with sidecars or an
+// instance identity runs the app and its sidecars through the run section
+// (see guestRunSection), and checks each sidecar's files before the start
+// tag. Any other stack guest runs stackInitScript.
+func (s *guestStack) initScript(nonce string) string {
+	if len(s.sidecars) == 0 && s.identity == nil {
+		return stackInitScript(nonce)
+	}
+	procs := s.processes()
+	return stage2Script(nonce, false, true, guestSidecarChecks(len(s.sidecars)), guestRunSection(nonce, procs, s.identity != nil, stackExec))
+}
+
+// processes returns the app, from /rvm/argv and the guest environment, and
+// then each sidecar, from its own argv and its environment over the guest's.
+// Every process starts in the app's working directory. The app records its
+// pid in guestAppPid, as it does without sidecars.
+func (s *guestStack) processes() []guestProcess {
+	procs := []guestProcess{{index: 0, argvPath: guestArgv, envPaths: []string{"/rvm/env"}, dir: s.cwd, pidPath: guestAppPid}}
+	for i := range s.sidecars {
+		n := i + 1
+		procs = append(procs, guestProcess{
+			index:    n,
+			argvPath: guestSidecarFile(n, "argv"),
+			envPaths: []string{"/rvm/env", guestSidecarFile(n, "env")},
+			dir:      s.cwd,
+			pidPath:  guestSidecarFile(n, "pid"),
+		})
+	}
+	return procs
+}
+
+// stackExec is the stack guest's guestExec. It runs a process as
+// guestStackRunCommand runs the app: it sources the process's environment
+// files, sets its arguments from its argv file with eval, and execs busybox
+// chroot into the app root, where the stack's env enters the working
+// directory and the stack's setpriv drops to uid 2000 before it execs the
+// argv. The working directory is quoted into the line, and the run section
+// has already recorded the pid and set the open-files limit, so nothing after
+// the first source reads a shell variable.
+func stackExec(p guestProcess) string {
+	line := ""
+	for _, env := range p.envPaths {
+		line += ". " + env + " && "
+	}
+	return line + `eval "set -- $(cat ` + p.argvPath + `)" && exec chroot ` + guestAppRoot + ` ` + guestStackEnv + ` -C ` + shellQuote(p.dir) + ` ` +
+		guestStackSetpriv + ` --reuid=` + guestAppUID + ` --regid=` + guestAppUID + ` --init-groups --no-new-privs -- "$@"`
+}
+
+// guestSidecarChecks makes a broken sidecar argv or environment file a
+// failed setup step, as guestStackChecks does for /rvm/argv and
+// guestEnvChecks for /rvm/env. Both checks run in subshells, so stage 2 never
+// takes a sidecar's arguments or environment.
+func guestSidecarChecks(sidecars int) string {
+	checks := ""
+	for n := 1; n <= sidecars; n++ {
+		name := guestProcessName(n)
+		argv, env := guestSidecarFile(n, "argv"), guestSidecarFile(n, "env")
+		checks += `( eval "set -- $(cat ` + argv + `)" && [ "$#" -gt 0 ] ) || rvm_fail "reading the arguments of ` + name + ` from ` + argv + ` failed"
+( . ` + env + ` ) || rvm_fail "reading the environment of ` + name + ` from ` + env + ` failed"
+`
+	}
+	return checks
+}
