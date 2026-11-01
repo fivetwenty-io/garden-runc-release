@@ -793,6 +793,237 @@ var _ = Describe("Rundmc", func() {
 					})
 				})
 
+				Context("when the wrapped launcher writes guest memory lines on stderr", func() {
+					const (
+						sampleLine = "vm-launch-metrics v1 used=300 total=1000 available=700 free=400 caches=200\n"
+						otherLine  = "vm-launch-metrics v1 used=50 total=1000 available=950 free=900 caches=10\n"
+					)
+
+					var (
+						inner  *gardenfakes.FakeProcess
+						stderr *bytes.Buffer
+						pio    garden.ProcessIO
+						lines  []string
+						now    time.Time
+					)
+
+					// Metrics reads the bundle's CPU shares, so the bundle needs
+					// resources as well as the annotation.
+					metricsBundle := func(annotations map[string]string) goci.Bndl {
+						bundle := bundleFor(annotations)
+						bundle.Spec.Linux = &specs.Linux{Resources: &specs.LinuxResources{}}
+						return bundle
+					}
+
+					BeforeEach(func() {
+						inner = new(gardenfakes.FakeProcess)
+						stderr = new(bytes.Buffer)
+						pio = garden.ProcessIO{Stderr: stderr}
+						lines = []string{sampleLine}
+						fakeOCIRuntime.BundleInfoReturns("/bundle", metricsBundle(map[string]string{backend.AnnotationKey: string(kind)}), nil)
+						now = time.Unix(1000, 0)
+						rundmc.SetGuestMemoryClock(containerizer, func() time.Time { return now })
+
+						fakeOCIRuntime.StatsReturns(gardener.StatsContainerMetrics{
+							CPU: garden.ContainerCPUStat{Usage: 9},
+							Memory: garden.ContainerMemoryStat{
+								TotalUsageTowardLimit:   800,
+								TotalRss:                700,
+								HierarchicalMemoryLimit: 1000,
+							},
+						}, nil)
+
+						fakeOCIRuntime.ExecStub = func(_ lager.Logger, _ string, _ garden.ProcessSpec, io garden.ProcessIO) (garden.Process, error) {
+							for _, line := range lines {
+								_, _ = io.Stderr.Write([]byte(line))
+							}
+							return inner, nil
+						}
+					})
+
+					run := func() garden.Process {
+						process, err := containerizer.Run(logger, "some-handle", launcherSpec(), pio)
+						Expect(err).NotTo(HaveOccurred())
+						return process
+					}
+
+					usage := func() uint64 {
+						metrics, err := containerizer.Metrics(logger, "some-handle")
+						Expect(err).NotTo(HaveOccurred())
+						return metrics.Memory.TotalUsageTowardLimit
+					}
+
+					It("takes the lines out of the stream and passes the rest on", func() {
+						lines = []string{"before\n", sampleLine, "after"}
+
+						run()
+
+						Expect(stderr.String()).To(Equal("before\nafter"))
+					})
+
+					It("reports the guest's used memory and keeps the other cgroup fields", func() {
+						run()
+
+						metrics, err := containerizer.Metrics(logger, "some-handle")
+						Expect(err).NotTo(HaveOccurred())
+						Expect(metrics.Memory).To(Equal(garden.ContainerMemoryStat{
+							TotalUsageTowardLimit:   300,
+							TotalRss:                700,
+							HierarchicalMemoryLimit: 1000,
+						}))
+						Expect(metrics.CPU.Usage).To(Equal(uint64(0)))
+					})
+
+					It("reports the newest sample", func() {
+						lines = []string{sampleLine, otherLine}
+
+						run()
+
+						Expect(usage()).To(Equal(uint64(50)))
+					})
+
+					It("caps the figure at the cgroup's memory limit", func() {
+						fakeOCIRuntime.StatsReturns(gardener.StatsContainerMetrics{
+							Memory: garden.ContainerMemoryStat{TotalUsageTowardLimit: 80, HierarchicalMemoryLimit: 250},
+						}, nil)
+
+						run()
+
+						Expect(usage()).To(Equal(uint64(250)))
+					})
+
+					It("does not cap the figure when the cgroup has no limit", func() {
+						fakeOCIRuntime.StatsReturns(gardener.StatsContainerMetrics{
+							Memory: garden.ContainerMemoryStat{TotalUsageTowardLimit: 80},
+						}, nil)
+
+						run()
+
+						Expect(usage()).To(Equal(uint64(300)))
+					})
+
+					It("falls back to the cgroup figure when the sample is stale", func() {
+						run()
+
+						now = now.Add(34 * time.Second)
+						Expect(usage()).To(Equal(uint64(300)))
+
+						now = now.Add(time.Second)
+						Expect(usage()).To(Equal(uint64(800)))
+					})
+
+					It("returns to the guest figure when a new sample arrives", func() {
+						var stderrWriter io.Writer
+						fakeOCIRuntime.ExecStub = func(_ lager.Logger, _ string, _ garden.ProcessSpec, io garden.ProcessIO) (garden.Process, error) {
+							stderrWriter = io.Stderr
+							_, _ = io.Stderr.Write([]byte(sampleLine))
+							return inner, nil
+						}
+						run()
+
+						now = now.Add(time.Minute)
+						Expect(usage()).To(Equal(uint64(800)))
+
+						_, _ = stderrWriter.Write([]byte(otherLine))
+						Expect(usage()).To(Equal(uint64(50)))
+					})
+
+					It("reports the cgroup figure when the launcher wrote no sample", func() {
+						lines = nil
+
+						run()
+
+						Expect(usage()).To(Equal(uint64(800)))
+					})
+
+					It("drops a malformed line and keeps the cgroup figure", func() {
+						lines = []string{"vm-launch-metrics v1 used=1 total=0 available=0 free=0 caches=0\n"}
+
+						run()
+
+						Expect(stderr.Len()).To(Equal(0))
+						Expect(usage()).To(Equal(uint64(800)))
+					})
+
+					It("removes the sample when its own process ends", func() {
+						process := run()
+						Expect(usage()).To(Equal(uint64(300)))
+
+						_, err := process.Wait()
+						Expect(err).NotTo(HaveOccurred())
+
+						Expect(usage()).To(Equal(uint64(800)))
+					})
+
+					It("keeps a successor's sample when an earlier process ends", func() {
+						first := run()
+
+						lines = []string{otherLine}
+						run()
+
+						_, _ = first.Wait()
+
+						Expect(usage()).To(Equal(uint64(50)))
+					})
+
+					It("releases a line cut off by the end of the stream when the process ends", func() {
+						lines = []string{"vm-launch-metrics v1 used=3"}
+
+						process := run()
+						Expect(stderr.Len()).To(Equal(0))
+
+						_, _ = process.Wait()
+
+						Expect(stderr.String()).To(Equal("vm-launch-metrics v1 used=3"))
+					})
+
+					It("removes the sample when the container is destroyed", func() {
+						run()
+						Expect(usage()).To(Equal(uint64(300)))
+
+						Expect(containerizer.Destroy(logger, "some-handle")).To(Succeed())
+
+						Expect(usage()).To(Equal(uint64(800)))
+					})
+
+					It("keeps the samples of other containers apart", func() {
+						run()
+
+						metrics, err := containerizer.Metrics(logger, "other-handle")
+						Expect(err).NotTo(HaveOccurred())
+						Expect(metrics.Memory.TotalUsageTowardLimit).To(Equal(uint64(800)))
+					})
+
+					It("logs when the figure moves between the guest and the cgroup, and not otherwise", func() {
+						run()
+
+						for i := 0; i < 3; i++ {
+							_ = usage()
+						}
+						now = now.Add(time.Minute)
+						for i := 0; i < 3; i++ {
+							_ = usage()
+						}
+
+						var messages []string
+						for _, entry := range logger.(*lagertest.TestLogger).LogMessages() {
+							if strings.Contains(entry, "vm-memory-from-") {
+								messages = append(messages, entry)
+							}
+						}
+						Expect(messages).To(HaveLen(2))
+						Expect(messages[0]).To(HaveSuffix("vm-memory-from-guest"))
+						Expect(messages[1]).To(HaveSuffix("vm-memory-from-cgroup"))
+					})
+
+					It("never uses the sample for a bundle that is not a VM", func() {
+						run()
+						fakeOCIRuntime.BundleInfoReturns("/bundle", metricsBundle(nil), nil)
+
+						Expect(usage()).To(Equal(uint64(800)))
+					})
+				})
+
 				It("does not wrap a pea that runs the launcher path", func() {
 					spec := launcherSpec()
 					spec.Image = garden.ImageRef{URI: "some-uri"}

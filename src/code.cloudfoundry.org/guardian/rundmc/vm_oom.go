@@ -68,37 +68,62 @@ func (s *oomLineScanner) Seen() bool {
 	return s.seen
 }
 
-// runVMLauncher runs the wrapped vm-launch process with a scanner on its
-// stderr, and returns a process that records a guest OOM when it ends.
+// runVMLauncher runs the wrapped vm-launch process with a filter and a scanner
+// on its stderr. The filter takes vm-launch's guest memory lines out of the
+// stream and stores them for Metrics, and the scanner behind it sees the
+// remaining bytes. The returned process records a guest OOM when it ends.
 func (c *Containerizer) runVMLauncher(log lager.Logger, handle string, spec garden.ProcessSpec, pio garden.ProcessIO) (garden.Process, error) {
 	scanner := newOOMLineScanner(pio.Stderr)
-	pio.Stderr = scanner
+
+	// The process is the source of its samples, so it exists before the
+	// filter that records them.
+	launched := &vmLaunchProcess{log: log, handle: handle, scanner: scanner, events: c.events, memory: &c.guestMemory}
+	launched.filter = newVMMetricsFilter(scanner,
+		func(sample vmMemorySample) { c.guestMemory.Record(handle, launched, sample) },
+		func(dropped int) {
+			if dropped == 1 {
+				log.Info("vm-metrics-line-dropped", lager.Data{"handle": handle})
+			}
+		},
+	)
+	pio.Stderr = launched.filter
 
 	process, err := c.runtime.Exec(log, handle, spec, pio)
 	if err != nil || process == nil {
+		c.guestMemory.Forget(handle, launched)
 		return process, err
 	}
 
-	return &vmLaunchProcess{Process: process, log: log, handle: handle, scanner: scanner, events: c.events}, nil
+	launched.Process = process
+
+	return launched, nil
 }
 
 // vmLaunchProcess is the wrapped vm-launch process. Once the process has
-// ended, Wait records a guest OOM in the container's events if the scanner saw
-// the report, so it is in the event store before the exit status travels back
-// to the caller.
+// ended, Wait releases what the filter still holds, removes the container's
+// guest memory sample if this process wrote it, and records a guest OOM in the
+// container's events if the scanner saw the report, so it is in the event
+// store before the exit status travels back to the caller.
 type vmLaunchProcess struct {
 	garden.Process
 
 	log     lager.Logger
 	handle  string
+	filter  *vmMetricsFilter
 	scanner interface{ Seen() bool }
 	events  EventStore
+	memory  *vmGuestMemory
 
 	once sync.Once
 }
 
 func (p *vmLaunchProcess) Wait() (int, error) {
 	status, err := p.Process.Wait()
+
+	if flushErr := p.filter.Flush(); flushErr != nil {
+		p.log.Error("flush-vm-launch-stderr-failed", flushErr)
+	}
+	p.memory.Forget(p.handle, p)
 
 	if p.scanner.Seen() {
 		p.once.Do(func() {
