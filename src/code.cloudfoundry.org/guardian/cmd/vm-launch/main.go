@@ -796,8 +796,10 @@ func run(argv []string, logger *log.Logger) int {
 	var stack *guestStack
 	if stackImg != nil {
 		if stack, err = newGuestStack(cfg.args); err != nil {
-			logger.Print(err)
-			return exitLaunchError
+			stack = nil
+			if !toBusybox(strings.ReplaceAll(err.Error(), "\n", "; ")) {
+				return exitLaunchError
+			}
 		}
 	}
 	closeLauncher := func() {

@@ -1542,6 +1542,17 @@ var _ = Describe("run with a stack image", func() {
 		expectTodaysGuest([]string{launcher, "app", "true", ""}, "building the droplet image with "+filepath.Join(art, artMksquashfs)+": exit status 1; cannot read the droplet")
 	})
 
+	It("keeps today's guest when the container's hostname is not one the stack guest accepts", func() {
+		containerHostname = func() (string, error) { return "web_1", nil }
+		_, argv := guestOf([]string{launcher, "app", "true", ""})
+		Expect(argv).NotTo(ContainSubstring("rvm-stack"))
+		Expect(logBuf.String()).To(ContainSubstring("busybox guest: "))
+		Expect(logBuf.String()).NotTo(ContainSubstring("stack guest:"))
+		Expect(strings.Count(logBuf.String(), "guest: ")).To(Equal(1), logBuf.String())
+		Expect(heldFilesEndingIn("rootfs.squashfs")).To(BeZero())
+		Expect(heldFilesEndingIn("/launcher")).To(BeZero())
+	})
+
 	It("keeps today's guest for an app with a volume", func() {
 		volDir := filepath.Join(dir, "volume")
 		infoDir := filepath.Join(dir, "info")
@@ -1588,12 +1599,11 @@ var _ = Describe("run with a stack image", func() {
 		Expect(heldFilesEndingIn("/launcher")).To(BeZero())
 	})
 
-	It("exits 125 for a launcher argv over the guest's limit before it makes a work directory", func() {
-		argvFile := writeFakeHypervisor(qemu, "")
-		Expect(runWith(backend.VMQemu, []string{launcher, "app", "true", strings.Repeat("m", maxGuestCommandBytes)})).To(Equal(exitLaunchError))
-		Expect(logBuf.String()).To(ContainSubstring("the launcher's argv is "))
-		Expect(argvFile).NotTo(BeAnExistingFile())
-		Expect(os.ReadDir(tmp)).To(BeEmpty())
+	It("keeps today's guest for a launcher argv over the stack guest's limit, with the reason on the line", func() {
+		_, argv := guestOf([]string{launcher, "app", "true", strings.Repeat("m", maxGuestCommandBytes)})
+		Expect(argv).NotTo(ContainSubstring("rvm-stack"))
+		Expect(logBuf.String()).To(ContainSubstring("busybox guest: the launcher's argv is "))
+		Expect(logBuf.String()).NotTo(ContainSubstring("stack guest:"))
 		Expect(heldFilesEndingIn("rootfs.squashfs")).To(BeZero())
 		Expect(heldFilesEndingIn("/launcher")).To(BeZero())
 	})
@@ -1731,6 +1741,22 @@ var _ = Describe("run with a stack image", func() {
 			GinkgoT().Setenv(sidecarsEnvVar, oneSidecar)
 			Expect(runWith(backend.VMQemu, []string{"/bin/sh", "-c", "echo hi"})).To(Equal(exitLaunchError))
 			Expect(logBuf.String()).To(Equal("this app has 1 sidecar, which runs only in the stack guest; the process is not the CF launcher\n"))
+			Expect(argvFile).NotTo(BeAnExistingFile())
+			Expect(os.ReadDir(tmp)).To(BeEmpty())
+			Expect(heldFilesEndingIn("rootfs.squashfs")).To(BeZero())
+			Expect(heldFilesEndingIn("/launcher")).To(BeZero())
+		})
+
+		It("exits 125 with the reason when the stack guest's gathering fails for an app with sidecars", func() {
+			withPair()
+			GinkgoT().Setenv(sidecarsEnvVar, oneSidecar)
+			containerHostname = func() (string, error) { return "web_1", nil }
+			argvFile := writeFakeHypervisor(qemu, "")
+
+			Expect(runWith(backend.VMQemu, launchArg)).To(Equal(exitLaunchError))
+			Expect(logBuf.String()).To(HavePrefix("this app has 1 sidecar, which runs only in the stack guest; "))
+			Expect(logBuf.String()).To(ContainSubstring("hostname"))
+			Expect(logBuf.String()).NotTo(ContainSubstring("guest: "))
 			Expect(argvFile).NotTo(BeAnExistingFile())
 			Expect(os.ReadDir(tmp)).To(BeEmpty())
 			Expect(heldFilesEndingIn("rootfs.squashfs")).To(BeZero())
