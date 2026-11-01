@@ -663,6 +663,89 @@ describe 'garden' do
           end
         end
       end
+
+      context 'stack properties' do
+        let(:tarballs) { %w[/var/vcap/packages/cflinuxfs4/rootfs.tar /var/vcap/packages/cflinuxfs3/rootfs.tar] }
+
+        def render_with(backends, extra)
+          template.render({ 'garden' => { 'execution_backends' => backends }.merge(extra) })
+        end
+
+        def render_server(backends, extra)
+          IniParse.parse(render_with(backends, extra))['server']
+        end
+
+        it 'declares an empty tarball list and a 20 second wait' do
+          garden_spec = YAML.load_file(File.join(File.dirname(__FILE__), '../../jobs/garden/spec'))
+          properties = garden_spec['properties']
+          expect(properties['garden.vm_stack_tarballs']['default']).to eql([])
+          expect(properties['garden.vm_stack_wait_seconds']['default']).to eql(20)
+          %w[garden.vm_stack_tarballs garden.vm_stack_wait_seconds].each do |name|
+            expect(properties[name]['description']).not_to be_empty
+          end
+        end
+
+        [[], ['vm-qemu'], %w[vm-qemu vm-firecracker], %w[oci-gvisor vm-qemu]].each do |backends|
+          it "renders no stack line by default (#{backends.inspect})" do
+            expect(render_with(backends, {})).not_to include('vm-stack')
+          end
+        end
+
+        context 'with two tarballs' do
+          it 'renders one vm-stack-tarball line for each entry and the default wait' do
+            raw = render_with(['vm-qemu'], { 'vm_stack_tarballs' => tarballs })
+            expect(raw.scan(/^  vm-stack-tarball = (.*)$/).flatten).to eql(tarballs)
+            expect(raw).to end_with(
+              "  vm-stack-tarball = #{tarballs[0]}\n  vm-stack-tarball = #{tarballs[1]}\n  vm-stack-wait = 20s\n"
+            )
+            expect(raw).not_to include('vm-stack-cache-dir')
+          end
+
+          it 'parses back into the list and the wait' do
+            server = render_server(['vm-firecracker'], { 'vm_stack_tarballs' => tarballs })
+            expect(server['vm-stack-tarball']).to eql(tarballs)
+            expect(server['vm-stack-wait']).to eql('20s')
+          end
+
+          it 'renders the wait in seconds' do
+            server = render_server(['vm-qemu'], { 'vm_stack_tarballs' => tarballs, 'vm_stack_wait_seconds' => 5 })
+            expect(server['vm-stack-wait']).to eql('5s')
+          end
+        end
+
+        it 'renders no wait without a tarball' do
+          expect(render_with(['vm-qemu'], { 'vm_stack_wait_seconds' => 5 })).not_to include('vm-stack')
+        end
+
+        it 'raises for a relative tarball path' do
+          expect { render_with(['vm-qemu'], { 'vm_stack_tarballs' => ['packages/cflinuxfs4/rootfs.tar'] }) }
+            .to raise_error(/garden.vm_stack_tarballs must hold absolute paths/)
+        end
+
+        it 'raises when one of several tarball paths is relative' do
+          expect { render_with(['vm-qemu'], { 'vm_stack_tarballs' => [tarballs[0], 'rootfs.tar'] }) }
+            .to raise_error(/garden.vm_stack_tarballs must hold absolute paths/)
+        end
+
+        it 'raises for a tarball value that is not a list' do
+          expect { render_with(['vm-qemu'], { 'vm_stack_tarballs' => tarballs[0] }) }
+            .to raise_error(/garden.vm_stack_tarballs must be a list/)
+        end
+
+        [[], ['oci-gvisor']].each do |backends|
+          it "raises when tarballs are set and the backends are #{backends.inspect}" do
+            expect { render_with(backends, { 'vm_stack_tarballs' => tarballs }) }
+              .to raise_error(/garden.vm_stack_tarballs requires a vm-\* entry/)
+          end
+        end
+
+        [0, -1, '20', 1.5].each do |value|
+          it "raises for a wait of #{value.inspect}" do
+            expect { render_with(['vm-qemu'], { 'vm_stack_wait_seconds' => value }) }
+              .to raise_error(/garden.vm_stack_wait_seconds must be a positive whole number/)
+          end
+        end
+      end
     end
   end
 
