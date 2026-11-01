@@ -23,7 +23,7 @@ const (
 
 // vmSidecar is one sidecar process that runs in the guest beside the app:
 // its argument vector, the environment entries it adds and removes, and the
-// log source its output carries.
+// log source that Diego gives it, which the mode line names.
 type vmSidecar struct {
 	Args      []string
 	Env       []string

@@ -152,4 +152,13 @@ var _ = Describe("sidecars", func() {
 			Expect(err).To(MatchError(ContainSubstring("NUL")))
 		})
 	})
+
+	Describe("guestExtrasLine", func() {
+		It("names each sidecar's log source, quoted, and adds nothing without sidecars or an identity", func() {
+			Expect(guestExtrasLine(nil, nil)).To(BeEmpty())
+			Expect(guestExtrasLine([]vmSidecar{{LogSource: "APP/PROC/WEB/SIDECAR/ONE"}}, nil)).To(Equal(`; 1 sidecar runs beside the app, with the log source "APP/PROC/WEB/SIDECAR/ONE"`))
+			three := []vmSidecar{{LogSource: "A"}, {LogSource: "B\nC"}, {}}
+			Expect(guestExtrasLine(three, nil)).To(Equal(`; 3 sidecars run beside the app, with the log sources "A", "B\nC", and ""`))
+		})
+	})
 })

@@ -900,7 +900,7 @@ func run(argv []string, logger *log.Logger) int {
 			return exitLaunchError
 		}
 		stack.sidecars, stack.identity = files, identity
-		guestMode += guestExtrasLine(len(sidecars), identity)
+		guestMode += guestExtrasLine(sidecars, identity)
 	} else if len(sidecars) > 0 {
 		logger.Print(sidecarsRefusal(len(sidecars), "the stack guest has no app root"))
 		return exitLaunchError
@@ -1172,16 +1172,23 @@ func sidecarsRefusal(n int, why string) string {
 	return fmt.Sprintf("this app has %d sidecars, which run only in the stack guest; %s", n, why)
 }
 
-// guestExtrasLine is what the stack guest's mode line adds for n sidecars
-// and the identity pair id, which may be nil. It adds nothing for a guest
-// with neither, so that guest's line stays as it was.
-func guestExtrasLine(n int, id *instanceIdentity) string {
+// guestExtrasLine is what the stack guest's mode line adds for its sidecars
+// and the identity pair id, which may be nil. It names each sidecar's log
+// source, quoted, because the sidecar's output carries the app's source, so
+// the mode line is where an operator sees which sidecars the guest runs. It
+// adds nothing for a guest with neither, so that guest's line stays as it
+// was.
+func guestExtrasLine(sidecars []vmSidecar, id *instanceIdentity) string {
 	var b strings.Builder
-	switch {
+	sources := make([]string, len(sidecars))
+	for i, sc := range sidecars {
+		sources[i] = fmt.Sprintf("%q", sc.LogSource)
+	}
+	switch n := len(sidecars); {
 	case n == 1:
-		b.WriteString("; 1 sidecar runs beside the app")
+		fmt.Fprintf(&b, "; 1 sidecar runs beside the app, with the log source %s", sources[0])
 	case n > 1:
-		fmt.Fprintf(&b, "; %d sidecars run beside the app", n)
+		fmt.Fprintf(&b, "; %d sidecars run beside the app, with the log sources %s", n, joinNames(sources, ""))
 	}
 	if id != nil {
 		fmt.Fprintf(&b, "; the instance identity has serial %s and expires %s", id.serial, id.notAfter.UTC().Format(time.RFC3339))

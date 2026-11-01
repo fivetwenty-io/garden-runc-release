@@ -1665,7 +1665,7 @@ var _ = Describe("run with a stack image", func() {
 			Expect(built.env).To(ContainSubstring("export CF_INSTANCE_KEY='/etc/cf-instance-credentials/instance.key'\n"))
 			Expect(built.env).NotTo(ContainSubstring(sidecarsEnvVar))
 			Expect(logBuf.String()).To(MatchRegexp(`(?m)^stack guest: the launcher runs on the stack image, with a droplet image of .* to build; ` +
-				`2 sidecars run beside the app; the instance identity has serial 4242 and expires ` + regexp.QuoteMeta(notAfter.UTC().Format(time.RFC3339)) + `$`))
+				`2 sidecars run beside the app, with the log sources "APP/PROC/WEB/SIDECAR/ONE" and "APP/PROC/WEB/SIDECAR/TWO"; the instance identity has serial 4242 and expires ` + regexp.QuoteMeta(notAfter.UTC().Format(time.RFC3339)) + `$`))
 			Expect(strings.Count(logBuf.String(), "guest: ")).To(Equal(1), logBuf.String())
 			Expect(logBuf.String()).NotTo(ContainSubstring("BEGIN"))
 		})
@@ -1682,7 +1682,7 @@ var _ = Describe("run with a stack image", func() {
 			Expect(id).To(BeNil())
 			Expect(built.env).NotTo(ContainSubstring("CF_INSTANCE_CERT"))
 			Expect(built.env).NotTo(ContainSubstring("CF_INSTANCE_KEY"))
-			Expect(logBuf.String()).To(MatchRegexp(`(?m)^stack guest: .* to build; 1 sidecar runs beside the app$`))
+			Expect(logBuf.String()).To(MatchRegexp(`(?m)^stack guest: .* to build; 1 sidecar runs beside the app, with the log source ""$`))
 		})
 
 		It("exits 125 when the pair does not match, before the hypervisor starts", func() {
