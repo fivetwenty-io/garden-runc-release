@@ -68,8 +68,8 @@ var _ = Describe("sidecars", func() {
 			},
 			Entry("another version", `{"version":2,"sidecars":[{"args":["x"]}]}`, "version 2"),
 			Entry("no version", `{"sidecars":[{"args":["x"]}]}`, "version 0"),
-			Entry("empty arguments", `{"version":1,"sidecars":[{"args":[]}]}`, "sidecar 0"),
-			Entry("missing arguments", `{"version":1,"sidecars":[{"args":["x"]},{"env":["A=b"]}]}`, "sidecar 1"),
+			Entry("empty arguments", `{"version":1,"sidecars":[{"args":[]}]}`, "sidecar 1 in"),
+			Entry("missing arguments", `{"version":1,"sidecars":[{"args":["x"]},{"env":["A=b"]}]}`, "sidecar 2 in"),
 			Entry("malformed JSON", `{"version":1,`, "not valid JSON"),
 			Entry("a JSON string", `"x"`, "not valid JSON"),
 		)

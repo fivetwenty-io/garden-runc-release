@@ -64,7 +64,8 @@ func parseSidecars(env map[string]string) ([]vmSidecar, error) {
 	sidecars := make([]vmSidecar, 0, len(desc.Sidecars))
 	for i, sc := range desc.Sidecars {
 		if len(sc.Args) == 0 {
-			return nil, fmt.Errorf("sidecar %d in %s has no arguments to run", i, sidecarsEnvVar)
+			// The guest numbers the sidecars from 1, because the app is 0.
+			return nil, fmt.Errorf("sidecar %d in %s has no arguments to run", i+1, sidecarsEnvVar)
 		}
 		sidecars = append(sidecars, vmSidecar{Args: sc.Args, Env: sc.Env, Unset: sc.Unset, LogSource: sc.LogSource})
 	}
