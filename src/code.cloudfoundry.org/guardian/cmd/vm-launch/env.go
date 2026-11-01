@@ -51,7 +51,8 @@ const (
 // container and not in the guest. VCAP_PLATFORM_OPTIONS belongs to the
 // launcher, which unsets it before the app starts. CF_VM_SIDECARS is
 // vm-launch's own description of the sidecars, which the guest gets as files
-// (see sidecarGuestFiles).
+// (see sidecarGuestFiles). CF_VM_SIDECAR_RELAY marks a launcher process as a
+// sidecar's log relay, and the guest never sees it (see relayEnv).
 var guestEnvDenylist = map[string]bool{
 	"PATH":                    true,
 	"HOME":                    true,
@@ -67,6 +68,7 @@ var guestEnvDenylist = map[string]bool{
 	"VCAP_SERVICES_FILE_PATH": true,
 	platformOptionsEnv:        true,
 	sidecarsEnvVar:            true,
+	relayEnv:                  true,
 }
 
 // stackGuestEnvDenylist is guestEnvDenylist for a guest that runs the app on

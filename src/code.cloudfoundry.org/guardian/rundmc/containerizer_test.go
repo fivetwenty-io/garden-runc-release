@@ -1024,6 +1024,104 @@ var _ = Describe("Rundmc", func() {
 					})
 				})
 
+				Context("when the launcher is a sidecar's log relay", func() {
+					const relayValue = "CF_VM_SIDECAR_RELAY=1:0123456789abcdef0123456789abcdef"
+
+					relaySpec := func(env ...string) garden.ProcessSpec {
+						return garden.ProcessSpec{Path: launcher, Env: env, User: "vcap", Dir: "/home/vcap"}
+					}
+
+					It("runs it as vm-launch relay, unwrapped and unmarked", func() {
+						inner := new(gardenfakes.FakeProcess)
+						stderr := new(bytes.Buffer)
+						var gotStderr io.Writer
+						fakeOCIRuntime.ExecStub = func(_ lager.Logger, _ string, _ garden.ProcessSpec, pio garden.ProcessIO) (garden.Process, error) {
+							gotStderr = pio.Stderr
+							return inner, nil
+						}
+
+						process, err := containerizer.Run(logger, "some-handle", relaySpec("A=b", relayValue), garden.ProcessIO{Stderr: stderr})
+						Expect(err).NotTo(HaveOccurred())
+						Expect(process).To(BeIdenticalTo(inner))
+						Expect(gotStderr).To(BeIdenticalTo(stderr))
+
+						Expect(fakeOCIRuntime.ExecCallCount()).To(Equal(1))
+						_, id, actual, _ := fakeOCIRuntime.ExecArgsForCall(0)
+						Expect(id).To(Equal("some-handle"))
+						Expect(actual.Path).To(Equal(bundlerules.VMLaunchMountPath))
+						Expect(actual.Args).To(Equal([]string{"relay"}))
+						Expect(actual.Env).To(Equal([]string{"A=b", relayValue}))
+						Expect(actual.User).To(Equal("vcap"))
+						Expect(actual.Dir).To(Equal("/home/vcap"))
+					})
+
+					It("drops the launcher's arguments", func() {
+						spec := relaySpec(relayValue)
+						spec.Args = []string{"app", "echo hi", ""}
+
+						_, err := containerizer.Run(logger, "some-handle", spec, garden.ProcessIO{})
+						Expect(err).NotTo(HaveOccurred())
+
+						_, _, actual, _ := fakeOCIRuntime.ExecArgsForCall(0)
+						Expect(actual.Args).To(Equal([]string{"relay"}))
+					})
+
+					It("strips a marker the client sent", func() {
+						_, err := containerizer.Run(logger, "some-handle", relaySpec(marker, relayValue), garden.ProcessIO{})
+						Expect(err).NotTo(HaveOccurred())
+
+						_, _, actual, _ := fakeOCIRuntime.ExecArgsForCall(0)
+						Expect(actual.Path).To(Equal(bundlerules.VMLaunchMountPath))
+						Expect(actual.Env).To(Equal([]string{relayValue}))
+					})
+
+					It("goes by the last value of the variable", func() {
+						_, err := containerizer.Run(logger, "some-handle", relaySpec("CF_VM_SIDECAR_RELAY=", relayValue), garden.ProcessIO{})
+						Expect(err).NotTo(HaveOccurred())
+						_, _, actual, _ := fakeOCIRuntime.ExecArgsForCall(0)
+						Expect(actual.Args).To(Equal([]string{"relay"}))
+
+						_, err = containerizer.Run(logger, "some-handle", relaySpec(relayValue, "CF_VM_SIDECAR_RELAY="), garden.ProcessIO{})
+						Expect(err).NotTo(HaveOccurred())
+						_, _, actual, _ = fakeOCIRuntime.ExecArgsForCall(1)
+						Expect(actual.Args).To(Equal(wrapped(launcher)))
+						Expect(actual.Env).To(Equal([]string{relayValue, "CF_VM_SIDECAR_RELAY=", marker}))
+					})
+
+					It("wraps a launcher whose value is malformed or empty, as an app", func() {
+						values := []string{
+							"CF_VM_SIDECAR_RELAY=",
+							"CF_VM_SIDECAR_RELAY=0:0123456789abcdef0123456789abcdef",
+							"CF_VM_SIDECAR_RELAY=9:0123456789abcdef0123456789abcdef",
+							"CF_VM_SIDECAR_RELAY=10:0123456789abcdef0123456789abcdef",
+							"CF_VM_SIDECAR_RELAY=1:0123456789ABCDEF0123456789ABCDEF",
+							"CF_VM_SIDECAR_RELAY=1:0123456789abcdef0123456789abcde",
+							"CF_VM_SIDECAR_RELAY=1:0123456789abcdef0123456789abcdef0",
+							"CF_VM_SIDECAR_RELAY= 1:0123456789abcdef0123456789abcdef",
+							"CF_VM_SIDECAR_RELAY=1:0123456789abcdef0123456789abcdef\n",
+							"CF_VM_SIDECAR_RELAY",
+							"CF_VM_SIDECAR_RELAYX=1:0123456789abcdef0123456789abcdef",
+						}
+						for i, value := range values {
+							_, err := containerizer.Run(logger, "some-handle", relaySpec(value), garden.ProcessIO{})
+							Expect(err).NotTo(HaveOccurred())
+
+							_, _, actual, _ := fakeOCIRuntime.ExecArgsForCall(i)
+							Expect(actual.Args).To(Equal(wrapped(launcher)), value)
+							Expect(actual.Env).To(Equal([]string{value, marker}), value)
+						}
+					})
+
+					It("leaves a process that is not the launcher alone", func() {
+						_, err := containerizer.Run(logger, "some-handle", garden.ProcessSpec{Path: "/tmp/lifecycle/diego-sshd", Env: []string{relayValue}}, garden.ProcessIO{})
+						Expect(err).NotTo(HaveOccurred())
+
+						_, _, actual, _ := fakeOCIRuntime.ExecArgsForCall(0)
+						Expect(actual.Path).To(Equal("/tmp/lifecycle/diego-sshd"))
+						Expect(actual.Args).To(BeEmpty())
+					})
+				})
+
 				It("does not wrap a pea that runs the launcher path", func() {
 					spec := launcherSpec()
 					spec.Image = garden.ImageRef{URI: "some-uri"}
@@ -1058,6 +1156,17 @@ var _ = Describe("Rundmc", func() {
 
 					_, _, actual, _ := fakeOCIRuntime.ExecArgsForCall(0)
 					Expect(actual).To(Equal(launcherSpec()))
+				})
+
+				It("never runs a launcher with a relay value as a relay", func() {
+					spec := launcherSpec()
+					spec.Env = []string{"CF_VM_SIDECAR_RELAY=1:0123456789abcdef0123456789abcdef"}
+
+					_, err := containerizer.Run(logger, "some-handle", spec, garden.ProcessIO{})
+					Expect(err).NotTo(HaveOccurred())
+
+					_, _, actual, _ := fakeOCIRuntime.ExecArgsForCall(0)
+					Expect(actual).To(Equal(spec))
 				})
 
 				It("does not scan the stderr or wrap the process", func() {

@@ -1774,10 +1774,10 @@ var _ = Describe("run with a stack image", func() {
 		})
 
 		It("exits 125 for a sidecar description it cannot read, before it chooses the guest", func() {
-			GinkgoT().Setenv(sidecarsEnvVar, `{"version":2,"sidecars":[]}`)
+			GinkgoT().Setenv(sidecarsEnvVar, `{"version":3,"sidecars":[]}`)
 			argvFile := writeFakeHypervisor(qemu, "")
 			Expect(runWith(backend.VMQemu, launchArg)).To(Equal(exitLaunchError))
-			Expect(logBuf.String()).To(Equal("CF_VM_SIDECARS has version 2, and this vm-launch reads only version 1\n"))
+			Expect(logBuf.String()).To(Equal("CF_VM_SIDECARS has version 3, and this vm-launch reads only versions 1 and 2\n"))
 			Expect(argvFile).NotTo(BeAnExistingFile())
 			Expect(heldFilesEndingIn("rootfs.squashfs")).To(BeZero())
 		})

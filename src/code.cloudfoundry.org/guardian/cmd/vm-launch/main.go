@@ -569,7 +569,41 @@ func init() {
 
 func main() {
 	logger := log.New(os.Stderr, "vm-launch: ", 0)
-	os.Exit(run(os.Args[1:], logger))
+	os.Exit(dispatch(os.Args[1:], logger))
+}
+
+// dispatch runs the relay when argv starts with "relay", and otherwise runs
+// the launch. The relay is a sidecar's log process in the container. It skips
+// the core dump and boot setup, and makes itself undumpable on its own.
+func dispatch(argv []string, logger *log.Logger) int {
+	if len(argv) > 0 && argv[0] == "relay" {
+		return runRelay(argv[1:])
+	}
+	return run(argv, logger)
+}
+
+// newSidecarRelayHub returns the relay hub for an app whose description
+// carried relayKey, with room for count sidecars, listening at path. It
+// returns nil and no error when there is no key or no sidecar, because the
+// sidecars' lines then go to vm-launch's own output.
+func newSidecarRelayHub(path, relayKey string, count int, logger *log.Logger) (*relayHub, error) {
+	if relayKey == "" || count == 0 {
+		return nil, nil
+	}
+	// The hub's fallback writes sidecar lines, which the guest controls, to
+	// vm-launch's own stderr, so they get the same guard as the app's.
+	return newRelayHub(path, relayKey, count, os.Stdout, guestStderr{out: os.Stdout, err: os.Stderr}, logger)
+}
+
+// relayCallbacks returns the supervisor's callbacks for hub. They are nil
+// without a hub, because a method value on a nil hub is not nil and would
+// swallow the sidecars' lines that the filter otherwise writes to
+// vm-launch's own output.
+func relayCallbacks(hub *relayHub) (logs func(index int, stream byte, line string), firstExit func(index, status int)) {
+	if hub == nil {
+		return nil, nil
+	}
+	return hub.deliver, hub.first
 }
 
 // coreDumpFilterPath is the file that holds vm-launch's coredump_filter.
@@ -685,7 +719,7 @@ func run(argv []string, logger *log.Logger) int {
 	// beside the app, from the droplet, so only a guest with an app root can
 	// run them. They are read before the guest is chosen, so that every
 	// reason for the busybox guest refuses them.
-	sidecars, err := parseSidecars(env)
+	sidecars, relayKey, err := parseSidecarsKeyed(env)
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError
@@ -872,6 +906,18 @@ func run(argv []string, logger *log.Logger) int {
 			}
 		}()
 	}
+
+	// The relay hub listens before the work directory is made and long before
+	// the guest boots, so a sidecar's relay finds it as soon as the container
+	// starts it. Only a version 2 description with sidecars gets one. Its
+	// close removes the socket and writes any lines still queued to
+	// vm-launch's own output.
+	hub, err := newSidecarRelayHub(relaySocketPath, relayKey, len(sidecars), logger)
+	if err != nil {
+		logger.Print(err)
+		return exitLaunchError
+	}
+	defer hub.close()
 
 	workDir, err := os.MkdirTemp("", "vm-launch-")
 	if err != nil {
@@ -1114,7 +1160,8 @@ func run(argv []string, logger *log.Logger) int {
 
 	logger.Print(guestMode)
 	cmd := newHypervisorCmd(hvArgv, files)
-	sup := supervisor{stdout: os.Stdout, logger: logger, signals: sigs, grace: killGrace, deadline: stopDeadline, started: closeInherited}
+	sup := supervisor{stdout: os.Stdout, stderr: os.Stderr, logger: logger, signals: sigs, grace: killGrace, deadline: stopDeadline, started: closeInherited}
+	sup.logs, sup.firstExit = relayCallbacks(hub)
 	if len(shares) > 0 {
 		// A virtiofsd that ends while QEMU runs kills it, which takes QEMU's
 		// process, known once it has started. QEMU's reap is reported at
@@ -1198,6 +1245,10 @@ func run(argv []string, logger *log.Logger) int {
 		// The gates' last lines about the ports come before the exit line.
 		gates.end()
 	}
+	// The hub's queued lines reach a relay, or else vm-launch's own output,
+	// before the exit line, and a sidecar that exited first holds the stop
+	// open until the signal arrives. This also runs when sup.run failed.
+	hub.finish(res.received, sigs, relayHold)
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError

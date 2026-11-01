@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -378,6 +379,12 @@ func (c *Containerizer) Run(log lager.Logger, handle string, spec garden.Process
 // processes.VMLaunchTransparentProxyFlag). Every other process, and every
 // container on another backend, is returned as is. It reports whether it
 // wrapped the process.
+//
+// A launcher whose environment ends with a valid CF_VM_SIDECAR_RELAY value
+// stands in for a sidecar that runs in the guest. It runs as "vm-launch
+// relay", which streams that sidecar's output from the app's vm-launch and
+// exits with its status. It is not wrapped, so it runs without the kvm gid
+// and without CAP_NET_RAW, as diego-sshd does.
 func (c *Containerizer) wrapVMLauncher(log lager.Logger, handle string, spec garden.ProcessSpec) (garden.ProcessSpec, bool, error) {
 	_, bundle, err := c.runtime.BundleInfo(log, handle)
 	if err != nil {
@@ -387,6 +394,13 @@ func (c *Containerizer) wrapVMLauncher(log lager.Logger, handle string, spec gar
 
 	kind := backend.FromBundle(bundle)
 	if !backend.IsVM(kind) {
+		return spec, false, nil
+	}
+
+	if isSidecarRelay(spec.Env) {
+		log.Info("vm-sidecar-relay", lager.Data{"backend": string(kind)})
+		spec.Path = processes.VMLaunchPath
+		spec.Args = []string{"relay"}
 		return spec, false, nil
 	}
 
@@ -401,6 +415,26 @@ func (c *Containerizer) wrapVMLauncher(log lager.Logger, handle string, spec gar
 	spec.Args = args
 
 	return processes.MarkVMLaunch(spec), true, nil
+}
+
+// sidecarRelayEnv names the variable that makes a launcher a sidecar's log
+// relay, and sidecarRelayValue is the form of its value: the sidecar's
+// index and the relay key. A value of any other form, the empty value rep
+// gives the app's own launcher included, leaves the launcher an app.
+const sidecarRelayEnv = "CF_VM_SIDECAR_RELAY"
+
+var sidecarRelayValue = regexp.MustCompile(`^[1-8]:[0-9a-f]{32}$`)
+
+// isSidecarRelay reports whether the last CF_VM_SIDECAR_RELAY in env, which
+// is the value the process sees, makes the process a sidecar's log relay.
+func isSidecarRelay(env []string) bool {
+	value, found := "", false
+	for _, kv := range env {
+		if v, ok := strings.CutPrefix(kv, sidecarRelayEnv+"="); ok {
+			value, found = v, true
+		}
+	}
+	return found && sidecarRelayValue.MatchString(value)
 }
 
 // runPeaAsExec runs a pea's process inside the sandbox container itself. A
