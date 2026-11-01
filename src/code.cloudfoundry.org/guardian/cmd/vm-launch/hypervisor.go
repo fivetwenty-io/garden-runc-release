@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -735,6 +736,21 @@ const maxPortDigits = 5
 // sequence number may have, which keeps either far inside an int.
 const maxOOMDigits = 9
 
+// maxFrameBytes bounds a log frame on the console, from the start of its tag
+// to its newline. The guest's framers put at most 960 bytes of payload in a
+// frame, so a frame tag without a newline this soon is ordinary output.
+const maxFrameBytes = 2 << 10
+
+// maxLogLine bounds a log line that the filter joins from the pieces of a
+// frame. The guest folds longer lines (see logTag), so a longer join only
+// comes from a broken frame, and the filter passes it on as more than one
+// line.
+const maxLogLine = 64 << 10
+
+// maxIndexDigits is the most digits a process index in a log frame or a
+// first-exit line may have. The index is at most maxSidecars as well.
+const maxIndexDigits = 2
+
 // serialFilter turns the guest serial console into the guest command's
 // output. It drops the console before the start tag and after the exit
 // marker, swallows the marker, converts the console's CRLF line endings to LF,
@@ -752,8 +768,19 @@ const maxOOMDigits = 9
 // the output around it is kept as it was. It never fails a Write, so the hypervisor's output keeps draining
 // when the destination breaks; the first destination error is kept in
 // writeErr.
+//
+// With onFrames, the filter also swallows the guest's log frames (see
+// logTag) and its first-exit line (see firstTag). A frame counts only at the
+// start of a console line, so a tag inside a frame's payload, the exit
+// marker's included, is never taken for what it says. The filter joins the
+// pieces of each process's lines, writes the app's stdout lines to out, in
+// order with the guest's unframed output, and the app's stderr lines to
+// errOut, and passes the lines of every other process to the logs callback,
+// or without one to out and errOut by stream. It passes the first-exit line
+// to the firstExit callback. Neither callback may block.
 type serialFilter struct {
 	out        io.Writer
+	errOut     io.Writer
 	startTag   []byte
 	exitTag    []byte
 	listenTag  []byte
@@ -761,8 +788,12 @@ type serialFilter struct {
 	credOKTag  []byte
 	credBadTag []byte
 	credOffTag []byte
+	logTag     []byte
+	firstTag   []byte
 	listen     func(port int, up bool)
 	credAck    func(seq int, ok bool)
+	logs       func(index int, stream byte, line string)
+	firstExit  func(index, status int)
 
 	phase    int
 	pending  []byte
@@ -771,6 +802,16 @@ type serialFilter struct {
 	oomKills int
 	credOff  bool
 	writeErr error
+
+	// lineStart reports whether the console byte before pending ended a
+	// line, which a log frame's tag needs at pending[0].
+	lineStart bool
+	// pieces holds the pieces of each process's unfinished stdout and
+	// stderr lines, at 2*index and 2*index+1.
+	pieces [2 * (maxSidecars + 1)][]byte
+	// line is the buffer in which a joined line gets its newline for out or
+	// errOut.
+	line []byte
 
 	// startSeen is closed when the start tag is parsed, before any of the
 	// command's output is written.
@@ -811,6 +852,21 @@ func (f *serialFilter) onCredAck(nonce string, ack func(seq int, ok bool)) {
 	f.credAck = ack
 }
 
+// onFrames makes the filter split the guest's log frames and swallow its
+// first-exit line. errOut takes the app's stderr lines, and nil means out.
+// logs, when set, takes the lines of every other process, and firstExit, when
+// set, takes the first-exit line's index and status.
+func (f *serialFilter) onFrames(nonce string, errOut io.Writer, logs func(index int, stream byte, line string), firstExit func(index, status int)) {
+	f.logTag = []byte(logTag(nonce))
+	f.firstTag = []byte(firstTag(nonce))
+	f.errOut = errOut
+	if errOut == nil {
+		f.errOut = f.out
+	}
+	f.logs = logs
+	f.firstExit = firstExit
+}
+
 func (f *serialFilter) Write(p []byte) (int, error) {
 	if f.phase == phaseDone {
 		return len(p), nil
@@ -824,10 +880,14 @@ func (f *serialFilter) Write(p []byte) (int, error) {
 }
 
 // finish flushes held bytes at end of stream. A marker without its line
-// terminator may be truncated, so it counts as output, not as a status.
+// terminator may be truncated, so it counts as output, not as a status. The
+// pieces of a line whose last piece never came go out as a line of their own.
 func (f *serialFilter) finish() {
 	if f.phase != phaseDone {
 		f.process(true)
+	}
+	for index := 0; index <= maxSidecars; index++ {
+		f.flushPieces(index)
 	}
 }
 
@@ -854,6 +914,7 @@ func (f *serialFilter) processBoot(eof bool) {
 		f.pending = f.pending[nl+1:]
 		if bytes.Contains(line, f.startTag) {
 			f.phase = phaseRun
+			f.lineStart = true
 			f.bootLog = nil
 			close(f.startSeen)
 			return
@@ -885,6 +946,14 @@ func (f *serialFilter) keepBootLog(b []byte) {
 
 func (f *serialFilter) processRun(eof bool) {
 	for {
+		// Nearly every line is a frame once the guest frames its output, so
+		// a frame at the start of pending skips the search for every tag.
+		if f.logTag != nil && f.lineStart && bytes.HasPrefix(f.pending, f.logTag) {
+			if !f.processFrame(0, eof) {
+				return
+			}
+			continue
+		}
 		idx := bytes.Index(f.pending, f.exitTag)
 		if li, kind := f.indexLine(); li >= 0 && (idx < 0 || li < idx) {
 			if !f.processLine(kind, li, eof) {
@@ -932,6 +1001,8 @@ const (
 	lineListen
 	lineCredOK
 	lineCredBad
+	lineLog
+	lineFirst
 	lineKinds
 )
 
@@ -939,24 +1010,45 @@ const (
 // the command runs, other than the exit marker, with nil for a kind it does
 // not look for.
 func (f *serialFilter) lineTags() [lineKinds][]byte {
-	return [lineKinds][]byte{lineOOM: f.oomTag, lineListen: f.listenTag, lineCredOK: f.credOKTag, lineCredBad: f.credBadTag}
+	return [lineKinds][]byte{lineOOM: f.oomTag, lineListen: f.listenTag, lineCredOK: f.credOKTag, lineCredBad: f.credBadTag, lineLog: f.logTag, lineFirst: f.firstTag}
 }
 
 // indexLine returns the index in pending of the first tag of a line that the
 // filter swallows, other than the exit marker, and the kind of that line, or
 // -1. No two of the tags can start at the same index, because each differs
-// from the others before its nonce.
+// from the others before its nonce. A log frame's tag counts only at the
+// start of a line.
 func (f *serialFilter) indexLine() (idx, kind int) {
 	idx = -1
 	for k, tag := range f.lineTags() {
 		if tag == nil {
 			continue
 		}
-		if i := bytes.Index(f.pending, tag); i >= 0 && (idx < 0 || i < idx) {
+		i := bytes.Index(f.pending, tag)
+		if k == lineLog {
+			i = f.indexFrame()
+		}
+		if i >= 0 && (idx < 0 || i < idx) {
 			idx, kind = i, k
 		}
 	}
 	return idx, kind
+}
+
+// indexFrame returns the index in pending of the first log tag that starts a
+// line, or -1.
+func (f *serialFilter) indexFrame() int {
+	for from := 0; ; {
+		i := bytes.Index(f.pending[from:], f.logTag)
+		if i < 0 {
+			return -1
+		}
+		i += from
+		if (i == 0 && f.lineStart) || (i > 0 && f.pending[i-1] == '\n') {
+			return i
+		}
+		from = i + len(f.logTag)
+	}
 }
 
 // processLine handles the tag of a line of the given kind at pending[idx:].
@@ -968,9 +1060,124 @@ func (f *serialFilter) processLine(kind, idx int, eof bool) bool {
 		return f.processCount(f.oomTag, idx, eof, func(kills int) { f.oomKills = kills })
 	case lineCredOK:
 		return f.processCount(f.credOKTag, idx, eof, func(seq int) { f.credAck(seq, true) })
-	default:
+	case lineCredBad:
 		return f.processCount(f.credBadTag, idx, eof, func(seq int) { f.credAck(seq, false) })
+	case lineLog:
+		return f.processFrame(idx, eof)
+	default:
+		return f.processFirst(idx, eof)
 	}
+}
+
+// processFrame handles the log tag at pending[idx:], which starts a line, as
+// processListen handles a listen tag. A complete frame leaves the output and
+// its piece goes to takePiece. A tag with anything else after it, or with no
+// newline within maxFrameBytes, is output.
+func (f *serialFilter) processFrame(idx int, eof bool) bool {
+	if idx > 0 {
+		f.emitPending(idx, true)
+	}
+	index, stream, last, payload, n, ok, needMore := parseFrame(f.pending[len(f.logTag):], maxFrameBytes-len(f.logTag))
+	if needMore && !eof {
+		return false
+	}
+	if !ok {
+		// The tag ends in its only '=', so no tag can start inside it.
+		f.emitPending(len(f.logTag), true)
+		return true
+	}
+	f.takePiece(index, stream, last, payload)
+	f.swallow(len(f.logTag) + n)
+	return true
+}
+
+// processFirst handles the first-exit tag at pending[idx:] as processCount
+// handles its tags. Before it passes on the line, it sends on the pieces that
+// the process left unfinished, whose last piece can no longer come.
+func (f *serialFilter) processFirst(idx int, eof bool) bool {
+	index, status, n, ok, needMore := parseFirst(f.pending[idx+len(f.firstTag):])
+	if needMore && !eof {
+		f.emitPending(idx, false)
+		return false
+	}
+	if !ok {
+		// The tag ends in its only '=', so no tag can start inside it.
+		f.emitPending(idx+len(f.firstTag), true)
+		return true
+	}
+	f.emitPending(idx, true)
+	f.swallow(len(f.firstTag) + n)
+	f.flushPieces(index)
+	if f.firstExit != nil {
+		f.firstExit(index, status)
+	}
+	return true
+}
+
+// takePiece adds a frame's payload to the pieces of its process's line, and
+// sends the line on at its last piece, or first when it would pass
+// maxLogLine.
+func (f *serialFilter) takePiece(index int, stream byte, last bool, payload []byte) {
+	slot := 2 * index
+	if stream == 'e' {
+		slot++
+	}
+	held := f.pieces[slot]
+	if len(held)+len(payload) > maxLogLine && len(held) > 0 {
+		f.sendLine(index, stream, held)
+		held = held[:0]
+	}
+	switch {
+	case last && len(held) == 0:
+		f.sendLine(index, stream, payload)
+	case last:
+		f.sendLine(index, stream, append(held, payload...))
+		held = held[:0]
+	default:
+		held = append(held, payload...)
+	}
+	f.pieces[slot] = held
+}
+
+// flushPieces sends on, as lines of their own, the pieces of index's lines
+// whose last piece has not come.
+func (f *serialFilter) flushPieces(index int) {
+	for i, stream := range []byte{'o', 'e'} {
+		slot := 2*index + i
+		if len(f.pieces[slot]) > 0 {
+			f.sendLine(index, stream, f.pieces[slot])
+		}
+		f.pieces[slot] = nil
+	}
+}
+
+// sendLine passes one whole line of index's stream, without its newline, to
+// the logs callback, or writes it with a newline to out or errOut.
+func (f *serialFilter) sendLine(index int, stream byte, line []byte) {
+	if index != 0 && f.logs != nil {
+		f.logs(index, stream, string(line))
+		return
+	}
+	w := f.out
+	if stream == 'e' {
+		w = f.errOut
+	}
+	f.line = append(append(f.line[:0], line...), '\n')
+	if f.writeErr != nil {
+		return
+	}
+	if _, err := w.Write(f.line); err != nil {
+		f.writeErr = err
+	}
+}
+
+// swallow drops a whole control line or frame, its line ending included,
+// from the start of pending, which leaves the console at the start of a line.
+// It does not copy the rest of pending, so a run of frames costs no more
+// than the frames themselves.
+func (f *serialFilter) swallow(n int) {
+	f.pending = f.pending[n:]
+	f.lineStart = true
 }
 
 // processListen handles the listen tag at pending[idx:]. It reports false
@@ -991,7 +1198,7 @@ func (f *serialFilter) processListen(idx int, eof bool) bool {
 		return true
 	}
 	f.emitPending(idx, true)
-	f.pending = append([]byte(nil), f.pending[len(f.listenTag)+n:]...)
+	f.swallow(len(f.listenTag) + n)
 	f.listen(port, up)
 	return true
 }
@@ -1012,7 +1219,7 @@ func (f *serialFilter) processCount(tag []byte, idx int, eof bool, take func(int
 		return true
 	}
 	f.emitPending(idx, true)
-	f.pending = append([]byte(nil), f.pending[len(tag)+n:]...)
+	f.swallow(len(tag) + n)
 	take(count)
 	return true
 }
@@ -1028,6 +1235,9 @@ func (f *serialFilter) emitPending(n int, final bool) {
 	}
 	out := bytes.ReplaceAll(f.pending[:n], []byte("\r\n"), []byte("\n"))
 	f.pending = append([]byte(nil), f.pending[n:]...)
+	if len(out) > 0 {
+		f.lineStart = out[len(out)-1] == '\n'
+	}
 	if len(out) == 0 || f.writeErr != nil {
 		return
 	}
@@ -1146,6 +1356,94 @@ func parseListen(b []byte) (port int, up bool, n int, ok, needMore bool) {
 	}
 }
 
+// parseIndex parses a process index at the start of b: 1 to maxIndexDigits
+// decimal digits with a value of at most maxSidecars. i is the length of the
+// digits. needMore reports that b ends before that can be decided.
+func parseIndex(b []byte) (index, i int, ok, needMore bool) {
+	for i < len(b) && i <= maxIndexDigits && b[i] >= '0' && b[i] <= '9' {
+		i++
+	}
+	switch {
+	case i > maxIndexDigits:
+		return 0, 0, false, false
+	case i == len(b):
+		return 0, 0, false, true
+	case i == 0:
+		return 0, 0, false, false
+	}
+	index, err := strconv.Atoi(string(b[:i]))
+	if err != nil || index > maxSidecars {
+		return 0, 0, false, false
+	}
+	return index, i, true, false
+}
+
+// parseFrame parses the bytes after a log tag: a process index (see
+// parseIndex), o, e, O, or E, a space, and the payload, then LF or CRLF,
+// with the LF among the first room bytes. stream is 'o' or 'e', and last
+// reports a lowercase letter. The payload has the line ending's CR taken off,
+// and it shares b's bytes. n is the length of what it parsed. needMore
+// reports that b ends before that can be decided.
+func parseFrame(b []byte, room int) (index int, stream byte, last bool, payload []byte, n int, ok, needMore bool) {
+	index, i, ok, needMore := parseIndex(b)
+	if !ok {
+		return 0, 0, false, nil, 0, false, needMore
+	}
+	switch {
+	case i == len(b):
+		return 0, 0, false, nil, 0, false, true
+	case b[i] == 'o' || b[i] == 'e':
+		stream, last = b[i], true
+	case b[i] == 'O' || b[i] == 'E':
+		stream = b[i] + 'a' - 'A'
+	default:
+		return 0, 0, false, nil, 0, false, false
+	}
+	switch {
+	case i+1 == len(b):
+		return 0, 0, false, nil, 0, false, true
+	case b[i+1] != ' ':
+		return 0, 0, false, nil, 0, false, false
+	}
+	window := b[:min(len(b), room)]
+	nl := bytes.IndexByte(window[i+2:], '\n')
+	switch {
+	case nl < 0 && len(b) >= room:
+		return 0, 0, false, nil, 0, false, false
+	case nl < 0:
+		return 0, 0, false, nil, 0, false, true
+	}
+	payload = bytes.TrimSuffix(b[i+2:i+2+nl], []byte("\r"))
+	return index, stream, last, payload, i + 2 + nl + 1, true, false
+}
+
+// parseFirst parses the bytes after a first-exit tag: a process index (see
+// parseIndex), a space, and 1 to 3 decimal digits with a value of at most
+// 255, then LF or CRLF. n is the length of what it parsed. needMore reports
+// that b ends before that can be decided.
+func parseFirst(b []byte) (index, status, n int, ok, needMore bool) {
+	index, i, ok, needMore := parseIndex(b)
+	if !ok {
+		return 0, 0, 0, false, needMore
+	}
+	if b[i] != ' ' {
+		return 0, 0, 0, false, false
+	}
+	rest := b[i+1:]
+	digits := 0
+	for digits < len(rest) && digits <= maxStatusDigits && rest[digits] >= '0' && rest[digits] <= '9' {
+		digits++
+	}
+	if digits > maxStatusDigits {
+		return 0, 0, 0, false, false
+	}
+	status, m, ok, needMore := parseCount(rest)
+	if !ok || status > 255 {
+		return 0, 0, 0, false, needMore
+	}
+	return index, status, i + 1 + m, true, false
+}
+
 // tagPrefixSuffix returns the length of the longest suffix of b that is a
 // proper prefix of tag, which is the part of b that may still become a tag.
 func tagPrefixSuffix(b, tag []byte) int {
@@ -1177,7 +1475,8 @@ type runResult struct {
 
 // supervisor runs one hypervisor process: it reads the serial console
 // through a serialFilter as fast as the guest writes it, passes the guest
-// command's output on to stdout through an outputQueue, stops the guest
+// command's output on to stdout, and the app's stderr lines on to stderr,
+// each through an outputQueue of its own, stops the guest
 // command or forwards signals, and kills the hypervisor when it outlives
 // deadline after the first signal, or grace after the guest reported its
 // status without a signal (a guest that hangs on its way down must not hang
@@ -1209,7 +1508,10 @@ type runResult struct {
 // the supervisor forwards runs closePorts at once, because the hypervisor
 // may end at once.
 type supervisor struct {
-	stdout  io.Writer
+	stdout io.Writer
+	// stderr, when set, takes the app's stderr lines from the guest's log
+	// frames (see serialFilter). Without it they go to stdout.
+	stderr  io.Writer
 	logger  *log.Logger
 	signals <-chan os.Signal
 	// grace bounds how long the hypervisor may run after the guest reported
@@ -1242,6 +1544,13 @@ type supervisor struct {
 	// credAck, when set, gets the guest's acknowledgements of identity pushes
 	// (see serialFilter). It must not block.
 	credAck func(seq int, ok bool)
+	// logs, when set, gets every line of the guest's sidecars, by index and
+	// stream (see serialFilter). Without it they go to stdout and stderr like
+	// the app's. It must not block.
+	logs func(index int, stream byte, line string)
+	// firstExit, when set, gets the index and status of the guest process
+	// that exited first (see serialFilter). It must not block.
+	firstExit func(index, status int)
 	// onConsole, when set, gets the writer of the guest's console input once
 	// the guest has started its command, so that vm-launch can push identity
 	// frames on it. The supervisor calls it once, from its own goroutine, and
@@ -1326,6 +1635,15 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 	}
 	output := newOutputQueue(s.stdout, limit, s.logger)
 	filter := newSerialFilter(output, nonce)
+	// A nil *outputQueue would make a non-nil io.Writer, so errOut stays an
+	// untyped nil without stderr.
+	var errOutput *outputQueue
+	var errOut io.Writer
+	if s.stderr != nil {
+		errOutput = newOutputQueue(s.stderr, limit, s.logger)
+		errOut = errOutput
+	}
+	filter.onFrames(nonce, errOut, s.logs, s.firstExit)
 	if s.listen != nil {
 		filter.onListen(nonce, s.listen)
 	}
@@ -1452,9 +1770,25 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 				s.logger.Printf("waiting for the hypervisor: %v", e.waitErr)
 			}
 			filter.finish()
+			// The queues drain side by side, so together they take no
+			// longer than outputFlushTimeout.
+			var flushed sync.WaitGroup
+			if errOutput != nil {
+				flushed.Add(1)
+				go func() {
+					defer flushed.Done()
+					errOutput.close(outputFlushTimeout)
+				}()
+			}
 			output.close(outputFlushTimeout)
+			flushed.Wait()
 			if err := output.err(); err != nil {
 				s.logger.Printf("writing guest output: %v", err)
+			}
+			if errOutput != nil {
+				if err := errOutput.err(); err != nil {
+					s.logger.Printf("writing the guest's stderr output: %v", err)
+				}
 			}
 			switch {
 			case filter.started():
