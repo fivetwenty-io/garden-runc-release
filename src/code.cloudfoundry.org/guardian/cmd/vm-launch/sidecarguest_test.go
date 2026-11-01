@@ -383,7 +383,7 @@ var _ = Describe("the run section", func() {
 			Eventually(func() string {
 				raw, _ := os.ReadFile(r.acks)
 				return string(raw)
-			}, 10*time.Second, 10*time.Millisecond).Should(Equal(guestCredOK(testNonce) + "1\n"))
+			}, 10*time.Second, 10*time.Millisecond).Should(Equal(credOKTag(testNonce) + "1\n"))
 			for name, want := range map[string][]byte{"instance.crt": pushed.crt, "instance.key": pushed.key} {
 				got, err := os.ReadFile(filepath.Join(r.credDir(), name))
 				Expect(err).NotTo(HaveOccurred())

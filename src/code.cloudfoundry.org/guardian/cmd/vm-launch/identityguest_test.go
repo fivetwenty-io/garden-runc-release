@@ -109,7 +109,7 @@ func testPushFrames(seq int, crt, key []byte) []string {
 	split := func(b []byte) []string { return strings.Split(strings.TrimSuffix(string(b), "\n"), "\n") }
 	crtLines, keyLines := split(crt), split(key)
 	sum := sha256.Sum256([]byte(strings.Join(crtLines, "\n") + "\n" + strings.Join(keyLines, "\n") + "\n"))
-	prefix := guestCredPrefix(testNonce)
+	prefix := credTag(testNonce)
 	frames := []string{fmt.Sprintf("%sbegin %d", prefix, seq)}
 	for _, line := range crtLines {
 		frames = append(frames, prefix+"crt "+line)
@@ -334,8 +334,8 @@ func expectInstalled(r *controlRun, pair testIdentityPair) {
 
 var _ = Describe("the control reader", func() {
 	stopLine := stopTag(testNonce) + "\n"
-	ok := func(seq int) string { return fmt.Sprintf("%s%d\n", guestCredOK(testNonce), seq) }
-	bad := func(seq int) string { return fmt.Sprintf("%s%d\n", guestCredBad(testNonce), seq) }
+	ok := func(seq int) string { return fmt.Sprintf("%s%d\n", credOKTag(testNonce), seq) }
+	bad := func(seq int) string { return fmt.Sprintf("%s%d\n", credBadTag(testNonce), seq) }
 
 	DescribeTable("installs each complete push, answers every end line, renames the key before the certificate, and signals the app on the stop",
 		func(shellOf func() guestShell) {
@@ -356,7 +356,7 @@ var _ = Describe("the control reader", func() {
 			// checksum tells.
 			changed := testPushFrames(3, other.crt, other.key)
 			line := []byte(changed[len(changed)-3])
-			at := len(guestCredPrefix(testNonce) + "key ")
+			at := len(credTag(testNonce) + "key ")
 			line[at] ^= 1
 			changed[len(changed)-3] = string(line)
 			// A certificate without its first boundary, whose counts and
@@ -365,7 +365,7 @@ var _ = Describe("the control reader", func() {
 			// An end line without a frame, and a frame that a new begin
 			// line interrupts.
 			input := append(append(append(dropped, changed...), testPushFrames(4, unbounded, other.key)...),
-				guestCredPrefix(testNonce)+"end 5 1 1 "+strings.Repeat("0", 64))
+				credTag(testNonce)+"end 5 1 1 "+strings.Repeat("0", 64))
 			input = append(input, testPushFrames(6, other.crt, other.key)[:5]...)
 			input = append(input, testPushFrames(7, second.crt, second.key)...)
 			r.write(consoleInput(input))

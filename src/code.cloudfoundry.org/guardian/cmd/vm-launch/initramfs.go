@@ -501,7 +501,7 @@ fi
 // and a volume that does not flush or unmount turns a status of 0 into a
 // failure (see guestVolumeTeardown).
 func initScript(nonce string, volume bool) string {
-	return stage2Script(nonce, volume, false)
+	return stage2Script(nonce, volume, false, "", "")
 }
 
 // stackInitScript is the guest /rvm/init of a guest with a stack, which
@@ -511,11 +511,15 @@ func initScript(nonce string, volume bool) string {
 // /rvm/cwd after /rvm/env (see guestStackChecks). And it runs the launcher
 // in the app root (see guestStackRunCommand) in place of /rvm/cmd.
 func stackInitScript(nonce string) string {
-	return stage2Script(nonce, false, true)
+	return stage2Script(nonce, false, true, "", "")
 }
 
-// stage2Script is initScript, or stackInitScript when stack is set.
-func stage2Script(nonce string, volume, stack bool) string {
+// stage2Script is initScript, or stackInitScript when stack is set. With a
+// run section (see guestRunSection), stage 2 adds checks to its setup steps
+// and runs the section after the start tag in place of the command, its
+// status, and the stop reader, whose part the section's control reader
+// takes.
+func stage2Script(nonce string, volume, stack bool, checks, section string) string {
 	setup := guestFailFunc + guestConsoleSetup
 	if !stack {
 		setup += guestShmSetup
@@ -526,11 +530,18 @@ func stage2Script(nonce string, volume, stack bool) string {
 		setup += guestStackChecks
 		command = guestStackRunCommand
 	}
+	setup += checks
 	if volume {
 		setup += guestVolumeSetup
 	}
-	setup += guestStopReader(nonce)
-	run := guestListenWatch(nonce) + command + guestRunStatus + guestStopReaderStop + guestListenStop + guestOOMReport(nonce)
+	run := guestListenWatch(nonce)
+	if section == "" {
+		setup += guestStopReader(nonce)
+		run += command + guestRunStatus + guestStopReaderStop
+	} else {
+		run += section
+	}
+	run += guestListenStop + guestOOMReport(nonce)
 	if volume {
 		run += guestVolumeTeardown
 	}
@@ -1777,11 +1788,32 @@ type guestContents struct {
 // /rvm/argv, the app's working directory, for /rvm/cwd, the container's
 // hostname, for /rvm/hostname, and its hosts file, for /rvm/hosts. The
 // caller closes the launcher after the initramfs is written.
+//
+// A guest with sidecars or an instance identity pair also holds those (see
+// guestSidecarSteps and guestIdentitySteps), and its stage 2 runs the app
+// and the sidecars through the run section (see guestStack.initScript).
+// Without either, the archive is the stack guest's as it was before them.
 type guestStack struct {
 	launcher            guestTool
 	argv, cwd, hostname string
 	hosts               []byte
+	// sidecars are the app's sidecars, which run beside the app in the app
+	// root, at most maxGuestSidecars of them.
+	sidecars []guestSidecar
+	// identity is the instance identity pair that the app finds in
+	// /etc/cf-instance-credentials, or nil for an app without one.
+	identity *instanceIdentity
 }
+
+// guestSidecar is one sidecar's two files in the stack guest. argv is its
+// whole argv quoted by shellJoin, as /rvm/argv is, and env is export lines
+// and then unset lines, which the sidecar sources after /rvm/env, so that
+// they apply over the guest environment.
+type guestSidecar struct{ argv, env string }
+
+// maxGuestSidecars is the most sidecars a guest runs, as parseSidecars
+// takes.
+const maxGuestSidecars = 8
 
 // maxGuestHostnameBytes caps the guest's hostname at Linux's HOST_NAME_MAX.
 const maxGuestHostnameBytes = 64
@@ -1809,15 +1841,31 @@ func (s *guestStack) check(volumes int) error {
 		return fmt.Errorf("the app's working directory %q is not an absolute path on one line", s.cwd)
 	case s.hostname == "" || len(s.hostname) > maxGuestHostnameBytes || strings.Trim(s.hostname, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-") != "":
 		return fmt.Errorf("the guest hostname %q is not 1 to %d letters, digits, dots, and hyphens", s.hostname, maxGuestHostnameBytes)
+	case len(s.sidecars) > maxGuestSidecars:
+		return fmt.Errorf("a guest runs at most %d sidecars, and this one has %d", maxGuestSidecars, len(s.sidecars))
+	case s.identity != nil && (len(s.identity.cert) == 0 || len(s.identity.key) == 0):
+		return errors.New("the instance identity pair for the guest lacks its certificate or its key")
+	}
+	for i, sidecar := range s.sidecars {
+		n := i + 1
+		switch {
+		case sidecar.argv == "":
+			return fmt.Errorf("sidecar %d has no argv", n)
+		case len(sidecar.argv) > maxGuestCommandBytes:
+			return fmt.Errorf("the argv of sidecar %d is %d bytes quoted, over the %d bytes a guest takes", n, len(sidecar.argv), maxGuestCommandBytes)
+		case len(sidecar.env) > maxGuestEnvBytes:
+			return fmt.Errorf("the environment of sidecar %d is %d bytes, over the %d bytes a guest takes", n, len(sidecar.env), maxGuestEnvBytes)
+		}
 	}
 	return nil
 }
 
 // archiveSteps returns the archive steps that add the lifecycle directory,
-// the launcher, and the stack guest's command and host files.
+// the launcher, and the stack guest's command and host files, and then the
+// sidecars' files and the identity pair when the guest has them.
 func (s *guestStack) archiveSteps(cw *cpioWriter, file func(name string, perm uint32, content string) func() error) []func() error {
 	lifecycle := strings.TrimPrefix(guestLifecycle, "/")
-	return []func() error{
+	steps := []func() error{
 		func() error { return cw.Dir(lifecycle, 0o755) },
 		func() error {
 			return cw.File(lifecycle+"/launcher", 0o755, s.launcher.size, io.NewSectionReader(s.launcher.file, 0, s.launcher.size))
@@ -1826,6 +1874,42 @@ func (s *guestStack) archiveSteps(cw *cpioWriter, file func(name string, perm ui
 		file(strings.TrimPrefix(guestCwd, "/"), 0o644, s.cwd),
 		file(strings.TrimPrefix(guestHosts, "/"), 0o644, string(s.hosts)),
 		file(strings.TrimPrefix(guestHostname, "/"), 0o644, s.hostname+"\n"),
+	}
+	steps = append(steps, s.guestSidecarSteps(cw, file)...)
+	return append(steps, s.guestIdentitySteps(cw, file)...)
+}
+
+// guestSidecarSteps adds, for a guest with sidecars, the directory
+// /rvm/sidecar/<i> of each, numbered from 1, holding its argv and env with
+// mode 0600, as /rvm/env has. The sidecar records its pid in the same
+// directory (see guestSidecarFile).
+func (s *guestStack) guestSidecarSteps(cw *cpioWriter, file func(name string, perm uint32, content string) func() error) []func() error {
+	if len(s.sidecars) == 0 {
+		return nil
+	}
+	steps := []func() error{func() error { return cw.Dir("rvm/sidecar", 0o755) }}
+	for i, sidecar := range s.sidecars {
+		dir := strings.TrimPrefix(path.Dir(guestSidecarFile(i+1, "argv")), "/")
+		steps = append(steps,
+			func() error { return cw.Dir(dir, 0o755) },
+			file(strings.TrimPrefix(guestSidecarFile(i+1, "argv"), "/"), 0o600, sidecar.argv),
+			file(strings.TrimPrefix(guestSidecarFile(i+1, "env"), "/"), 0o600, sidecar.env),
+		)
+	}
+	return steps
+}
+
+// guestIdentitySteps adds, for a guest with an instance identity, the boot
+// pair as guestIdentityCert and guestIdentityKey with mode 0600, in a
+// directory of mode 0700, which guestIdentitySetup copies into the app root.
+func (s *guestStack) guestIdentitySteps(cw *cpioWriter, file func(name string, perm uint32, content string) func() error) []func() error {
+	if s.identity == nil {
+		return nil
+	}
+	return []func() error{
+		func() error { return cw.Dir(strings.TrimPrefix(path.Dir(guestIdentityCert), "/"), 0o700) },
+		file(strings.TrimPrefix(guestIdentityCert, "/"), 0o600, string(s.identity.cert)),
+		file(strings.TrimPrefix(guestIdentityKey, "/"), 0o600, string(s.identity.key)),
 	}
 }
 
@@ -2064,7 +2148,9 @@ func addSeals(f *os.File, seals int) error {
 // it also holds /rvm/mounts, and with a CA bundle it holds that at
 // /etc/ssl/certs/ca-certificates.crt. With a stack it also holds the
 // launcher at /rvm/lifecycle/launcher, /rvm/argv, /rvm/cwd, /rvm/hosts, and
-// /rvm/hostname, and its two stages are guestStackInit and stackInitScript.
+// /rvm/hostname, with each sidecar's files and the identity pair when it has
+// them, and its two stages are guestStackInit and the stack's stage 2 (see
+// guestStack.initScript).
 // A hard open-files limit of 0 is an error, because it is a limit no caller
 // can have meant: vm-launch itself could not run under it. So are drives
 // that disksFile rejects and a stack that guestStack.check rejects.
@@ -2111,7 +2197,7 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, g 
 		if err := g.stack.check(len(g.vols)); err != nil {
 			return err
 		}
-		stage1, stage2 = guestStackInit, stackInitScript(g.nonce)
+		stage1, stage2 = guestStackInit, g.stack.initScript(g.nonce)
 	}
 	steps := []func() error{
 		func() error { return cw.Dir("bin", 0o755) },

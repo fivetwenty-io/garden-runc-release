@@ -70,7 +70,7 @@ const guestAppRootEtc = "/rvm/app/etc"
 func guestControlReader(nonce string, pidFiles []string, identity bool) string {
 	cred, match := "", ""
 	if identity {
-		prefix := guestCredPrefix(nonce)
+		prefix := credTag(nonce)
 		cred = guestCredReader(nonce)
 		match = `		case "$rvm_line" in
 		"` + prefix + `"*) rvm_cred "${rvm_line#"` + prefix + `"}" ;;
@@ -128,15 +128,6 @@ func guestSignalPidFiles(pidFiles []string) string {
 `)
 	return b.String()
 }
-
-// guestCredPrefix is how every frame line of a pushed pair starts on the
-// console input. It is the host's frame tag and its equals sign.
-func guestCredPrefix(nonce string) string { return "RVM_CRED_" + nonce + "=" }
-
-// guestCredOK and guestCredBad start the lines with which the guest answers
-// a push, followed by the push's sequence number.
-func guestCredOK(nonce string) string  { return "RVM_CREDOK_" + nonce + "=" }
-func guestCredBad(nonce string) string { return "RVM_CREDBAD_" + nonce + "=" }
 
 // guestCredReader defines rvm_cred, which the control reader calls with the
 // rest of each frame line after the prefix, and the state it keeps between
@@ -238,9 +229,9 @@ func guestCredReader(nonce string) string {
 			'' | *[!0-9]*) return ;;
 			esac
 			if [ -n "$rvm_open" ] && [ -z "$rvm_bad" ] && [ "$rvm_es" = "$rvm_open" ] && [ "$rvm_ec" = "$rvm_nc" ] && [ "$rvm_ek" = "$rvm_nk" ] && rvm_pem && rvm_install; then
-				echo "` + guestCredOK(nonce) + `$rvm_es" >/dev/console
+				echo "` + credOKTag(nonce) + `$rvm_es" >/dev/console
 			else
-				echo "` + guestCredBad(nonce) + `$rvm_es" >/dev/console
+				echo "` + credBadTag(nonce) + `$rvm_es" >/dev/console
 			fi
 			;;
 		esac
