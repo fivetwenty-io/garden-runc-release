@@ -403,6 +403,44 @@ var _ = Describe("the run section", func() {
 		shellEntries(""),
 	)
 
+	DescribeTable("leaves every frame line alone and keeps the boot pair when the console still echoes its input",
+		func(shellOf func() guestShell) {
+			shell := shellOf()
+			boot, pushed := newTestIdentityPair(1, "rsa"), newTestIdentityPair(2, "pkcs8")
+			procs := sectionProcs(GinkgoT().TempDir(), []string{termScript(7)}, appEnv)
+			r := startSection(shell, procs, true, boot, func(r *sectionRun) {
+				r.cmd.Env = append(r.cmd.Env, "rvm_echo=1")
+			})
+			processFile(procs, 0, "start")
+			// The reader reads the push before the stop request, which ends
+			// it, so the push has had its chance by the time the run ends.
+			_, err := r.console.WriteString(consoleInput(testPushFrames(1, pushed.crt, pushed.key)) + stopTag(testNonce) + "\n")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(r.finish(10*time.Second)).To(Equal("status=7\n"), shell.name)
+			acks, _ := os.ReadFile(r.acks)
+			Expect(string(acks)).NotTo(ContainSubstring("RVM_CRED"))
+			for name, want := range map[string][]byte{"instance.crt": boot.crt, "instance.key": boot.key} {
+				got, err := os.ReadFile(filepath.Join(r.credDir(), name))
+				Expect(err).NotTo(HaveOccurred())
+				Expect(string(got)).To(Equal(string(want)), name)
+			}
+		},
+		shellEntries(""),
+	)
+
+	It("says that it takes no pushes, from its echo check, only when the console refuses to turn off echo", func() {
+		bin := GinkgoT().TempDir()
+		Expect(os.WriteFile(filepath.Join(bin, "stty"), []byte("#!/bin/sh\necho \"stty $*\" >&2\nexit \"$STTY_RC\"\n"), 0o755)).To(Succeed())
+		check := strings.ReplaceAll(guestIdentityEchoCheck(testNonce), "</dev/console", "</dev/null")
+		for rc, want := range map[string]string{"0": "rvm_echo=[]\n", "1": credOffTag(testNonce) + "\nrvm_echo=[1]\n"} {
+			cmd := exec.Command("/bin/sh", "-c", "rvm_echo=stale\n"+check+`echo "rvm_echo=[$rvm_echo]"`)
+			cmd.Env = []string{"PATH=" + bin + ":/usr/bin:/bin", "STTY_RC=" + rc}
+			out, err := cmd.CombinedOutput()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(out)).To(Equal(want), "stty exits %s", rc)
+		}
+	})
+
 	It("installs the identity first only when it has one, and starts the reader with every pid file and each process through exec", func() {
 		procs := []guestProcess{
 			{index: 0, argvPath: "/a/argv", envPaths: []string{"/a/env"}, dir: "/a", pidPath: guestAppPid},

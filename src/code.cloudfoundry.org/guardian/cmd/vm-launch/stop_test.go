@@ -442,6 +442,18 @@ var _ = Describe("the supervisor's stop path", func() {
 		Expect(calls).To(BeZero())
 	}, SpecTimeout(time.Minute), MustPassRepeatedly(20))
 
+	It("never calls onConsole, and logs that the identity rotation is off, when the guest says before its start tag that it takes no pushes", func(ctx SpecContext) {
+		sup.credAck = func(int, bool) {}
+		calls := 0
+		sup.onConsole = func(*consoleWriter) { calls++ }
+		res, err := sup.run(fakeHypervisor(`printf 'RVM_CREDOFF_`+testNonce+`\r\n'; `+startLine+`echo ready; sleep 0.3; `+exitLine("0")), testNonce)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(codeOf(res)).To(Equal(0), logBuf.String())
+		Expect(out.String()).To(Equal("ready\n"))
+		Expect(calls).To(BeZero())
+		Expect(logBuf.String()).To(Equal("the guest could not turn off its console's echo, so vm-launch pushes it no instance identity pairs; identity rotation is off for this guest\n"))
+	}, SpecTimeout(time.Minute))
+
 	It("fails a push once it has returned", func(ctx SpecContext) {
 		var console *consoleWriter
 		sup.onConsole = func(w *consoleWriter) { console = w }

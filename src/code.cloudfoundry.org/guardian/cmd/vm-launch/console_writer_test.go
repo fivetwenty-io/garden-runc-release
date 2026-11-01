@@ -367,4 +367,33 @@ var _ = Describe("identity acknowledgements on the serial console", func() {
 		f.finish()
 		Expect(out.String()).To(Equal(okTag + "1\n" + badTag + "2\n"))
 	})
+
+	It("swallows the guest's word, before the start tag, that it takes no pushes, and sets credOff, only when it reports acknowledgements", func() {
+		boot := "boot noise\r\n" + credOffTag(testNonce) + "\r\n"
+		var out bytes.Buffer
+		f := newSerialFilter(&out, testNonce)
+		f.onCredAck(testNonce, func(int, bool) {})
+		_, _ = io.WriteString(f, boot)
+		Expect(f.credOff).To(BeTrue())
+		Expect(string(f.bootLog)).To(Equal("boot noise\r\n"))
+		_, _ = io.WriteString(f, start+"a\r\n"+marker)
+		f.finish()
+		Expect(out.String()).To(Equal("a\n"))
+
+		var plainOut bytes.Buffer
+		plain := newSerialFilter(&plainOut, testNonce)
+		_, _ = io.WriteString(plain, boot)
+		Expect(plain.credOff).To(BeFalse())
+		Expect(string(plain.bootLog)).To(Equal(boot))
+	})
+
+	It("takes the word only before the start tag, and passes it on as output after it", func() {
+		var out bytes.Buffer
+		f := newSerialFilter(&out, testNonce)
+		f.onCredAck(testNonce, func(int, bool) {})
+		_, _ = io.WriteString(f, start+credOffTag(testNonce)+"\r\n"+marker)
+		f.finish()
+		Expect(f.credOff).To(BeFalse())
+		Expect(out.String()).To(Equal(credOffTag(testNonce) + "\n"))
+	})
 })

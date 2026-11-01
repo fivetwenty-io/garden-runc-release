@@ -613,7 +613,7 @@ var _ = Describe("the initramfs of a guest with a stack", func() {
 		Expect(empty).To(Equal(plain))
 	})
 
-	DescribeTable("runs the app and its sidecars through the run section in place of the command and the stop reader, with the sidecars' checks before the start tag",
+	DescribeTable("runs the app and its sidecars through the run section in place of the command and the stop reader, with the sidecars' checks and, with an identity, the echo check before the start tag",
 		func(sidecars, identity bool) {
 			g := stackGuest()
 			if sidecars {
@@ -624,6 +624,9 @@ var _ = Describe("the initramfs of a guest with a stack", func() {
 			}
 			script := g.stack.initScript(testNonce)
 			checks := guestSidecarChecks(len(g.stack.sidecars))
+			if identity {
+				checks += guestIdentityEchoCheck(testNonce)
+			}
 			section := guestRunSection(testNonce, g.stack.processes(), identity, stackExec)
 			plain := stackInitScript(testNonce)
 			Expect(strings.Count(plain, guestStopReader(testNonce))).To(Equal(1))
@@ -635,6 +638,7 @@ var _ = Describe("the initramfs of a guest with a stack", func() {
 			).Replace(plain)))
 			Expect(strings.Contains(script, guestIdentitySetup)).To(Equal(identity))
 			Expect(strings.Contains(script, credTag(testNonce))).To(Equal(identity))
+			Expect(strings.Contains(script, credOffTag(testNonce))).To(Equal(identity))
 			start := strings.Index(script, "\necho "+startTag(testNonce)+"\n")
 			Expect(strings.Index(script, guestStackChecks+checks)).To(BeNumerically("<", start))
 			Expect(strings.Index(script, section)).To(BeNumerically(">", start))

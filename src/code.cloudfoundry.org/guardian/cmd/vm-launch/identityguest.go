@@ -44,6 +44,20 @@ cp ` + guestIdentityKey + ` ` + guestCredDir + `/instance.key && chmod 0644 ` + 
 mkdir -p ` + guestIdentityNext + ` && chmod 0700 ` + guestIdentityNext + ` || rvm_fail "creating ` + guestIdentityNext + ` for the pushed instance identity pairs failed"
 `
 
+// guestIdentityEchoCheck is the setup step, before the start tag, of a
+// guest with an instance identity. A console that still echoes its input
+// would copy each line of a push, the private key included, into the
+// command's output, so the step turns echo off once more, as
+// guestConsoleSetup did, and a guest whose console refuses again takes no
+// pushes. The step then sets rvm_echo, so that the control reader leaves
+// every frame line alone, and prints credOffTag, which tells vm-launch not
+// to push any. The app still gets the boot pair. guestConsoleSetup has
+// already warned about the failure, so stty's own message goes to
+// /dev/null.
+func guestIdentityEchoCheck(nonce string) string {
+	return "rvm_echo=\nstty -echo </dev/console 2>/dev/null || { rvm_echo=1; echo " + credOffTag(nonce) + "; }\n"
+}
+
 // guestAppRootEtc is the app root's /etc, which holds guestCredDir.
 const guestAppRootEtc = "/rvm/app/etc"
 
@@ -66,14 +80,15 @@ const guestAppRootEtc = "/rvm/app/etc"
 // never holds back the signal to the others.
 //
 // With identity set, the reader also installs each pair that vm-launch
-// pushes (see guestCredReader).
+// pushes (see guestCredReader), unless the console still echoes its input
+// (see guestIdentityEchoCheck).
 func guestControlReader(nonce string, pidFiles []string, identity bool) string {
 	cred, match := "", ""
 	if identity {
 		prefix := credTag(nonce)
 		cred = guestCredReader(nonce)
 		match = `		case "$rvm_line" in
-		"` + prefix + `"*) rvm_cred "${rvm_line#"` + prefix + `"}" ;;
+		"` + prefix + `"*) [ -n "$rvm_echo" ] || rvm_cred "${rvm_line#"` + prefix + `"}" ;;
 		esac
 `
 	}

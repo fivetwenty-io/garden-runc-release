@@ -556,7 +556,8 @@ export PATH=/bin
 // guestConsoleSetup turns off echo on the guest's console, so that the
 // stop request vm-launch writes to it never shows in the command's output.
 // A console that keeps echo on still delivers the request, so a failure only
-// warns.
+// warns. A guest with an instance identity checks again before it takes
+// any pushes (see guestIdentityEchoCheck).
 const guestConsoleSetup = `stty -echo </dev/console || echo "vm-launch guest setup: turning off console echo failed; a stop request will appear in the output"
 `
 

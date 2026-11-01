@@ -125,13 +125,18 @@ func (s *guestStack) hasAppRoot() bool { return s != nil }
 // initScript is the stack guest's stage 2. A guest with sidecars or an
 // instance identity runs the app and its sidecars through the run section
 // (see guestRunSection), and checks each sidecar's files before the start
-// tag. Any other stack guest runs stackInitScript.
+// tag, as well as, with an identity, whether the console still echoes. Any
+// other stack guest runs stackInitScript.
 func (s *guestStack) initScript(nonce string) string {
 	if len(s.sidecars) == 0 && s.identity == nil {
 		return stackInitScript(nonce)
 	}
 	procs := s.processes()
-	return stage2Script(nonce, false, true, guestSidecarChecks(len(s.sidecars)), guestRunSection(nonce, procs, s.identity != nil, stackExec))
+	checks := guestSidecarChecks(len(s.sidecars))
+	if s.identity != nil {
+		checks += guestIdentityEchoCheck(nonce)
+	}
+	return stage2Script(nonce, false, true, checks, guestRunSection(nonce, procs, s.identity != nil, stackExec))
 }
 
 // processes returns the app, from /rvm/argv and the guest environment, and

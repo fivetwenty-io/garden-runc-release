@@ -741,7 +741,9 @@ const maxOOMDigits = 9
 // its count in oomKills. With an acknowledgement callback, it swallows the
 // guest's acknowledgement of each identity push (see credOKTag and
 // credBadTag) and passes its sequence number to the callback, which must not
-// block either. A listen, OOM, or acknowledgement line can follow command
+// block either. With that callback, it also swallows the line before the
+// start tag with which the guest says that it takes no pushes (see
+// credOffTag) and sets credOff. A listen, OOM, or acknowledgement line can follow command
 // output that has no newline yet, so each is found anywhere in a line, and
 // the output around it is kept as it was. It never fails a Write, so the hypervisor's output keeps draining
 // when the destination breaks; the first destination error is kept in
@@ -754,6 +756,7 @@ type serialFilter struct {
 	oomTag     []byte
 	credOKTag  []byte
 	credBadTag []byte
+	credOffTag []byte
 	listen     func(port int, up bool)
 	credAck    func(seq int, ok bool)
 
@@ -762,6 +765,7 @@ type serialFilter struct {
 	bootLog  []byte
 	status   int
 	oomKills int
+	credOff  bool
 	writeErr error
 
 	// startSeen is closed when the start tag is parsed, before any of the
@@ -799,6 +803,7 @@ func (f *serialFilter) onListen(nonce string, listen func(port int, up bool)) {
 func (f *serialFilter) onCredAck(nonce string, ack func(seq int, ok bool)) {
 	f.credOKTag = []byte(credOKTag(nonce))
 	f.credBadTag = []byte(credBadTag(nonce))
+	f.credOffTag = []byte(credOffTag(nonce))
 	f.credAck = ack
 }
 
@@ -848,6 +853,10 @@ func (f *serialFilter) processBoot(eof bool) {
 			f.bootLog = nil
 			close(f.startSeen)
 			return
+		}
+		if f.credOffTag != nil && bytes.Contains(line, f.credOffTag) {
+			f.credOff = true
+			continue
 		}
 		f.keepBootLog(line)
 	}
@@ -1232,8 +1241,10 @@ type supervisor struct {
 	// onConsole, when set, gets the writer of the guest's console input once
 	// the guest has started its command, so that vm-launch can push identity
 	// frames on it. The supervisor calls it once, from its own goroutine, and
-	// never when a signal came first or the guest has already reported its
-	// status. It must not block, so it starts any work of its own in a
+	// never when a signal came first, the guest has already reported its
+	// status, or the guest said before its start tag that it takes no pushes.
+	// In that last case the supervisor logs that the identity rotation is off
+	// for the guest. It must not block, so it starts any work of its own in a
 	// goroutine. The writer refuses pushes once the stop request is written
 	// and once run returns.
 	onConsole func(w *consoleWriter)
@@ -1397,8 +1408,13 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 		case <-running:
 			running = nil
 			// The console input carries more than the stop request only
-			// while the guest command runs and no signal has come.
-			if s.onConsole != nil && !signalled && !isClosed(filter.exited) {
+			// while the guest command runs and no signal has come, and
+			// never for a guest whose console still echoes its input,
+			// which would copy each pushed key into the command's output.
+			// The filter set credOff in the write that closed running.
+			if s.onConsole != nil && filter.credOff {
+				s.logger.Println("the guest could not turn off its console's echo, so vm-launch pushes it no instance identity pairs; identity rotation is off for this guest")
+			} else if s.onConsole != nil && !signalled && !isClosed(filter.exited) {
 				s.onConsole(stdin)
 			}
 		case <-markerSeen:

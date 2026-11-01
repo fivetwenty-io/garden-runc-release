@@ -46,6 +46,12 @@ func credOKTag(nonce string) string { return "RVM_CREDOK_" + nonce + "=" }
 // the guest refused, with its "=". The sequence follows the tag.
 func credBadTag(nonce string) string { return "RVM_CREDBAD_" + nonce + "=" }
 
+// credOffTag returns the tag of the console output line, before the start
+// tag, with which a guest whose console still echoes its input says that it
+// takes no identity pushes (see guestIdentityEchoCheck). The line is the tag
+// alone.
+func credOffTag(nonce string) string { return "RVM_CREDOFF_" + nonce }
+
 // fileStamp names the state of the two files of the identity pair, so that a
 // rewrite by Diego shows as a difference. Each file contributes the device,
 // inode, size, and modification time that stat reports, which change when a
