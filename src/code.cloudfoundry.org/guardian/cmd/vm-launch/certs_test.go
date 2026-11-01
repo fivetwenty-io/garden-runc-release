@@ -384,7 +384,10 @@ var _ = Describe("run with trusted certificates", func() {
 			byName := guestArchive(kind)
 			Expect(bundleCerts(byName["etc/ssl/certs/ca-certificates.crt"].data)).To(Equal([][]byte{rootfs.der, system.der}), string(kind))
 			Expect(string(byName["rvm/env"].data)).To(ContainSubstring("export SSL_CERT_FILE='/etc/ssl/certs/ca-certificates.crt'\n"))
-			Expect(string(byName["rvm/env"].data)).NotTo(ContainSubstring(systemCertPathEnv))
+			// The directory itself reaches the guest too, at the same path with the
+			// same bytes, and CF_SYSTEM_CERT_PATH names it.
+			Expect(string(byName["rvm/env"].data)).To(ContainSubstring("export " + systemCertPathEnv + "=" + shellQuote(certDir) + "\n"))
+			Expect(string(byName[strings.TrimPrefix(certDir, "/")+"/trusted-ca-1.crt"].data)).To(Equal(system.pem), string(kind))
 		}
 	})
 

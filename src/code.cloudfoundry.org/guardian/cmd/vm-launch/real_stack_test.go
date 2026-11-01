@@ -198,11 +198,19 @@ echo "app-droplet=$(cat /home/vcap/app/from-the-droplet)"
 echo "app-stack=$(cat /etc/stack-name)"
 echo "app-hostname=$(hostname)"
 echo "app-loader=[${LD_PRELOAD-unset}] [${LD_LIBRARY_PATH-unset}] [${LD_AUDIT-unset}]"
+echo "app-certenv=[${CF_SYSTEM_CERT_PATH-unset}]"
+if [ -d "${CF_SYSTEM_CERT_PATH:-/no/such/dir}" ]; then
+	for f in "$CF_SYSTEM_CERT_PATH"/*; do
+		echo "app-cert=$(basename "$f"):$(cat "$f")"
+	done
+	echo "app-certdir=$(stat -c %a:%u "$CF_SYSTEM_CERT_PATH")"
+	if echo changed >"$CF_SYSTEM_CERT_PATH/new" 2>/dev/null; then echo app-certwrite=wrote; else echo app-certwrite=denied; fi
+fi
 `
 
 // realStackApplets are the busybox applets the test stack has in /bin, the
 // ones realStackLauncher runs.
-var realStackApplets = []string{"sh", "id", "grep", "tr", "pwd", "echo", "mkdir", "cat", "stat", "hostname"}
+var realStackApplets = []string{"sh", "id", "grep", "tr", "pwd", "echo", "mkdir", "cat", "stat", "hostname", "basename"}
 
 // buildRealStackTools builds realStackToolsSource as a static x86-64
 // binary in a temporary directory with the go command on PATH, and skips
@@ -292,6 +300,12 @@ func realDropletImage(art string) *os.File {
 // root image when withRoot is set. It returns the console output, with carriage returns removed, and fails
 // the spec unless QEMU exits 0 and the guest started the launcher.
 func bootRealStackGuest(argv []string, withRoot bool, env string) string {
+	return bootRealStackGuestWithCerts(argv, withRoot, env, nil)
+}
+
+// bootRealStackGuestWithCerts is bootRealStackGuest for a guest that also
+// holds the trusted certificate files certs.
+func bootRealStackGuestWithCerts(argv []string, withRoot bool, env string, certs *systemCerts) string {
 	art := realArtifacts()
 	qemu := realQEMU()
 	requireMicrovm(qemu)
@@ -309,6 +323,8 @@ func bootRealStackGuest(argv []string, withRoot bool, env string) string {
 		cwd:      "/home/vcap",
 		hostname: "stack-guest-0",
 		hosts:    []byte("127.0.0.1 localhost\n"),
+
+		systemCerts: certs,
 	}
 	var root *os.File
 	if withRoot {
@@ -352,6 +368,23 @@ var _ = Describe("the stack guest against a real QEMU", func() {
 		Entry("on a guest root disk", true),
 		Entry("with the app root's upper layer in RAM", false),
 	)
+
+	It("installs the trusted certificate files at CF_SYSTEM_CERT_PATH, readable by vcap and read-only, and tells the app where they are", func() {
+		argv := []string{stackLauncherPath, "/home/vcap/app", "", `{"start_command":"./app","process_type":"web"}`}
+		certs := &systemCerts{dir: "/etc/cf-system-certificates", files: []systemCertFile{
+			{name: "ca-one.crt", data: []byte("first-certificate\n")},
+			{name: "ca-two.crt", data: []byte("second-certificate\n")},
+		}}
+		out := bootRealStackGuestWithCerts(argv, false, "export CF_SYSTEM_CERT_PATH='/etc/cf-system-certificates'\n", certs)
+
+		Expect(out).To(MatchRegexp(`(?m)^app-id=uid=2000\(vcap\)`), out)
+		Expect(out).To(MatchRegexp(`(?m)^app-certenv=\[/etc/cf-system-certificates\]$`), out)
+		Expect(out).To(MatchRegexp(`(?m)^app-cert=ca-one.crt:first-certificate$`), out)
+		Expect(out).To(MatchRegexp(`(?m)^app-cert=ca-two.crt:second-certificate$`), out)
+		Expect(out).To(MatchRegexp(`(?m)^app-certdir=755:0$`), out)
+		Expect(out).To(MatchRegexp(`(?m)^app-certwrite=denied$`), out)
+		Expect(out).To(ContainSubstring(exitTag(testNonce) + "0"))
+	})
 
 	It("gives the launcher the app's loader variables only after setpriv has dropped to vcap, so a library that does not exist never reaches a program that runs as root", func() {
 		argv := []string{stackLauncherPath, "/home/vcap/app", "", `{"start_command":"./app","process_type":"web"}`}

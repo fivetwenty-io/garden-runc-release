@@ -859,7 +859,7 @@ var _ = Describe("run with CredHub references", func() {
 			// The uri exists only in the response, so DATABASE_URL proves the
 			// references were resolved first.
 			Expect(got).To(HaveKeyWithValue("DATABASE_URL", "postgres://u:"+secretSentinel+"@db.internal/app"), string(kind))
-			for _, name := range []string{instanceCertEnv, instanceKeyEnv, systemCertPathEnv, platformOptionsEnv} {
+			for _, name := range []string{instanceCertEnv, instanceKeyEnv, platformOptionsEnv} {
 				Expect(got).NotTo(HaveKey(name), "%s %s", kind, name)
 			}
 			Expect(logBuf.String()).NotTo(ContainSubstring(secretSentinel), string(kind))

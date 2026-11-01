@@ -212,7 +212,39 @@ func lookupIn(env map[string]string) func(string) (string, bool) {
 // and a file over maxGuestEnvBytes are errors. No error or log line holds a
 // value.
 func buildGuestEnv(env map[string]string, guestMiB int, logger *log.Logger) (string, error) {
-	return buildGuestEnvDenying(env, guestMiB, logger, guestEnvDenylist)
+	return buildGuestEnvWithCerts(env, guestMiB, "", logger)
+}
+
+// buildGuestEnvWithCerts is buildGuestEnv for a guest that holds the
+// trusted certificate files at certDir (see systemCerts). It exports
+// CF_SYSTEM_CERT_PATH with certDir, which is the path Diego gives it in a
+// container. An empty certDir leaves the variable out, as buildGuestEnv does.
+func buildGuestEnvWithCerts(env map[string]string, guestMiB int, certDir string, logger *log.Logger) (string, error) {
+	if certDir == "" {
+		return buildGuestEnvDenying(env, guestMiB, logger, guestEnvDenylist)
+	}
+	return buildGuestEnvDenying(withEnvValue(env, systemCertPathEnv, certDir), guestMiB, logger, denylistWithout(guestEnvDenylist, systemCertPathEnv))
+}
+
+// withEnvValue returns a copy of env with name set to value.
+func withEnvValue(env map[string]string, name, value string) map[string]string {
+	withValue := make(map[string]string, len(env)+1)
+	for k, v := range env {
+		withValue[k] = v
+	}
+	withValue[name] = value
+	return withValue
+}
+
+// denylistWithout returns a copy of deny without name.
+func denylistWithout(deny map[string]bool, name string) map[string]bool {
+	kept := make(map[string]bool, len(deny))
+	for k := range deny {
+		if k != name {
+			kept[k] = true
+		}
+	}
+	return kept
 }
 
 // buildStackGuestEnv is buildGuestEnv for a guest that runs the app on the
@@ -223,16 +255,22 @@ func buildGuestEnv(env map[string]string, guestMiB int, logger *log.Logger) (str
 // and CF_INSTANCE_KEY with the paths where the guest installs the pair,
 // whatever the container's values were, so that both always name the files.
 func buildStackGuestEnv(env map[string]string, guestMiB int, identity bool, logger *log.Logger) (string, error) {
-	if !identity {
-		return buildGuestEnvDenying(env, guestMiB, logger, stackGuestEnvDenylist)
+	return buildStackGuestEnvWithCerts(env, guestMiB, identity, "", logger)
+}
+
+// buildStackGuestEnvWithCerts is buildStackGuestEnv for a guest that also
+// holds the trusted certificate files at certDir, which it exports as
+// CF_SYSTEM_CERT_PATH (see buildGuestEnvWithCerts).
+func buildStackGuestEnvWithCerts(env map[string]string, guestMiB int, identity bool, certDir string, logger *log.Logger) (string, error) {
+	deny := stackGuestDenylist(identity)
+	if identity {
+		env = withEnvValue(withEnvValue(env, instanceCertEnv, guestInstanceCertPath), instanceKeyEnv, guestInstanceKeyPath)
 	}
-	withPaths := make(map[string]string, len(env)+2)
-	for name, value := range env {
-		withPaths[name] = value
+	if certDir != "" {
+		env = withEnvValue(env, systemCertPathEnv, certDir)
+		deny = denylistWithout(deny, systemCertPathEnv)
 	}
-	withPaths[instanceCertEnv] = guestInstanceCertPath
-	withPaths[instanceKeyEnv] = guestInstanceKeyPath
-	return buildGuestEnvDenying(withPaths, guestMiB, logger, stackGuestIdentityEnvDenylist)
+	return buildGuestEnvDenying(env, guestMiB, logger, deny)
 }
 
 // buildGuestEnvDenying is buildGuestEnv with deny in place of
