@@ -405,6 +405,29 @@ var _ = Describe("Gardener", func() {
 					Expect(createdSpec().VMStackDir).To(BeEmpty())
 				})
 
+				It("does not call the imager when the handle is already in use", func() {
+					containerizer.HandlesReturns([]string{"some-ctr"}, nil)
+					_, err := gdnr.Create(garden.ContainerSpec{
+						Handle:     "some-ctr",
+						Image:      garden.ImageRef{URI: stackURI},
+						Properties: garden.Properties{backend.AnnotationKey: "vm-qemu"},
+					})
+					Expect(err).To(MatchError("Handle 'some-ctr' already in use"))
+					Expect(imager.tarballs).To(BeEmpty())
+				})
+
+				It("does not call the imager when the cell is full", func() {
+					gdnr.MaxContainers = 1
+					containerizer.HandlesReturns([]string{"other-ctr"}, nil)
+					_, err := gdnr.Create(garden.ContainerSpec{
+						Handle:     "some-ctr",
+						Image:      garden.ImageRef{URI: stackURI},
+						Properties: garden.Properties{backend.AnnotationKey: "vm-qemu"},
+					})
+					Expect(err).To(HaveOccurred())
+					Expect(imager.tarballs).To(BeEmpty())
+				})
+
 				It("leaves the stack directory empty when VMStacks is nil", func() {
 					gdnr.VMStacks = nil
 					createWith("vm-qemu", stackURI)

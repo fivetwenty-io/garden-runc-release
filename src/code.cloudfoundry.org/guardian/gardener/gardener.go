@@ -292,8 +292,6 @@ func (g *Gardener) Create(containerSpec garden.ContainerSpec) (ctr garden.Contai
 		return nil, err
 	}
 
-	vmStackDir := g.vmStackDir(log, executionBackend, containerSpec)
-
 	knownHandles, err := g.Containerizer.Handles()
 	if err != nil {
 		return nil, err
@@ -306,6 +304,10 @@ func (g *Gardener) Create(containerSpec garden.ContainerSpec) (ctr garden.Contai
 	if err := g.checkMaxContainers(knownHandles); err != nil {
 		return nil, err
 	}
+
+	// The stack image can make the create wait, so it comes after the checks
+	// that refuse the create at once.
+	vmStackDir := g.vmStackDir(log, executionBackend, containerSpec)
 
 	defer func() {
 		if err != nil {
