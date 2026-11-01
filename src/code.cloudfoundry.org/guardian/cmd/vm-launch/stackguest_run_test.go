@@ -50,12 +50,11 @@ exec "$root$prog" "$@"
 		writeFile("rvm/app/usr/bin/env", "#!/bin/sh\n"+show+`if [ "$1" = -C ]; then
 	cd "$STUB_ROOT$2" || exit 125
 	shift 2
-else
-	while case $1 in *=*) true ;; *) false ;; esac; do
-		export "$1"
-		shift
-	done
 fi
+while case $1 in *=*) true ;; *) false ;; esac; do
+	export "$1"
+	shift
+done
 prog=$1
 shift
 exec "$STUB_ROOT$prog" "$@"
@@ -118,10 +117,9 @@ exit "${LAUNCHER_RC:-0}"
 	// NAME=value words held, in the order in which they stand in front of
 	// the argv, and shown as the launcher's stub prints them.
 	wantWith := func(pid string, argv []string, status string, held []string, shown string) string {
-		after := append(append([]string{"/usr/bin/env"}, held...), argv...)
+		after := append(append([]string{"/usr/bin/env", "-C", "/home/vcap"}, held...), argv...)
 		launch := append([]string{"/usr/bin/setpriv", "--reuid=2000", "--regid=2000", "--init-groups", "--no-new-privs", "--"}, after...)
-		return "chroot " + pid + "\n" + bracketed(append([]string{dir + "/rvm/app", "/usr/bin/env", "-C", "/home/vcap"}, launch...)...) +
-			"env " + pid + "\n" + bracketed(append([]string{"-C", "/home/vcap"}, launch...)...) +
+		return "chroot " + pid + "\n" + bracketed(append([]string{dir + "/rvm/app"}, launch...)...) +
 			"setpriv " + pid + "\n" + bracketed(launch[1:]...) +
 			"env " + pid + "\n" + bracketed(after[1:]...) +
 			"launcher " + pid + "\n" + bracketed(argv[1:]...) + shown +
@@ -175,14 +173,7 @@ exit "${LAUNCHER_RC:-0}"
 		// The host's own loader would act on these variables in the
 		// launcher's stub, so env, after the drop, stops once it has shown
 		// what it was given.
-		writeFile("rvm/app/usr/bin/env", "#!/bin/sh\n"+show+`if [ "$1" = -C ]; then
-	cd "$STUB_ROOT$2" || exit 125
-	shift 2
-	prog=$1
-	shift
-	exec "$STUB_ROOT$prog" "$@"
-fi
-`, 0o755)
+		writeFile("rvm/app/usr/bin/env", "#!/bin/sh\n"+show, 0o755)
 		argv := []string{"/tmp/lifecycle/launcher", "app", "", ""}
 		writeFile("rvm/argv", shellJoin(argv), 0o644)
 		env := "export FROM_ENV='from /rvm/env'\nexport LD_NOT_A_LOADER_NAME='kept'\n"
@@ -195,7 +186,7 @@ fi
 		}
 		writeFile("rvm/env", env, 0o600)
 		out, pid := run()
-		after := "env " + pid + "\n" + bracketed(append(held, argv...)...) + "status=0\n"
+		after := "env " + pid + "\n" + bracketed(append(append([]string{"-C", "/home/vcap"}, held...), argv...)...) + "status=0\n"
 		Expect(out).To(HaveSuffix(after))
 		Expect(strings.TrimSuffix(out, after)).NotTo(ContainSubstring("=["))
 		Expect(out).NotTo(ContainSubstring("[LD_NOT_A_LOADER_NAME="))

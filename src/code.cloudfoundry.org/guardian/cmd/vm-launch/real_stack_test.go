@@ -16,10 +16,11 @@ import (
 
 // realStackToolsSource is the program that stands in for the stack's GNU
 // env and util-linux setpriv in the test stack, built static for the guest.
-// Run as env, it takes only -C DIR PROG ARGS, as root, and NAME=value...
-// PROG ARGS, as uid 2000, and run as setpriv, only the exact options stage 2
+// Run as env, it takes only -C DIR NAME=value... PROG ARGS, as uid 2000, and
+// refuses to run as root, so a working directory is never entered with root's
+// rights. Run as setpriv, it takes only the exact options stage 2
 // passes (see guestStackRunCommand), so a change to that command line fails
-// the boot instead of passing unnoticed. Either one refuses to run as root
+// the boot instead of passing unnoticed. Setpriv refuses to run as root
 // with a loader variable in its environment, because the stack's own,
 // dynamically linked, would load what the variable names (see
 // guestLoaderNames), so a guest that let one through fails the boot. Its setpriv
@@ -70,26 +71,27 @@ func main() {
 }
 
 func env(args []string) error {
-	if os.Getuid() != 0 {
-		for len(args) > 0 && strings.Contains(args[0], "=") {
-			name, value, _ := strings.Cut(args[0], "=")
-			if err := os.Setenv(name, value); err != nil {
-				return err
-			}
-			args = args[1:]
-		}
-		if len(args) == 0 {
-			return fmt.Errorf("want NAME=value... PROG [ARG...] as uid %d, got no PROG", os.Getuid())
-		}
-		return run(args)
+	if os.Getuid() == 0 {
+		return fmt.Errorf("run as root, which would enter the working directory with root's rights")
 	}
-	if len(args) < 3 || args[0] != "-C" {
-		return fmt.Errorf("want -C DIR PROG [ARG...] as root, got %q", args)
+	if len(args) < 2 || args[0] != "-C" {
+		return fmt.Errorf("want -C DIR NAME=value... PROG [ARG...] as uid %d, got %q", os.Getuid(), args)
 	}
 	if err := os.Chdir(args[1]); err != nil {
 		return err
 	}
-	return run(args[2:])
+	args = args[2:]
+	for len(args) > 0 && strings.Contains(args[0], "=") {
+		name, value, _ := strings.Cut(args[0], "=")
+		if err := os.Setenv(name, value); err != nil {
+			return err
+		}
+		args = args[1:]
+	}
+	if len(args) == 0 {
+		return fmt.Errorf("want -C DIR NAME=value... PROG [ARG...] as uid %d, got no PROG", os.Getuid())
+	}
+	return run(args)
 }
 
 func setpriv(args []string) error {

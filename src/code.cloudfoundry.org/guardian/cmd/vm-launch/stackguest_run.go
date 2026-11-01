@@ -26,15 +26,16 @@ const guestRunPrefix = "command exec 3>&2 2>/dev/null\n( command exec 2>&3 3>&-;
 // arguments from /rvm/argv with eval, which the quoting makes exact for any
 // bytes, newlines and quotes included, moves the loader variables out of the
 // environment and into the arguments (see guestLoaderHold), and execs busybox
-// chroot into the app root. There the stack's env enters the working
-// directory from /rvm/cwd, and the stack's setpriv sets the real, effective,
-// and saved uid and gid to 2000, takes vcap's supplementary groups from the
-// stack's /etc/group, and sets no_new_privs, as Garden does for a
-// container's processes. It then execs the stack's env a second time, as
-// uid 2000, which puts the loader variables back and execs the launcher with
-// the rest of the argv. Every one of those programs execs in place, so the
-// recorded pid is the launcher's, then bash's, and then the start command's
-// own, as it is under runC, and the stop reader's SIGTERM reaches the app.
+// chroot into the app root. There the stack's setpriv sets the real,
+// effective, and saved uid and gid to 2000, takes vcap's supplementary groups
+// from the stack's /etc/group, and sets no_new_privs, as Garden does for a
+// container's processes. It then execs the stack's env, as uid 2000, which
+// enters the working directory from /rvm/cwd, puts the loader variables back,
+// and execs the launcher with the rest of the argv. The working directory is
+// entered only after the drop, so a link in the droplet cannot make root
+// resolve it. Every one of those programs execs in place, so the recorded pid
+// is the launcher's, then bash's, and then the start command's own, as it is
+// under runC, and the stop reader's SIGTERM reaches the app.
 //
 // Nothing after the source of /rvm/env reads a shell variable that the
 // guest environment can set, because the guest environment may set any
@@ -43,16 +44,17 @@ const guestRunPrefix = "command exec 3>&2 2>/dev/null\n( command exec 2>&3 3>&-;
 // sets itself. A PATH from /rvm/env does not reach chroot or cat, which are
 // applets the guest's busybox runs before anything on PATH, and the stack's
 // programs are named by their paths.
-var guestStackRunCommand = guestRunPrefix + `eval "set -- $(cat ` + guestArgv + `)" && ` + guestLoaderHold + `exec chroot ` + guestAppRoot + ` ` + guestStackEnv + ` -C "$(cat ` + guestCwd + `)" ` +
-	guestStackDrop + ` ) </dev/null
+var guestStackRunCommand = guestRunPrefix + `eval "set -- $(cat ` + guestArgv + `)" && ` + guestLoaderHold + `exec chroot ` + guestAppRoot + ` ` + guestStackDrop(`"$(cat `+guestCwd+`)"`) + ` ) </dev/null
 `
 
 // guestStackDrop is the end of the line that runs a process in the stack
-// guest, after the stack's env has entered its working directory: the
-// stack's setpriv drops to uid 2000 and execs the stack's env, which puts
-// back the loader variables that guestLoaderHold moved into the arguments
-// and execs the process's own argv.
-const guestStackDrop = guestStackSetpriv + ` --reuid=` + guestAppUID + ` --regid=` + guestAppUID + ` --init-groups --no-new-privs -- ` + guestStackEnv + ` "$@"`
+// guest, after busybox chroot: the stack's setpriv drops to uid 2000 and
+// execs the stack's env, which enters the working directory cwd, a word
+// already quoted for the shell, puts back the loader variables that
+// guestLoaderHold moved into the arguments, and execs the process's own argv.
+func guestStackDrop(cwd string) string {
+	return guestStackSetpriv + ` --reuid=` + guestAppUID + ` --regid=` + guestAppUID + ` --init-groups --no-new-privs -- ` + guestStackEnv + ` -C ` + cwd + ` "$@"`
+}
 
 // guestLoaderNames are the environment variables with which glibc's dynamic
 // loader and its libc choose code to load or change how they run: every
