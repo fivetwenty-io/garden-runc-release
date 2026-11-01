@@ -79,6 +79,7 @@ files:
   - code.cloudfoundry.org/guardian/rundmc/users/*.go # gosub
   - code.cloudfoundry.org/guardian/sysinfo/*.go # gosub
   - code.cloudfoundry.org/guardian/throttle/*.go # gosub
+  - code.cloudfoundry.org/guardian/vmstack/*.go # gosub
   - code.cloudfoundry.org/guardian/vendor/code.cloudfoundry.org/lager/v3/*.go # gosub
   - code.cloudfoundry.org/guardian/vendor/code.cloudfoundry.org/lager/v3/chug/*.go # gosub
   - code.cloudfoundry.org/guardian/vendor/code.cloudfoundry.org/lager/v3/internal/truncate/*.go # gosub
