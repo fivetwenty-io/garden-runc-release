@@ -1094,6 +1094,29 @@ func wrappedCommand(args []string) (string, credhubRetry, error) {
 	return args[2], retry, nil
 }
 
+// stackLauncherPath is where the guest has the CF launcher in stack mode.
+const stackLauncherPath = "/tmp/lifecycle/launcher"
+
+// stackCommand returns the argv the guest's launcher runs in stack mode,
+// quoted for POSIX sh with shellJoin, and the CredHub retry settings from the
+// launcher's flags. Unlike wrappedCommand, it hands the launcher the whole
+// argv, because the guest has the droplet and so the launcher can detect the
+// start command itself. The start command may therefore be empty. The argv
+// starts with stackLauncherPath in place of the host's path to the launcher.
+func stackCommand(args []string) (argv string, retry credhubRetry, err error) {
+	if len(args) == 0 || filepath.Base(args[0]) != "launcher" {
+		return "", credhubRetry{}, errors.New("stack mode needs the CF launcher as the wrapped process")
+	}
+	if len(args) < 3 {
+		return "", credhubRetry{}, fmt.Errorf("launcher argv has %d arguments, want APP-DIR START-COMMAND [METADATA]", len(args)-1)
+	}
+	retry, err = credhubRetryFromArgs(args[3:])
+	if err != nil {
+		return "", credhubRetry{}, err
+	}
+	return shellJoin(append([]string{stackLauncherPath}, args[1:]...)), retry, nil
+}
+
 // shellJoin quotes each argument for POSIX sh and joins them with spaces.
 func shellJoin(args []string) string {
 	quoted := make([]string, len(args))

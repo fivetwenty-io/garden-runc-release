@@ -1218,3 +1218,69 @@ echo "RVM_EXIT_$nonce=7"
 		Expect(stderr.String()).To(ContainSubstring("broken pipe"))
 	})
 })
+
+var _ = Describe("stackCommand", func() {
+	It("passes the launcher's whole argv, quoted, after the guest's launcher path", func() {
+		argv, retry, err := stackCommand([]string{"/tmp/lifecycle/launcher", "app", "", ""})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(argv).To(Equal(`'/tmp/lifecycle/launcher' 'app' '' ''`))
+		Expect(retry).To(Equal(defaultCredhubRetry))
+	})
+
+	It("replaces the host's path to the launcher", func() {
+		argv, _, err := stackCommand([]string{"/some/where/launcher", "app", "start", "{}"})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(argv).To(HavePrefix(`'/tmp/lifecycle/launcher' `))
+	})
+
+	It("keeps a start command with quotes, dollar signs, and newlines whole", func() {
+		start := "echo 'it'\"s\" $HOME `id`\nexit \\1"
+		argv, _, err := stackCommand([]string{"/tmp/lifecycle/launcher", "app", start, `{"a":"b"}`})
+		Expect(err).NotTo(HaveOccurred())
+
+		out, err := exec.Command("sh", "-c", `set -- `+argv+`; printf '%s\0' "$@"`).Output()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00")).To(Equal(
+			[]string{"/tmp/lifecycle/launcher", "app", start, `{"a":"b"}`}))
+	})
+
+	It("gives the CredHub retry settings that wrappedCommand gives", func() {
+		args := []string{"/tmp/lifecycle/launcher", "app", "true", "-credhubConnectAttempts=7", "-credhubRetryDelay=2s", "{}"}
+		_, want, err := wrappedCommand(args)
+		Expect(err).NotTo(HaveOccurred())
+
+		argv, got, err := stackCommand(args)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got).To(Equal(want))
+		Expect(got).To(Equal(credhubRetry{attempts: 7, delay: 2 * time.Second}))
+		Expect(argv).To(HaveSuffix(`'-credhubConnectAttempts=7' '-credhubRetryDelay=2s' '{}'`))
+	})
+
+	It("refuses a launcher without a start command argument", func() {
+		_, _, err := stackCommand([]string{"/tmp/lifecycle/launcher", "app"})
+		Expect(err).To(MatchError(ContainSubstring("want APP-DIR START-COMMAND")))
+	})
+
+	It("refuses a process that is not the launcher, and an empty argv", func() {
+		_, _, err := stackCommand([]string{"/bin/true"})
+		Expect(err).To(MatchError(ContainSubstring("CF launcher")))
+		_, _, err = stackCommand(nil)
+		Expect(err).To(HaveOccurred())
+	})
+
+	It("refuses CredHub flags that do not parse", func() {
+		_, _, err := stackCommand([]string{"/tmp/lifecycle/launcher", "app", "", "-credhubRetryDelay=soon", "{}"})
+		Expect(err).To(MatchError(ContainSubstring("-credhubRetryDelay")))
+	})
+
+	It("leaves wrappedCommand's behavior alone", func() {
+		cmd, _, err := wrappedCommand([]string{"/tmp/lifecycle/launcher", "app", "run it", "{}"})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cmd).To(Equal("run it"))
+		_, _, err = wrappedCommand([]string{"/tmp/lifecycle/launcher", "app", " ", "{}"})
+		Expect(err).To(MatchError(ContainSubstring("empty start command")))
+		cmd, _, err = wrappedCommand([]string{"/bin/echo", "a b"})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cmd).To(Equal(`'/bin/echo' 'a b'`))
+	})
+})
