@@ -767,6 +767,11 @@ type serialFilter struct {
 	// startSeen is closed when the start tag is parsed, before any of the
 	// command's output is written.
 	startSeen chan struct{}
+	// running is closed at the end of the write in which the start tag was
+	// parsed, after exited when that write held the exit marker too, so that
+	// whoever wakes on it sees whether the guest has already reported its
+	// status.
+	running chan struct{}
 	// exited is closed when the exit marker is parsed.
 	exited chan struct{}
 }
@@ -778,6 +783,7 @@ func newSerialFilter(out io.Writer, nonce string) *serialFilter {
 		exitTag:   []byte(exitTag(nonce)),
 		oomTag:    []byte(oomTag(nonce)),
 		startSeen: make(chan struct{}),
+		running:   make(chan struct{}),
 		exited:    make(chan struct{}),
 	}
 }
@@ -802,6 +808,9 @@ func (f *serialFilter) Write(p []byte) (int, error) {
 	}
 	f.pending = append(f.pending, p...)
 	f.process(false)
+	if f.phase != phaseBoot && !isClosed(f.running) {
+		close(f.running)
+	}
 	return len(p), nil
 }
 
@@ -1322,7 +1331,7 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 	}()
 
 	var res runResult
-	startSeen, markerSeen := filter.startSeen, filter.exited
+	running, markerSeen := filter.running, filter.exited
 	var kill <-chan time.Time
 	var killReason string
 	// signalled is set at the first signal, and asked once the stop request
@@ -1385,8 +1394,8 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 				kill = time.After(s.deadline)
 				killReason = fmt.Sprintf("the guest did not stop within %v of the signal; killing the hypervisor", s.deadline)
 			}
-		case <-startSeen:
-			startSeen = nil
+		case <-running:
+			running = nil
 			// The console input carries more than the stop request only
 			// while the guest command runs and no signal has come.
 			if s.onConsole != nil && !signalled && !isClosed(filter.exited) {
