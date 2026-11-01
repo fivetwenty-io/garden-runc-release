@@ -491,7 +491,7 @@ var _ = Describe("QEMU arguments for a guest with shares", func() {
 			concat(withInitrd(goldenQEMUBase, goldenVolumeInitrd), goldenQEMUTaskNetdev, goldenQEMUDrive, goldenQEMUMonitor("5"))))
 		argv, err := hypervisorArgv(backend.VMQemu, goldenArt, "/unused", goldenVolumeInitrd, goldenMemMiB, task, drivePathsFor(1), "", 0)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(argv).To(Equal(concat(withInitrd(goldenQEMUBase, goldenVolumeInitrd), goldenQEMUTaskNetdev, goldenQEMUDrive)))
+		Expect(argv).To(Equal(concat(withInitrd(goldenQEMUBase, goldenVolumeInitrd), goldenQEMUTaskNetdev, goldenQEMUDrive, goldenQEMUBalloon)))
 	})
 
 	It("gives one share shared memory the size of the guest's, a socket, and a vhost-user-fs device", func() {
@@ -516,7 +516,7 @@ var _ = Describe("QEMU arguments for a guest with shares", func() {
 		drives := []volumeDrive{{fd: firstVolumeFD, id: qemuVolumeSerial(1), mode: attachFileImage, index: 1}}
 		argv, err := hypervisorArgv(backend.VMQemu, goldenArt, "/unused", goldenVolumeInitrd, goldenMemMiB, task, drives, "", 0, shareAt(0))
 		Expect(err).NotTo(HaveOccurred())
-		Expect(argv).To(Equal(concat(sharedBase(goldenVolumeInitrd), goldenQEMUTaskNetdev, driveAt(1, 3), memfd(goldenMemMiB), fsDevice(0))))
+		Expect(argv).To(Equal(concat(sharedBase(goldenVolumeInitrd), goldenQEMUTaskNetdev, driveAt(1, 3), memfd(goldenMemMiB), fsDevice(0), goldenQEMUBalloon)))
 		Expect(argv).NotTo(ContainElement(ContainSubstring("id=vol0,")))
 		Expect(argv).NotTo(ContainElement(ContainSubstring("drive=vol0,")))
 		Expect(argv).NotTo(ContainElement(ContainSubstring("serial=rvm-vol0")))
@@ -529,7 +529,7 @@ var _ = Describe("QEMU arguments for a guest with shares", func() {
 		}
 		argv, err := hypervisorArgv(backend.VMQemu, goldenArt, "/unused", procSelfFD(5), goldenMemMiB, task, drives, "", 6, shareAt(1))
 		Expect(err).NotTo(HaveOccurred())
-		Expect(argv).To(Equal(concat(sharedBase(procSelfFD(5)), goldenQEMUTaskNetdev, driveAt(0, 3), driveAt(2, 4), memfd(goldenMemMiB), fsDevice(1), goldenQEMUMonitor("6"))))
+		Expect(argv).To(Equal(concat(sharedBase(procSelfFD(5)), goldenQEMUTaskNetdev, driveAt(0, 3), driveAt(2, 4), memfd(goldenMemMiB), fsDevice(1), goldenQEMUMonitor("6"), goldenQEMUBalloon)))
 	})
 
 	It("takes the drive's volume index from the attachment, so hypervisorFiles names a drive after a share by its volume index", func() {

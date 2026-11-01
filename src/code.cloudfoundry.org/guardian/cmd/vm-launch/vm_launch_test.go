@@ -778,6 +778,7 @@ var _ = Describe("hypervisor command lines", func() {
 			"-kernel", art + "/kernel/bzImage", "-initrd", "/proc/self/fd/3",
 			"-append", "console=ttyS0 reboot=t panic=-1 rdinit=/init pci=off quiet",
 			"-netdev", "user,id=n0,net=10.0.2.0/24", "-device", "virtio-net-device,netdev=n0",
+			"-device", "virtio-balloon-device,id=balloon0,deflate-on-oom=on,free-page-reporting=on",
 		}))
 	})
 
@@ -785,7 +786,7 @@ var _ = Describe("hypervisor command lines", func() {
 		work := GinkgoT().TempDir()
 		argv, err := hypervisorArgv(backend.VMFirecracker, art, work, "/proc/self/fd/3", 128, taskNetwork(), nil, "", 0)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(argv).To(Equal([]string{art + "/firecracker/firecracker", "--no-api", "--config-file", work + "/fc.json"}))
+		Expect(argv).To(Equal([]string{art + "/firecracker/firecracker", "--api-sock", work + "/fc.sock", "--config-file", work + "/fc.json"}))
 
 		raw, err := os.ReadFile(filepath.Join(work, "fc.json"))
 		Expect(err).NotTo(HaveOccurred())
@@ -804,6 +805,12 @@ var _ = Describe("hypervisor command lines", func() {
 				"guest_mac":     "06:00:a9:fe:64:02",
 				"host_dev_name": "tap0",
 			}},
+			"balloon": map[string]any{
+				"amount_mib":               float64(0),
+				"deflate_on_oom":           true,
+				"stats_polling_interval_s": float64(5),
+				"free_page_reporting":      true,
+			},
 		}))
 	})
 
@@ -1048,12 +1055,12 @@ var _ = Describe("run with a guest root image", func() {
 
 	It("gives QEMU the root image as the file descriptor after the initramfs, with discard, and keeps nothing on disk", func() {
 		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"),
-			initramfsAt("3")+rootImageAt("4", rootSize)+noFilesUnder(tmp)+initramfsReleased+rootImageReleased)
+			initramfsAt("3")+rootImageAt("5", rootSize)+noFilesUnder(tmp)+initramfsReleased+rootImageReleased)
 		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
 
 		argv, err := os.ReadFile(argvFile)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(string(argv)).To(HaveSuffix("\n" + strings.Join(goldenQEMURootDrive("4"), "\n") + "\n"))
+		Expect(string(argv)).To(HaveSuffix("\n" + strings.Join(concat(goldenQEMUMonitor("4"), goldenQEMURootDrive("5"), goldenQEMUBalloon), "\n") + "\n"))
 		Expect(string(argv)).To(ContainSubstring("\n-initrd\n/proc/self/fd/3\n"))
 		Expect(logBuf.String()).NotTo(ContainSubstring("does not apply"))
 		Expect(os.ReadDir(tmp)).To(BeEmpty())
@@ -1445,15 +1452,15 @@ var _ = Describe("run with a stack image", func() {
 		Expect(os.WriteFile(want, []byte("droplet of "+home), 0o644)).To(Succeed())
 		initrdCopy := filepath.Join(art, "initrd-copy")
 		argvFile := writeFakeHypervisor(qemu, `cp "$initrd" `+shellQuote(initrdCopy)+` || exit 1
-`+initramfsAt("3")+rootImageAt("4", (64-rootDiskHeadroomMiB)*bytesPerMiB)+
-			readOnlyImageAt("5", "*/rootfs.squashfs", stackImg)+
-			readOnlyImageAt("6", `*/droplet.sqfs\ \(deleted\)`, want)+
+`+initramfsAt("3")+rootImageAt("5", (64-rootDiskHeadroomMiB)*bytesPerMiB)+
+			readOnlyImageAt("6", "*/rootfs.squashfs", stackImg)+
+			readOnlyImageAt("7", `*/droplet.sqfs\ \(deleted\)`, want)+
 			noFilesUnder(tmp)+initramfsReleased+rootImageReleased+stackImagesReleased)
 		Expect(runWith(backend.VMQemu, launchArg)).To(Equal(0), logBuf.String())
 
 		argv, err := os.ReadFile(argvFile)
 		Expect(err).NotTo(HaveOccurred())
-		drives := append(append(goldenQEMURootDrive("4"), qemuReadOnlyDrive(stackDriveID, qemuStackSerial, 5)...), qemuReadOnlyDrive(dropletDriveID, qemuDropletSerial, 6)...)
+		drives := concat(goldenQEMUMonitor("4"), goldenQEMURootDrive("5"), qemuReadOnlyDrive(stackDriveID, qemuStackSerial, 6), qemuReadOnlyDrive(dropletDriveID, qemuDropletSerial, 7), goldenQEMUBalloon)
 		Expect(string(argv)).To(HaveSuffix("\n" + strings.Join(drives, "\n") + "\n"))
 
 		raw, err := os.ReadFile(initrdCopy)

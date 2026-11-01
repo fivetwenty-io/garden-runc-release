@@ -495,6 +495,7 @@ type firecrackerConfig struct {
 	Drives            []firecrackerDrive            `json:"drives"`
 	MachineConfig     firecrackerMachineConfig      `json:"machine-config"`
 	NetworkInterfaces []firecrackerNetworkInterface `json:"network-interfaces,omitempty"`
+	Balloon           *firecrackerBalloon           `json:"balloon,omitempty"`
 }
 
 type firecrackerBootSource struct {
@@ -558,7 +559,9 @@ type firecrackerNetworkInterface struct {
 // engine. Firecracker opens neither with O_DIRECT, so a block device's data
 // passes through the page cache and counts against the container's memory
 // limit. nw must be set; the port does not change the configuration, because
-// vm-launch itself, not Firecracker, forwards PORT.
+// vm-launch itself, not Firecracker, forwards PORT. Every guest gets the
+// balloon from newFirecrackerBalloon, which reports the guest's memory and is
+// never inflated.
 func newFirecrackerConfig(root, initrd string, memMiB int, nw *network, drives []volumeDrive, rootPath string) firecrackerConfig {
 	return newFirecrackerConfigWithStack(root, initrd, memMiB, nw, drives, rootPath, nil)
 }
@@ -614,6 +617,7 @@ func newFirecrackerConfigWithStack(root, initrd string, memMiB int, nw *network,
 		}
 	}
 	cfg.NetworkInterfaces = []firecrackerNetworkInterface{{IfaceID: "eth0", GuestMAC: fcGuestMAC, HostDevName: fcTapName}}
+	cfg.Balloon = newFirecrackerBalloon()
 	return cfg
 }
 
@@ -621,10 +625,6 @@ func newFirecrackerConfigWithStack(root, initrd string, memMiB int, nw *network,
 // images on.
 type stackFDs struct {
 	stack, droplet int
-}
-
-func firecrackerArgv(root, configPath string) []string {
-	return []string{filepath.Join(root, artFirecracker), "--no-api", "--config-file", configPath}
 }
 
 // hypervisorArgv returns the command line for kind, writing any config file
@@ -640,9 +640,13 @@ func firecrackerArgv(root, configPath string) []string {
 // because QEMU passes it as the serial. rootPath is the path of the guest
 // root image, or empty when the guest root stays in RAM; that drive comes
 // after the volumes' on both backends. monitorFD is QEMU's QMP socket (see
-// qemuArgv), or 0; Firecracker has no monitor. shares are the guest's
-// shares, which only QEMU serves, so Firecracker refuses them. QEMU refuses a
-// share list that checkShares rejects.
+// qemuArgv), or 0; Firecracker has no monitor, and serves its API on
+// firecrackerAPISocket of workDir instead. shares are the guest's shares,
+// which only QEMU serves, so Firecracker refuses them. QEMU refuses a share
+// list that checkShares rejects. Every guest gets a balloon device, which
+// reports the guest's memory: on QEMU it is the last device on the command
+// line, after the root, stack, and droplet drives, so no other device's
+// virtio-mmio transport moves, and on Firecracker it is in the config file.
 func hypervisorArgv(kind backend.Kind, root, workDir, initrd string, memMiB int, nw *network, drives []volumeDrive, rootPath string, monitorFD int, shares ...shareSocket) ([]string, error) {
 	return hypervisorArgvWithStack(kind, root, workDir, initrd, memMiB, nw, drives, rootPath, monitorFD, nil, shares...)
 }
@@ -692,7 +696,7 @@ func hypervisorArgvWithStack(kind backend.Kind, root, workDir, initrd string, me
 			argv = append(argv, qemuReadOnlyDrive(stackDriveID, qemuStackSerial, fds.stack)...)
 			argv = append(argv, qemuReadOnlyDrive(dropletDriveID, qemuDropletSerial, fds.droplet)...)
 		}
-		return argv, nil
+		return append(argv, qemuBalloonArgs()...), nil
 	case backend.VMFirecracker:
 		if monitorFD != 0 {
 			return nil, errors.New("firecracker has no QMP monitor")
@@ -705,7 +709,7 @@ func hypervisorArgvWithStack(kind backend.Kind, root, workDir, initrd string, me
 		if err := os.WriteFile(cfgPath, cfg, 0o600); err != nil {
 			return nil, fmt.Errorf("writing firecracker config: %w", err)
 		}
-		return firecrackerArgv(root, cfgPath), nil
+		return firecrackerAPIArgv(root, cfgPath, firecrackerAPISocket(workDir)), nil
 	default:
 		return nil, fmt.Errorf("unsupported backend %q", kind)
 	}

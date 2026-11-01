@@ -80,7 +80,8 @@ func firecrackerAPIArgv(root, configPath, socketPath string) []string {
 // connection to Firecracker's API socket. It removes the socket's path once
 // it is connected, so no other process in the container can open a new
 // connection to the API. A connection that breaks ends the source for good,
-// because nothing can reach the socket again.
+// because nothing can reach the socket again. Its zero value connects with
+// connect.
 type firecrackerStatsSource struct {
 	mu     sync.Mutex
 	conn   net.Conn
@@ -89,25 +90,54 @@ type firecrackerStatsSource struct {
 
 var _ guestStatsSource = (*firecrackerStatsSource)(nil)
 
+// firecrackerAPIGone is the error of a source whose connection to the API
+// is closed, or could not be made. The source removes the socket's path once
+// it connects, so nothing can connect again, and the error says it is fatal.
+type firecrackerAPIGone struct{ err error }
+
+func (e firecrackerAPIGone) Error() string { return e.err.Error() }
+func (e firecrackerAPIGone) Unwrap() error { return e.err }
+func (e firecrackerAPIGone) Fatal() bool   { return true }
+
 // newFirecrackerStatsSource waits up to wait for the socket at socketPath,
 // connects to it, and removes the path. It gives up early when ctx ends.
 func newFirecrackerStatsSource(ctx context.Context, socketPath string, wait time.Duration) (*firecrackerStatsSource, error) {
+	s := &firecrackerStatsSource{}
+	if err := s.connect(ctx, socketPath, wait); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// connect waits up to wait for the socket at socketPath, connects to it,
+// and removes the path. It gives up early when ctx ends, with ctx's error,
+// and the source may connect again later. Any other failure is fatal,
+// because a socket that never appeared, or a path that could not be removed,
+// will not come right.
+func (s *firecrackerStatsSource) connect(ctx context.Context, socketPath string, wait time.Duration) error {
 	deadline := time.Now().Add(wait)
 	for {
 		conn, err := net.DialTimeout("unix", socketPath, fcReadTimeout)
 		if err == nil {
 			if rmErr := os.Remove(socketPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
 				_ = conn.Close()
-				return nil, fmt.Errorf("remove the firecracker API socket path: %w", rmErr)
+				return firecrackerAPIGone{fmt.Errorf("remove the firecracker API socket path: %w", rmErr)}
 			}
-			return &firecrackerStatsSource{conn: conn, reader: bufio.NewReader(conn)}, nil
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if s.conn != nil {
+				_ = conn.Close()
+				return errors.New("the firecracker API is already connected")
+			}
+			s.conn, s.reader = conn, bufio.NewReader(conn)
+			return nil
 		}
 		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("connect to the firecracker API socket: %w", err)
+			return firecrackerAPIGone{fmt.Errorf("connect to the firecracker API socket: %w", err)}
 		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return ctx.Err()
 		case <-time.After(fcSocketPoll):
 		}
 	}
@@ -125,18 +155,21 @@ type firecrackerBalloonStats struct {
 // Read asks Firecracker for the newest statistics on the kept connection,
 // with a deadline of two seconds or the earlier deadline of ctx. Any error
 // other than errFirecrackerStatsPending closes the connection, because a
-// reply that arrives late would answer the wrong request.
+// reply that arrives late would answer the wrong request, and is fatal,
+// because the connection cannot be made again. A source that is closed, or
+// never connected, fails every read with an error that is fatal too.
 func (s *firecrackerStatsSource) Read(ctx context.Context) (guestMemorySample, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.conn == nil {
-		return guestMemorySample{}, errors.New("the firecracker API connection is closed")
+		return guestMemorySample{}, firecrackerAPIGone{errors.New("the firecracker API connection is closed")}
 	}
 
 	sample, err := s.roundTrip(ctx)
 	if err != nil && !errors.Is(err, errFirecrackerStatsPending) {
-		s.closeLocked()
+		_ = s.closeLocked()
+		return sample, firecrackerAPIGone{fmt.Errorf("%w; the firecracker API connection is closed", err)}
 	}
 	return sample, err
 }

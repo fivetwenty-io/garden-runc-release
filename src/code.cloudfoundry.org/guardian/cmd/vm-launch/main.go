@@ -319,10 +319,11 @@
 // environment is built in a sealed memfd and never written to disk. The
 // hypervisor gets it as the file descriptor after the volume images', 3
 // without a volume, 4 with one, and 7 with four, and vm-launch closes its
-// own copy once the hypervisor has started. A QEMU monitor socket comes
-// next, and the guest root image last, so the image is file descriptor 4
-// without a volume or a monitor and 6 with one volume and a monitor;
-// vm-launch closes its copy of it, too, once the hypervisor has started.
+// own copy once the hypervisor has started. On QEMU, the monitor socket
+// comes next, and the guest root image comes last, so the image is file
+// descriptor 4 on Firecracker without a volume, 5 on QEMU without a volume,
+// and 6 on QEMU with one volume; vm-launch closes its copy of it, too, once
+// the hypervisor has started.
 //
 // Stack guest: when the process is the CF launcher, Garden bound a stack
 // image that is a regular file holding an lz4 squashfs, and the app has no
@@ -437,6 +438,20 @@
 // of memory: its kernel killed N processes; the guest has M MiB" before it
 // exits. Guardian reads that line to report an out-of-memory exit.
 //
+// Memory metrics: every guest gets a virtio balloon that is never inflated.
+// Its guest kernel reports its memory statistics through it every 5 seconds,
+// and hands the pages it frees back to the host. vm-launch reads the
+// statistics every 10 seconds, over QEMU's QMP monitor, which every QEMU
+// guest gets, or over Firecracker's API socket, whose path it removes as soon
+// as it has connected, so nothing else in the container can reach the API.
+// For each sample that fits the guest's size, it writes one stderr line
+// "vm-launch-metrics v1 used=U total=T available=A free=F caches=C" in bytes,
+// where used is the total less the memory the guest kernel considers
+// available. Guardian removes these lines from the stream and reports used as
+// the container's memory. vm-launch logs one line when the statistics stop
+// being good and one when they are good again, and it stops reading, with
+// one line, once the hypervisor can no longer be read.
+//
 // A container runs one VM per port: a second vm-launch for the same PORT, such
 // as a CF sidecar that gets the app's PORT, cannot reserve it and exits 125,
 // as does a vm-launch whose PORT another process already listens on, with a
@@ -450,6 +465,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -1024,16 +1040,19 @@ func run(argv []string, logger *log.Logger) int {
 		logger.Print(err)
 		return exitLaunchError
 	}
-	// QEMU forwards the ports through rules that vm-launch adds and removes
-	// on its QMP monitor.
-	var monitor net.Conn
-	if len(nw.ports) > 0 && cfg.backend == backend.VMQemu {
+	// Every QEMU guest gets the QMP monitor, which the memory poller reads
+	// the balloon's statistics on, and on which vm-launch adds and removes
+	// the rules that forward the ports.
+	var qmp *qmpMonitor
+	if cfg.backend == backend.VMQemu {
+		var monitor net.Conn
 		monitor, qemuMonitor, err = newQMPSocket()
 		if err != nil {
 			logger.Print(err)
 			return exitLaunchError
 		}
 		defer monitor.Close()
+		qmp = newQMPMonitor(monitor)
 	}
 	// Each share's virtiofsd listens on a socket in the work directory,
 	// which QEMU connects to by path. The sockets exist from here on, and
@@ -1093,6 +1112,22 @@ func run(argv []string, logger *log.Logger) int {
 	if cfg.backend == backend.VMFirecracker {
 		sup.prepare = confinedPrepare(cmd)
 	}
+	// The memory poller starts once the hypervisor has, and stops when the
+	// ports close, before the gates send their last commands on the
+	// monitor, or once the supervisor returns, before the exit line. A stop
+	// ends a read in flight at once, so it never holds up the shutdown.
+	poller, closeStats := newGuestMetrics(cfg.backend, qmp, workDir, memMiB, logger)
+	stopMetrics := func() {
+		poller.stop()
+		closeStats()
+	}
+	defer stopMetrics()
+	afterStart := sup.started
+	sup.started = func() {
+		afterStart()
+		poller.start()
+	}
+	sup.closePorts = stopMetrics
 	var gates *portGates
 	if len(nw.ports) > 0 {
 		// One proxy or one monitor serves every port's opener.
@@ -1108,7 +1143,6 @@ func run(argv []string, logger *log.Logger) int {
 				return proxyPort{proxy: proxy, addr: nw.listenAddr(port), upstream: nw.upstream(port)}
 			}
 		} else {
-			qmp := newQMPMonitor(monitor)
 			open = func(port int) portOpener { return qmpPort{monitor: qmp, port: port} }
 		}
 		// The explicit gates.end after sup.run is the one that ends the
@@ -1119,7 +1153,10 @@ func run(argv []string, logger *log.Logger) int {
 		// no-op.
 		gates = startPortGates(nw.ports, open, gateRetry, logger)
 		defer gates.end()
-		sup.closePorts = gates.shutDown
+		sup.closePorts = func() {
+			stopMetrics()
+			gates.shutDown()
+		}
 		sup.listen = gates.set
 	}
 	// A guest that holds the identity pair gets each of Diego's rewrites of
@@ -1132,6 +1169,7 @@ func run(argv []string, logger *log.Logger) int {
 	}
 	res, err := sup.run(cmd, nonce)
 	stopWatch()
+	stopMetrics()
 	// QEMU has been reaped, or never started. Every virtiofsd has stopped,
 	// or stops now, and its last lines come before the exit line.
 	shareSrv.guestEnded()
@@ -1161,6 +1199,27 @@ func run(argv []string, logger *log.Logger) int {
 		logger.Printf("%s; exiting %d", reason, code)
 	}
 	return code
+}
+
+// newGuestMetrics returns the poller of the guest's memory for backend, which
+// writes its lines to the logger's writer, vm-launch's stderr, and the
+// function that releases its source once the poller has stopped. On QEMU it
+// reads the balloon over qmp, and turns its statistics on first. On
+// Firecracker it connects to the API socket in workDir first, which removes
+// the socket's path.
+func newGuestMetrics(kind backend.Kind, qmp *qmpMonitor, workDir string, memMiB int, logger *log.Logger) (*metricsPoller, func()) {
+	guestBytes := uint64(memMiB) << 20
+	if kind == backend.VMFirecracker {
+		source := &firecrackerStatsSource{}
+		poller := newMetricsPoller(source, guestBytes, logger.Writer(), logger)
+		socket := firecrackerAPISocket(workDir)
+		poller.prepare = func(ctx context.Context) error { return source.connect(ctx, socket, fcSocketWait) }
+		return poller, func() { _ = source.Close() }
+	}
+	source := newQEMUGuestStats(qmp)
+	poller := newMetricsPoller(source, guestBytes, logger.Writer(), logger)
+	poller.prepare = source.Enable
+	return poller, func() {}
 }
 
 // sidecarsRefusal is the line with which vm-launch refuses an app with n

@@ -34,7 +34,7 @@ const (
 	// every guest had before its size came from MEMORY_LIMIT.
 	goldenMemMiB = 128
 
-	goldenFCNet = `{"boot-source":{"kernel_image_path":"/opt/garden-vm/artifacts/kernel/vmlinux","initrd_path":"/proc/self/fd/3","boot_args":"console=ttyS0 reboot=k panic=1 rdinit=/init quiet"},"drives":[],"machine-config":{"vcpu_count":1,"mem_size_mib":128},"network-interfaces":[{"iface_id":"eth0","guest_mac":"06:00:a9:fe:64:02","host_dev_name":"tap0"}]}`
+	goldenFCNet = `{"boot-source":{"kernel_image_path":"/opt/garden-vm/artifacts/kernel/vmlinux","initrd_path":"/proc/self/fd/3","boot_args":"console=ttyS0 reboot=k panic=1 rdinit=/init quiet"},"drives":[],"machine-config":{"vcpu_count":1,"mem_size_mib":128},"network-interfaces":[{"iface_id":"eth0","guest_mac":"06:00:a9:fe:64:02","host_dev_name":"tap0"}],"balloon":{"amount_mib":0,"deflate_on_oom":true,"stats_polling_interval_s":5,"free_page_reporting":true}}`
 
 	// goldenFCDrive is the drives entry a volume adds.
 	goldenFCDrive = `"drives":[{"drive_id":"vol0","path_on_host":"/proc/self/fd/3","is_root_device":false,"is_read_only":false,"cache_type":"Writeback","io_engine":"Sync"}]`
@@ -66,6 +66,9 @@ var (
 	goldenQEMUMonitor = func(fd string) []string {
 		return []string{"-chardev", "socket,id=qmp0,fd=" + fd + ",server=off", "-mon", "chardev=qmp0,mode=control"}
 	}
+	// goldenQEMUBalloon is the memory balloon that hypervisorArgv puts last on
+	// every QEMU command line.
+	goldenQEMUBalloon = []string{"-device", "virtio-balloon-device,id=balloon0,deflate-on-oom=on,free-page-reporting=on"}
 	// goldenQEMUTaskNetdev is the NIC of a task, which has no port to forward.
 	goldenQEMUTaskNetdev = []string{
 		"-netdev", "user,id=n0,net=10.0.2.0/24",
@@ -256,7 +259,7 @@ var _ = Describe("hypervisor volume drive", func() {
 		work := GinkgoT().TempDir()
 		argv, err := hypervisorArgv(backend.VMFirecracker, goldenArt, work, goldenVolumeInitrd, goldenMemMiB, task, drivePathsFor(1), "", 0)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(argv).To(Equal([]string{goldenArt + "/firecracker/firecracker", "--no-api", "--config-file", work + "/fc.json"}))
+		Expect(argv).To(Equal([]string{goldenArt + "/firecracker/firecracker", "--api-sock", work + "/fc.sock", "--config-file", work + "/fc.json"}))
 		raw, err := os.ReadFile(filepath.Join(work, "fc.json"))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(string(raw)).To(ContainSubstring(goldenFCDrive))
@@ -264,7 +267,7 @@ var _ = Describe("hypervisor volume drive", func() {
 
 		qemu, err := hypervisorArgv(backend.VMQemu, goldenArt, work, goldenVolumeInitrd, goldenMemMiB, task, drivePathsFor(1), "", 0)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(qemu).To(Equal(concat(withInitrd(goldenQEMUBase, goldenVolumeInitrd), goldenQEMUTaskNetdev, goldenQEMUDrive)))
+		Expect(qemu).To(Equal(concat(withInitrd(goldenQEMUBase, goldenVolumeInitrd), goldenQEMUTaskNetdev, goldenQEMUDrive, goldenQEMUBalloon)))
 	})
 })
 
@@ -272,14 +275,14 @@ var _ = Describe("hypervisor guest root drive", func() {
 	nw := &network{ports: []int{8080}}
 	task := &network{}
 
-	It("attaches the root image to QEMU as a raw virtio-blk drive with discard, after everything else", func() {
+	It("attaches the root image to QEMU as a raw virtio-blk drive with discard, before the balloon, which comes last", func() {
 		argv, err := hypervisorArgv(backend.VMQemu, goldenArt, "/unused", goldenInitrd, goldenMemMiB, task, nil, procSelfFD(4), 0)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(argv).To(Equal(concat(goldenQEMUBase, goldenQEMUTaskNetdev, goldenQEMURootDrive("4"))))
+		Expect(argv).To(Equal(concat(goldenQEMUBase, goldenQEMUTaskNetdev, goldenQEMURootDrive("4"), goldenQEMUBalloon)))
 
 		argv, err = hypervisorArgv(backend.VMQemu, goldenArt, "/unused", goldenVolumeInitrd, goldenMemMiB, nw, drivePathsFor(1), procSelfFD(6), 5)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(argv).To(Equal(concat(withInitrd(goldenQEMUBase, goldenVolumeInitrd), goldenQEMUNetdev, goldenQEMUDrive, goldenQEMUMonitor("5"), goldenQEMURootDrive("6"))))
+		Expect(argv).To(Equal(concat(withInitrd(goldenQEMUBase, goldenVolumeInitrd), goldenQEMUNetdev, goldenQEMUDrive, goldenQEMUMonitor("5"), goldenQEMURootDrive("6"), goldenQEMUBalloon)))
 	})
 
 	It("pins the QEMU root drive to raw, unmap and zero detection, unsafe caching, reported errors, and no QEMU locking", func() {
@@ -293,7 +296,7 @@ var _ = Describe("hypervisor guest root drive", func() {
 	It("leaves the volume drive on QEMU unchanged when a root image comes with it", func() {
 		argv, err := hypervisorArgv(backend.VMQemu, goldenArt, "/unused", goldenVolumeInitrd, goldenMemMiB, task, drivePathsFor(1), procSelfFD(5), 0)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(argv).To(Equal(concat(withInitrd(goldenQEMUBase, goldenVolumeInitrd), goldenQEMUTaskNetdev, goldenQEMUDrive, goldenQEMURootDrive("5"))))
+		Expect(argv).To(Equal(concat(withInitrd(goldenQEMUBase, goldenVolumeInitrd), goldenQEMUTaskNetdev, goldenQEMUDrive, goldenQEMURootDrive("5"), goldenQEMUBalloon)))
 		Expect(strings.Join(goldenQEMUDrive, " ")).To(ContainSubstring("discard=ignore"))
 	})
 
@@ -469,12 +472,12 @@ var _ = Describe("hypervisor drives for several volumes", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(argv).To(Equal(concat(withInitrd(goldenQEMUBase, procSelfFD(7)), goldenQEMUNetdev,
 			goldenQEMUVolumeDrive(0, "3"), goldenQEMUVolumeDrive(1, "4"), goldenQEMUVolumeDrive(2, "5"), goldenQEMUVolumeDrive(3, "6"),
-			goldenQEMUMonitor("8"), goldenQEMURootDrive("9"))))
+			goldenQEMUMonitor("8"), goldenQEMURootDrive("9"), goldenQEMUBalloon)))
 
 		argv, err = hypervisorArgv(backend.VMQemu, goldenArt, "/unused", procSelfFD(5), goldenMemMiB, task, drivePathsFor(2), "", 0)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(argv).To(Equal(concat(withInitrd(goldenQEMUBase, procSelfFD(5)), goldenQEMUTaskNetdev,
-			goldenQEMUVolumeDrive(0, "3"), goldenQEMUVolumeDrive(1, "4"))))
+			goldenQEMUVolumeDrive(0, "3"), goldenQEMUVolumeDrive(1, "4"), goldenQEMUBalloon)))
 	})
 
 	It("gives Firecracker one drive for each volume, in volume order, before the root drive", func() {
@@ -849,7 +852,7 @@ var _ = Describe("hypervisor stack and droplet drives", func() {
 			argv, err := hypervisorArgvWithStack(backend.VMQemu, goldenArt, "/unused", goldenInitrd, goldenMemMiB, task, nil, procSelfFD(4), 0, stackFiles())
 			Expect(err).NotTo(HaveOccurred())
 			Expect(argv).To(Equal(concat(goldenQEMUBase, goldenQEMUTaskNetdev, goldenQEMURootDrive("4"),
-				goldenQEMUReadOnlyDrive("stack0", "rvm-stack", "5"), goldenQEMUReadOnlyDrive("droplet0", "rvm-droplet", "6"))))
+				goldenQEMUReadOnlyDrive("stack0", "rvm-stack", "5"), goldenQEMUReadOnlyDrive("droplet0", "rvm-droplet", "6"), goldenQEMUBalloon)))
 			Expect(strings.Split(optionAfter(argv, "-drive", "id=stack0"), ",")).To(ContainElement("read-only=on"))
 			Expect(strings.Split(optionAfter(argv, "-drive", "id=droplet0"), ",")).To(ContainElement("read-only=on"))
 		})
@@ -858,14 +861,14 @@ var _ = Describe("hypervisor stack and droplet drives", func() {
 			argv, err := hypervisorArgvWithStack(backend.VMQemu, goldenArt, "/unused", goldenVolumeInitrd, goldenMemMiB, nw, drivePathsFor(1), procSelfFD(6), 5, stackFiles())
 			Expect(err).NotTo(HaveOccurred())
 			Expect(argv).To(Equal(concat(withInitrd(goldenQEMUBase, goldenVolumeInitrd), goldenQEMUNetdev, goldenQEMUDrive, goldenQEMUMonitor("5"),
-				goldenQEMURootDrive("6"), goldenQEMUReadOnlyDrive("stack0", "rvm-stack", "7"), goldenQEMUReadOnlyDrive("droplet0", "rvm-droplet", "8"))))
+				goldenQEMURootDrive("6"), goldenQEMUReadOnlyDrive("stack0", "rvm-stack", "7"), goldenQEMUReadOnlyDrive("droplet0", "rvm-droplet", "8"), goldenQEMUBalloon)))
 		})
 
 		It("attaches them without a root image, straight after the initramfs", func() {
 			argv, err := hypervisorArgvWithStack(backend.VMQemu, goldenArt, "/unused", goldenInitrd, goldenMemMiB, task, nil, "", 0, stackFiles())
 			Expect(err).NotTo(HaveOccurred())
 			Expect(argv).To(Equal(concat(goldenQEMUBase, goldenQEMUTaskNetdev,
-				goldenQEMUReadOnlyDrive("stack0", "rvm-stack", "4"), goldenQEMUReadOnlyDrive("droplet0", "rvm-droplet", "5"))))
+				goldenQEMUReadOnlyDrive("stack0", "rvm-stack", "4"), goldenQEMUReadOnlyDrive("droplet0", "rvm-droplet", "5"), goldenQEMUBalloon)))
 		})
 
 		It("names the same serials newGuestDrivesWithStack gives", func() {

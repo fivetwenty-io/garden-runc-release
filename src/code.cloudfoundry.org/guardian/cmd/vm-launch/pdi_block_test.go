@@ -857,7 +857,7 @@ var _ = Describe("block drives in the hypervisor arguments", func() {
 			"-add-fd", "fd=3,set=3",
 			"-drive", "if=none,id=vol0,format=raw,file.driver=host_device,file.filename=/dev/fdset/3,cache=none,aio=threads,file.locking=off,file.auto-read-only=off,werror=report,rerror=report,discard=ignore",
 			"-device", "virtio-blk-device,drive=vol0,serial=rvm-vol0",
-		})))
+		}, goldenQEMUBalloon)))
 	})
 
 	It("gives Firecracker a block device the same drive an image gets", func() {
