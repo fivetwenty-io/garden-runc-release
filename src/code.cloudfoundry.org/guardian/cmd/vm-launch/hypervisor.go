@@ -160,7 +160,9 @@ func checkArtifacts(kind backend.Kind, root string) error {
 // device carries the drive's identity as its serial, which is qemuVolumeSerial
 // of the volume's volume index (see newGuestDrives) and which the guest reads
 // back. A share has no drive, so a drive's name counts the shares before it,
-// as its serial does, and is QEMU's own name for the drive. The format is pinned
+// as its serial does, and is QEMU's own name for the drive. QEMU takes each
+// drive's file from the descriptor vm-launch checked and opens nothing again
+// (see qemuVolumeDrive). The format is pinned
 // to raw, so QEMU never probes the guest-written disk for a format header
 // such as a qcow2 backing file. I/O errors, ENOSPC and EDQUOT included, reach
 // the guest as errors instead of pausing the VM. QEMU's own locking is off,
@@ -270,31 +272,60 @@ func checkShares(shares []shareSocket) error {
 }
 
 // qemuVolumeDrive returns the QEMU options that attach the volume drive d as
-// the drive id. An image goes through QEMU's file driver with writeback
-// caching. A block device goes through the host_device driver, because the
-// file driver refuses block devices, with cache=none, which opens it with
-// O_DIRECT so that the disk's data stays out of the container's page cache.
-// Both keep discard=ignore and report I/O errors to the guest.
+// the drive id. -add-fd puts the drive's inherited descriptor in a file
+// descriptor set of its own, numbered as the descriptor is, and the drive
+// opens /dev/fdset/N, so QEMU duplicates the descriptor vm-launch checked
+// instead of opening the file again. QEMU's I/O then shares that open file:
+// an image's holds the flock, and on NFS the client fails I/O through it with
+// EIO once the lock is lost, and a block device's holds the exclusive claim
+// and stays bound to the disk whose sequence number and UUID vm-launch read.
+// A set matches an open by its access mode and by O_DIRECT, so the
+// descriptor is open read-write and carries O_DIRECT exactly when the drive
+// has cache=none; any other descriptor fails QEMU's start. Under -drive,
+// QEMU opens the file read-only until the device attaches and then opens it
+// again read-write (auto-read-only). No set holds a read-only descriptor, so
+// file.auto-read-only=off makes QEMU open the file read-write, once.
+//
+// An image goes through QEMU's file driver with writeback caching, and its
+// descriptor has no O_DIRECT. A block device goes through the host_device
+// driver, because the file driver refuses block devices, with cache=none, so
+// that the disk's data stays out of the container's page cache, and
+// openBlockVolume sets O_DIRECT on its descriptor for that. Both name their
+// driver, so QEMU never probes the path to choose one, and both keep
+// discard=ignore and report I/O errors to the guest.
 func qemuVolumeDrive(id string, d volumeDrive) []string {
+	fd := strconv.Itoa(d.fd)
+	file := qemuFDSetPath(d.fd)
 	var drive string
 	if d.mode == attachBlock {
-		drive = "if=none,id=" + id + ",format=raw,file.driver=host_device,file.filename=" + d.path +
-			",cache=none,aio=threads,file.locking=off,werror=report,rerror=report,discard=ignore"
+		drive = "if=none,id=" + id + ",format=raw,file.driver=host_device,file.filename=" + file +
+			",cache=none,aio=threads,file.locking=off,file.auto-read-only=off,werror=report,rerror=report,discard=ignore"
 	} else {
-		drive = "if=none,id=" + id + ",file=" + d.path +
-			",format=raw,cache=writeback,aio=threads,file.locking=off,werror=report,rerror=report,discard=ignore"
+		drive = "if=none,id=" + id + ",format=raw,file.driver=file,file.filename=" + file +
+			",cache=writeback,aio=threads,file.locking=off,file.auto-read-only=off,werror=report,rerror=report,discard=ignore"
 	}
-	return []string{"-drive", drive, "-device", "virtio-blk-device,drive=" + id + ",serial=" + d.id}
+	return []string{
+		"-add-fd", "fd=" + fd + ",set=" + fd,
+		"-drive", drive,
+		"-device", "virtio-blk-device,drive=" + id + ",serial=" + d.id,
+	}
+}
+
+// qemuFDSetPath is the path by which QEMU opens a duplicate of a descriptor
+// in the file descriptor set set.
+func qemuFDSetPath(set int) string {
+	return "/dev/fdset/" + strconv.Itoa(set)
 }
 
 // volumeDrive is one volume drive as the hypervisor's arguments name it: the
-// path the hypervisor opens it by, the drive's identity, how the disk
-// reaches the guest, and the volume index of its volume. hypervisorFiles takes
-// all four from the attachment. Both backends name the drive after the volume
-// index (see volumeDriveID), so a share among the volumes, which has no
-// drive, does not renumber the drives after it.
+// hypervisor's file descriptor for the disk, the drive's identity, how the
+// disk reaches the guest, and the volume index of its volume. hypervisorFiles
+// takes all four from the attachment, and an fd below firstExtraFD means the
+// drive has no file. Both backends name the drive after the volume index (see
+// volumeDriveID), so a share among the volumes, which has no drive, does not
+// renumber the drives after it.
 type volumeDrive struct {
-	path  string
+	fd    int
 	id    string
 	mode  attachMode
 	index int
@@ -303,23 +334,27 @@ type volumeDrive struct {
 // The hypervisor's inherited files. The hypervisor gets the volume disks,
 // one for each volume that has a drive, the initramfs, a QEMU monitor
 // socket, when there is one, and the guest root image, when there is one, as
-// extra files, and opens each through /proc/self/fd, so the container path
-// of a volume never reaches a QEMU option string or the Firecracker
-// configuration. For a volume image, a regular file, that open reaches
-// exactly the inode vm-launch checked. A block volume's file is a device
-// node, and an open of a device node finds its disk by the node's device
-// number at the moment of the open, so the hypervisor reaches whichever disk
-// has that number then, and its open does not ask for O_EXCL. vm-launch
-// checked the disk behind its own O_EXCL descriptor, which it keeps open
-// while the hypervisor runs, so no other exclusive opener can take the disk
-// meanwhile. A disk that is detached between that check and the
-// hypervisor's open, or while the guest runs, frees its number, and a disk
-// attached after it can be given the same number. The root image has no
-// path at all, because vm-launch unlinks it when it creates it. The volume
-// images take file descriptors from firstVolumeFD on, in volume order, so
-// that the first one keeps 3, and the initramfs takes the next one: 3
-// without a volume, 4 with one, and 7 with four. The monitor takes the one
-// after that, and the root image comes last, so that adding it moves no
+// extra files, so the container path of a volume never reaches a QEMU option
+// string or the Firecracker configuration.
+//
+// QEMU does its I/O on a volume disk through the descriptor it inherits,
+// which shares vm-launch's checked open file (see qemuVolumeDrive).
+// Firecracker opens each disk again through /proc/self/fd, and that open is
+// a new open file description. For a volume image it reaches exactly the
+// inode vm-launch checked, but without the flock, so on NFS Firecracker's
+// I/O does not meet the client's EIO after a lost lock. For a block volume it
+// finds its disk by the node's device number at the moment of the open and
+// does not ask for O_EXCL, so it relies on the number still naming the disk
+// vm-launch checked (see openBlockVolume). Both backends open the initramfs
+// and the root image through /proc/self/fd. vm-launch made both files, holds
+// no lock on them, and keeps them open, so the open reaches the inode it
+// made. The root image has no path at all, because vm-launch unlinks it when
+// it creates it.
+//
+// The volume disks take file descriptors from firstVolumeFD on, in volume
+// order, so that the first one keeps 3, and the initramfs takes the next
+// one: 3 without a volume, 4 with one, and 7 with four. The monitor takes the
+// one after that, and the root image comes last, so that adding it moves no
 // other file: 4 without a volume or a monitor, and 6 with one volume and a
 // monitor.
 const (
@@ -340,21 +375,22 @@ func procSelfFD(fd int) string {
 	return "/proc/self/fd/" + strconv.Itoa(fd)
 }
 
-// volumeDrivePath is the path the hypervisor opens the volume image at index
-// i in volume order by.
+// volumeDrivePath is the path Firecracker opens the volume disk at index i in
+// volume order by.
 func volumeDrivePath(i int) string {
 	return procSelfFD(firstVolumeFD + i)
 }
 
 // hypervisorFiles returns the hypervisor's extra files in order, for
-// exec.Cmd.ExtraFiles, with the paths the hypervisor opens them by. vols are
-// the volumes' attachments in volume order, after newGuestDrives has given
-// each its identity, and drives holds the path, the identity, and the mode of
-// each, in the same order, or nothing without a volume. An attachment
-// without a file, or a nil one, gives a drive with no path, which
-// hypervisorArgv refuses. That drive keeps the attachment's volume index, so
-// the refusal names the volume, and a nil attachment, which has none, gives
-// the index -1, so the refusal names the drive's position instead. initrd is the
+// exec.Cmd.ExtraFiles, with the descriptors and paths the hypervisor takes
+// them by. vols are the volumes' attachments in volume order, after
+// newGuestDrives has given each its identity, and drives holds the
+// descriptor, the identity, and the mode of each, in the same order, or
+// nothing without a volume. An attachment without a file, or a nil one,
+// gives a drive with no file, which hypervisorArgv refuses. That drive keeps
+// the attachment's volume index, so the refusal names the volume, and a nil
+// attachment, which has none, gives the index -1, so the refusal names the
+// drive's position instead. initrd is the
 // initramfs from newInitramfs. monitor is QEMU's end of the QMP socket or nil, and
 // monitorFD is its file descriptor in the hypervisor, or 0 without one. root
 // is the guest root image from createRootImage or nil, and rootPath is empty
@@ -371,7 +407,7 @@ func hypervisorFiles(vols []*attachment, initrd, monitor, root *os.File) (files 
 			continue
 		}
 		files = append(files, att.File)
-		drives = append(drives, volumeDrive{path: procSelfFD(firstExtraFD + len(files) - 1), id: att.ID, mode: att.Mode, index: att.Index})
+		drives = append(drives, volumeDrive{fd: firstExtraFD + len(files) - 1, id: att.ID, mode: att.Mode, index: att.Index})
 	}
 	files = append(files, initrd)
 	initrdPath = procSelfFD(firstExtraFD + len(files) - 1)
@@ -462,7 +498,10 @@ type firecrackerNetworkInterface struct {
 // device, which Garden creates for every Firecracker container, with or
 // without a port, a drive for each volume drive in drives, in volume order
 // and named as on QEMU, and the guest root image as a drive after them when
-// rootPath is set. Firecracker takes no serial, and the identity it gives
+// rootPath is set. Firecracker opens each volume drive by its /proc/self/fd
+// path, because its drive configuration takes only a path, so it does its
+// I/O through an open file of its own and not through vm-launch's checked
+// one. Firecracker takes no serial, and the identity it gives
 // each drive comes from the file it opens, which newGuestDrives predicts; for
 // a block device that is the device node. An image and a block device get the
 // same drive: Writeback, which passes the guest's flushes on, and the Sync
@@ -483,7 +522,7 @@ func newFirecrackerConfig(root, initrd string, memMiB int, nw *network, drives [
 	for _, d := range drives {
 		cfg.Drives = append(cfg.Drives, firecrackerDrive{
 			DriveID:      volumeDriveID(d.index),
-			PathOnHost:   d.path,
+			PathOnHost:   procSelfFD(d.fd),
 			IsRootDevice: false,
 			IsReadOnly:   false,
 			CacheType:    fcDriveCacheType,
@@ -515,7 +554,7 @@ func firecrackerArgv(root, configPath string) []string {
 // the floor and the ceiling. nw is the guest network, which run always
 // builds, and drives are the volume drives from hypervisorFiles, in volume
 // order, or none without a volume. More than maxVolumes of them is an error,
-// and so is a drive without a path, which the error names by its volume
+// and so is a drive without a file, which the error names by its volume
 // index, or by its place among drives when hypervisorFiles had no
 // attachment to take an index from, a drive in neither file-image nor block
 // mode, and, on QEMU, a drive whose identity the guest could not read back,
@@ -531,10 +570,10 @@ func hypervisorArgv(kind backend.Kind, root, workDir, initrd string, memMiB int,
 	}
 	for i, d := range drives {
 		switch {
-		case d.path == "" && d.index < 0:
-			return nil, fmt.Errorf("the volume drive at place %d among the drives has no path and no volume index", i)
-		case d.path == "":
-			return nil, fmt.Errorf("volume drive %s has no path", volumeDriveID(d.index))
+		case d.fd < firstExtraFD && d.index < 0:
+			return nil, fmt.Errorf("the volume drive at place %d among the drives has no file and no volume index", i)
+		case d.fd < firstExtraFD:
+			return nil, fmt.Errorf("volume drive %s has no file", volumeDriveID(d.index))
 		case d.mode != attachFileImage && d.mode != attachBlock:
 			return nil, fmt.Errorf("volume drive %s is in %s, which VM backends do not attach as a drive", volumeDriveID(d.index), d.mode)
 		case kind == backend.VMQemu && !validDriveID(d.id):

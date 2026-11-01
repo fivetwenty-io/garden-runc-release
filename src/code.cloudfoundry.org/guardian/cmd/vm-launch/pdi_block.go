@@ -44,7 +44,10 @@ import (
 // retries a busy device within the launch's shared lock wait, so a restart
 // that overlaps the previous instance's VM on the same cell waits for it. The
 // hypervisor inherits the open file, so the claim lasts until both have let
-// go of it. Firecracker's identity for the drive comes from the node's own
+// go of it. Once the checks pass, vm-launch sets O_DIRECT on the open file,
+// because QEMU attaches the device with cache=none and takes the file only
+// with that flag (see qemuVolumeDrive), and vm-launch reads nothing through it
+// after that. Firecracker's identity for the drive comes from the node's own
 // st_dev, st_rdev, and st_ino (see firecrackerDriveID), because the node is
 // the file it opens.
 //
@@ -55,11 +58,22 @@ import (
 // container (gardenDiskseqSource). vm-launch refuses a device whose
 // BLKGETDISKSEQ on the exclusive descriptor differs from that record.
 // The kernel gives every disk it attaches a higher number, so the check
-// proves that vm-launch opened the disk Garden granted. It cannot reach a
-// hypervisor that is already running when its disk is detached and another
-// takes the number. That hypervisor still has the device node in the
-// container, and only the kernel's exclusive hold of the new disk, by a host
-// mount or another VM, stops it from opening the new disk again.
+// proves that vm-launch opened the disk Garden granted. An open file of a
+// block device stays bound to the disk it opened, so QEMU, which does its
+// I/O through vm-launch's open file, reaches that disk or gets errors once it
+// is detached, and never reaches a disk attached after it. Firecracker opens
+// the node again when it starts, and that open finds whichever disk has the
+// number then. It reaches the checked disk because the mainline sd,
+// virtio-blk, and NVMe drivers keep a disk's number reserved until the last
+// file on the disk closes, and vm-launch's stays open until the hypervisor
+// exits. That is the drivers' behaviour, which nothing in this tree tests, so
+// a driver that frees the number when the disk is removed would let
+// Firecracker open a later disk unchecked. Once vm-launch has exited, the
+// container keeps the node and its device cgroup rule until Garden destroys
+// it. Only vm-launch and the processes it starts carry the kvm group that the
+// node needs, and the hypervisor gets SIGKILL when vm-launch dies, so
+// reaching the node in that tail takes an escape from the guest into the
+// hypervisor that leaves a process behind.
 
 // The block-mode descriptor, which must match the bosh-disk driver's
 // pkg/driver/descriptor.go in cf-bosh-disk-broker-release (DescriptorSource,
@@ -161,6 +175,8 @@ type blockHost interface {
 	// diskSeq is the disk sequence number of the open block device fd, from
 	// BLKGETDISKSEQ.
 	diskSeq(fd int) (uint64, error)
+	// setDirect sets O_DIRECT on the open file fd.
+	setDirect(fd int) error
 }
 
 // linuxBlockHost is the kernel.
@@ -194,6 +210,17 @@ func (linuxBlockHost) diskSeq(fd int) (uint64, error) {
 		return 0, fmt.Errorf("BLKGETDISKSEQ: %w", err)
 	}
 	return seq, nil
+}
+
+func (linuxBlockHost) setDirect(fd int) error {
+	flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
+	if err != nil {
+		return fmt.Errorf("F_GETFL: %w", err)
+	}
+	if _, err := unix.FcntlInt(uintptr(fd), unix.F_SETFL, flags|unix.O_DIRECT); err != nil {
+		return fmt.Errorf("F_SETFL O_DIRECT: %w", err)
+	}
+	return nil
 }
 
 // gardenDiskseqSource starts the source of the tmpfs that Garden mounts in a
@@ -462,15 +489,19 @@ func (p *blockProvider) Prepare(req prepareRequest) (*attachment, error) {
 // requires of an image's directory. The descriptor is read beneath that
 // directory without following links or crossing a mount (readBlockDescriptor).
 // The node is first opened as O_PATH and must be a block device with the
-// descriptor's number. BeforeLock, when there is one, gets that O_PATH file,
+// descriptor's number, so a container without the node, which Garden makes
+// only with block volumes on, is refused for that before anything else.
+// Garden must then have recorded the disk's sequence number for that device
+// (gardenDiskseq). BeforeLock, when there is one, gets that O_PATH file,
 // so a device an earlier volume of the launch holds is refused in the
 // launch's own words before the exclusive open would fail as busy. The node
 // is then opened with O_RDWR|O_EXCL|O_CLOEXEC|O_NOFOLLOW, waiting while it is
 // busy (openExclusive), and the open file must be the inode checked before,
-// with the descriptor's number, the descriptor's size, and an ext4
-// superblock with the descriptor's UUID, a journal, and no more blocks than
-// the device holds (checkExt4Superblock). Every failure closes what it
-// opened.
+// with the descriptor's number, the sequence number Garden recorded, the
+// descriptor's size, and an ext4 superblock with the descriptor's UUID, a
+// journal, and no more blocks than the device holds (checkExt4Superblock).
+// The open file then gets O_DIRECT, for QEMU's cache=none. Every failure
+// closes what it opened.
 func (p *blockProvider) openBlockVolume(req prepareRequest) (*os.File, error) {
 	dir := req.Mount.ContainerDir
 	qdir := quoteForLog(dir)
@@ -502,10 +533,6 @@ func (p *blockProvider) openBlockVolume(req prepareRequest) (*os.File, error) {
 	node := p.nodeDir + "/" + strconv.FormatUint(uint64(desc.Major), 10) + "-" + strconv.FormatUint(uint64(desc.Minor), 10)
 	what := fmt.Sprintf("the %s device %s (%s) for volume path %s", p.name, node, desc.DiskName, qdir)
 	rdev := unix.Mkdev(desc.Major, desc.Minor)
-	grantedSeq, err := gardenDiskseq(desc.Major, desc.Minor)
-	if err != nil {
-		return nil, fmt.Errorf("checking %s: %w", what, err)
-	}
 
 	pathFD, err := p.host.open(node, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC)
 	if err != nil {
@@ -519,6 +546,10 @@ func (p *blockProvider) openBlockVolume(req prepareRequest) (*os.File, error) {
 	}
 	if err := checkBlockNode(&want, rdev, desc, what); err != nil {
 		return nil, err
+	}
+	grantedSeq, err := gardenDiskseq(desc.Major, desc.Minor)
+	if err != nil {
+		return nil, fmt.Errorf("checking %s: %w", what, err)
 	}
 	if req.BeforeLock != nil {
 		if err := req.BeforeLock(pathFile); err != nil {
@@ -567,6 +598,9 @@ func (p *blockProvider) openBlockVolume(req prepareRequest) (*os.File, error) {
 	}
 	if err := checkExt4Superblock(fd, desc, what); err != nil {
 		return nil, err
+	}
+	if err := p.host.setDirect(fd); err != nil {
+		return nil, fmt.Errorf("turning on direct I/O for %s, which QEMU attaches with cache=none: %w", what, err)
 	}
 	ok = true
 	return dev, nil

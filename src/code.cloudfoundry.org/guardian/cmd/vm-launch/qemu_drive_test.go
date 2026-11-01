@@ -61,6 +61,10 @@ func optionAfter(argv []string, flag, marker string) string {
 // driveOption returns the -drive argument of the generated QEMU command line.
 func driveOption(argv []string) string { return optionAfter(argv, "-drive", "") }
 
+// addFDOption returns the -add-fd argument of the generated QEMU command line,
+// which puts the volume's descriptor in the set its drive opens.
+func addFDOption(argv []string) string { return optionAfter(argv, "-add-fd", "") }
+
 // rootDriveOption and rootDeviceOption return the guest root image's -drive
 // and -device arguments of the generated QEMU command line.
 func rootDriveOption(argv []string) string { return optionAfter(argv, "-drive", "id=root0") }
@@ -104,7 +108,9 @@ func runRealQEMU(argv []string, files []*os.File, stdin string, timeout time.Dur
 
 var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 	// parseDrive starts QEMU stopped, with no display, and the drive's file as
-	// file descriptor 3 exactly as vm-launch passes the image. QEMU parses and
+	// file descriptor 3 exactly as vm-launch passes the image, open read-write
+	// as vm-launch opens it, because QEMU takes a read-write drive only from a
+	// read-write descriptor. QEMU parses and
 	// opens the drive during start up; the monitor's quit then ends a QEMU
 	// that accepted it. machine and extra are the machine type and any
 	// further arguments, such as the -device that uses the drive.
@@ -164,9 +170,18 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 
 	It("accepts the drive option string vm-launch generates", func() {
 		qemu := realQEMU()
+		argv := qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), drivePathsFor(1), 0)
+		drive := driveOption(argv)
+		code, stderr := parseDrive(qemu, noMachine, "-add-fd", addFDOption(argv), "-drive", drive)
+		Expect(code).To(Equal(0), "QEMU rejected -drive %s: %s", drive, stderr)
+	})
+
+	It("rejects the drive without its file descriptor set, so the check above can fail", func() {
+		qemu := realQEMU()
 		drive := driveOption(qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), drivePathsFor(1), 0))
 		code, stderr := parseDrive(qemu, noMachine, "-drive", drive)
-		Expect(code).To(Equal(0), "QEMU rejected -drive %s: %s", drive, stderr)
+		Expect(code).NotTo(Equal(0))
+		Expect(stderr).To(ContainSubstring("/dev/fdset/3"))
 	})
 
 	It("accepts the -drive and -device pair vm-launch generates on a microvm machine", func() {
@@ -175,7 +190,7 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 		argv := qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), drivePathsFor(1), 0)
 		drive, device := driveOption(argv), deviceOption(argv)
 		Expect(device).To(ContainSubstring("drive=vol0"))
-		code, stderr := parseDrive(qemu, microvm, "-drive", drive, "-device", device)
+		code, stderr := parseDrive(qemu, microvm, "-add-fd", addFDOption(argv), "-drive", drive, "-device", device)
 		Expect(code).To(Equal(0), "QEMU rejected -drive %s -device %s: %s", drive, device, stderr)
 	})
 
@@ -184,7 +199,7 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 		requireMicrovm(qemu)
 		argv := qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), drivePathsFor(1), 0)
 		device := strings.Replace(deviceOption(argv), "drive=vol0", "drive=vol9", 1)
-		code, stderr := parseDrive(qemu, microvm, "-drive", driveOption(argv), "-device", device)
+		code, stderr := parseDrive(qemu, microvm, "-add-fd", addFDOption(argv), "-drive", driveOption(argv), "-device", device)
 		Expect(code).NotTo(Equal(0))
 		Expect(stderr).To(ContainSubstring("vol9"))
 	})
@@ -242,7 +257,8 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 		for i := range maxVolumes {
 			files = append(files, openSizedFile(1<<20))
 			id := volumeDriveID(i)
-			args = append(args, "-drive", optionAfter(argv, "-drive", "id="+id+","), "-device", optionAfter(argv, "-device", "drive="+id+","))
+			args = append(args, "-add-fd", optionAfter(argv, "-add-fd", "fd="+strconv.Itoa(firstVolumeFD+i)+","),
+				"-drive", optionAfter(argv, "-drive", "id="+id+","), "-device", optionAfter(argv, "-device", "drive="+id+","))
 		}
 		// The initramfs's descriptor comes before the root image's, as in
 		// vm-launch, and nothing here reads it.
@@ -259,16 +275,17 @@ var _ = Describe("the QEMU volume drive against a real QEMU", func() {
 		requireMicrovm(qemu)
 		argv := qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), drivePathsFor(1), 0)
 		device := strings.Replace(deviceOption(argv), ",serial=", ",serial-number=", 1)
-		code, stderr := parseDrive(qemu, microvm, "-drive", driveOption(argv), "-device", device)
+		code, stderr := parseDrive(qemu, microvm, "-add-fd", addFDOption(argv), "-drive", driveOption(argv), "-device", device)
 		Expect(code).NotTo(Equal(0))
 		Expect(stderr).To(ContainSubstring("serial-number"))
 	})
 
 	It("rejects the unprefixed locking option, so the check above can fail", func() {
 		qemu := realQEMU()
-		drive := strings.Replace(driveOption(qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), drivePathsFor(1), 0)), "file.locking=off", "locking=off", 1)
+		argv := qemuArgv(goldenArt, goldenVolumeInitrd, goldenMemMiB, taskNetwork(), drivePathsFor(1), 0)
+		drive := strings.Replace(driveOption(argv), "file.locking=off", "locking=off", 1)
 		Expect(drive).To(ContainSubstring(",locking=off,"))
-		code, stderr := parseDrive(qemu, noMachine, "-drive", drive)
+		code, stderr := parseDrive(qemu, noMachine, "-add-fd", addFDOption(argv), "-drive", drive)
 		Expect(code).NotTo(Equal(0))
 		Expect(stderr).To(ContainSubstring("locking"))
 	})
@@ -461,7 +478,8 @@ var _ = Describe("QEMU arguments for a guest with shares", func() {
 	// whose image is on file descriptor fd.
 	driveAt := func(i, fd int) []string {
 		return []string{
-			"-drive", fmt.Sprintf("if=none,id=vol%d,file=/proc/self/fd/%d,format=raw,cache=writeback,aio=threads,file.locking=off,werror=report,rerror=report,discard=ignore", i, fd),
+			"-add-fd", fmt.Sprintf("fd=%d,set=%d", fd, fd),
+			"-drive", fmt.Sprintf("if=none,id=vol%d,format=raw,file.driver=file,file.filename=/dev/fdset/%d,cache=writeback,aio=threads,file.locking=off,file.auto-read-only=off,werror=report,rerror=report,discard=ignore", i, fd),
 			"-device", fmt.Sprintf("virtio-blk-device,drive=vol%d,serial=rvm-vol%d", i, i),
 		}
 	}
@@ -495,7 +513,7 @@ var _ = Describe("QEMU arguments for a guest with shares", func() {
 	})
 
 	It("keeps a private volume's drive, serial, and name at its volume index when a share comes first", func() {
-		drives := []volumeDrive{{path: volumeDrivePath(0), id: qemuVolumeSerial(1), mode: attachFileImage, index: 1}}
+		drives := []volumeDrive{{fd: firstVolumeFD, id: qemuVolumeSerial(1), mode: attachFileImage, index: 1}}
 		argv, err := hypervisorArgv(backend.VMQemu, goldenArt, "/unused", goldenVolumeInitrd, goldenMemMiB, task, drives, "", 0, shareAt(0))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(argv).To(Equal(concat(sharedBase(goldenVolumeInitrd), goldenQEMUTaskNetdev, driveAt(1, 3), memfd(goldenMemMiB), fsDevice(0))))
@@ -506,8 +524,8 @@ var _ = Describe("QEMU arguments for a guest with shares", func() {
 
 	It("lets a share sit between two private volumes and names each drive by its volume index", func() {
 		drives := []volumeDrive{
-			{path: volumeDrivePath(0), id: qemuVolumeSerial(0), mode: attachFileImage, index: 0},
-			{path: volumeDrivePath(1), id: qemuVolumeSerial(2), mode: attachFileImage, index: 2},
+			{fd: firstVolumeFD, id: qemuVolumeSerial(0), mode: attachFileImage, index: 0},
+			{fd: firstVolumeFD + 1, id: qemuVolumeSerial(2), mode: attachFileImage, index: 2},
 		}
 		argv, err := hypervisorArgv(backend.VMQemu, goldenArt, "/unused", procSelfFD(5), goldenMemMiB, task, drives, "", 6, shareAt(1))
 		Expect(err).NotTo(HaveOccurred())
@@ -540,7 +558,7 @@ var _ = Describe("QEMU arguments for a guest with shares", func() {
 	})
 
 	It("names a Firecracker drive by its volume index", func() {
-		drives := []volumeDrive{{path: volumeDrivePath(0), id: "12345", mode: attachFileImage, index: 2}}
+		drives := []volumeDrive{{fd: firstVolumeFD, id: "12345", mode: attachFileImage, index: 2}}
 		raw := fcConfigJSON(goldenVolumeInitrd, goldenMemMiB, task, drives, "")
 		Expect(raw).To(ContainSubstring(`"drive_id":"vol2"`))
 		Expect(raw).NotTo(ContainSubstring(`"drive_id":"vol0"`))

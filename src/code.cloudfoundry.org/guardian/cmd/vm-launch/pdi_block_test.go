@@ -103,6 +103,11 @@ type fakeBlockHost struct {
 	sizeErr  error
 	seq      uint64
 	seqErr   error
+	// direct holds each file descriptor setDirect was asked about, and
+	// directErr, when set, is its answer. The fake sets no flag, because
+	// the nodes are regular files on a filesystem that may refuse O_DIRECT.
+	direct    []int
+	directErr error
 	// openErr, when set, answers an open before the file is opened.
 	openErr func(path string, flags int) error
 	// replace makes the exclusive open report another inode.
@@ -196,6 +201,11 @@ func (h *fakeBlockHost) deviceBytes(int) (uint64, error) {
 
 func (h *fakeBlockHost) diskSeq(int) (uint64, error) {
 	return h.seq, h.seqErr
+}
+
+func (h *fakeBlockHost) setDirect(fd int) error {
+	h.direct = append(h.direct, fd)
+	return h.directErr
 }
 
 // setDiskseqTable makes gardenDiskseq read a mount table with lines until the
@@ -444,7 +454,14 @@ var _ = Describe("the block provider", func() {
 			flags, err := unix.FcntlInt(att.File.Fd(), unix.F_GETFL, 0)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(flags & unix.O_ACCMODE).To(Equal(unix.O_RDWR))
+			Expect(f.host.direct).To(Equal([]int{int(att.File.Fd())}), "the exclusive file gets O_DIRECT, for QEMU's cache=none")
 			Expect(att.Release()).To(Succeed())
+		})
+
+		It("is refused, with nothing left open, when the exclusive file cannot take O_DIRECT", func() {
+			f.host.directErr = errors.New("F_SETFL O_DIRECT: invalid argument")
+			Expect(f.prepareRefused(f.request())).To(MatchError(fmt.Sprintf("turning on direct I/O for %s, which QEMU attaches with cache=none: F_SETFL O_DIRECT: invalid argument", f.what())))
+			Expect(f.host.direct).To(HaveLen(1))
 		})
 
 		It("accepts a descriptor that root owns, as the driver writes it, when vm-launch is not root", func() {
@@ -564,6 +581,13 @@ var _ = Describe("the block provider", func() {
 			It("is refused when Garden made no node, naming the cell setting", func() {
 				Expect(os.Remove(f.node)).To(Succeed())
 				Expect(f.prepareRefused(f.request())).To(MatchError(fmt.Sprintf("opening %s: the container has no such node; Garden makes it only when the cell runs Garden with --vm-block-volumes", f.what())))
+			})
+
+			It("names the cell setting when Garden made neither the node nor the record, as it does with block volumes off", func() {
+				Expect(os.Remove(f.node)).To(Succeed())
+				setDiskseqTable()
+				Expect(f.prepareRefused(f.request())).To(MatchError(fmt.Sprintf("opening %s: the container has no such node; Garden makes it only when the cell runs Garden with --vm-block-volumes", f.what())))
+				Expect(f.host.opens).To(Equal([]int{unix.O_PATH | unix.O_NOFOLLOW | unix.O_CLOEXEC}))
 			})
 
 			It("is refused when it is a symbolic link", func() {
@@ -704,11 +728,11 @@ var _ = Describe("the block provider", func() {
 				Expect(att.Release()).To(Succeed())
 			})
 
-			DescribeTable("is refused, before anything is opened, unless Garden recorded the disk once",
+			DescribeTable("is refused, after the look at the node and before the exclusive open, unless Garden recorded the disk once",
 				func(lines []string, msg string) {
 					setDiskseqTable(lines...)
 					Expect(f.prepareRefused(f.request())).To(MatchError(fmt.Sprintf("checking %s: %s", f.what(), msg)))
-					Expect(f.host.opens).To(BeEmpty())
+					Expect(f.host.opens).To(Equal([]int{unix.O_PATH | unix.O_NOFOLLOW | unix.O_CLOEXEC}))
 				},
 				Entry("without the record", nil, "the container has no garden-pdi-diskseq: mount, so this Garden did not record which disk it granted; block volumes need a Garden that records it"),
 				Entry("with two records", []string{diskseqLine(60, "8:16=42"), diskseqLine(61, "8:16=42")}, "the container has 2 garden-pdi-diskseq: mounts, and Garden makes one"),
@@ -725,10 +749,10 @@ var _ = Describe("the block provider", func() {
 				Entry("naming the device twice", []string{diskseqLine(60, "8:16=42,8:16=43")}, "garden-pdi-diskseq: names device 8:16 more than once"),
 			)
 
-			It("is refused, before anything is opened, when a line that names the record does not parse", func() {
+			It("is refused, before the exclusive open, when a line that names the record does not parse", func() {
 				setDiskseqTable("60 22 0:60 / /opt/garden-vm/pdi-diskseq ro tmpfs garden-pdi-diskseq:8:16=42 ro")
 				Expect(f.prepareRefused(f.request())).To(MatchError(HavePrefix(fmt.Sprintf("checking %s: a line of %s that names garden-pdi-diskseq: is malformed: ", f.what(), diskseqMountInfo))))
-				Expect(f.host.opens).To(BeEmpty())
+				Expect(f.host.opens).To(Equal([]int{unix.O_PATH | unix.O_NOFOLLOW | unix.O_CLOEXEC}))
 			})
 
 			It("ignores a mount whose path, not its source, holds the record's prefix", func() {
@@ -824,13 +848,14 @@ var _ = Describe("the block provider", func() {
 
 var _ = Describe("block drives in the hypervisor arguments", func() {
 	task := &network{}
-	blockDrive := volumeDrive{path: volumeDrivePath(0), id: qemuVolumeSerial(0), mode: attachBlock}
+	blockDrive := volumeDrive{fd: firstVolumeFD, id: qemuVolumeSerial(0), mode: attachBlock}
 
-	It("gives QEMU a block device through host_device with cache=none, and keeps the serial", func() {
+	It("gives QEMU a block device from its file descriptor set through host_device with cache=none, and keeps the serial", func() {
 		argv, err := hypervisorArgv(backend.VMQemu, goldenArt, "/unused", goldenVolumeInitrd, goldenMemMiB, task, []volumeDrive{blockDrive}, "", 0)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(argv).To(Equal(concat(withInitrd(goldenQEMUBase, goldenVolumeInitrd), goldenQEMUTaskNetdev, []string{
-			"-drive", "if=none,id=vol0,format=raw,file.driver=host_device,file.filename=/proc/self/fd/3,cache=none,aio=threads,file.locking=off,werror=report,rerror=report,discard=ignore",
+			"-add-fd", "fd=3,set=3",
+			"-drive", "if=none,id=vol0,format=raw,file.driver=host_device,file.filename=/dev/fdset/3,cache=none,aio=threads,file.locking=off,file.auto-read-only=off,werror=report,rerror=report,discard=ignore",
 			"-device", "virtio-blk-device,drive=vol0,serial=rvm-vol0",
 		})))
 	})
@@ -840,29 +865,30 @@ var _ = Describe("block drives in the hypervisor arguments", func() {
 	})
 
 	It("mixes block and image drives in volume order", func() {
-		drives := []volumeDrive{drivePathsFor(1)[0], {path: volumeDrivePath(1), id: qemuVolumeSerial(1), mode: attachBlock, index: 1}}
+		drives := []volumeDrive{drivePathsFor(1)[0], {fd: firstVolumeFD + 1, id: qemuVolumeSerial(1), mode: attachBlock, index: 1}}
 		argv := qemuArgv(goldenArt, procSelfFD(5), goldenMemMiB, task, drives, 0)
-		Expect(optionAfter(argv, "-drive", "id=vol0")).To(ContainSubstring(",file=/proc/self/fd/3,format=raw,cache=writeback,"))
-		Expect(optionAfter(argv, "-drive", "id=vol1")).To(ContainSubstring(",file.driver=host_device,file.filename=/proc/self/fd/4,cache=none,"))
+		Expect(optionAfter(argv, "-drive", "id=vol0")).To(ContainSubstring(",file.driver=file,file.filename=/dev/fdset/3,cache=writeback,"))
+		Expect(optionAfter(argv, "-drive", "id=vol1")).To(ContainSubstring(",file.driver=host_device,file.filename=/dev/fdset/4,cache=none,"))
+		Expect(optionAfter(argv, "-add-fd", "fd=4,")).To(Equal("fd=4,set=4"))
 	})
 
-	It("takes each drive's path, identity, and mode from its attachment", func() {
+	It("takes each drive's file descriptor, identity, and mode from its attachment", func() {
 		img, err := os.Open(os.DevNull)
 		Expect(err).NotTo(HaveOccurred())
 		defer img.Close()
 		files, drives, _, _, _ := hypervisorFiles([]*attachment{{File: img, Mode: attachBlock, ID: "12345"}}, img, nil, nil)
 		Expect(files).To(HaveLen(2))
-		Expect(drives).To(Equal([]volumeDrive{{path: "/proc/self/fd/3", id: "12345", mode: attachBlock}}))
+		Expect(drives).To(Equal([]volumeDrive{{fd: 3, id: "12345", mode: attachBlock}}))
 	})
 
 	It("refuses a drive in neither mode, and on QEMU a drive whose identity cannot be a serial", func() {
 		for _, kind := range []backend.Kind{backend.VMQemu, backend.VMFirecracker} {
-			_, err := hypervisorArgv(kind, goldenArt, GinkgoT().TempDir(), goldenVolumeInitrd, goldenMemMiB, task, []volumeDrive{{path: volumeDrivePath(0), id: "rvm-vol0"}}, "", 0)
+			_, err := hypervisorArgv(kind, goldenArt, GinkgoT().TempDir(), goldenVolumeInitrd, goldenMemMiB, task, []volumeDrive{{fd: firstVolumeFD, id: "rvm-vol0"}}, "", 0)
 			Expect(err).To(MatchError(ContainSubstring("volume drive vol0 is in ")), string(kind))
 		}
-		_, err := hypervisorArgv(backend.VMQemu, goldenArt, "/unused", goldenVolumeInitrd, goldenMemMiB, task, []volumeDrive{{path: volumeDrivePath(0), id: "a,b", mode: attachBlock}}, "", 0)
+		_, err := hypervisorArgv(backend.VMQemu, goldenArt, "/unused", goldenVolumeInitrd, goldenMemMiB, task, []volumeDrive{{fd: firstVolumeFD, id: "a,b", mode: attachBlock}}, "", 0)
 		Expect(err).To(MatchError(`volume drive vol0 has the identity "a,b", which is not 1 to 20 letters, digits, and hyphens, so QEMU cannot pass it as the drive's serial`))
-		_, err = hypervisorArgv(backend.VMQemu, goldenArt, "/unused", goldenVolumeInitrd, goldenMemMiB, task, []volumeDrive{{path: volumeDrivePath(0), mode: attachBlock}}, "", 0)
+		_, err = hypervisorArgv(backend.VMQemu, goldenArt, "/unused", goldenVolumeInitrd, goldenMemMiB, task, []volumeDrive{{fd: firstVolumeFD, mode: attachBlock}}, "", 0)
 		Expect(err).To(MatchError(ContainSubstring(`volume drive vol0 has the identity ""`)))
 	})
 
@@ -966,9 +992,6 @@ func newLoopDisk(size int64, mkfsArgs ...string) *loopDisk {
 	return d
 }
 
-// descriptorMount mounts a tmpfs with the driver's source and options at a
-// new directory, writes text as its descriptor with the driver's mode, and
-// remounts it read-only, as the driver does. The spec's cleanup unmounts it.
 // sysfsDiskseq returns the disk sequence number of d from sysfs.
 func sysfsDiskseq(d *loopDisk) uint64 {
 	raw, err := os.ReadFile(fmt.Sprintf("/sys/dev/block/%d:%d/diskseq", d.major, d.minor))
@@ -978,6 +1001,9 @@ func sysfsDiskseq(d *loopDisk) uint64 {
 	return seq
 }
 
+// descriptorMount mounts a tmpfs with the driver's source and options at a
+// new directory, writes text as its descriptor with the driver's mode, and
+// remounts it read-only, as the driver does. The spec's cleanup unmounts it.
 func descriptorMount(text string) string {
 	dir := GinkgoT().TempDir()
 	runTool("mount", "-t", "tmpfs", "-o", "size=16k,mode=0755,nodev,nosuid,noexec", boshDiskDescriptorSource, dir)
@@ -1060,6 +1086,10 @@ var _ = Describe("the block provider on a loop device", func() {
 		})
 		Expect(att.Mode).To(Equal(attachBlock))
 		Expect(blockDeviceBytes(att.File)).To(Equal(disk.size))
+		flags, err := unix.FcntlInt(att.File.Fd(), unix.F_GETFL, 0)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(flags & unix.O_ACCMODE).To(Equal(unix.O_RDWR))
+		Expect(flags&unix.O_DIRECT).NotTo(BeZero(), "the device carries O_DIRECT, which QEMU's cache=none drive asks its file descriptor set for")
 
 		mnt := GinkgoT().TempDir()
 		out, err := exec.Command("mount", "-t", "ext4", disk.dev, mnt).CombinedOutput()
@@ -1177,7 +1207,7 @@ var _ = Describe("the block provider on a loop device", func() {
 		drives, err := newGuestDrives(backend.VMQemu, pv, nil)
 		Expect(err).NotTo(HaveOccurred())
 		_, hv, _, _, _ := hypervisorFiles(pv.files(), pv[0].Attachment.File, nil, nil)
-		Expect(hv).To(Equal([]volumeDrive{{path: "/proc/self/fd/3", id: drives.volumes[0].id, mode: attachBlock}}))
+		Expect(hv).To(Equal([]volumeDrive{{fd: 3, id: drives.volumes[0].id, mode: attachBlock}}))
 	})
 })
 
