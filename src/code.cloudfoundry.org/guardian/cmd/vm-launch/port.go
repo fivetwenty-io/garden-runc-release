@@ -487,46 +487,7 @@ type qmpError struct {
 
 // humanCommand runs a human monitor command and returns its output.
 func (m *qmpMonitor) humanCommand(line string) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.broken != nil {
-		return "", m.broken
-	}
-	if err := m.conn.SetDeadline(time.Now().Add(m.timeout)); err != nil {
-		return "", m.fail(fmt.Errorf("QMP: setting a deadline: %w", err))
-	}
-	if !m.greeted {
-		msg, err := m.read()
-		if err != nil {
-			return "", m.readFailed(fmt.Errorf("QMP: reading the greeting: %w", err))
-		}
-		if msg.QMP == nil {
-			return "", m.fail(errors.New("QMP: the first message is not a greeting"))
-		}
-		m.greeted = true
-	}
-	if !m.ready {
-		if m.capsID == 0 {
-			id, err := m.send("qmp_capabilities", nil)
-			if err != nil {
-				return "", err
-			}
-			m.capsID = id
-		}
-		_, err := m.await("qmp_capabilities", m.capsID)
-		if err != nil {
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				return "", err
-			}
-			return "", m.fail(err)
-		}
-		m.ready = true
-	}
-	id, err := m.send("human-monitor-command", map[string]string{"command-line": line})
-	if err != nil {
-		return "", err
-	}
-	ret, err := m.await("human-monitor-command", id)
+	ret, err := m.command("human-monitor-command", map[string]string{"command-line": line})
 	if err != nil {
 		return "", err
 	}
@@ -535,6 +496,52 @@ func (m *qmpMonitor) humanCommand(line string) (string, error) {
 		return "", fmt.Errorf("QMP human-monitor-command: the return is not a string: %w", err)
 	}
 	return out, nil
+}
+
+// command runs one QMP command, with arguments when args is not nil, and
+// returns its return value. It holds the monitor's lock for the whole
+// exchange, so commands from different goroutines never interleave.
+func (m *qmpMonitor) command(name string, args any) (json.RawMessage, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.broken != nil {
+		return nil, m.broken
+	}
+	if err := m.conn.SetDeadline(time.Now().Add(m.timeout)); err != nil {
+		return nil, m.fail(fmt.Errorf("QMP: setting a deadline: %w", err))
+	}
+	if !m.greeted {
+		msg, err := m.read()
+		if err != nil {
+			return nil, m.readFailed(fmt.Errorf("QMP: reading the greeting: %w", err))
+		}
+		if msg.QMP == nil {
+			return nil, m.fail(errors.New("QMP: the first message is not a greeting"))
+		}
+		m.greeted = true
+	}
+	if !m.ready {
+		if m.capsID == 0 {
+			id, err := m.send("qmp_capabilities", nil)
+			if err != nil {
+				return nil, err
+			}
+			m.capsID = id
+		}
+		_, err := m.await("qmp_capabilities", m.capsID)
+		if err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				return nil, err
+			}
+			return nil, m.fail(err)
+		}
+		m.ready = true
+	}
+	id, err := m.send(name, args)
+	if err != nil {
+		return nil, err
+	}
+	return m.await(name, id)
 }
 
 // send writes one command with a new id and returns the id.
