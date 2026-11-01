@@ -35,16 +35,16 @@ const (
 )
 
 // credTag returns the tag that starts every frame line on the console input
-// for nonce. A frame line is the tag, then "=", then the frame.
-func credTag(nonce string) string { return "RVM_CRED_" + nonce }
+// for nonce, with its "=". A frame line is the tag and then the frame.
+func credTag(nonce string) string { return "RVM_CRED_" + nonce + "=" }
 
 // credOKTag returns the tag of the console output line that reports a pair
-// the guest installed. The line is the tag, then "=", then the sequence.
-func credOKTag(nonce string) string { return "RVM_CREDOK_" + nonce }
+// the guest installed, with its "=". The sequence follows the tag.
+func credOKTag(nonce string) string { return "RVM_CREDOK_" + nonce + "=" }
 
 // credBadTag returns the tag of the console output line that reports a pair
-// the guest refused. The line is the tag, then "=", then the sequence.
-func credBadTag(nonce string) string { return "RVM_CREDBAD_" + nonce }
+// the guest refused, with its "=". The sequence follows the tag.
+func credBadTag(nonce string) string { return "RVM_CREDBAD_" + nonce + "=" }
 
 // fileStamp names the state of the two files of the identity pair, so that a
 // rewrite by Diego shows as a difference. Each file contributes the device,
@@ -180,7 +180,7 @@ func pemLines(data []byte) []string {
 // joining its lines with a newline and ending the last one with a newline, so
 // the digest is of the files in that form, which is the form Diego writes.
 func credFrames(nonce string, seq int, id *instanceIdentity) []string {
-	tag := credTag(nonce) + "="
+	tag := credTag(nonce)
 	crt, key := pemLines(id.cert), pemLines(id.key)
 	sum := sha256.New()
 	sum.Write([]byte(strings.Join(crt, "\n") + "\n"))
@@ -208,6 +208,9 @@ type credWatcher struct {
 	logger            *log.Logger
 	now               func() time.Time
 	ackTimeout        time.Duration
+
+	ackMu sync.Mutex
+	ack   *credAck
 
 	mu       sync.Mutex
 	seen     fileStamp
@@ -251,21 +254,38 @@ func (w *credWatcher) run(stop <-chan struct{}) {
 	}
 }
 
-// acked records the guest's answer to push number seq. An answer to an older
-// push does not count.
+// credAck is the guest's answer to one push.
+type credAck struct {
+	seq int
+	ok  bool
+}
+
+// acked records the guest's answer to push number seq. It never blocks, so
+// the console reader can call it while a push is in progress, and the next
+// tick applies the answer. An answer to an older push does not count.
 func (w *credWatcher) acked(seq int, ok bool) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if !w.pending || seq != w.seq {
+	w.ackMu.Lock()
+	defer w.ackMu.Unlock()
+	w.ack = &credAck{seq: seq, ok: ok}
+}
+
+// applyAck takes the recorded answer, if any, and applies it. The caller
+// holds the lock.
+func (w *credWatcher) applyAck() {
+	w.ackMu.Lock()
+	ack := w.ack
+	w.ack = nil
+	w.ackMu.Unlock()
+	if ack == nil || !w.pending || ack.seq != w.seq {
 		return
 	}
-	if ok {
+	if ack.ok {
 		w.pending = false
-		w.logger.Printf("the guest installed instance identity push %d", seq)
+		w.logger.Printf("the guest installed instance identity push %d", ack.seq)
 		return
 	}
 	w.failed = true
-	w.logger.Printf("the guest refused instance identity push %d", seq)
+	w.logger.Printf("the guest refused instance identity push %d", ack.seq)
 }
 
 // tick does one pass of the watch.
@@ -273,6 +293,7 @@ func (w *credWatcher) tick() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	w.applyAck()
 	stamp, ok := statIdentity(w.certPath, w.keyPath)
 	if !ok {
 		return

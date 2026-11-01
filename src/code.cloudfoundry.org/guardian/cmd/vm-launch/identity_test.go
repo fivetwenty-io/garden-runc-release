@@ -183,9 +183,9 @@ var _ = Describe("the instance identity pair", func() {
 		})
 
 		It("names its tags from the nonce", func() {
-			Expect(credTag("abc")).To(Equal("RVM_CRED_abc"))
-			Expect(credOKTag("abc")).To(Equal("RVM_CREDOK_abc"))
-			Expect(credBadTag("abc")).To(Equal("RVM_CREDBAD_abc"))
+			Expect(credTag("abc")).To(Equal("RVM_CRED_abc="))
+			Expect(credOKTag("abc")).To(Equal("RVM_CREDOK_abc="))
+			Expect(credBadTag("abc")).To(Equal("RVM_CREDBAD_abc="))
 		})
 
 		It("reassembles into the exact bytes, with the right counts and digest", func() {
