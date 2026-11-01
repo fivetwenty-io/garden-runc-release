@@ -4,11 +4,14 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -336,5 +339,213 @@ var _ = Describe("run with the guest filesystem tools", func() {
 		before := openFDCount()
 		initrdOf()
 		Expect(openFDCount()).To(Equal(before))
+	})
+})
+
+var _ = Describe("the initramfs of a guest without a stack", func() {
+	// archiveSum is the sha256 of the uncompressed archive that
+	// writeInitramfsArchive builds for g, so that the check does not depend
+	// on the compressor's output.
+	archiveSum := func(g guestContents) string {
+		var archive bytes.Buffer
+		Expect(writeInitramfsArchive(&archive, strings.NewReader("busybox"), int64(len("busybox")), g)).To(Succeed())
+		sum := sha256.Sum256(gunzip(archive.Bytes()))
+		return hex.EncodeToString(sum[:])
+	}
+
+	// The sums are those of the archives from before the stack guest, so
+	// that a guest without a stack boots the very initramfs it always did.
+	It("is byte for byte the archive it was before the stack guest, for a task, an LRP with a root disk and a CA bundle, and a guest with a volume", func() {
+		task := taskGuest("true")
+		Expect(archiveSum(task)).To(Equal("56a82e4104526177e88073e7e336bb9b7587555ccf5ccac5942991a35f39d3ea"))
+
+		lrp := taskGuest("exec ./server")
+		lrp.nw = &network{ports: []int{8080}, address: qemuGuestCIDR, gateway: qemuGateway, resolvConf: "nameserver 10.0.2.3\n"}
+		lrp.rootBytes, lrp.rootInodeRatio, lrp.drives.rootID = 64<<20, inodeRatioFor(64<<20), qemuRootSerial
+		lrp.caBundle = []byte("-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n")
+		Expect(archiveSum(lrp)).To(Equal("112057c868b6523968d6afd3ecb590b1355796692189cab097defa817ebc9603"))
+
+		vol := taskGuest("true")
+		vol.vols = []guestVolume{{ContainerDir: "/home/vcap/data", ImageName: "rvm-disk-0.img"}}
+		vol.drives.volumes = qemuImageDrives(defaultImageSize)
+		Expect(archiveSum(vol)).To(Equal("93cbe815c6c3235c643ba59e761f5b2365bc6f8b40acb9ad3e3c031b7dce200f"))
+	})
+})
+
+var _ = Describe("the initramfs of a guest with a stack", func() {
+	const launcherBytes = "#!/bin/sh\nexec the-launcher \"$@\"\n"
+
+	// stackGuest returns a task guest with a stack, its launcher in a
+	// temporary file, and the stack and droplet drives' QEMU serials.
+	stackGuest := func() guestContents {
+		f, err := os.Open(writeTempFile("launcher", launcherBytes))
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(f.Close)
+		g := taskGuest("")
+		g.drives.stackID, g.drives.dropletID = qemuStackSerial, qemuDropletSerial
+		g.stack = &guestStack{
+			launcher: guestTool{name: "launcher", file: f, size: int64(len(launcherBytes))},
+			argv:     shellJoin([]string{stackLauncherPath, "/home/vcap/app", "", `{"start_command":"it's \"here\""}`}),
+			cwd:      "/home/vcap/app",
+			hostname: "4f1b6c5e-3a2d-4c7b-9e0f-1a2b3c4d5e6f",
+			hosts:    []byte("127.0.0.1 localhost\n10.255.0.2 4f1b6c5e-3a2d-4c7b-9e0f-1a2b3c4d5e6f\n"),
+		}
+		return g
+	}
+
+	write := func(g guestContents) error {
+		var archive bytes.Buffer
+		return writeInitramfsArchive(&archive, strings.NewReader("busybox"), int64(len("busybox")), g)
+	}
+
+	archive := func(g guestContents) ([]string, map[string]cpioEntry) {
+		var archive bytes.Buffer
+		Expect(writeInitramfsArchive(&archive, strings.NewReader("busybox"), int64(len("busybox")), g)).To(Succeed())
+		return archiveEntries(archive.Bytes())
+	}
+
+	It("holds the launcher, the argv, the working directory, the hosts file, and the hostname, with their modes, and runs the stack guest's two stages", func() {
+		g := stackGuest()
+		names, byName := archive(g)
+		Expect(names).To(Equal([]string{"bin", "dev", "dev/console", "dev/null", "etc", "proc", "sys", "tmp", "rvm",
+			"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "rvm/limits", "etc/resolv.conf",
+			"rvm/lifecycle", "rvm/lifecycle/launcher", "rvm/argv", "rvm/cwd", "rvm/hosts", "rvm/hostname",
+			"rvm/disks", "rvm/init", "init", cpioTrailer}))
+		Expect(byName["rvm/lifecycle"].mode).To(Equal(uint32(0o040755)))
+		Expect(string(byName["rvm/lifecycle/launcher"].data)).To(Equal(launcherBytes))
+		Expect(byName["rvm/lifecycle/launcher"].mode).To(Equal(uint32(0o100755)))
+		want := map[string]string{
+			"rvm/argv":     g.stack.argv,
+			"rvm/cwd":      "/home/vcap/app",
+			"rvm/hosts":    string(g.stack.hosts),
+			"rvm/hostname": g.stack.hostname + "\n",
+		}
+		for name, content := range want {
+			Expect(string(byName[name].data)).To(Equal(content), name)
+			Expect(byName[name].mode).To(Equal(uint32(0o100644)), name)
+		}
+		Expect(string(byName["rvm/disks"].data)).To(Equal("RVM_VOLUMES=0\nRVM_STACK_ID=rvm-stack\nRVM_DROPLET_ID=rvm-droplet\n"))
+		Expect(string(byName["init"].data)).To(Equal(guestStackInit))
+		Expect(byName["init"].mode).To(Equal(uint32(0o100755)))
+		Expect(string(byName["rvm/init"].data)).To(Equal(stackInitScript(testNonce)))
+		Expect(byName["rvm/init"].mode).To(Equal(uint32(0o100755)))
+	})
+
+	It("reads /rvm/argv back in the guest's shell as the argv it was given", func() {
+		g := stackGuest()
+		_, byName := archive(g)
+		out, err := exec.Command("/bin/sh", "-c", `eval "set -- $(cat "$1")" && printf '[%s]' "$@"`, "sh", writeTempFile("argv", string(byName["rvm/argv"].data))).Output()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(out)).To(Equal(`[/tmp/lifecycle/launcher][/home/vcap/app][][{"start_command":"it's \"here\""}]`))
+	})
+
+	It("names the stack and droplet drives after the root and the volumes in /rvm/disks", func() {
+		g := stackGuest()
+		g.rootBytes, g.rootInodeRatio, g.drives.rootID = 64<<20, inodeRatioFor(64<<20), qemuRootSerial
+		disks, err := disksFile(g)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(disks).To(Equal("RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=131072\nRVM_ROOT_INODE_RATIO=" + strconv.FormatInt(inodeRatioFor(64<<20), 10) + "\n" +
+			"RVM_VOLUMES=0\nRVM_STACK_ID=rvm-stack\nRVM_DROPLET_ID=rvm-droplet\n"))
+		g.stack = nil
+		g.drives.stackID, g.drives.dropletID = "", ""
+		disks, err = disksFile(g)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(disks).NotTo(ContainSubstring("STACK"))
+		Expect(disks).NotTo(ContainSubstring("DROPLET"))
+	})
+
+	DescribeTable("refuses stack and droplet identities that stage 1 could not match to its drives, so no initramfs is built",
+		func(change func(*guestContents), want string) {
+			g := stackGuest()
+			change(&g)
+			_, err := disksFile(g)
+			Expect(err).To(MatchError(want))
+			Expect(write(g)).To(MatchError(want))
+		},
+		Entry("a stack without the stack image's identity", func(g *guestContents) { g.drives.stackID = "" },
+			`a guest with a stack needs the identities of both the stack image and the droplet image, and has "" and "rvm-droplet"`),
+		Entry("a stack without the droplet image's identity", func(g *guestContents) { g.drives.dropletID = "" },
+			`a guest with a stack needs the identities of both the stack image and the droplet image, and has "rvm-stack" and ""`),
+		Entry("the identities without a stack", func(g *guestContents) { g.stack = nil },
+			`drive identities "rvm-stack" and "rvm-droplet" for no stack and droplet images`),
+		Entry("the stack image with the root's identity", func(g *guestContents) {
+			g.rootBytes, g.rootInodeRatio, g.drives.rootID = 64<<20, inodeRatioFor(64<<20), qemuRootSerial
+			g.drives.stackID = qemuRootSerial
+		}, `the guest root image and the stack image would both have the drive identity "rvm-root", so the guest could not tell them apart`),
+		Entry("the droplet image with the stack's identity", func(g *guestContents) { g.drives.dropletID = qemuStackSerial },
+			`the stack image and the droplet image would both have the drive identity "rvm-stack", so the guest could not tell them apart`),
+		Entry("an identity the guest cannot match", func(g *guestContents) { g.drives.dropletID = "rvm droplet" },
+			`the drive identity "rvm droplet" of the droplet image is not 1 to 20 letters, digits, and hyphens, so the guest could not match it`),
+	)
+
+	It("takes a launcher argv of 131071 bytes quoted and refuses one of 131072, which the guest could not hand the launcher", func() {
+		g := stackGuest()
+		g.stack.argv = shellJoin([]string{stackLauncherPath, "/home/vcap/app", ""}) + " "
+		g.stack.argv += shellQuote(strings.Repeat("x", maxGuestCommandBytes-len(g.stack.argv)-2))
+		Expect(g.stack.argv).To(HaveLen(maxGuestCommandBytes))
+		Expect(write(g)).To(Succeed())
+		g.stack.argv = strings.Replace(g.stack.argv, "'x", "'xx", 1)
+		Expect(write(g)).To(MatchError("the launcher's argv is 131072 bytes quoted, over the 131071 bytes a guest takes"))
+	})
+
+	DescribeTable("refuses a stack the guest could not run, so no initramfs is built",
+		func(change func(*guestContents), want string) {
+			g := stackGuest()
+			change(&g)
+			Expect(write(g)).To(MatchError(want))
+		},
+		Entry("a volume", func(g *guestContents) {
+			g.vols = []guestVolume{{ContainerDir: "/home/vcap/data", ImageName: "rvm-disk-0.img"}}
+			g.drives.volumes = qemuImageDrives(defaultImageSize)
+		}, "a guest with a stack mounts no volumes, and this one has 1"),
+		Entry("no launcher", func(g *guestContents) { g.stack.launcher = guestTool{} },
+			"a guest with a stack needs the launcher, and it has none"),
+		Entry("an empty launcher", func(g *guestContents) { g.stack.launcher.size = 0 },
+			"a guest with a stack needs the launcher, and it has none"),
+		Entry("no argv", func(g *guestContents) { g.stack.argv = "" },
+			"a guest with a stack needs the launcher's argv, and it has none"),
+		Entry("a relative working directory", func(g *guestContents) { g.stack.cwd = "home/vcap/app" },
+			`the app's working directory "home/vcap/app" is not an absolute path on one line`),
+		Entry("no working directory", func(g *guestContents) { g.stack.cwd = "" },
+			`the app's working directory "" is not an absolute path on one line`),
+		Entry("a working directory that ends in a newline, which $(cat) drops", func(g *guestContents) { g.stack.cwd = "/home/vcap/app\n" },
+			`the app's working directory "/home/vcap/app\n" is not an absolute path on one line`),
+		Entry("no hostname", func(g *guestContents) { g.stack.hostname = "" },
+			`the guest hostname "" is not 1 to 64 letters, digits, dots, and hyphens`),
+		Entry("a hostname of two lines", func(g *guestContents) { g.stack.hostname = "a\nb" },
+			`the guest hostname "a\nb" is not 1 to 64 letters, digits, dots, and hyphens`),
+		Entry("a hostname over 64 bytes", func(g *guestContents) { g.stack.hostname = strings.Repeat("h", 65) },
+			`the guest hostname "`+strings.Repeat("h", 65)+`" is not 1 to 64 letters, digits, dots, and hyphens`),
+	)
+
+	It("runs the stack guest's stage 1 in place of the overlay root, after the drive search that knows the stack and droplet drives", func() {
+		Expect(guestStackInit).To(HavePrefix(guestInitStart + guestFailFunc + guestStackDiskFind))
+		Expect(guestStackInit).To(HaveSuffix(guestStackSetup + guestStage2Exec))
+		Expect(guestStackInit).NotTo(ContainSubstring(guestRootSetup))
+		Expect(guestRootInit).To(Equal(guestInitStart + guestFailFunc + guestDiskFind + guestRootSetup + guestStage2Exec))
+		Expect(guestStackDiskFind).To(Equal(guestStackDiskFunc + guestDiskRead + guestStackDiskRead + guestDiskWait + "rvm_stack=$rvm_dev_stack\nrvm_droplet=$rvm_dev_droplet\n"))
+		for name, script := range map[string]string{"stage 1": guestStackInit, "stage 2": stackInitScript(testNonce)} {
+			out, err := exec.Command("/bin/sh", "-n", "-c", script).CombinedOutput()
+			Expect(err).NotTo(HaveOccurred(), "%s: %s", name, out)
+		}
+	})
+
+	It("differs from the rvm.6 drive search only in the size check, which it skips for a drive without a size", func() {
+		Expect(guestDiskFunc).To(Equal(guestDiskFuncStart + guestDiskSizeCheck + guestDiskFuncEnd))
+		Expect(strings.Count(guestDiskFunc, guestDiskSizeCheck)).To(Equal(1))
+		Expect(guestStackDiskFunc).To(Equal(strings.Replace(guestDiskFunc, guestDiskSizeCheck, guestStackDiskSizeCheck, 1)))
+		Expect(guestStackDiskSizeCheck).To(Equal(strings.Replace(guestDiskSizeCheck, `[ "$rvm_s" = "$rvm_w" ]`, `[ -z "$rvm_w" ] || [ "$rvm_s" = "$rvm_w" ]`, 1)))
+	})
+
+	It("runs the launcher in stage 2 after the argv and working directory checks, and mounts no /dev/shm of its own", func() {
+		script := stackInitScript(testNonce)
+		Expect(script).To(Equal(strings.NewReplacer(guestShmSetup, "", guestEnvChecks, guestEnvChecks+guestStackChecks, guestRunCommand, guestStackRunCommand).Replace(initScript(testNonce, false))))
+		Expect(script).NotTo(ContainSubstring(guestShmSetup))
+		Expect(script).NotTo(ContainSubstring(guestRunCommand))
+		Expect(script).NotTo(ContainSubstring("/rvm/cmd"))
+		start := strings.Index(script, "\necho "+startTag(testNonce)+"\n")
+		Expect(strings.Index(script, guestEnvChecks+guestStackChecks)).To(BeNumerically(">", 0))
+		Expect(strings.Index(script, guestStackChecks)).To(BeNumerically("<", start))
+		Expect(strings.Index(script, guestStackRunCommand)).To(BeNumerically(">", start))
 	})
 })

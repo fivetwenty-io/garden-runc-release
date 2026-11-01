@@ -162,15 +162,34 @@ func stopTag(nonce string) string { return "RVM_STOP_" + nonce }
 // and as a device node, after six checks a second apart. Stage 1 writes no
 // console marker, so a failure reboots before the start tag and vm-launch
 // shows the console, which ends with the failed step.
-const guestRootInit = `#!/bin/busybox sh
+const guestRootInit = guestInitStart + guestFailFunc + guestDiskFind + guestRootSetup + guestStage2Exec
+
+// guestInitStart is how stage 1 starts in every guest: it installs
+// busybox's applets, mounts /proc, /sys, and /dev, and records in
+// rvm_devtmpfs whether /dev is a devtmpfs mount.
+const guestInitStart = `#!/bin/busybox sh
 /bin/busybox --install -s /bin
 export PATH=/bin
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 rvm_devtmpfs=
 mount -t devtmpfs dev /dev 2>/dev/null && rvm_devtmpfs=1
-` + guestFailFunc + guestDiskFind + guestRootSetup + `exec /bin/sh ` + guestStage2 + ` "$@"
 `
+
+// guestStage2Exec is how stage 1 ends in every guest that runs stage 2 on
+// the initramfs: it hands stage 2 the volumes' devices as its arguments.
+const guestStage2Exec = `exec /bin/sh ` + guestStage2 + ` "$@"
+`
+
+// guestStackInit is the guest /init of a guest with a stack (see
+// guestContents.stack), stage 1 of its boot. It starts as guestRootInit does
+// and finds the drives in the same way, with the stack and droplet images
+// among them (see guestStackDiskFind). In place of the overlay root, it
+// builds the app root from the stack, the droplet, and the root disk, or RAM
+// without one (see guestStackSetup), and it runs stage 2 on the initramfs,
+// which stays the guest's own root. The app alone runs in the app root (see
+// guestStackRunCommand).
+const guestStackInit = guestInitStart + guestFailFunc + guestStackDiskFind + guestStackSetup + guestStage2Exec
 
 // guestStage2 is where the initramfs holds stage 2 of the guest's boot.
 const guestStage2 = "/rvm/init"
@@ -195,7 +214,12 @@ const guestStage2 = "/rvm/init"
 // right size and the wrong identity. A device whose identity or size cannot
 // be read yet, and a drive without its device node, make the pass fail, with
 // rvm_missing saying why, so that the caller checks again.
-const guestDiskFunc = `rvm_number() { case "$1" in '' | 0* | *[!0-9]*) return 1 ;; esac; }
+const guestDiskFunc = guestDiskFuncStart + guestDiskSizeCheck + guestDiskFuncEnd
+
+// guestDiskFuncStart and guestDiskFuncEnd are guestDiskFunc before and
+// after its size check, which the stack guest replaces (see
+// guestStackDiskFunc).
+const guestDiskFuncStart = `rvm_number() { case "$1" in '' | 0* | *[!0-9]*) return 1 ;; esac; }
 rvm_ident() {
 	case "$1" in '' | *[!A-Za-z0-9-]*) return 1 ;; esac
 	[ "${#1}" -le ` + virtioBlockIDBytesText + ` ]
@@ -226,8 +250,9 @@ rvm_scan() {
 		[ -z "$rvm_o" ] || rvm_fail "two block devices, $rvm_o and $rvm_n, have the identity $rvm_id of the $rvm_l, so the guest cannot tell which one it is"
 		eval "rvm_dev_$rvm_m=\$rvm_n"
 		if [ -r "$rvm_b/size" ] && read -r rvm_s 2>/dev/null <"$rvm_b/size"; then
-			[ "$rvm_s" = "$rvm_w" ] || rvm_fail "the $rvm_l $rvm_n has $rvm_s sectors, and /rvm/disks gives it $rvm_w, so the guest will not use it"
-			[ -b "$rvm_n" ] || rvm_missing="${rvm_missing:+$rvm_missing, and }no device node $rvm_n yet for the $rvm_l"
+`
+
+const guestDiskFuncEnd = `			[ -b "$rvm_n" ] || rvm_missing="${rvm_missing:+$rvm_missing, and }no device node $rvm_n yet for the $rvm_l"
 		else
 			rvm_missing="${rvm_missing:+$rvm_missing, and }no readable size yet for the $rvm_l on $rvm_n"
 		fi
@@ -238,6 +263,27 @@ rvm_scan() {
 	done
 	[ -z "$rvm_missing" ]
 }
+`
+
+// guestDiskSizeCheck is the line of rvm_scan that fails the boot when a
+// drive's device has another size than the one /rvm/disks gives the drive.
+const guestDiskSizeCheck = `			[ "$rvm_s" = "$rvm_w" ] || rvm_fail "the $rvm_l $rvm_n has $rvm_s sectors, and /rvm/disks gives it $rvm_w, so the guest will not use it"
+`
+
+// guestStackDiskFunc is guestDiskFunc for a guest with a stack. Its rvm_scan
+// compares a drive's size only when the drive has one in rvm_sectors_KEY.
+// /rvm/disks gives the stack and droplet images no size, because the guest
+// only reads them and squashfs takes its size from its own superblock, and
+// because QEMU rounds a file's size up to whole sectors where Firecracker
+// rounds it down. Every other check is the same, so a vd device whose
+// identity no drive has still fails the boot. The root and every volume
+// drive keep their size checks, since stage 1 refuses any of them without a
+// size before it scans.
+const guestStackDiskFunc = guestDiskFuncStart + guestStackDiskSizeCheck + guestDiskFuncEnd
+
+// guestStackDiskSizeCheck is guestDiskSizeCheck for a drive that may have
+// no size in /rvm/disks.
+const guestStackDiskSizeCheck = `			[ -z "$rvm_w" ] || [ "$rvm_s" = "$rvm_w" ] || rvm_fail "the $rvm_l $rvm_n has $rvm_s sectors, and /rvm/disks gives it $rvm_w, so the guest will not use it"
 `
 
 // virtioBlockIDBytesText is virtioBlockIDBytes in decimal, as the guest's
@@ -264,7 +310,11 @@ const virtioBlockIDBytesText = "20"
 // names it and its identity. rvm_dev_root is cleared with the drive list, so
 // that a variable the kernel left in init's environment can never stand in
 // for a root drive that /rvm/disks does not name.
-const guestDiskFind = guestDiskFunc + `. /rvm/disks
+const guestDiskFind = guestDiskFunc + guestDiskRead + guestDiskWait
+
+// guestDiskRead is the part of guestDiskFind that reads and checks
+// /rvm/disks and sets up rvm_drives for rvm_scan.
+const guestDiskRead = `. /rvm/disks
 rvm_drives=
 rvm_dev_root=
 if [ -n "${RVM_ROOT_ID:-}${RVM_ROOT_SECTORS:-}" ]; then
@@ -304,7 +354,11 @@ while [ "$rvm_i" -lt "$RVM_VOLUMES" ]; do
 	rvm_drives="$rvm_drives vol$rvm_i"
 	rvm_i=$((rvm_i + 1))
 done
-n=0
+`
+
+// guestDiskWait is the part of guestDiskFind that waits for the drives and
+// sets rvm_root and stage 1's positional arguments.
+const guestDiskWait = `n=0
 until rvm_scan; do
 	n=$((n + 1))
 	[ "$n" -gt 5 ] && rvm_fail "$rvm_missing"
@@ -316,6 +370,33 @@ rvm_i=0
 while [ "$rvm_i" -lt "$RVM_VOLUMES" ]; do
 	eval "set -- \"\$@\" \"\$rvm_dev_vol$rvm_i\""
 	rvm_i=$((rvm_i + 1))
+done
+`
+
+// guestStackDiskFind is guestDiskFind for a guest with a stack. After the
+// root and the volumes, it reads the identities of the stack and droplet
+// images, RVM_STACK_ID and RVM_DROPLET_ID, which must be ones rvm_ident
+// accepts and no other drive's, and adds the two drives, without a size, to
+// those rvm_scan waits for (see guestStackDiskFunc). It leaves their devices
+// in rvm_stack and rvm_droplet, which guestStackSetup mounts.
+const guestStackDiskFind = guestStackDiskFunc + guestDiskRead + guestStackDiskRead + guestDiskWait + `rvm_stack=$rvm_dev_stack
+rvm_droplet=$rvm_dev_droplet
+`
+
+// guestStackDiskRead adds the stack and droplet drives to rvm_drives.
+const guestStackDiskRead = `rvm_want_stack=${RVM_STACK_ID:-}
+rvm_label_stack="stack image drive"
+rvm_want_droplet=${RVM_DROPLET_ID:-}
+rvm_label_droplet="droplet image drive"
+for rvm_k in stack droplet; do
+	eval "rvm_w=\$rvm_want_$rvm_k rvm_l=\$rvm_label_$rvm_k"
+	rvm_ident "$rvm_w" || rvm_fail "the $rvm_l's identity in /rvm/disks is not 1 to ` + virtioBlockIDBytesText + ` letters, digits, and hyphens"
+	for rvm_d in $rvm_drives; do
+		eval "rvm_o=\$rvm_want_$rvm_d rvm_ol=\$rvm_label_$rvm_d"
+		[ "$rvm_o" != "$rvm_w" ] || rvm_fail "the $rvm_ol and the $rvm_l have the one identity $rvm_w in /rvm/disks, so the guest cannot tell them apart"
+	done
+	eval "rvm_sectors_$rvm_k="
+	rvm_drives="$rvm_drives $rvm_k"
 done
 `
 
@@ -420,12 +501,36 @@ fi
 // and a volume that does not flush or unmount turns a status of 0 into a
 // failure (see guestVolumeTeardown).
 func initScript(nonce string, volume bool) string {
-	setup := guestFailFunc + guestConsoleSetup + guestShmSetup + guestNetworkSetup + guestLimitsSetup + guestEnvChecks
+	return stage2Script(nonce, volume, false)
+}
+
+// stackInitScript is the guest /rvm/init of a guest with a stack, which
+// guestStackInit runs on the initramfs. It is initScript without volumes and
+// with three differences. It mounts no /dev/shm of its own, because the app
+// sees only the one stage 1 mounted in the app root. It checks /rvm/argv and
+// /rvm/cwd after /rvm/env (see guestStackChecks). And it runs the launcher
+// in the app root (see guestStackRunCommand) in place of /rvm/cmd.
+func stackInitScript(nonce string) string {
+	return stage2Script(nonce, false, true)
+}
+
+// stage2Script is initScript, or stackInitScript when stack is set.
+func stage2Script(nonce string, volume, stack bool) string {
+	setup := guestFailFunc + guestConsoleSetup
+	if !stack {
+		setup += guestShmSetup
+	}
+	setup += guestNetworkSetup + guestLimitsSetup + guestEnvChecks
+	command := guestRunCommand
+	if stack {
+		setup += guestStackChecks
+		command = guestStackRunCommand
+	}
 	if volume {
 		setup += guestVolumeSetup
 	}
 	setup += guestStopReader(nonce)
-	run := guestListenWatch(nonce) + guestRunCommand + guestRunStatus + guestStopReaderStop + guestListenStop + guestOOMReport(nonce)
+	run := guestListenWatch(nonce) + command + guestRunStatus + guestStopReaderStop + guestListenStop + guestOOMReport(nonce)
 	if volume {
 		run += guestVolumeTeardown
 	}
@@ -1523,6 +1628,12 @@ const sectorBytes = 512
 // identity, and volume drives that do not match the guest's volumes (see
 // volumesOnDrives) are an error, because stage 1 would then refuse to boot,
 // and a guess could format a volume or mount one at another's path.
+//
+// A guest with a stack also gets the identities of the stack and droplet
+// images, as RVM_STACK_ID and RVM_DROPLET_ID after the volumes, and no size
+// for either (see guestStackDiskFunc). A guest with a stack and without
+// both identities is an error, and so is one of the identities in a guest
+// without a stack, whose stage 1 would refuse the drive.
 func disksFile(g guestContents) (string, error) {
 	var b strings.Builder
 	d := g.drives
@@ -1567,6 +1678,15 @@ func disksFile(g guestContents) (string, error) {
 		}
 		named = append(named, namedDriveID{name: "drive " + drive, id: v.id})
 		fmt.Fprintf(&b, "RVM_VOL%d_KIND=%s\nRVM_VOL%d_ID=%s\nRVM_VOL%d_SECTORS=%d\n", n, v.kind, n, v.id, n, v.bytes/sectorBytes)
+	}
+	switch {
+	case g.stack == nil && d.stackID+d.dropletID != "":
+		return "", fmt.Errorf("drive identities %q and %q for no stack and droplet images", d.stackID, d.dropletID)
+	case g.stack != nil && (d.stackID == "" || d.dropletID == ""):
+		return "", fmt.Errorf("a guest with a stack needs the identities of both the stack image and the droplet image, and has %q and %q", d.stackID, d.dropletID)
+	case g.stack != nil:
+		named = append(named, namedDriveID{name: "the stack image", id: d.stackID}, namedDriveID{name: "the droplet image", id: d.dropletID})
+		fmt.Fprintf(&b, "RVM_STACK_ID=%s\nRVM_DROPLET_ID=%s\n", d.stackID, d.dropletID)
 	}
 	if err := checkDriveIDs(named, ""); err != nil {
 		return "", err
@@ -1643,6 +1763,70 @@ type guestContents struct {
 	// filesystem has a journal without sync and dirsync. The zero value
 	// keeps every image's mount synchronous.
 	noVolumeSync bool
+	// stack is what a guest that runs the app on its stack and droplet
+	// images needs in its initramfs (see guestStack), or nil for a guest
+	// that runs /rvm/cmd on busybox. The stack and droplet drives' identities
+	// are in drives.
+	stack *guestStack
+}
+
+// guestStack is the part of the initramfs of a guest with a stack that the
+// guest cannot take from its drives: the CF launcher, which goes at
+// /rvm/lifecycle/launcher and which stage 1 binds read-only into the app root
+// (see guestStackSetup), the launcher's whole argv quoted by shellJoin, for
+// /rvm/argv, the app's working directory, for /rvm/cwd, the container's
+// hostname, for /rvm/hostname, and its hosts file, for /rvm/hosts. The
+// caller closes the launcher after the initramfs is written.
+type guestStack struct {
+	launcher            guestTool
+	argv, cwd, hostname string
+	hosts               []byte
+}
+
+// maxGuestHostnameBytes caps the guest's hostname at Linux's HOST_NAME_MAX.
+const maxGuestHostnameBytes = 64
+
+// check returns an error for a stack the guest could not run. /rvm/argv is
+// capped at maxGuestCommandBytes, as /rvm/cmd is. Its quoting only adds bytes,
+// so every argument stays under the 128 KiB Linux allows one argument, and
+// the arguments and an environment within maxGuestEnvBytes stay well under
+// the 2 MiB that the launcher's execve can carry with the default stack
+// limit. The argv must not be empty, the working directory must be an
+// absolute path that the guest's $(cat) reads back unchanged, and the
+// hostname must be one hostname -F sets as it is. The stack guest mounts no
+// volumes while stackModeAllowsVolumes is false, so volumes are an error.
+func (s *guestStack) check(volumes int) error {
+	switch {
+	case volumes > 0 && !stackModeAllowsVolumes:
+		return fmt.Errorf("a guest with a stack mounts no volumes, and this one has %d", volumes)
+	case s.launcher.file == nil || s.launcher.size <= 0:
+		return errors.New("a guest with a stack needs the launcher, and it has none")
+	case s.argv == "":
+		return errors.New("a guest with a stack needs the launcher's argv, and it has none")
+	case len(s.argv) > maxGuestCommandBytes:
+		return fmt.Errorf("the launcher's argv is %d bytes quoted, over the %d bytes a guest takes", len(s.argv), maxGuestCommandBytes)
+	case !path.IsAbs(s.cwd) || strings.ContainsAny(s.cwd, "\n\x00"):
+		return fmt.Errorf("the app's working directory %q is not an absolute path on one line", s.cwd)
+	case s.hostname == "" || len(s.hostname) > maxGuestHostnameBytes || strings.Trim(s.hostname, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-") != "":
+		return fmt.Errorf("the guest hostname %q is not 1 to %d letters, digits, dots, and hyphens", s.hostname, maxGuestHostnameBytes)
+	}
+	return nil
+}
+
+// archiveSteps returns the archive steps that add the lifecycle directory,
+// the launcher, and the stack guest's command and host files.
+func (s *guestStack) archiveSteps(cw *cpioWriter, file func(name string, perm uint32, content string) func() error) []func() error {
+	lifecycle := strings.TrimPrefix(guestLifecycle, "/")
+	return []func() error{
+		func() error { return cw.Dir(lifecycle, 0o755) },
+		func() error {
+			return cw.File(lifecycle+"/launcher", 0o755, s.launcher.size, io.NewSectionReader(s.launcher.file, 0, s.launcher.size))
+		},
+		file(strings.TrimPrefix(guestArgv, "/"), 0o644, s.argv),
+		file(strings.TrimPrefix(guestCwd, "/"), 0o644, s.cwd),
+		file(strings.TrimPrefix(guestHosts, "/"), 0o644, string(s.hosts)),
+		file(strings.TrimPrefix(guestHostname, "/"), 0o644, s.hostname+"\n"),
+	}
 }
 
 // The guest filesystem tools. A guest with an image or block volume gets
@@ -1878,9 +2062,12 @@ func addSeals(f *os.File, seals int) error {
 // /rvm/limits, the drive identities and sizes as /rvm/disks, and the two
 // stages of the guest's boot that run it, /init and /rvm/init. With volumes
 // it also holds /rvm/mounts, and with a CA bundle it holds that at
-// /etc/ssl/certs/ca-certificates.crt. A hard open-files limit of 0 is an
-// error, because it is a limit no caller can have meant: vm-launch itself
-// could not run under it. So are drives that disksFile rejects.
+// /etc/ssl/certs/ca-certificates.crt. With a stack it also holds the
+// launcher at /rvm/lifecycle/launcher, /rvm/argv, /rvm/cwd, /rvm/hosts, and
+// /rvm/hostname, and its two stages are guestStackInit and stackInitScript.
+// A hard open-files limit of 0 is an error, because it is a limit no caller
+// can have meant: vm-launch itself could not run under it. So are drives
+// that disksFile rejects and a stack that guestStack.check rejects.
 func writeInitramfs(dst *os.File, busyboxPath string, g guestContents) error {
 	if g.nw == nil {
 		return errors.New("writing the initramfs: no guest network")
@@ -1919,7 +2106,13 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, g 
 	if err != nil {
 		return err
 	}
-	stage2 := initScript(g.nonce, len(g.vols) > 0)
+	stage1, stage2 := guestRootInit, initScript(g.nonce, len(g.vols) > 0)
+	if g.stack != nil {
+		if err := g.stack.check(len(g.vols)); err != nil {
+			return err
+		}
+		stage1, stage2 = guestStackInit, stackInitScript(g.nonce)
+	}
 	steps := []func() error{
 		func() error { return cw.Dir("bin", 0o755) },
 		func() error { return cw.Dir("dev", 0o755) },
@@ -1958,10 +2151,13 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, g 
 			file(bundle, 0o644, string(g.caBundle)),
 		)
 	}
+	if g.stack != nil {
+		steps = append(steps, g.stack.archiveSteps(cw, file)...)
+	}
 	steps = append(steps,
 		file("rvm/disks", 0o644, disks),
 		file(strings.TrimPrefix(guestStage2, "/"), 0o755, stage2),
-		file("init", 0o755, guestRootInit),
+		file("init", 0o755, stage1),
 		cw.Close,
 		gz.Close,
 		buf.Flush,

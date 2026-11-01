@@ -55,14 +55,17 @@ var _ = Describe("stage 1's tools in the guest's busybox", func() {
 		"rvm_want_root=rvm-root rvm_sectors_root=131072 rvm_label_root=\"guest root drive\"\n" +
 		"rvm_want_vol0=rvm-vol0 rvm_sectors_vol0=2097152 rvm_label_vol0=\"volume drive vol0\"\n"
 
-	// scan runs rvm_scan once in the guest's busybox against the sysfs
-	// tree sys, with the device files in dev in place of /dev, and returns
-	// what it printed and set, and its exit status.
-	scan := func(sys, dev string) (string, int) {
-		script := strings.Replace(guestFailFunc, "reboot -nf", "echo REBOOT", 1) +
-			strings.NewReplacer("/sys/block/", sys+"/", "/dev/${rvm_b", dev+"/${rvm_b").Replace(guestDiskFunc) + scanDrives +
-			`rvm_scan; echo "status=$? root=${rvm_dev_root:-} vol0=${rvm_dev_vol0:-} missing=$rvm_missing"`
-		out, err := exec.Command(guestBusybox(), "sh", "-c", script).CombinedOutput()
+	// stackScanDrives adds to scanDrives the stack and droplet drives, which
+	// have no size, as stage 1 of a guest with a stack sets them up.
+	const stackScanDrives = scanDrives + "rvm_drives=\"$rvm_drives stack droplet\"\n" +
+		"rvm_want_stack=rvm-stack rvm_sectors_stack= rvm_label_stack=\"stack image drive\"\n" +
+		"rvm_want_droplet=rvm-droplet rvm_sectors_droplet= rvm_label_droplet=\"droplet image drive\"\n"
+
+	// run runs script in the guest's busybox, with rvm_fail's reboot
+	// replaced by a line that says so, and returns what it printed and its
+	// exit status.
+	run := func(script string) (string, int) {
+		out, err := exec.Command(guestBusybox(), "sh", "-c", strings.Replace(guestFailFunc, "reboot -nf", "echo REBOOT", 1)+script).CombinedOutput()
 		if err != nil {
 			exitErr, ok := err.(*exec.ExitError)
 			Expect(ok).To(BeTrue(), "%v: %s", err, out)
@@ -70,6 +73,24 @@ var _ = Describe("stage 1's tools in the guest's busybox", func() {
 		}
 		return string(out), 0
 	}
+
+	// onTree points the drive search text at the sysfs tree sys and at the
+	// device files in dev in place of /dev.
+	onTree := func(text, sys, dev string) string {
+		return strings.NewReplacer("/sys/block/", sys+"/", "/dev/${rvm_b", dev+"/${rvm_b").Replace(text)
+	}
+
+	// scanWith runs rvm_scan from diskFunc once in the guest's busybox for
+	// drives, against the sysfs tree sys, with the device files in dev in
+	// place of /dev, and returns what it printed and set, and its exit
+	// status.
+	scanWith := func(diskFunc, drives, sys, dev string) (string, int) {
+		return run(onTree(diskFunc, sys, dev) + drives +
+			`rvm_scan; echo "status=$? root=${rvm_dev_root:-} vol0=${rvm_dev_vol0:-}${rvm_want_stack:+ stack=$rvm_dev_stack droplet=$rvm_dev_droplet} missing=$rvm_missing"`)
+	}
+
+	// scan is scanWith for the rvm.6 guest's rvm_scan and drives.
+	scan := func(sys, dev string) (string, int) { return scanWith(guestDiskFunc, scanDrives, sys, dev) }
 
 	// sysDisk adds the block device name to the sysfs tree sys with the
 	// identity serial, written without a newline as virtio_blk gives it,
@@ -169,6 +190,120 @@ var _ = Describe("stage 1's tools in the guest's busybox", func() {
 			"two block devices, /dev/vda and /dev/vdb, have the identity rvm-root of the guest root drive, so the guest cannot tell which one it is"),
 		Entry("a root of the volume's size", [3]string{"rvm-root", "rvm-vol0", "-"}, [3]string{"2097152", "2097152", ""},
 			"the guest root drive /dev/vda has 2097152 sectors, and /rvm/disks gives it 131072, so the guest will not use it"),
+	)
+
+	It("finds the rvm.6 drives alone with the stack guest's rvm_scan as the rvm.6 guest's finds them", func() {
+		dev := blockNodes("vda", "vdb")
+		sys := GinkgoT().TempDir()
+		sysDisk(sys, "vda", "rvm-vol0", "2097152")
+		sysDisk(sys, "vdb", "rvm-root", "131072")
+		want := "status=0 root=" + dev + "/vdb vol0=" + dev + "/vda missing=\n"
+		for _, diskFunc := range []string{guestDiskFunc, guestStackDiskFunc} {
+			out, code := scanWith(diskFunc, scanDrives, sys, dev)
+			Expect(code).To(Equal(0), out)
+			Expect(out).To(Equal(want))
+		}
+	})
+
+	It("finds the stack and droplet drives by their serials whatever their sizes, and still checks the sizes of the root and the volume", func() {
+		dev := blockNodes("vda", "vdb", "vdc", "vdd")
+		sys := GinkgoT().TempDir()
+		sysDisk(sys, "vda", "rvm-droplet", "8")
+		sysDisk(sys, "vdb", "rvm-root", "131072")
+		sysDisk(sys, "vdc", "rvm-stack", "1234567")
+		sysDisk(sys, "vdd", "rvm-vol0", "2097152")
+		out, code := scanWith(guestStackDiskFunc, stackScanDrives, sys, dev)
+		Expect(code).To(Equal(0), out)
+		Expect(out).To(Equal("status=0 root=" + dev + "/vdb vol0=" + dev + "/vdd stack=" + dev + "/vdc droplet=" + dev + "/vda missing=\n"))
+
+		Expect(os.WriteFile(filepath.Join(sys, "vdb", "size"), []byte("131080\n"), 0o444)).To(Succeed())
+		out, code = scanWith(guestStackDiskFunc, stackScanDrives, sys, dev)
+		Expect(code).To(Equal(1), out)
+		Expect(out).To(Equal("vm-launch guest setup: the guest root drive " + dev + "/vdb has 131080 sectors, and /rvm/disks gives it 131072, so the guest will not use it\nREBOOT\n"))
+	})
+
+	It("waits for a stack drive that has not appeared and names it", func() {
+		dev := blockNodes("vda", "vdb", "vdc")
+		sys := GinkgoT().TempDir()
+		sysDisk(sys, "vda", "rvm-root", "131072")
+		sysDisk(sys, "vdb", "rvm-vol0", "2097152")
+		sysDisk(sys, "vdc", "rvm-droplet", "8")
+		out, code := scanWith(guestStackDiskFunc, stackScanDrives, sys, dev)
+		Expect(code).To(Equal(0), out)
+		Expect(out).To(Equal("status=1 root=" + dev + "/vda vol0=" + dev + "/vdb stack= droplet=" + dev + "/vdc missing=no block device with the identity rvm-stack for the stack image drive\n"))
+	})
+
+	DescribeTable("fails the boot of a guest with a stack at once on a device no drive owns or two devices of one drive",
+		func(drives string, serials []string, line string) {
+			// The root and the volume have their own sizes, and every other
+			// device has one that no drive's size check would take.
+			sizes := map[string]string{"rvm-root": "131072", "rvm-vol0": "2097152"}
+			sys := GinkgoT().TempDir()
+			for i, serial := range serials {
+				size, ok := sizes[serial]
+				if !ok {
+					size = "8"
+				}
+				sysDisk(sys, "vd"+string(rune('a'+i)), serial, size)
+			}
+			out, code := scanWith(guestStackDiskFunc, drives, sys, "/dev")
+			Expect(code).To(Equal(1), out)
+			Expect(out).To(Equal("vm-launch guest setup: " + line + "\nREBOOT\n"))
+		},
+		Entry("an unnamed drive besides the rvm.6 drives", scanDrives, []string{"rvm-root", "rvm-vol0", "rvm-stack"},
+			"the block device /dev/vdc has the identity rvm-stack, which /rvm/disks gives no drive, so the guest will not boot with it"),
+		Entry("an unnamed drive besides the stack and droplet drives", stackScanDrives, []string{"rvm-root", "rvm-vol0", "rvm-stack", "rvm-droplet", "rvm-vol1"},
+			"the block device /dev/vde has the identity rvm-vol1, which /rvm/disks gives no drive, so the guest will not boot with it"),
+		Entry("a device without an identity besides the stack and droplet drives", stackScanDrives, []string{"rvm-stack", ""},
+			"the block device /dev/vdb has no identity, so it is no drive /rvm/disks names, and the guest will not boot with it"),
+		Entry("two devices with the stack's identity", stackScanDrives, []string{"rvm-stack", "rvm-stack"},
+			"two block devices, /dev/vda and /dev/vdb, have the identity rvm-stack of the stack image drive, so the guest cannot tell which one it is"),
+	)
+
+	// stackFind runs the stack guest's whole drive search in the guest's
+	// busybox for the /rvm/disks text disks, against the sysfs tree sys and
+	// the device files in dev, and returns what it printed and its exit
+	// status. It prints the devices it leaves and its positional arguments.
+	stackFind := func(disks, sys, dev string) (string, int) {
+		find := strings.Replace(onTree(guestStackDiskFind, sys, dev), ". /rvm/disks\n", ". "+shellQuote(writeTempFile("disks", disks))+"\n", 1)
+		return run(find + `echo "root=$rvm_root stack=$rvm_stack droplet=$rvm_droplet args=$#:$*"`)
+	}
+
+	It("reads the stack and droplet identities from /rvm/disks and leaves their devices for the app root's mounts", func() {
+		dev := blockNodes("vda", "vdb", "vdc")
+		sys := GinkgoT().TempDir()
+		sysDisk(sys, "vda", "rvm-stack", "40")
+		sysDisk(sys, "vdb", "rvm-root", "131072")
+		sysDisk(sys, "vdc", "rvm-droplet", "8")
+		out, code := stackFind("RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=131072\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUMES=0\nRVM_STACK_ID=rvm-stack\nRVM_DROPLET_ID=rvm-droplet\n", sys, dev)
+		Expect(code).To(Equal(0), out)
+		Expect(out).To(Equal("root=" + dev + "/vdb stack=" + dev + "/vda droplet=" + dev + "/vdc args=0:\n"))
+
+		// Without a root disk, the app root's upper layer is in RAM.
+		Expect(os.RemoveAll(filepath.Join(sys, "vdb"))).To(Succeed())
+		out, code = stackFind("RVM_VOLUMES=0\nRVM_STACK_ID=rvm-stack\nRVM_DROPLET_ID=rvm-droplet\n", sys, dev)
+		Expect(code).To(Equal(0), out)
+		Expect(out).To(Equal("root= stack=" + dev + "/vda droplet=" + dev + "/vdc args=0:\n"))
+	})
+
+	DescribeTable("fails the boot of a guest with a stack before it looks at a device when /rvm/disks cannot name the stack and droplet drives",
+		func(disks, line string) {
+			out, code := stackFind(disks, GinkgoT().TempDir(), "/dev")
+			Expect(code).To(Equal(1), out)
+			Expect(out).To(Equal("vm-launch guest setup: " + line + "\nREBOOT\n"))
+		},
+		Entry("no stack identity", "RVM_VOLUMES=0\nRVM_DROPLET_ID=rvm-droplet\n",
+			"the stack image drive's identity in /rvm/disks is not 1 to 20 letters, digits, and hyphens"),
+		Entry("no droplet identity", "RVM_VOLUMES=0\nRVM_STACK_ID=rvm-stack\n",
+			"the droplet image drive's identity in /rvm/disks is not 1 to 20 letters, digits, and hyphens"),
+		Entry("a droplet identity the guest cannot match", "RVM_VOLUMES=0\nRVM_STACK_ID=rvm-stack\nRVM_DROPLET_ID='rvm droplet'\n",
+			"the droplet image drive's identity in /rvm/disks is not 1 to 20 letters, digits, and hyphens"),
+		Entry("the stack with the root's identity", "RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=131072\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUMES=0\nRVM_STACK_ID=rvm-root\nRVM_DROPLET_ID=rvm-droplet\n",
+			"the guest root drive and the stack image drive have the one identity rvm-root in /rvm/disks, so the guest cannot tell them apart"),
+		Entry("the droplet with a volume's identity", "RVM_VOLUMES=1\nRVM_VOL0_KIND=image\nRVM_VOL0_ID=rvm-vol0\nRVM_VOL0_SECTORS=2097152\nRVM_STACK_ID=rvm-stack\nRVM_DROPLET_ID=rvm-vol0\n",
+			"the volume drive vol0 and the droplet image drive have the one identity rvm-vol0 in /rvm/disks, so the guest cannot tell them apart"),
+		Entry("the droplet with the stack's identity", "RVM_VOLUMES=0\nRVM_STACK_ID=rvm-stack\nRVM_DROPLET_ID=rvm-stack\n",
+			"the stack image drive and the droplet image drive have the one identity rvm-stack in /rvm/disks, so the guest cannot tell them apart"),
 	)
 
 	// The ext2 superblock starts 1024 bytes into the filesystem and keeps the
