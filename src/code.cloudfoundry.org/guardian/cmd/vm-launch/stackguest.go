@@ -179,7 +179,7 @@ func stackExec(p guestProcess) string {
 	for _, env := range p.envPaths {
 		line += ". " + env + " && "
 	}
-	return line + `eval "set -- $(cat ` + p.argvPath + `)" && ` + guestLoaderHold + `exec chroot ` + guestAppRoot + ` ` + guestStackDrop(shellQuote(p.dir))
+	return line + `eval "set -- $(` + guestRootCat + ` ` + p.argvPath + `)" && ` + guestLoaderHold + `exec ` + guestRootChroot + ` ` + guestAppRoot + ` ` + guestStackDrop(shellQuote(p.dir))
 }
 
 // guestSidecarChecks makes a broken sidecar argv or environment file a

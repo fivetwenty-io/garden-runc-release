@@ -75,12 +75,13 @@ exit "${LAUNCHER_RC:-0}"
 
 	// script returns text in the guest's shell, with the guest paths moved
 	// into the test directory, chroot called as the stub by path, because
-	// the guest's busybox runs its own applets before anything on PATH, and
-	// reboot replaced by a marker.
+	// the guest's busybox binary is not at /bin/busybox here, cat called
+	// through the test's busybox, and reboot replaced by a marker.
 	script := func(text string) string {
 		return strings.NewReplacer(
 			"reboot -nf", "echo REBOOT",
-			"exec chroot ", "exec "+filepath.Join(bin, "chroot")+" ",
+			"exec "+guestRootChroot+" ", "exec "+filepath.Join(bin, "chroot")+" ",
+			guestRootCat, guestBusybox()+" cat",
 			"/rvm/", dir+"/rvm/",
 		).Replace(text)
 	}

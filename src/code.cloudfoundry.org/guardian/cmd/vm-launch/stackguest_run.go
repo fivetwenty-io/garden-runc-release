@@ -12,6 +12,17 @@ const (
 	guestCwd  = "/rvm/cwd"
 )
 
+// guestRootCat and guestRootChroot are the two programs that the process
+// lines run as guest root, outside the app root, after they have sourced the
+// guest environment. They name the busybox applets by the path of the
+// busybox binary, so that the app's PATH, which /rvm/env exports, never
+// chooses the program. A busybox that looks on PATH before its applets would
+// otherwise run a program from the droplet as root.
+const (
+	guestRootCat    = "/bin/busybox cat"
+	guestRootChroot = "/bin/busybox chroot"
+)
+
 // guestRunPrefix is how the command's subshell starts in every guest (see
 // guestRunCommand, which starts with the same text, as a spec checks): it
 // gives stage 2's standard error to fd 3, records the subshell's pid in
@@ -41,10 +52,10 @@ const guestRunPrefix = "command exec 3>&2 2>/dev/null\n( command exec 2>&3 3>&-;
 // guest environment can set, because the guest environment may set any
 // name; the arguments and the working directory come from the files each
 // time, and guestLoaderHold reads only the loader variables, by names it
-// sets itself. A PATH from /rvm/env does not reach chroot or cat, which are
-// applets the guest's busybox runs before anything on PATH, and the stack's
+// sets itself. A PATH from /rvm/env does not choose chroot or cat, which are
+// named by the busybox binary's path (see guestRootCat), and the stack's
 // programs are named by their paths.
-var guestStackRunCommand = guestRunPrefix + `eval "set -- $(cat ` + guestArgv + `)" && ` + guestLoaderHold + `exec chroot ` + guestAppRoot + ` ` + guestStackDrop(`"$(cat `+guestCwd+`)"`) + ` ) </dev/null
+var guestStackRunCommand = guestRunPrefix + `eval "set -- $(` + guestRootCat + ` ` + guestArgv + `)" && ` + guestLoaderHold + `exec ` + guestRootChroot + ` ` + guestAppRoot + ` ` + guestStackDrop(`"$(`+guestRootCat+` `+guestCwd+`)"`) + ` ) </dev/null
 `
 
 // guestStackDrop is the end of the line that runs a process in the stack
