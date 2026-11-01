@@ -1043,12 +1043,20 @@ func (cmd *CommonCommand) wireExecutionBackends(log lager.Logger) (*executionBac
 
 	var vmStacks *vmstack.Builder
 	if kvmGid != 0 && len(cmd.ExecutionBackends.VMStackTarballs) > 0 {
+		// The whole-image check needs unsquashfs. Without it the builder
+		// falls back to trusting an image with a sound superblock.
+		unsquashfs := filepath.Join(cmd.ExecutionBackends.VMArtifactsDir, "unsquashfs")
+		if info, err := os.Stat(unsquashfs); err != nil || !info.Mode().IsRegular() {
+			log.Info("vm-stack-unsquashfs-unavailable", lager.Data{"path": unsquashfs})
+			unsquashfs = ""
+		}
 		vmStacks = vmstack.New(vmstack.Config{
-			Sqfstar:  filepath.Join(cmd.ExecutionBackends.VMArtifactsDir, "sqfstar"),
-			CacheDir: cmd.ExecutionBackends.VMStackCacheDir,
-			Tarballs: cmd.ExecutionBackends.VMStackTarballs,
-			Wait:     cmd.ExecutionBackends.VMStackWait,
-			Logger:   log.Session("vm-stack"),
+			Sqfstar:    filepath.Join(cmd.ExecutionBackends.VMArtifactsDir, "sqfstar"),
+			Unsquashfs: unsquashfs,
+			CacheDir:   cmd.ExecutionBackends.VMStackCacheDir,
+			Tarballs:   cmd.ExecutionBackends.VMStackTarballs,
+			Wait:       cmd.ExecutionBackends.VMStackWait,
+			Logger:     log.Session("vm-stack"),
 		})
 	}
 

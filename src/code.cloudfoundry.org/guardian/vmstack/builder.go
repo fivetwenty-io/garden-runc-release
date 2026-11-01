@@ -29,10 +29,16 @@ const (
 	tempPrefix      = "." + imageName + "-"
 	lockSuffix      = ".lock"
 	failureBackoff  = 60 * time.Second
+	maxBackoff      = 15 * time.Minute
 	buildTimeout    = 30 * time.Minute
+	verifyTimeout   = 5 * time.Minute
 	maxHashAttempts = 5
 	maxToolOutput   = 64 * 1024
 )
+
+// niceBinary is run by absolute path, because Garden runs as root and its PATH
+// must not decide which program a build starts.
+const niceBinary = "/usr/bin/nice"
 
 var errLocked = errors.New("another build holds the lock")
 
@@ -54,6 +60,11 @@ type Config struct {
 	// tarball's own sha256 and the build recipe, which is the recipe version,
 	// the sqfstar options, and the sqfstar binary's sha256.
 	CacheDir string
+	// Unsquashfs is the path of the static unsquashfs binary. When it is set,
+	// the builder checks the whole of each cached image once per process
+	// before it hands the image out, and rebuilds an image that fails. When
+	// it is empty, the builder trusts an image whose superblock is sound.
+	Unsquashfs string
 	// Tarballs lists the only tarballs the builder will build.
 	Tarballs []string
 	// Wait bounds how long Image waits for a build that is running.
@@ -66,18 +77,23 @@ type Config struct {
 // cache entry keeps a second Garden process from building the same image at
 // the same time.
 type Builder struct {
-	sqfstar  string
-	cacheDir string
-	wait     time.Duration
-	logger   lager.Logger
-	tarballs []string
-	listed   map[string]bool
+	sqfstar    string
+	unsquashfs string
+	cacheDir   string
+	wait       time.Duration
+	logger     lager.Logger
+	tarballs   []string
+	listed     map[string]bool
 
-	// backoff is how long a failed build keeps the next one from starting.
+	// backoff is how long the first failed build keeps the next one from
+	// starting. Each further failure of the same key doubles it, up to
+	// maxBackoff.
 	backoff time.Duration
 	// timeout bounds one run of sqfstar, so a hung build cannot hold its
 	// entry's lock for good.
 	timeout time.Duration
+	// verifyTimeout bounds one whole-image check the same way.
+	verifyTimeout time.Duration
 	// afterHash, when set, runs after each hash of a tarball and before the
 	// second stat, so a spec can rewrite the tarball part way.
 	afterHash func(path string)
@@ -87,7 +103,17 @@ type Builder struct {
 	tool     hashed
 	resolves map[string]*flight
 	builds   map[string]*flight
-	failures map[string]time.Time
+	failures map[string]failure
+	// verified holds the keys whose images passed the whole-image check in
+	// this process.
+	verified map[string]bool
+}
+
+// failure records the last failed build of a key and how long it keeps the
+// next try away.
+type failure struct {
+	at    time.Time
+	delay time.Duration
 }
 
 // fileID identifies a version of a tarball well enough to reuse its hash.
@@ -123,17 +149,20 @@ func New(config Config) *Builder {
 	}
 
 	b := &Builder{
-		sqfstar:  config.Sqfstar,
-		cacheDir: filepath.Clean(config.CacheDir),
-		wait:     config.Wait,
-		logger:   logger,
-		listed:   map[string]bool{},
-		backoff:  failureBackoff,
-		timeout:  buildTimeout,
-		hashes:   map[string]hashed{},
-		resolves: map[string]*flight{},
-		builds:   map[string]*flight{},
-		failures: map[string]time.Time{},
+		sqfstar:       config.Sqfstar,
+		unsquashfs:    config.Unsquashfs,
+		cacheDir:      filepath.Clean(config.CacheDir),
+		wait:          config.Wait,
+		logger:        logger,
+		listed:        map[string]bool{},
+		backoff:       failureBackoff,
+		timeout:       buildTimeout,
+		verifyTimeout: verifyTimeout,
+		hashes:        map[string]hashed{},
+		resolves:      map[string]*flight{},
+		builds:        map[string]*flight{},
+		failures:      map[string]failure{},
+		verified:      map[string]bool{},
 	}
 	for _, tarball := range config.Tarballs {
 		path := filepath.Clean(tarball)
@@ -187,9 +216,12 @@ func (b *Builder) Image(log lager.Logger, tarball string) (string, bool) {
 
 // WarmUp builds the image of every listed tarball that exists and returns
 // when every build has finished or failed, so callers run it in a goroutine.
+// It goes through the same resolutions and entry locks as Image, so a create
+// that arrives during the warm-up waits on the build that the warm-up started.
 func (b *Builder) WarmUp() {
 	log := b.logger.Session("warm-up")
 	start := time.Now()
+	log.Info("started", lager.Data{"tarballs": b.tarballs})
 
 	type pending struct {
 		tarball string
@@ -212,6 +244,7 @@ func (b *Builder) WarmUp() {
 		}
 		log.Info("vm-stack-image-ready", lager.Data{"tarball": p.tarball, "dir": p.f.dir, "elapsed": time.Since(start).String()})
 	}
+	log.Info("finished", lager.Data{"elapsed": time.Since(start).String()})
 }
 
 // Clean removes every cache entry whose key matches no listed tarball's
@@ -305,8 +338,9 @@ func (b *Builder) ready(path string) (string, bool) {
 		return "", false
 	}
 
-	dir := filepath.Join(b.cacheDir, entryKey(h.sum, recipe))
-	if checkImagePath(filepath.Join(dir, imageName)) != nil {
+	key := entryKey(h.sum, recipe)
+	dir := filepath.Join(b.cacheDir, key)
+	if checkImagePath(filepath.Join(dir, imageName)) != nil || !b.isVerified(key) {
 		return "", false
 	}
 	return dir, true
@@ -482,58 +516,28 @@ func (b *Builder) hash(log lager.Logger, path string) (string, error) {
 }
 
 // build returns the directory of the finished image for a key, building it
-// under the entry's lock when it is missing or damaged.
+// under the entry's lock when it is missing or damaged. Every failure after
+// the backoff check starts a backoff, so a cell that cannot finish a build
+// does not start a new one at every request.
 func (b *Builder) build(log lager.Logger, e entry, tarball string) (string, error) {
 	key := e.key
 	dir := filepath.Join(b.cacheDir, key)
 	image := filepath.Join(dir, imageName)
-	if checkImagePath(image) == nil {
+	if checkImagePath(image) == nil && b.isVerified(key) {
 		return dir, nil
 	}
 
 	b.mu.Lock()
-	failedAt, failed := b.failures[key]
+	last, failed := b.failures[key]
 	b.mu.Unlock()
-	if failed && time.Since(failedAt) < b.backoff {
-		return "", fmt.Errorf("the last build of %s failed %s ago, so the next try waits until %s have passed", tarball, time.Since(failedAt).Round(time.Second), b.backoff)
-	}
-
-	if err := os.MkdirAll(b.cacheDir, 0755); err != nil {
-		return "", err
-	}
-	lock, err := lockEntry(b.lockPath(key), true)
-	if err != nil {
-		return "", err
-	}
-	defer lock.Close()
-
-	// Another Garden process may have finished the image while this one
-	// waited for the lock.
-	if err := checkImagePath(image); err == nil {
-		return dir, nil
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		log.Info("removing-bad-image", lager.Data{"image": image, "reason": err.Error()})
-		if err := os.Remove(image); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return "", err
-		}
-	}
-
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return "", err
-	}
-	if err := os.Chmod(dir, 0755); err != nil {
-		return "", err
-	}
-	if err := removeTemps(dir); err != nil {
-		return "", err
+	if failed && time.Since(last.at) < last.delay {
+		return "", fmt.Errorf("the last build of %s failed %s ago, so the next try waits until %s have passed", tarball, time.Since(last.at).Round(time.Second), last.delay)
 	}
 
 	start := time.Now()
-	log.Info("building", lager.Data{"tarball": tarball})
-	if err := b.runSqfstar(e.sum, tarball, dir); err != nil {
-		b.mu.Lock()
-		b.failures[key] = time.Now()
-		b.mu.Unlock()
+	err := b.buildLocked(log, e, tarball)
+	if err != nil {
+		b.recordFailure(key, last, failed)
 		log.Error("build-failed", err, lager.Data{"tarball": tarball, "elapsed": time.Since(start).String()})
 		return "", err
 	}
@@ -541,8 +545,128 @@ func (b *Builder) build(log lager.Logger, e entry, tarball string) (string, erro
 	b.mu.Lock()
 	delete(b.failures, key)
 	b.mu.Unlock()
-	log.Info("built", lager.Data{"tarball": tarball, "image": image, "build-time": time.Since(start).String()})
 	return dir, nil
+}
+
+// recordFailure starts or lengthens the backoff of a key.
+func (b *Builder) recordFailure(key string, last failure, failed bool) {
+	delay := b.backoff
+	if failed {
+		delay = min(max(last.delay*2, b.backoff), max(maxBackoff, b.backoff))
+	}
+
+	b.mu.Lock()
+	b.failures[key] = failure{at: time.Now(), delay: delay}
+	b.mu.Unlock()
+}
+
+// buildLocked builds the image under the entry's lock unless another process
+// finished it while this one waited.
+func (b *Builder) buildLocked(log lager.Logger, e entry, tarball string) error {
+	key := e.key
+	dir := filepath.Join(b.cacheDir, key)
+	image := filepath.Join(dir, imageName)
+
+	if err := os.MkdirAll(b.cacheDir, 0755); err != nil {
+		return err
+	}
+	lock, err := lockEntry(b.lockPath(key), true)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+
+	// Another Garden process may have finished the image while this one
+	// waited for the lock.
+	err = checkImagePath(image)
+	if err == nil && !b.isVerified(key) {
+		err = b.verifyImage(image)
+	}
+	if err == nil {
+		b.markVerified(key)
+		return nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		log.Info("removing-bad-image", lager.Data{"image": image, "reason": err.Error()})
+		if err := os.Remove(image); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
+
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	if err := os.Chmod(dir, 0755); err != nil {
+		return err
+	}
+	if err := removeTemps(dir); err != nil {
+		return err
+	}
+
+	start := time.Now()
+	log.Info("building", lager.Data{"tarball": tarball})
+	if err := b.runSqfstar(e.sum, tarball, dir); err != nil {
+		return err
+	}
+
+	b.markVerified(key)
+	log.Info("built", lager.Data{"tarball": tarball, "image": image, "build-time": time.Since(start).String()})
+	return nil
+}
+
+func (b *Builder) isVerified(key string) bool {
+	if b.unsquashfs == "" {
+		return true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.verified[key]
+}
+
+func (b *Builder) markVerified(key string) {
+	b.mu.Lock()
+	b.verified[key] = true
+	b.mu.Unlock()
+}
+
+// verifyImage checks the whole of a cached image, which the superblock test
+// cannot do. It has unsquashfs read the superblock and then list every
+// directory, which walks all of the image's metadata, and it reads the file
+// to its end so that a medium error in a data block shows up as well. It does
+// nothing when no unsquashfs is configured.
+func (b *Builder) verifyImage(image string) error {
+	if b.unsquashfs == "" {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), b.verifyTimeout)
+	defer cancel()
+
+	for _, flag := range []string{"-s", "-ll"} {
+		output := &tailBuffer{max: maxToolOutput}
+		cmd := exec.CommandContext(ctx, niceBinary, "-n", "10", b.unsquashfs, flag, image)
+		cmd.Stdout = output
+		cmd.Stderr = output
+		cmd.WaitDelay = 10 * time.Second
+		if err := cmd.Run(); err != nil {
+			if ctx.Err() != nil {
+				err = fmt.Errorf("%w after %s", err, b.verifyTimeout)
+			}
+			// The error is formatted without %w so that a missing unsquashfs
+			// binary reads as a failed check, not as a missing image.
+			return fmt.Errorf("unsquashfs %s %s: %v: %s", flag, image, err, strings.TrimSpace(output.String()))
+		}
+	}
+
+	f, err := os.Open(image)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := io.Copy(io.Discard, f); err != nil {
+		return fmt.Errorf("read %s: %w", image, err)
+	}
+	return nil
 }
 
 // runSqfstar builds the image into a temporary file in dir and renames it
@@ -625,7 +749,7 @@ func (b *Builder) runSqfstar(want, tarball, dir string) error {
 // whole tarball and compresses it while the cell runs apps.
 func (b *Builder) sqfstarCommand(ctx context.Context, out string) *exec.Cmd {
 	args := append([]string{"-n", "10", b.sqfstar}, sqfstarArgs...)
-	return exec.CommandContext(ctx, "nice", append(args, out)...)
+	return exec.CommandContext(ctx, niceBinary, append(args, out)...)
 }
 
 func finishImage(img *os.File) error {
