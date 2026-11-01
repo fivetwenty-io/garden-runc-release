@@ -69,6 +69,13 @@ cp %[5]s "$out"
 		return hex.EncodeToString(h[:])
 	}
 
+	// keyOf is the cache key of a tarball for the fake sqfstar as it is now.
+	keyOf := func(path string) string {
+		recipe, err := New(config).recipe()
+		Expect(err).NotTo(HaveOccurred())
+		return entryKey(sum(path), recipe)
+	}
+
 	tempFiles := func(dir string) []string {
 		matches, err := filepath.Glob(filepath.Join(dir, tempPrefix+"*"))
 		Expect(err).NotTo(HaveOccurred())
@@ -115,7 +122,7 @@ cp %[5]s "$out"
 		}
 		wg.Wait()
 
-		want := filepath.Join(cacheDir, sum(tarball))
+		want := filepath.Join(cacheDir, keyOf(tarball))
 		for i := range dirs {
 			Expect(oks[i]).To(BeTrue())
 			Expect(dirs[i]).To(Equal(want))
@@ -176,7 +183,7 @@ cp %[5]s "$out"
 
 	DescribeTable("deletes a damaged image and builds it again",
 		func(content []byte) {
-			dir := filepath.Join(cacheDir, sum(tarball))
+			dir := filepath.Join(cacheDir, keyOf(tarball))
 			Expect(os.MkdirAll(dir, 0755)).To(Succeed())
 			Expect(os.WriteFile(filepath.Join(dir, imageName), content, 0644)).To(Succeed())
 
@@ -248,14 +255,14 @@ cp %[5]s "$out"
 		dir, ok := b.Image(logger, tarball)
 		Expect(ok).To(BeTrue())
 		Expect(hashes.Load()).To(Equal(int32(2)))
-		Expect(dir).To(Equal(filepath.Join(cacheDir, sum(tarball))))
+		Expect(dir).To(Equal(filepath.Join(cacheDir, keyOf(tarball))))
 		Expect(os.ReadFile(stdin)).To(Equal([]byte("the rewritten stack tarball\n")))
 		Expect(logger.LogMessages()).To(ContainElement(HaveSuffix("tarball-changed-while-hashing")))
 	})
 
 	It("discards a build when the tarball changes while sqfstar reads it", func() {
 		writeFake(0, fmt.Sprintf("echo more >> %s", tarball))
-		key := sum(tarball)
+		key := keyOf(tarball)
 
 		_, ok := New(config).Image(logger, tarball)
 		Expect(ok).To(BeFalse())
@@ -268,7 +275,7 @@ cp %[5]s "$out"
 		func(body, logged string) {
 			writeFake(0, body)
 			b := New(config)
-			dir := filepath.Join(cacheDir, sum(tarball))
+			dir := filepath.Join(cacheDir, keyOf(tarball))
 
 			_, ok := b.Image(logger, tarball)
 			Expect(ok).To(BeFalse())
@@ -284,7 +291,8 @@ cp %[5]s "$out"
 			b.backoff = 0
 			got, ok := b.Image(logger, tarball)
 			Expect(ok).To(BeTrue())
-			Expect(got).To(Equal(dir))
+			// The repaired sqfstar is a new binary, so the image has a new key.
+			Expect(got).To(Equal(filepath.Join(cacheDir, keyOf(tarball))))
 			Expect(runCount()).To(Equal(2))
 		},
 		Entry("when sqfstar exits with an error",
@@ -307,14 +315,14 @@ cp %[5]s "$out"
 		_, ok := b.Image(logger, tarball)
 		Expect(ok).To(BeFalse())
 		Expect(time.Since(start)).To(BeNumerically("<", 5*time.Second))
-		dir := filepath.Join(cacheDir, sum(tarball))
+		dir := filepath.Join(cacheDir, keyOf(tarball))
 		Expect(filepath.Join(dir, imageName)).NotTo(BeAnExistingFile())
 		Expect(tempFiles(dir)).To(BeEmpty())
 		Expect(string(logger.Buffer().Contents())).To(ContainSubstring("after 300ms"))
 	})
 
 	It("removes temporary files that an earlier build left behind", func() {
-		dir := filepath.Join(cacheDir, sum(tarball))
+		dir := filepath.Join(cacheDir, keyOf(tarball))
 		Expect(os.MkdirAll(dir, 0755)).To(Succeed())
 		stale := filepath.Join(dir, tempPrefix+"123456")
 		Expect(os.WriteFile(stale, []byte("partial"), 0644)).To(Succeed())
@@ -326,7 +334,7 @@ cp %[5]s "$out"
 	})
 
 	It("waits for another process's lock and uses the image that process finished", func() {
-		key := sum(tarball)
+		key := keyOf(tarball)
 		Expect(os.MkdirAll(cacheDir, 0755)).To(Succeed())
 		held, err := os.OpenFile(filepath.Join(cacheDir, key+lockSuffix), os.O_RDWR|os.O_CREATE, 0600)
 		Expect(err).NotTo(HaveOccurred())
@@ -358,7 +366,7 @@ cp %[5]s "$out"
 			b := New(config)
 
 			b.WarmUp()
-			Expect(filepath.Join(cacheDir, sum(tarball), imageName)).To(BeAnExistingFile())
+			Expect(filepath.Join(cacheDir, keyOf(tarball), imageName)).To(BeAnExistingFile())
 			Expect(runCount()).To(Equal(1))
 			Expect(logger.LogMessages()).To(ContainElement(HaveSuffix("vm-stack-image-ready")))
 			Expect(logger.LogMessages()).To(ContainElement(HaveSuffix("tarball-unavailable")))
@@ -379,6 +387,93 @@ cp %[5]s "$out"
 
 			_, ok = b.Image(logger, tarball)
 			Expect(ok).To(BeTrue())
+		})
+	})
+
+	Describe("the cache key", func() {
+		It("is 64 hex digits and differs from the tarball's own hash", func() {
+			key := keyOf(tarball)
+
+			Expect(isKey(key)).To(BeTrue())
+			Expect(key).NotTo(Equal(sum(tarball)))
+		})
+
+		It("changes when the sqfstar options change", func() {
+			before := keyOf(tarball)
+
+			saved := sqfstarArgs
+			defer func() { sqfstarArgs = saved }()
+			sqfstarArgs = append(append([]string{}, saved...), "-root-mode", "755")
+
+			Expect(keyOf(tarball)).NotTo(Equal(before))
+		})
+
+		It("changes when the sqfstar binary changes", func() {
+			before := keyOf(tarball)
+
+			writeFake(0, "# a newer sqfstar")
+
+			Expect(keyOf(tarball)).NotTo(Equal(before))
+		})
+
+		It("changes when the tarball changes and stays put otherwise", func() {
+			before := keyOf(tarball)
+			Expect(keyOf(tarball)).To(Equal(before))
+
+			Expect(os.WriteFile(tarball, []byte("another stack tarball\n"), 0644)).To(Succeed())
+
+			Expect(keyOf(tarball)).NotTo(Equal(before))
+		})
+
+		It("builds a new image and Clean removes the old one after the binary changes", func() {
+			b := New(config)
+			oldDir, ok := b.Image(logger, tarball)
+			Expect(ok).To(BeTrue())
+			Expect(runCount()).To(Equal(1))
+
+			writeFake(0, "# a newer sqfstar")
+
+			b = New(config)
+			newDir, ok := b.Image(logger, tarball)
+			Expect(ok).To(BeTrue())
+			Expect(newDir).NotTo(Equal(oldDir))
+			Expect(runCount()).To(Equal(2))
+
+			b.Clean()
+			Expect(oldDir).NotTo(BeAnExistingFile())
+			Expect(filepath.Join(cacheDir, filepath.Base(oldDir)+lockSuffix)).NotTo(BeAnExistingFile())
+			Expect(filepath.Join(newDir, imageName)).To(BeAnExistingFile())
+		})
+
+		It("builds a new image and Clean removes the old one after the options change", func() {
+			saved := sqfstarArgs
+			defer func() { sqfstarArgs = saved }()
+
+			oldDir, ok := New(config).Image(logger, tarball)
+			Expect(ok).To(BeTrue())
+
+			sqfstarArgs = append(append([]string{}, saved...), "-no-xattrs")
+
+			b := New(config)
+			newDir, ok := b.Image(logger, tarball)
+			Expect(ok).To(BeTrue())
+			Expect(newDir).NotTo(Equal(oldDir))
+
+			b.Clean()
+			Expect(oldDir).NotTo(BeAnExistingFile())
+			Expect(filepath.Join(newDir, imageName)).To(BeAnExistingFile())
+		})
+
+		It("notices a sqfstar binary that is replaced while the builder runs", func() {
+			b := New(config)
+			oldDir, ok := b.Image(logger, tarball)
+			Expect(ok).To(BeTrue())
+
+			writeFake(0, "# a newer sqfstar")
+
+			newDir, ok := b.Image(logger, tarball)
+			Expect(ok).To(BeTrue())
+			Expect(newDir).NotTo(Equal(oldDir))
 		})
 	})
 
@@ -403,7 +498,7 @@ cp %[5]s "$out"
 			Expect(filepath.Join(cacheDir, oldKey)).NotTo(BeAnExistingFile())
 			Expect(filepath.Join(cacheDir, oldKey+lockSuffix)).NotTo(BeAnExistingFile())
 			Expect(filepath.Join(dir, imageName)).To(BeAnExistingFile())
-			Expect(filepath.Join(cacheDir, sum(tarball)+lockSuffix)).To(BeAnExistingFile())
+			Expect(filepath.Join(cacheDir, keyOf(tarball)+lockSuffix)).To(BeAnExistingFile())
 			Expect(filepath.Join(cacheDir, "README")).To(BeAnExistingFile())
 		})
 

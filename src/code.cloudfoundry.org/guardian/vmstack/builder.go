@@ -40,11 +40,19 @@ var errLocked = errors.New("another build holds the lock")
 // guest kernels read lz4, and 128 KiB is the squashfs default block size.
 var sqfstarArgs = []string{"-comp", "lz4", "-b", "128K", "-mem", "256M", "-processors", "1", "-no-progress", "-quiet"}
 
+// recipeVersion names the way the builder turns a tarball into an image. It
+// goes into every cache key beside sqfstarArgs and the sqfstar binary's hash,
+// so a change to the build that those two do not show, such as a post-processing
+// step, bumps it by hand and retires every older image.
+const recipeVersion = "1"
+
 type Config struct {
 	// Sqfstar is the path of the static sqfstar binary.
 	Sqfstar string
-	// CacheDir holds one directory per tarball sha256, each with the image
-	// inside, and one lock file beside each directory.
+	// CacheDir holds one directory per cache key, each with the image inside,
+	// and one lock file beside each directory. A key is the sha256 of a
+	// tarball's own sha256 and the build recipe, which is the recipe version,
+	// the sqfstar options, and the sqfstar binary's sha256.
 	CacheDir string
 	// Tarballs lists the only tarballs the builder will build.
 	Tarballs []string
@@ -76,6 +84,7 @@ type Builder struct {
 
 	mu       sync.Mutex
 	hashes   map[string]hashed
+	tool     hashed
 	resolves map[string]*flight
 	builds   map[string]*flight
 	failures map[string]time.Time
@@ -91,6 +100,12 @@ type fileID struct {
 type hashed struct {
 	id  fileID
 	sum string
+}
+
+// entry is the result of keying a tarball. The sum is the tarball's own
+// sha256, and the key names its cache entry.
+type entry struct {
+	key, sum string
 }
 
 // flight is one piece of work that many callers can wait on. Its result
@@ -200,14 +215,14 @@ func (b *Builder) WarmUp() {
 }
 
 // Clean removes every cache entry whose key matches no listed tarball's
-// current hash. It keeps the whole cache when it cannot hash a listed
+// current key, which includes entries that an older build recipe made. It keeps the whole cache when it cannot hash a listed
 // tarball that exists, and it skips an entry whose lock another build holds.
 func (b *Builder) Clean() {
 	log := b.logger.Session("clean")
 
 	keep := map[string]bool{}
 	for _, path := range b.tarballs {
-		sum, err := b.key(log, path)
+		e, err := b.key(log, path)
 		if errors.Is(err, fs.ErrNotExist) {
 			continue
 		}
@@ -215,7 +230,7 @@ func (b *Builder) Clean() {
 			log.Error("keeping-cache", err, lager.Data{"tarball": path})
 			return
 		}
-		keep[sum] = true
+		keep[e.key] = true
 	}
 
 	entries, err := os.ReadDir(b.cacheDir)
@@ -285,7 +300,12 @@ func (b *Builder) ready(path string) (string, bool) {
 		return "", false
 	}
 
-	dir := filepath.Join(b.cacheDir, h.sum)
+	recipe, err := b.recipe()
+	if err != nil {
+		return "", false
+	}
+
+	dir := filepath.Join(b.cacheDir, entryKey(h.sum, recipe))
 	if checkImagePath(filepath.Join(dir, imageName)) != nil {
 		return "", false
 	}
@@ -317,10 +337,11 @@ func (b *Builder) resolve(path string) *flight {
 }
 
 func (b *Builder) resolveImage(log lager.Logger, path string) (string, error) {
-	key, err := b.key(log, path)
+	e, err := b.key(log, path)
 	if err != nil {
 		return "", err
 	}
+	key := e.key
 
 	b.mu.Lock()
 	f, ok := b.builds[key]
@@ -335,7 +356,7 @@ func (b *Builder) resolveImage(log lager.Logger, path string) (string, error) {
 		return f.dir, f.err
 	}
 
-	f.dir, f.err = b.build(log.Session("build", lager.Data{"key": key}), key, path)
+	f.dir, f.err = b.build(log.Session("build", lager.Data{"key": key}), e, path)
 
 	b.mu.Lock()
 	delete(b.builds, key)
@@ -344,10 +365,73 @@ func (b *Builder) resolveImage(log lager.Logger, path string) (string, error) {
 	return f.dir, f.err
 }
 
-// key returns the sha256 of a tarball. It reuses the last hash while the
+// key returns the cache key of a tarball, together with the tarball's own
+// sha256.
+func (b *Builder) key(log lager.Logger, path string) (entry, error) {
+	sum, err := b.hash(log, path)
+	if err != nil {
+		return entry{}, err
+	}
+
+	recipe, err := b.recipe()
+	if err != nil {
+		return entry{}, err
+	}
+
+	return entry{key: entryKey(sum, recipe), sum: sum}, nil
+}
+
+// entryKey is the sha256 of the recipe and the tarball's sha256, in the
+// 64 lowercase hex digits that isKey accepts.
+func entryKey(sum, recipe string) string {
+	key := sha256.Sum256([]byte(recipe + "\n" + sum))
+	return hex.EncodeToString(key[:])
+}
+
+// recipe returns a digest of everything about the build, other than the
+// tarball, that changes the image: the recipe version, the sqfstar options,
+// and the sqfstar binary's sha256. It reuses the binary's hash while its
+// device, inode, size, and modification time stay the same.
+func (b *Builder) recipe() (string, error) {
+	file, err := os.Open(b.sqfstar)
+	if err != nil {
+		return "", fmt.Errorf("hash sqfstar: %w", err)
+	}
+	defer file.Close()
+
+	id, err := fileIDOf(file)
+	if err != nil {
+		return "", fmt.Errorf("hash sqfstar: %w", err)
+	}
+
+	b.mu.Lock()
+	tool := b.tool
+	b.mu.Unlock()
+	if tool.sum == "" || tool.id != id {
+		hash := sha256.New()
+		if _, err := io.Copy(hash, file); err != nil {
+			return "", fmt.Errorf("hash sqfstar: %w", err)
+		}
+		tool = hashed{id: id, sum: hex.EncodeToString(hash.Sum(nil))}
+
+		b.mu.Lock()
+		b.tool = tool
+		b.mu.Unlock()
+	}
+
+	digest := sha256.New()
+	fmt.Fprintf(digest, "recipe %s\n", recipeVersion)
+	for _, arg := range sqfstarArgs {
+		fmt.Fprintf(digest, "arg %q\n", arg)
+	}
+	fmt.Fprintf(digest, "sqfstar %s\n", tool.sum)
+	return hex.EncodeToString(digest.Sum(nil)), nil
+}
+
+// hash returns the sha256 of a tarball. It reuses the last hash while the
 // tarball's device, inode, size, and modification time stay the same, and it
 // hashes again when they change while it reads.
-func (b *Builder) key(log lager.Logger, path string) (string, error) {
+func (b *Builder) hash(log lager.Logger, path string) (string, error) {
 	for attempt := 1; attempt <= maxHashAttempts; attempt++ {
 		file, err := os.Open(path)
 		if err != nil {
@@ -399,7 +483,8 @@ func (b *Builder) key(log lager.Logger, path string) (string, error) {
 
 // build returns the directory of the finished image for a key, building it
 // under the entry's lock when it is missing or damaged.
-func (b *Builder) build(log lager.Logger, key, tarball string) (string, error) {
+func (b *Builder) build(log lager.Logger, e entry, tarball string) (string, error) {
+	key := e.key
 	dir := filepath.Join(b.cacheDir, key)
 	image := filepath.Join(dir, imageName)
 	if checkImagePath(image) == nil {
@@ -445,7 +530,7 @@ func (b *Builder) build(log lager.Logger, key, tarball string) (string, error) {
 
 	start := time.Now()
 	log.Info("building", lager.Data{"tarball": tarball})
-	if err := b.runSqfstar(key, tarball, dir); err != nil {
+	if err := b.runSqfstar(e.sum, tarball, dir); err != nil {
 		b.mu.Lock()
 		b.failures[key] = time.Now()
 		b.mu.Unlock()
@@ -463,8 +548,8 @@ func (b *Builder) build(log lager.Logger, key, tarball string) (string, error) {
 // runSqfstar builds the image into a temporary file in dir and renames it
 // into place only once it is complete and on disk. The tarball streams
 // through a hash on its way to sqfstar, so an image never lands under a key
-// that its content does not match.
-func (b *Builder) runSqfstar(key, tarball, dir string) error {
+// whose tarball hash its content does not match.
+func (b *Builder) runSqfstar(want, tarball, dir string) error {
 	tmp, err := os.CreateTemp(dir, tempPrefix+"*")
 	if err != nil {
 		return err
@@ -513,8 +598,8 @@ func (b *Builder) runSqfstar(key, tarball, dir string) error {
 	if _, err := io.Copy(hash, src); err != nil {
 		return fmt.Errorf("hash %s: %w", tarball, err)
 	}
-	if sum := hex.EncodeToString(hash.Sum(nil)); sum != key {
-		return fmt.Errorf("%s changed during the build, from sha256 %s to %s", tarball, key, sum)
+	if sum := hex.EncodeToString(hash.Sum(nil)); sum != want {
+		return fmt.Errorf("%s changed during the build, from sha256 %s to %s", tarball, want, sum)
 	}
 
 	img, err := os.OpenFile(tmpPath, os.O_RDWR, 0)
