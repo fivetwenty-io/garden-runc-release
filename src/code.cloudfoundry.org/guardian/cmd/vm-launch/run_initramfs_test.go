@@ -627,6 +627,7 @@ var _ = Describe("the initramfs of a guest with a stack", func() {
 			if identity {
 				checks += guestIdentityEchoCheck(testNonce)
 			}
+			checks += guestRunSetup(identity)
 			section := guestRunSection(testNonce, g.stack.processes(), identity, stackExec)
 			plain := stackInitScript(testNonce)
 			Expect(strings.Count(plain, guestStopReader(testNonce))).To(Equal(1))

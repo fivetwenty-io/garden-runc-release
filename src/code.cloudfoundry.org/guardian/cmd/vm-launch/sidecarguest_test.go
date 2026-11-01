@@ -117,7 +117,7 @@ func startSection(shell guestShell, procs []guestProcess, identity bool, pair te
 	DeferCleanup(func() { _ = console.Close() })
 	r.console = console
 
-	section := guestRunSection(testNonce, procs, identity, stubGuestExec)
+	section := guestRunSetup(identity) + guestRunSection(testNonce, procs, identity, stubGuestExec)
 	script := strings.NewReplacer(
 		guestEvents, filepath.Join(dir, "events"),
 		"</dev/console", "<"+fifo,
@@ -441,7 +441,18 @@ var _ = Describe("the run section", func() {
 		}
 	})
 
-	It("installs the identity first only when it has one, and starts the reader with every pid file and each process through exec", func() {
+	It("sets up the identity first only when it has one, and the FIFO, and leaves both out of the section", func() {
+		without, with := guestRunSetup(false), guestRunSetup(true)
+		fifo := "mkfifo -m 0600 " + guestEvents + " || rvm_fail \"creating the event FIFO " + guestEvents + " failed\"\n"
+		Expect(without).To(Equal(fifo))
+		Expect(with).To(Equal(guestIdentitySetup + fifo))
+		section := guestRunSection(testNonce, sectionProcs(GinkgoT().TempDir(), []string{"exit 0"}, appEnv), true, stubGuestExec)
+		Expect(section).NotTo(ContainSubstring(guestIdentitySetup))
+		Expect(section).NotTo(ContainSubstring("mkfifo"))
+		Expect(section).To(HavePrefix("command exec 4<>" + guestEvents + " || rvm_fail"))
+	})
+
+	It("starts the reader with every pid file and each process through exec", func() {
 		procs := []guestProcess{
 			{index: 0, argvPath: "/a/argv", envPaths: []string{"/a/env"}, dir: "/a", pidPath: guestAppPid},
 			{index: 1, argvPath: guestSidecarFile(1, "argv"), envPaths: []string{"/a/env", guestSidecarFile(1, "env")}, dir: "/a", pidPath: guestSidecarFile(1, "pid")},
@@ -449,8 +460,6 @@ var _ = Describe("the run section", func() {
 		run := func(p guestProcess) string { return "run-process " + strconv.Itoa(p.index) }
 		without := guestRunSection(testNonce, procs, false, run)
 		with := guestRunSection(testNonce, procs, true, run)
-		Expect(without).NotTo(ContainSubstring(guestIdentitySetup))
-		Expect(with).To(HavePrefix(guestIdentitySetup))
 		Expect(with).To(ContainSubstring(guestControlReader(testNonce, []string{guestAppPid, "/rvm/sidecar/1/pid"}, true)))
 		Expect(without).To(ContainSubstring(guestControlReader(testNonce, []string{guestAppPid, "/rvm/sidecar/1/pid"}, false)))
 		for _, text := range []string{with, without} {

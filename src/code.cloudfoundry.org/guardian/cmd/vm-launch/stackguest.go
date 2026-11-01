@@ -125,8 +125,9 @@ func (s *guestStack) hasAppRoot() bool { return s != nil }
 // initScript is the stack guest's stage 2. A guest with sidecars or an
 // instance identity runs the app and its sidecars through the run section
 // (see guestRunSection), and checks each sidecar's files before the start
-// tag, as well as, with an identity, whether the console still echoes. Any
-// other stack guest runs stackInitScript.
+// tag, as well as, with an identity, whether the console still echoes. The
+// boot pair and the run section's FIFO are set up before the start tag too
+// (see guestRunSetup). Any other stack guest runs stackInitScript.
 func (s *guestStack) initScript(nonce string) string {
 	if len(s.sidecars) == 0 && s.identity == nil {
 		return stackInitScript(nonce)
@@ -136,6 +137,7 @@ func (s *guestStack) initScript(nonce string) string {
 	if s.identity != nil {
 		checks += guestIdentityEchoCheck(nonce)
 	}
+	checks += guestRunSetup(s.identity != nil)
 	return stage2Script(nonce, false, true, checks, guestRunSection(nonce, procs, s.identity != nil, stackExec))
 }
 

@@ -54,11 +54,12 @@ const (
 // once the app root is ready, in place of the single command subshell and
 // the stop reader. procs holds the app as process 0 and then each sidecar,
 // and exec gives the line that runs each one in the app root. With identity
-// set, the section first installs the boot pair (see guestIdentitySetup),
-// and its control reader installs each pair that vm-launch pushes.
+// set, its control reader installs each pair that vm-launch pushes. The
+// boot pair and guestEvents are already in place, from the setup steps
+// before the start tag (see guestRunSetup).
 //
-// The section creates guestEvents and holds it open for reading and writing
-// on fd 4, so its reads never see the end of the FIFO. It starts the control
+// The section holds guestEvents open for reading and writing on fd 4, so
+// its reads never see the end of the FIFO. It starts the control
 // reader with every process's pid file, and then runs every process and the
 // event loop as the elements of one pipeline. Their standard input and
 // output are not the pipe: each process gets /dev/null and stage 2's
@@ -88,10 +89,7 @@ const (
 // reader stopped.
 func guestRunSection(nonce string, procs []guestProcess, identity bool, exec guestExec) string {
 	var b strings.Builder
-	if identity {
-		b.WriteString(guestIdentitySetup)
-	}
-	b.WriteString(`mkfifo -m 0600 ` + guestEvents + ` && command exec 4<>` + guestEvents + ` || rvm_fail "creating the event FIFO ` + guestEvents + ` failed"
+	b.WriteString(`command exec 4<>` + guestEvents + ` || rvm_fail "opening the event FIFO ` + guestEvents + ` failed"
 `)
 	pidFiles := make([]string, len(procs))
 	for i, p := range procs {
@@ -105,6 +103,21 @@ func guestRunSection(nonce string, procs []guestProcess, identity bool, exec gue
 	b.WriteString(guestEventLoop(procs))
 	b.WriteString("rvm_status=$?\ncommand exec 4>&- 5>&-\n" + guestStopReaderStop)
 	return b.String()
+}
+
+// guestRunSetup is the setup step of a guest that runs the run section,
+// which stage 2 runs with the other setup steps, before the start tag. With
+// identity set, it installs the boot pair (see guestIdentitySetup), and it
+// then creates guestEvents. A failure of either is then a setup failure,
+// with the console shown, as every other setup step's is, and never output
+// of the command.
+func guestRunSetup(identity bool) string {
+	setup := ""
+	if identity {
+		setup = guestIdentitySetup
+	}
+	return setup + `mkfifo -m 0600 ` + guestEvents + ` || rvm_fail "creating the event FIFO ` + guestEvents + ` failed"
+`
 }
 
 // guestProcessName is how the guest's lines name process index.

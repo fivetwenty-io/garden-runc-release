@@ -20,12 +20,13 @@ const (
 )
 
 // guestEvents is the FIFO on which the run section learns that a process
-// has exited or that vm-launch asked for a stop. The run section creates it
-// and holds it open, and the control reader writes the stop to it.
+// has exited or that vm-launch asked for a stop. Setup creates it (see
+// guestRunSetup), the run section holds it open, and the control reader
+// writes the stop to it.
 const guestEvents = "/rvm/events"
 
-// guestIdentitySetup installs the boot pair for the app, as the first step
-// of the run section, before any process starts. It creates
+// guestIdentitySetup installs the boot pair for the app, as a setup step
+// before the start tag (see guestRunSetup), so before any process starts. It creates
 // /etc/cf-instance-credentials in the app root when the root lacks it,
 // mounts a tmpfs there with the options that keep the pair out of reach of
 // writes, devices, and programs, and copies both files into it with mode
