@@ -1759,6 +1759,10 @@ type guestContents struct {
 	// caBundle is the guest's CA bundle (see guestCABundle), or nil when
 	// there is no certificate to trust.
 	caBundle []byte
+	// systemCerts are the files of the directory CF_SYSTEM_CERT_PATH names
+	// (see readSystemCerts), or nil when there are none. A guest with a stack
+	// gets them through stack.systemCerts, which holds the same value.
+	systemCerts *systemCerts
 	// nofile is the command's open-files limit (see guestNofile), /rvm/limits.
 	nofile nofileLimit
 	// rootBytes is the size of the guest root image (see rootDiskSize), or
@@ -1804,6 +1808,9 @@ type guestStack struct {
 	// identity is the instance identity pair that the app finds in
 	// /etc/cf-instance-credentials, or nil for an app without one.
 	identity *instanceIdentity
+	// systemCerts are the trusted certificate files that the app finds at
+	// CF_SYSTEM_CERT_PATH, or nil for an app without any.
+	systemCerts *systemCerts
 }
 
 // guestSidecar is one sidecar's two files in the stack guest. argv is its
@@ -1877,7 +1884,8 @@ func (s *guestStack) archiveSteps(cw *cpioWriter, file func(name string, perm ui
 		file(strings.TrimPrefix(guestHostname, "/"), 0o644, s.hostname+"\n"),
 	}
 	steps = append(steps, s.guestSidecarSteps(cw, file)...)
-	return append(steps, s.guestIdentitySteps(cw, file)...)
+	steps = append(steps, s.guestIdentitySteps(cw, file)...)
+	return append(steps, s.systemCerts.stackSteps(cw)...)
 }
 
 // guestSidecarSteps adds, for a guest with sidecars, the directory
@@ -2240,6 +2248,8 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, g 
 	}
 	if g.stack != nil {
 		steps = append(steps, g.stack.archiveSteps(cw, file)...)
+	} else {
+		steps = append(steps, g.systemCerts.busyboxSteps(cw)...)
 	}
 	steps = append(steps,
 		file("rvm/disks", 0o644, disks),

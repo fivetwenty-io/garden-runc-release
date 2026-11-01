@@ -823,6 +823,11 @@ func run(argv []string, logger *log.Logger) int {
 		logger.Print(err)
 		return exitLaunchError
 	}
+	sysCerts, err := readSystemCerts(lookupEnv, logger)
+	if err != nil {
+		logger.Print(err)
+		return exitLaunchError
+	}
 	// SSL_CERT_FILE points a TLS library whose own default path is not
 	// guestCABundlePath, such as a static OpenSSL build, at the bundle. A
 	// value the app set itself stays.
@@ -834,7 +839,7 @@ func run(argv []string, logger *log.Logger) int {
 	// has settled the guest, after the work directory exists.
 	var envFile string
 	if stack == nil {
-		if envFile, err = buildGuestEnv(env, memMiB, logger); err != nil {
+		if envFile, err = buildGuestEnvWithCerts(env, memMiB, sysCerts.dirOf(), logger); err != nil {
 			logger.Print(err)
 			return exitLaunchError
 		}
@@ -890,7 +895,7 @@ func run(argv []string, logger *log.Logger) int {
 			if !toBusybox(strings.ReplaceAll(err.Error(), "\n", "; ")) {
 				return exitLaunchError
 			}
-			if envFile, err = buildGuestEnv(env, memMiB, logger); err != nil {
+			if envFile, err = buildGuestEnvWithCerts(env, memMiB, sysCerts.dirOf(), logger); err != nil {
 				logger.Print(err)
 				return exitLaunchError
 			}
@@ -915,14 +920,14 @@ func run(argv []string, logger *log.Logger) int {
 			logger.Print(err)
 			return exitLaunchError
 		}
-		stack.sidecars, stack.identity = files, identity
+		stack.sidecars, stack.identity, stack.systemCerts = files, identity, sysCerts
 		guestMode += guestExtrasLine(sidecars, identity)
 	} else if len(sidecars) > 0 {
 		logger.Print(sidecarsRefusal(len(sidecars), "the stack guest has no app root"))
 		return exitLaunchError
 	}
 	if stack != nil {
-		if envFile, err = buildStackGuestEnv(env, memMiB, identity != nil, logger); err != nil {
+		if envFile, err = buildStackGuestEnvWithCerts(env, memMiB, identity != nil, sysCerts.dirOf(), logger); err != nil {
 			logger.Print(err)
 			return exitLaunchError
 		}
@@ -1024,6 +1029,7 @@ func run(argv []string, logger *log.Logger) int {
 		vols:           vols,
 		drives:         drives,
 		caBundle:       caBundle,
+		systemCerts:    sysCerts,
 		nofile:         nofile,
 		rootBytes:      rootSize,
 		rootInodeRatio: rootInodeRatio,
