@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -341,6 +342,114 @@ var _ = Describe("the supervisor's stop path", func() {
 		gates.end()
 		Expect(res.markerFound).To(BeTrue())
 		Expect(openers[8080].got()).To(BeEmpty())
+	}, SpecTimeout(time.Minute))
+
+	It("gives the console writer to onConsole once the guest command starts, and reports the guest's acknowledgements", func(ctx SpecContext) {
+		push := "RVM_CRED_" + testNonce + "=begin 1"
+		var mu sync.Mutex
+		var acks []ackReport
+		sup.credAck = func(seq int, ok bool) {
+			mu.Lock()
+			defer mu.Unlock()
+			acks = append(acks, ackReport{seq, ok})
+		}
+		calls := 0
+		pushed := make(chan error, 1)
+		sup.onConsole = func(w *consoleWriter) {
+			calls++
+			go func() { pushed <- w.push([]string{push}) }()
+		}
+		sup.stdout = &signalOnWrite{w: out, signals: signals, sig: syscall.SIGTERM}
+		// The fake guest reads the push, acknowledges it, and then writes
+		// output, which brings the signal, and reads the stop request.
+		res, err := sup.run(fakeHypervisor(`trap 'exit 99' TERM INT; `+startLine+readRequest()+`printf 'RVM_CREDOK_`+testNonce+`=1\r\n'; echo ready; `+readRequest()+exitLine("0")), testNonce)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(codeOf(res)).To(Equal(0), logBuf.String())
+		Expect(calls).To(Equal(1))
+		Expect(pushed).To(Receive(BeNil()))
+		Expect(os.ReadFile(stdin)).To(Equal([]byte(push + "\n" + stopLine)))
+		Expect(out.String()).To(Equal("ready\n"))
+		mu.Lock()
+		defer mu.Unlock()
+		Expect(acks).To(Equal([]ackReport{{1, true}}))
+	}, SpecTimeout(time.Minute))
+
+	It("writes the stop request ahead of the rest of a push, and fails the push", func(ctx SpecContext) {
+		// Forty lines of 128 bytes make a push of 20 chunks, which takes
+		// about two seconds.
+		lines := pushLines(40)
+		pushed := make(chan error, 1)
+		var signalled time.Time
+		sup.onConsole = func(w *consoleWriter) {
+			go func() { pushed <- w.push(lines) }()
+			time.AfterFunc(250*time.Millisecond, func() {
+				signalled = time.Now()
+				signals <- syscall.SIGTERM
+			})
+		}
+		// The fake guest copies its console input to stdin until it reads
+		// the stop request.
+		res, err := sup.run(fakeHypervisor(`trap 'exit 99' TERM INT; `+startLine+`while IFS= read -r line; do printf '%s\n' "$line" >>'`+stdin+`'; [ "$line" = '`+stopTag(testNonce)+`' ] && break; done; `+exitLine("0")), testNonce)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(codeOf(res)).To(Equal(0), logBuf.String())
+		// What is left of the push would take another 1.7 s.
+		Expect(time.Since(signalled)).To(BeNumerically("<", time.Second))
+		Expect(pushed).To(Receive(MatchError(errConsoleStopped)))
+		got, err := os.ReadFile(stdin)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got).To(HaveSuffix(stopLine))
+		before := got[:len(got)-len(stopLine)]
+		Expect(len(before)).To(BeNumerically(">=", consoleChunk))
+		Expect(len(before)).To(BeNumerically("<", 10*consoleChunk))
+		Expect(joinLines(lines)).To(HavePrefix(string(before)))
+		Expect(logBuf.String()).To(Equal("received terminated, asking the guest command to stop\n"))
+	}, SpecTimeout(time.Minute))
+
+	It("never calls onConsole when a signal comes before the guest starts its command", func(ctx SpecContext) {
+		closed := filepath.Join(dir, "closed")
+		trapped := filepath.Join(dir, "trapped")
+		sup.closePorts = func() { Expect(os.WriteFile(closed, nil, 0o600)).To(Succeed()) }
+		sup.started = func() {
+			defer GinkgoRecover()
+			waitForFile(trapped)
+			signals <- syscall.SIGTERM
+		}
+		calls := 0
+		sup.onConsole = func(*consoleWriter) { calls++ }
+		// The guest ignores the forwarded signal and starts its command
+		// once the supervisor has acted on it.
+		res, err := sup.run(fakeHypervisor(`trap '' TERM; : >'`+trapped+`'; while [ ! -e '`+closed+`' ]; do sleep 0.02; done; `+startLine+`echo ready; sleep 0.3; `+exitLine("0")), testNonce)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.markerFound).To(BeTrue())
+		Expect(out.String()).To(Equal("ready\n"))
+		Expect(calls).To(BeZero())
+	}, SpecTimeout(time.Minute))
+
+	It("never calls onConsole when the guest has already reported its status", func(ctx SpecContext) {
+		// The console goroutine starts after started returns, by when the
+		// fake has written the start tag and the exit marker together, so
+		// the filter parses both in one write.
+		written := filepath.Join(dir, "written")
+		sup.started = func() {
+			defer GinkgoRecover()
+			waitForFile(written)
+		}
+		calls := 0
+		sup.onConsole = func(*consoleWriter) { calls++ }
+		res, err := sup.run(fakeHypervisor(`printf 'RVM_START_`+testNonce+`\r\nRVM_EXIT_`+testNonce+`=4\r\n'; : >'`+written+`'; sleep 0.3`), testNonce)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(codeOf(res)).To(Equal(4))
+		Expect(calls).To(BeZero())
+	}, SpecTimeout(time.Minute), MustPassRepeatedly(20))
+
+	It("fails a push once it has returned", func(ctx SpecContext) {
+		var console *consoleWriter
+		sup.onConsole = func(w *consoleWriter) { console = w }
+		res, err := sup.run(fakeHypervisor(startLine+`sleep 0.3; `+exitLine("0")), testNonce)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(codeOf(res)).To(Equal(0))
+		Expect(console).NotTo(BeNil())
+		Expect(console.push([]string{"RVM_CRED_" + testNonce + "=begin 1"})).To(MatchError(errConsoleStopped))
 	}, SpecTimeout(time.Minute))
 
 	DescribeTable("refuses a kill grace or stop deadline that is not positive, before it starts anything",
