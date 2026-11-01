@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -159,6 +160,11 @@ type Containerizer struct {
 	backendDispatch        bool
 	gvisorStreamer         Streamer
 	deviceReleaser         DeviceReleaser
+
+	// guestMemory holds the newest guest memory sample of each VM container,
+	// and guestFigure remembers which containers Metrics last answered from it.
+	guestMemory vmGuestMemory
+	guestFigure sync.Map
 }
 
 // Option configures a Containerizer collaborator that only some deployments need.
@@ -667,6 +673,9 @@ func (c *Containerizer) Destroy(log lager.Logger, handle string) error {
 		return err
 	}
 
+	c.guestMemory.Remove(handle)
+	c.guestFigure.Delete(handle)
+
 	// The cgroup removal fails while any process of the container is left,
 	// so its success shows that nothing holds the container's devices. When
 	// it fails, only a stopped state from the runtime lets the devices go. A
@@ -806,7 +815,38 @@ func (c *Containerizer) Metrics(log lager.Logger, handle string) (gardener.Actua
 
 	actualContainerMetrics.CPUEntitlement = calculateCPUEntitlement(getShares(bundle), c.cpuEntitlementPerShare, containerMetrics.Age)
 
+	if backend.IsVM(backend.FromBundle(bundle)) {
+		c.applyGuestMemory(log, handle, &actualContainerMetrics)
+	}
+
 	return actualContainerMetrics, nil
+}
+
+// applyGuestMemory replaces the cgroup's memory figure with the guest's used
+// memory, capped at the cgroup's limit when it has one, while the container has
+// a fresh sample. Without one the cgroup figure stays. It logs when the answer
+// moves between the two, and at no other time.
+func (c *Containerizer) applyGuestMemory(log lager.Logger, handle string, metrics *gardener.ActualContainerMetrics) {
+	sample, fresh := c.guestMemory.Fresh(handle)
+
+	if previous, loaded := c.guestFigure.Swap(handle, fresh); fresh != (loaded && previous.(bool)) {
+		if fresh {
+			log.Info("vm-memory-from-guest", lager.Data{"handle": handle})
+		} else {
+			log.Info("vm-memory-from-cgroup", lager.Data{"handle": handle})
+		}
+	}
+
+	if !fresh {
+		return
+	}
+
+	used := sample.Used
+	if limit := metrics.Memory.HierarchicalMemoryLimit; limit > 0 && used > limit {
+		used = limit
+	}
+
+	metrics.Memory.TotalUsageTowardLimit = used
 }
 
 func (c *Containerizer) Shutdown() error {
