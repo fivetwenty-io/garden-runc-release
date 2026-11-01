@@ -60,9 +60,10 @@ const (
 //
 // The section holds guestEvents open for reading and writing on fd 4, so
 // its reads never see the end of the FIFO. It starts the control
-// reader with every process's pid file, and then runs every process and the
+// reader with every process's pid file, defines the framer (see
+// guestFrameFunc) and the drain check, and then runs every process and the
 // event loop as the elements of one pipeline. Their standard input and
-// output are not the pipe: each process gets /dev/null and stage 2's
+// output are not the pipe: each wrapper gets /dev/null and stage 2's
 // console, which fd 5 keeps for them. A pipeline is the one way in which the
 // shell runs commands side by side and keeps the default action of SIGINT
 // and SIGQUIT in each, as runC does for a container's processes; a command
@@ -70,19 +71,16 @@ const (
 // both. The status of a pipeline is that of its last element, which is the
 // event loop, and the shell returns only once every element has ended.
 //
-// Each process runs in a wrapper subshell, which writes one line,
+// Each process runs in a wrapper subshell (see guestProcessWrapper), which
+// frames the process's output on the console and writes one line,
 // "exit <index> <status>", to the FIFO when the process ends. A short write
-// to a FIFO is atomic, so lines from several wrappers never mix. Inside the
-// wrapper, the process's own subshell records its pid, as the app's does in
-// the single-process guest (see guestRunCommand), sets the open-files limit,
-// and runs the line from exec. The wrapper gives its own standard error to
-// /dev/null, as stage 2 does while it waits for the single command, so the
-// shell's report of a process that a signal ended never reaches the console,
-// and the process takes the console back from fd 3. Neither fd 3, 4, nor 5
-// reaches the process. The wrappers and the event loop set their
-// oom_score_adj to -1000, as the stop reader does, so the guest kernel never
-// picks one of them and leaves a process whose exit no one reports; each
-// process sets its own back to 0, the value it would have had from stage 2.
+// to a FIFO is atomic, so lines from several wrappers never mix. No process
+// holds the console, so none can read the stop request's nonce from it or
+// write a line that vm-launch would take for the guest's own. The wrappers
+// and the event loop set their oom_score_adj to -1000, as the stop reader
+// does, so the guest kernel never picks one of them and leaves a process
+// whose exit no one reports; each process sets its own back to 0, the value
+// it would have had from stage 2.
 //
 // The event loop picks the status (see guestEventLoop). The section ends
 // with the status in rvm_status, the FIFO and fd 5 closed, and the control
@@ -96,28 +94,30 @@ func guestRunSection(nonce string, procs []guestProcess, identity bool, exec gue
 		pidFiles[i] = p.pidPath
 	}
 	b.WriteString(guestControlReader(nonce, pidFiles, identity))
+	b.WriteString(guestFrameFunc(nonce) + guestDrainFunc)
 	b.WriteString("command exec 5>&1\n")
 	for _, p := range procs {
 		b.WriteString(guestProcessWrapper(p, exec) + " |\n")
 	}
-	b.WriteString(guestEventLoop(procs))
+	b.WriteString(guestEventLoop(nonce, procs))
 	b.WriteString("rvm_status=$?\ncommand exec 4>&- 5>&-\n" + guestStopReaderStop)
 	return b.String()
 }
 
-// guestRunSetup is the setup step of a guest that runs the run section,
-// which stage 2 runs with the other setup steps, before the start tag. With
-// identity set, it installs the boot pair (see guestIdentitySetup), and it
-// then creates guestEvents. A failure of either is then a setup failure,
-// with the console shown, as every other setup step's is, and never output
-// of the command.
-func guestRunSetup(identity bool) string {
+// guestRunSetup is the setup step of a guest that runs the run section for
+// procs, which stage 2 runs with the other setup steps, before the start
+// tag. With identity set, it installs the boot pair (see
+// guestIdentitySetup), and it then creates guestEvents and the log FIFOs of
+// procs (see guestLogSetup). A failure of any of them is then a setup
+// failure, with the console shown, as every other setup step's is, and never
+// output of the command.
+func guestRunSetup(identity bool, procs []guestProcess) string {
 	setup := ""
 	if identity {
 		setup = guestIdentitySetup
 	}
 	return setup + `mkfifo -m 0600 ` + guestEvents + ` || rvm_fail "creating the event FIFO ` + guestEvents + ` failed"
-`
+` + guestLogSetup(procs)
 }
 
 // guestProcessName is how the guest's lines name process index.
@@ -128,33 +128,97 @@ func guestProcessName(index int) string {
 	return "sidecar " + strconv.Itoa(index)
 }
 
-// guestProcessWrapper is the pipeline element that runs p and reports its
-// exit on the FIFO (see guestRunSection). The pid is read from
+// guestProcessWrapper is the pipeline element that runs p, frames its
+// output, and reports its exit on the FIFO (see guestRunSection).
+//
+// The wrapper takes the console from fd 5 as its standard output and gives
+// its own standard error to /dev/null, as stage 2 does while it waits for
+// the single command, so the shell's report of a process that a signal ended
+// never reaches the console. It keeps stage 2's standard error, which is the
+// console too, on fd 3 for its one line about log FIFOs that do not open. It
+// starts a framer on each of p's FIFOs in the background (see
+// guestFrameFunc), with the console as its output and with fd 3 and fd 4
+// closed. A FIFO's open waits for the other end, so each framer starts
+// reading as the process's subshell opens the FIFO for writing.
+//
+// Inside the wrapper, the process's own subshell makes the two FIFOs its
+// standard output and standard error and closes fd 3 and fd 4, so the
+// process holds /dev/null, its two FIFOs, and nothing of stage 2's. A FIFO
+// that does not open ends the subshell before anything runs, so a process
+// never starts on the console. The subshell then records its pid, as the
+// app's does in the single-process guest (see guestRunCommand), sets the
+// open-files limit, and runs the line from exec. The pid is read from
 // /proc/self/stat with the shell's builtin read, so it is the subshell's and
 // not that of a child, and the exec line keeps it.
+//
+// Once the process has ended, the wrapper keeps its status and waits for
+// both framers to end (see guestDrainFunc), so that the process's last
+// lines are on the console before its exit line reaches the event loop and
+// the loop names the first exit.
 func guestProcessWrapper(p guestProcess, exec guestExec) string {
 	name := guestProcessName(p.index)
+	idx := strconv.Itoa(p.index)
+	out, errs := guestLogFIFO(p.index, "out"), guestLogFIFO(p.index, "err")
 	return `(
 	command exec >&5 5>&- </dev/null 3>&2 2>/dev/null
 	echo -1000 >/proc/self/oom_score_adj
+	read -r rvm_wrapper rvm_rest </proc/self/stat
+	rvm_frame ` + idx + ` o <` + out + ` 3>&- 4>&- &
+	rvm_out=$!
+	rvm_frame ` + idx + ` e <` + errs + ` 3>&- 4>&- &
+	rvm_err=$!
 	(
-		command exec 2>&3 3>&- 4>&-
+		command exec >` + out + ` 2>` + errs + ` 3>&- 4>&- || { echo "vm-launch guest: opening the log FIFOs of ` + name + ` failed; not starting it" >&3; exit 1; }
 		echo 0 >/proc/self/oom_score_adj
 		{ read -r rvm_self rvm_rest </proc/self/stat && echo "$rvm_self" >` + p.pidPath + `; } || echo "vm-launch guest: recording the pid of ` + name + ` in ` + p.pidPath + ` failed; a stop request cannot reach it"
 		` + guestSetLimits + ` || exit
 		` + exec(p) + `
 	)
-	echo "exit ` + strconv.Itoa(p.index) + ` $?" >&4
+	rvm_s=$?
+	rvm_drain "$rvm_out" "$rvm_err"
+	echo "exit ` + idx + ` $rvm_s" >&4
 )`
 }
+
+// guestDrainFunc defines rvm_drain, with which a wrapper waits for the two
+// framers whose pids it is given to end, and rvm_live, which reports
+// whether one still runs. A framer ends once every holder of its FIFO's
+// write end has closed it and it has written the last frame. The process
+// may have left a descendant that still holds the FIFO, though, so the wait
+// checks every 50 ms, up to 10 times, and a descendant holds back the exit
+// line by at most half a second; its framer goes on framing what the
+// descendant writes. rvm_live reads /proc/<pid>/stat with the shell's
+// builtin read. A framer that is a zombie or gone has ended, and so has a
+// pid whose parent is not the wrapper, which is a pid that the kernel gave
+// to another process after the shell reaped the framer.
+const guestDrainFunc = `rvm_live() {
+	read -r rvm_st 2>/dev/null </proc/"$1"/stat || return 1
+	rvm_st=${rvm_st##*") "}
+	case "$rvm_st" in
+	"Z "*) return 1 ;;
+	esac
+	rvm_st=${rvm_st#* }
+	[ "${rvm_st%% *}" = "$rvm_wrapper" ]
+}
+rvm_drain() {
+	rvm_n=0
+	while [ "$rvm_n" -lt 10 ] && { rvm_live "$1" || rvm_live "$2"; }; do
+		sleep 0.05
+		rvm_n=$((rvm_n + 1))
+	done
+}
+`
 
 // guestEventLoop is the last element of the run section's pipeline. It
 // reads the events from fd 4 until every process has exited, and its own
 // status is the status the guest reports.
 //
 // On the first exit, the status is that process's own. The loop then prints
-// a line that names the process and its status, sends SIGTERM to every
-// process that has not exited, and starts a timer. On a stop, which the
+// the first-exit line (see firstTag), which vm-launch takes off the output,
+// and, with sidecars, a line that names the process and its status, sends
+// SIGTERM to every process that has not exited, and starts a timer. The
+// process's wrapper has waited for its framers before it reported the exit,
+// so the first-exit line follows the process's last frame. On a stop, which the
 // control reader writes before it signals any process, the status is the
 // app's, because that is the process Diego asked to stop, and the loop
 // starts the timer. When the timer fires after guestTimeoutSeconds, the loop
@@ -177,7 +241,7 @@ func guestProcessWrapper(p guestProcess, exec guestExec) string {
 // before the trap is set ends the timer at once, before its sleep starts.
 // The shell's reports of a sleep or a timer that SIGTERM ended go to
 // /dev/null.
-func guestEventLoop(procs []guestProcess) string {
+func guestEventLoop(nonce string, procs []guestProcess) string {
 	var signal, names strings.Builder
 	for _, p := range procs {
 		idx := strconv.Itoa(p.index)
@@ -241,6 +305,7 @@ func guestEventLoop(procs []guestProcess) string {
 			if [ -z "$rvm_by" ]; then
 				rvm_by=exit
 				rvm_status=$rvm_s
+				echo "` + firstTag(nonce) + `$rvm_i $rvm_s"
 ` + first + `			fi
 			;;
 		stop)

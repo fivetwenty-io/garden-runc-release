@@ -169,10 +169,13 @@ func (s *guestStack) hasAppRoot() bool { return s != nil }
 // instance identity runs the app and its sidecars through the run section
 // (see guestRunSection), and checks each sidecar's files before the start
 // tag, as well as, with an identity, whether the console still echoes. The
-// boot pair and the run section's FIFO are set up before the start tag too
-// (see guestRunSetup), and so are the trusted certificate files, with or
-// without the rest (see guestSystemCertsSetup). Any other stack guest runs
-// stackInitScript.
+// boot pair, the run section's FIFO, and the log FIFOs of every process are
+// set up before the start tag too (see guestRunSetup), and so are the
+// trusted certificate files, with or without the rest (see
+// guestSystemCertsSetup). Such a guest frames the output of every process
+// (see guestProcessWrapper), so no process holds the console. Any other
+// stack guest runs stackInitScript, whose app shares the console with stage
+// 2.
 func (s *guestStack) initScript(nonce string) string {
 	certs := guestSystemCertsSetup(s.systemCerts)
 	if len(s.sidecars) == 0 && s.identity == nil {
@@ -183,7 +186,7 @@ func (s *guestStack) initScript(nonce string) string {
 	if s.identity != nil {
 		checks += guestIdentityEchoCheck(nonce)
 	}
-	checks += certs + guestRunSetup(s.identity != nil)
+	checks += certs + guestRunSetup(s.identity != nil, procs)
 	return stage2Script(nonce, false, true, checks, guestRunSection(nonce, procs, s.identity != nil, stackExec))
 }
 
