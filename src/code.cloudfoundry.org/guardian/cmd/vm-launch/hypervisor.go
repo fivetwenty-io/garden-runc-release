@@ -727,8 +727,8 @@ const maxStatusDigits = 3
 // maxPortDigits is the longest decimal TCP port number (65535).
 const maxPortDigits = 5
 
-// maxOOMDigits is the most digits an OOM count may have, which keeps the
-// count far inside an int.
+// maxOOMDigits is the most digits an OOM count or an acknowledged push's
+// sequence number may have, which keeps either far inside an int.
 const maxOOMDigits = 9
 
 // serialFilter turns the guest serial console into the guest command's
@@ -738,18 +738,24 @@ const maxOOMDigits = 9
 // listen line the guest writes while the command runs (see
 // guestListenWatch) and passes its state to the callback, which must not
 // block. It swallows the guest's OOM line too (see guestOOMReport) and keeps
-// its count in oomKills. A listen or OOM line can follow command output that
-// has no newline yet, so each is found anywhere in a line, and the output
-// around it is kept as it was. It never fails a Write, so the hypervisor's output keeps draining
+// its count in oomKills. With an acknowledgement callback, it swallows the
+// guest's acknowledgement of each identity push (see credOKTag and
+// credBadTag) and passes its sequence number to the callback, which must not
+// block either. A listen, OOM, or acknowledgement line can follow command
+// output that has no newline yet, so each is found anywhere in a line, and
+// the output around it is kept as it was. It never fails a Write, so the hypervisor's output keeps draining
 // when the destination breaks; the first destination error is kept in
 // writeErr.
 type serialFilter struct {
-	out       io.Writer
-	startTag  []byte
-	exitTag   []byte
-	listenTag []byte
-	oomTag    []byte
-	listen    func(port int, up bool)
+	out        io.Writer
+	startTag   []byte
+	exitTag    []byte
+	listenTag  []byte
+	oomTag     []byte
+	credOKTag  []byte
+	credBadTag []byte
+	listen     func(port int, up bool)
+	credAck    func(seq int, ok bool)
 
 	phase    int
 	pending  []byte
@@ -780,6 +786,14 @@ func newSerialFilter(out io.Writer, nonce string) *serialFilter {
 func (f *serialFilter) onListen(nonce string, listen func(port int, up bool)) {
 	f.listenTag = []byte(listenTag(nonce))
 	f.listen = listen
+}
+
+// onCredAck makes the filter pass the guest's acknowledgements of identity
+// pushes to ack, with ok set for a push the guest installed.
+func (f *serialFilter) onCredAck(nonce string, ack func(seq int, ok bool)) {
+	f.credOKTag = []byte(credOKTag(nonce))
+	f.credBadTag = []byte(credBadTag(nonce))
+	f.credAck = ack
 }
 
 func (f *serialFilter) Write(p []byte) (int, error) {
@@ -850,15 +864,8 @@ func (f *serialFilter) keepBootLog(b []byte) {
 func (f *serialFilter) processRun(eof bool) {
 	for {
 		idx := bytes.Index(f.pending, f.exitTag)
-		li := f.indexListen()
-		if oi := bytes.Index(f.pending, f.oomTag); oi >= 0 && (idx < 0 || oi < idx) && (li < 0 || oi < li) {
-			if !f.processOOM(oi, eof) {
-				return
-			}
-			continue
-		}
-		if li >= 0 && (idx < 0 || li < idx) {
-			if !f.processListen(li, eof) {
+		if li, kind := f.indexLine(); li >= 0 && (idx < 0 || li < idx) {
+			if !f.processLine(kind, li, eof) {
 				return
 			}
 			continue
@@ -887,19 +894,61 @@ func (f *serialFilter) processRun(eof bool) {
 		f.emitPending(len(f.pending), true)
 		return
 	}
-	hold := max(tagPrefixSuffix(f.pending, f.exitTag), tagPrefixSuffix(f.pending, f.oomTag))
-	if f.listenTag != nil {
-		hold = max(hold, tagPrefixSuffix(f.pending, f.listenTag))
+	hold := tagPrefixSuffix(f.pending, f.exitTag)
+	for _, tag := range f.lineTags() {
+		if tag != nil {
+			hold = max(hold, tagPrefixSuffix(f.pending, tag))
+		}
 	}
 	f.emitPending(len(f.pending)-hold, false)
 }
 
-// indexListen returns the index of the first listen tag in pending, or -1.
-func (f *serialFilter) indexListen() int {
-	if f.listenTag == nil {
-		return -1
+// The kinds of line, other than the exit marker, that the filter swallows
+// while the command runs, as indexes into lineTags.
+const (
+	lineOOM = iota
+	lineListen
+	lineCredOK
+	lineCredBad
+	lineKinds
+)
+
+// lineTags returns the tag of each kind of line the filter swallows while
+// the command runs, other than the exit marker, with nil for a kind it does
+// not look for.
+func (f *serialFilter) lineTags() [lineKinds][]byte {
+	return [lineKinds][]byte{lineOOM: f.oomTag, lineListen: f.listenTag, lineCredOK: f.credOKTag, lineCredBad: f.credBadTag}
+}
+
+// indexLine returns the index in pending of the first tag of a line that the
+// filter swallows, other than the exit marker, and the kind of that line, or
+// -1. No two of the tags can start at the same index, because each differs
+// from the others before its nonce.
+func (f *serialFilter) indexLine() (idx, kind int) {
+	idx = -1
+	for k, tag := range f.lineTags() {
+		if tag == nil {
+			continue
+		}
+		if i := bytes.Index(f.pending, tag); i >= 0 && (idx < 0 || i < idx) {
+			idx, kind = i, k
+		}
 	}
-	return bytes.Index(f.pending, f.listenTag)
+	return idx, kind
+}
+
+// processLine handles the tag of a line of the given kind at pending[idx:].
+func (f *serialFilter) processLine(kind, idx int, eof bool) bool {
+	switch kind {
+	case lineListen:
+		return f.processListen(idx, eof)
+	case lineOOM:
+		return f.processCount(f.oomTag, idx, eof, func(kills int) { f.oomKills = kills })
+	case lineCredOK:
+		return f.processCount(f.credOKTag, idx, eof, func(seq int) { f.credAck(seq, true) })
+	default:
+		return f.processCount(f.credBadTag, idx, eof, func(seq int) { f.credAck(seq, false) })
+	}
 }
 
 // processListen handles the listen tag at pending[idx:]. It reports false
@@ -914,7 +963,7 @@ func (f *serialFilter) processListen(idx int, eof bool) bool {
 		return false
 	}
 	if !ok {
-		// The tag ends in its only '=', and neither tag can start inside
+		// The tag ends in its only '=', and no other tag can start inside
 		// it, so scanning resumes right after it.
 		f.emitPending(idx+len(f.listenTag), true)
 		return true
@@ -925,23 +974,24 @@ func (f *serialFilter) processListen(idx int, eof bool) bool {
 	return true
 }
 
-// processOOM handles the OOM tag at pending[idx:] as processListen handles a
-// listen tag: a complete line leaves the output and sets oomKills, and
-// anything else after the tag is output.
-func (f *serialFilter) processOOM(idx int, eof bool) bool {
-	kills, n, ok, needMore := parseCount(f.pending[idx+len(f.oomTag):])
+// processCount handles a tag at pending[idx:] whose line carries a count, the
+// OOM line and both acknowledgements, as processListen handles a listen tag:
+// a complete line leaves the output and its count goes to take, and anything
+// else after the tag is output.
+func (f *serialFilter) processCount(tag []byte, idx int, eof bool, take func(int)) bool {
+	count, n, ok, needMore := parseCount(f.pending[idx+len(tag):])
 	if needMore && !eof {
 		f.emitPending(idx, false)
 		return false
 	}
 	if !ok {
 		// The tag ends in its only '=', so no tag can start inside it.
-		f.emitPending(idx+len(f.oomTag), true)
+		f.emitPending(idx+len(tag), true)
 		return true
 	}
 	f.emitPending(idx, true)
-	f.pending = append([]byte(nil), f.pending[len(f.oomTag)+n:]...)
-	f.oomKills = kills
+	f.pending = append([]byte(nil), f.pending[len(tag)+n:]...)
+	take(count)
 	return true
 }
 
@@ -998,9 +1048,9 @@ func parseStatus(b []byte) (status int, ok, needMore bool) {
 	}
 }
 
-// parseCount parses the bytes after an OOM tag: 1 to maxOOMDigits decimal
-// digits, then LF or CRLF. n is the length of what it parsed. needMore
-// reports that b ends before that can be decided.
+// parseCount parses the bytes after an OOM or acknowledgement tag: 1 to
+// maxOOMDigits decimal digits, then LF or CRLF. n is the length of what it
+// parsed. needMore reports that b ends before that can be decided.
 func parseCount(b []byte) (count, n int, ok, needMore bool) {
 	i := 0
 	for i < len(b) && i <= maxOOMDigits && b[i] >= '0' && b[i] <= '9' {
@@ -1115,7 +1165,9 @@ type runResult struct {
 // reported so far. While the guest's command runs, after the start tag and
 // before the exit marker, the supervisor writes the stop request (see
 // stopTag) once to the hypervisor's stdin, which is the guest's serial
-// console, and does not forward the signal. The guest's stop reader then
+// console, and does not forward the signal. It writes through a
+// consoleWriter, which identity pushes share, so the stop request goes ahead
+// of what remains of a push. The guest's stop reader then
 // sends SIGTERM to the command, which may finish its work, and /init reports
 // the command's status and powers off as after any other end of the command.
 // Before the start tag there is no command to stop, and after the exit
@@ -1165,6 +1217,17 @@ type supervisor struct {
 	// listen, when set, gets the guest's listen lines (see serialFilter). It
 	// must not block.
 	listen func(port int, up bool)
+	// credAck, when set, gets the guest's acknowledgements of identity pushes
+	// (see serialFilter). It must not block.
+	credAck func(seq int, ok bool)
+	// onConsole, when set, gets the writer of the guest's console input once
+	// the guest has started its command, so that vm-launch can push identity
+	// frames on it. The supervisor calls it once, from its own goroutine, and
+	// never when a signal came first or the guest has already reported its
+	// status. It must not block, so it starts any work of its own in a
+	// goroutine. The writer refuses pushes once the stop request is written
+	// and once run returns.
+	onConsole func(w *consoleWriter)
 	// reported, when set, runs once the supervisor has acted on the guest's
 	// status line, so a spec can send a signal that comes after it. It must
 	// not block. vm-launch leaves it unset.
@@ -1201,7 +1264,8 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 		serialOut.Close()
 		return runResult{}, fmt.Errorf("creating the hypervisor's stdin pipe: %w", err)
 	}
-	defer consoleIn.Close()
+	stdin := newConsoleWriter(consoleIn)
+	defer stdin.close()
 	growPipe(serial, s.logger)
 	cmd.Stdin, cmd.Stdout = console, serialOut
 	var release func()
@@ -1241,6 +1305,9 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 	if s.listen != nil {
 		filter.onListen(nonce, s.listen)
 	}
+	if s.credAck != nil {
+		filter.onCredAck(nonce, s.credAck)
+	}
 	type ended struct{ copyErr, waitErr error }
 	done := make(chan ended, 1)
 	go func() {
@@ -1255,7 +1322,7 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 	}()
 
 	var res runResult
-	markerSeen := filter.exited
+	startSeen, markerSeen := filter.startSeen, filter.exited
 	var kill <-chan time.Time
 	var killReason string
 	// signalled is set at the first signal, and asked once the stop request
@@ -1301,7 +1368,7 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 				s.logger.Printf("received %v, asking the guest command to stop", sig)
 			}
 			if started && !reported {
-				if err := requestStop(consoleIn, nonce); err != nil {
+				if err := stdin.stop(stopTag(nonce)); err != nil {
 					s.logger.Printf("sending the stop request to the guest failed: %v; forwarding %v to the hypervisor", err, sig)
 				} else {
 					asked = true
@@ -1317,6 +1384,13 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 			if kill == nil {
 				kill = time.After(s.deadline)
 				killReason = fmt.Sprintf("the guest did not stop within %v of the signal; killing the hypervisor", s.deadline)
+			}
+		case <-startSeen:
+			startSeen = nil
+			// The console input carries more than the stop request only
+			// while the guest command runs and no signal has come.
+			if s.onConsole != nil && !signalled && !isClosed(filter.exited) {
+				s.onConsole(stdin)
 			}
 		case <-markerSeen:
 			markerSeen = nil
@@ -1404,18 +1478,9 @@ func isClosed(ch <-chan struct{}) bool {
 	}
 }
 
-// stopRequestTimeout bounds the write of the stop request. The request is
-// one short write into a pipe that nothing else writes, so it does not
-// block; the bound only keeps a hypervisor that never reads its stdin, with
-// the pipe full, from holding up the supervisor.
+// stopRequestTimeout bounds each write to the hypervisor's stdin, the stop
+// request's and each chunk of an identity push's. Those writes are short and
+// go into a pipe that only consoleWriter writes, so they do not block; the
+// bound only keeps a hypervisor that never reads its stdin, with the pipe
+// full, from holding up the supervisor.
 const stopRequestTimeout = time.Second
-
-// requestStop writes the stop request (see stopTag), one line, to the
-// hypervisor's stdin w.
-func requestStop(w *os.File, nonce string) error {
-	if err := w.SetWriteDeadline(time.Now().Add(stopRequestTimeout)); err != nil && !errors.Is(err, os.ErrNoDeadline) {
-		return err
-	}
-	_, err := w.WriteString(stopTag(nonce) + "\n")
-	return err
-}
