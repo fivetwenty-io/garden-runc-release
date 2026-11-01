@@ -56,12 +56,9 @@ func newQEMUGuestStats(monitor *qmpMonitor) *qemuGuestStats {
 }
 
 // Enable turns on QEMU's polling of the guest. The device reports nothing
-// until it is on.
+// until it is on. It gives up when ctx ends, and the monitor stays usable.
 func (s *qemuGuestStats) Enable(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	_, err := s.monitor.command("qom-set", map[string]any{
+	_, err := s.monitor.commandContext(ctx, "qom-set", map[string]any{
 		"path":     qemuBalloonPath,
 		"property": "guest-stats-polling-interval",
 		"value":    qemuStatsIntervalSeconds,
@@ -87,12 +84,12 @@ type qemuGuestStatsReply struct {
 // Read returns the newest sample. It fails when the guest has not sent all
 // four memory statistics, and when the guest's last answer has not changed
 // for 30 seconds, because a guest that stops answering leaves its old
-// numbers in place.
+// numbers in place. It gives up when ctx ends, even while it waits for the
+// monitor or for QEMU's reply, so a stop never waits behind it, and the
+// monitor stays usable for the port gates. A monitor that is broken for good
+// gives an error that says it is fatal (see qmpBrokenError).
 func (s *qemuGuestStats) Read(ctx context.Context) (guestMemorySample, error) {
-	if err := ctx.Err(); err != nil {
-		return guestMemorySample{}, err
-	}
-	ret, err := s.monitor.command("qom-get", map[string]any{
+	ret, err := s.monitor.commandContext(ctx, "qom-get", map[string]any{
 		"path":     qemuBalloonPath,
 		"property": "guest-stats",
 	})

@@ -320,7 +320,7 @@ var _ = Describe("run with a volume", func() {
 
 		argv, err := os.ReadFile(argvFile)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(string(argv)).To(HaveSuffix("\n" + strings.Join(goldenQEMUDrive, "\n") + "\n"))
+		Expect(string(argv)).To(HaveSuffix("\n" + strings.Join(concat(goldenQEMUDrive, goldenQEMUMonitor("5"), goldenQEMUBalloon), "\n") + "\n"))
 		Expect(string(argv)).To(ContainSubstring("\n-initrd\n/proc/self/fd/4\n"))
 		Expect(string(argv)).NotTo(ContainSubstring(volDir))
 
@@ -340,7 +340,7 @@ var _ = Describe("run with a volume", func() {
 		sizesFile := filepath.Join(GinkgoT().TempDir(), "sizes")
 		writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), fdThreeChecks(img)+initramfsAt("4")+
 			`cp "$initrd" `+shellQuote(initrdCopy)+` || exit 1
-stat -L -c %s /proc/self/fd/3 /proc/self/fd/5 >`+shellQuote(sizesFile)+` || exit 1
+stat -L -c %s /proc/self/fd/3 /proc/self/fd/6 >`+shellQuote(sizesFile)+` || exit 1
 `)
 		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
 
@@ -560,7 +560,7 @@ var _ = Describe("run with several volumes", func() {
 
 		argv, err := os.ReadFile(argvFile)
 		Expect(err).NotTo(HaveOccurred())
-		drives := concat(goldenQEMUVolumeDrive(0, "3"), goldenQEMUVolumeDrive(1, "4"), goldenQEMUVolumeDrive(2, "5"), goldenQEMUVolumeDrive(3, "6"))
+		drives := concat(goldenQEMUVolumeDrive(0, "3"), goldenQEMUVolumeDrive(1, "4"), goldenQEMUVolumeDrive(2, "5"), goldenQEMUVolumeDrive(3, "6"), goldenQEMUMonitor("8"), goldenQEMUBalloon)
 		Expect(string(argv)).To(HaveSuffix("\n" + strings.Join(drives, "\n") + "\n"))
 		Expect(string(argv)).To(ContainSubstring("\n-initrd\n/proc/self/fd/7\n"))
 		for i, img := range imgs {
@@ -586,7 +586,7 @@ var _ = Describe("run with several volumes", func() {
 
 		argv, err := os.ReadFile(argvFile)
 		Expect(err).NotTo(HaveOccurred())
-		drives := concat(goldenQEMUVolumeDrive(0, "3"), goldenQEMUVolumeDrive(1, "4"), goldenQEMUVolumeDrive(2, "5"), goldenQEMUVolumeDrive(3, "6"))
+		drives := concat(goldenQEMUVolumeDrive(0, "3"), goldenQEMUVolumeDrive(1, "4"), goldenQEMUVolumeDrive(2, "5"), goldenQEMUVolumeDrive(3, "6"), goldenQEMUMonitor("8"), goldenQEMUBalloon)
 		Expect(string(argv)).To(HaveSuffix("\n" + strings.Join(drives, "\n") + "\n"))
 		for i, img := range imgs {
 			Expect(string(argv)).NotTo(ContainSubstring(dirs[i]))

@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -448,10 +449,13 @@ const qmpTimeout = 10 * time.Second
 // capabilities only when their negotiation is already complete, which
 // cannot happen on a socket that only vm-launch uses, so a refusal means a
 // monitor that vm-launch cannot use, and sending them again would not help.
+// The error of a broken monitor says it is fatal (see qmpBrokenError).
 type qmpMonitor struct {
-	// mu serializes commands, which the gates of different ports send from
-	// their own goroutines.
-	mu      sync.Mutex
+	// lock serializes commands, which the gates of different ports and the
+	// guest memory poller send from their own goroutines. It holds a token
+	// while a command runs, so a command with a context can stop waiting
+	// for it.
+	lock    chan struct{}
 	conn    net.Conn
 	r       *bufio.Reader
 	timeout time.Duration
@@ -467,7 +471,7 @@ type qmpMonitor struct {
 }
 
 func newQMPMonitor(conn net.Conn) *qmpMonitor {
-	return &qmpMonitor{conn: conn, r: bufio.NewReader(conn), timeout: qmpTimeout}
+	return &qmpMonitor{lock: make(chan struct{}, 1), conn: conn, r: bufio.NewReader(conn), timeout: qmpTimeout}
 }
 
 // qmpMessage is any message QEMU sends on its QMP monitor: the greeting, a
@@ -502,14 +506,51 @@ func (m *qmpMonitor) humanCommand(line string) (string, error) {
 // returns its return value. It holds the monitor's lock for the whole
 // exchange, so commands from different goroutines never interleave.
 func (m *qmpMonitor) command(name string, args any) (json.RawMessage, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	return m.commandContext(context.Background(), name, args)
+}
+
+// commandContext is command, and it gives up when ctx ends: while it waits
+// for the lock, and while it waits for a reply, which then counts as one
+// that timed out, so the monitor stays usable and the next command skips the
+// late reply. ctx never cuts a write short, because a request cut off part
+// way would leave the monitor broken. A command that gives up while it
+// waits for a reply returns an error that matches os.ErrDeadlineExceeded.
+func (m *qmpMonitor) commandContext(ctx context.Context, name string, args any) (json.RawMessage, error) {
+	select {
+	case m.lock <- struct{}{}:
+	case <-ctx.Done():
+		return nil, fmt.Errorf("QMP %s: %w", name, ctx.Err())
+	}
+	defer func() { <-m.lock }()
 	if m.broken != nil {
 		return nil, m.broken
 	}
-	if err := m.conn.SetDeadline(time.Now().Add(m.timeout)); err != nil {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("QMP %s: %w", name, err)
+	}
+	deadline := time.Now().Add(m.timeout)
+	if err := m.conn.SetWriteDeadline(deadline); err != nil {
 		return nil, m.fail(fmt.Errorf("QMP: setting a deadline: %w", err))
 	}
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	if err := m.conn.SetReadDeadline(deadline); err != nil {
+		return nil, m.fail(fmt.Errorf("QMP: setting a deadline: %w", err))
+	}
+	// An end of ctx moves the read deadline into the past. The function
+	// has finished before the lock is released, so it never moves the
+	// deadline of the next command.
+	cut := make(chan struct{})
+	stopCut := context.AfterFunc(ctx, func() {
+		_ = m.conn.SetReadDeadline(time.Unix(1, 0))
+		close(cut)
+	})
+	defer func() {
+		if !stopCut() {
+			<-cut
+		}
+	}()
 	if !m.greeted {
 		msg, err := m.read()
 		if err != nil {
@@ -583,11 +624,21 @@ func (m *qmpMonitor) await(command string, id uint64) (json.RawMessage, error) {
 	}
 }
 
-// fail marks the monitor broken with err and returns err.
+// fail marks the monitor broken with err and returns the monitor's error,
+// which every later command returns too.
 func (m *qmpMonitor) fail(err error) error {
-	m.broken = err
-	return err
+	m.broken = qmpBrokenError{err: err}
+	return m.broken
 }
+
+// qmpBrokenError is the error of a monitor that is broken for good. It
+// matches what it wraps, such as io.EOF, and it says it is fatal, so the
+// guest memory poller stops on it instead of reading again.
+type qmpBrokenError struct{ err error }
+
+func (e qmpBrokenError) Error() string { return e.err.Error() }
+func (e qmpBrokenError) Unwrap() error { return e.err }
+func (e qmpBrokenError) Fatal() bool   { return true }
 
 // readFailed returns err, a failure of read, and marks the monitor broken
 // with it unless it is a timeout.

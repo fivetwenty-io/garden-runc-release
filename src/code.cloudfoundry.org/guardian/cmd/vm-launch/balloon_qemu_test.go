@@ -5,6 +5,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"log"
+	"net"
+	"os"
 	"strings"
 	"time"
 
@@ -212,6 +216,125 @@ var _ = Describe("the QEMU balloon", func() {
 			Expect(err).To(MatchError(ContainSubstring("a line that is not a QMP message")))
 			_, err = source.Read(context.Background())
 			Expect(err).To(MatchError(ContainSubstring("a line that is not a QMP message")))
+			Expect(isBrokenSource(err)).To(BeTrue())
+		})
+
+		It("fails for good once QEMU closes the monitor", func() {
+			done := qemu.serve(func() {
+				handshake()
+				qemu.recv()
+				Expect(qemu.conn.(*net.UnixConn).CloseWrite()).To(Succeed())
+			})
+			_, err := source.Read(context.Background())
+			Expect(err).To(MatchError(io.EOF))
+			Expect(isBrokenSource(err)).To(BeTrue())
+			Eventually(done).Should(BeClosed())
+		})
+
+		It("fails a read that times out only for that read", func() {
+			m, _ := newFakeQMP()
+			m.timeout = 100 * time.Millisecond
+			_, err := newQEMUGuestStats(m).Read(context.Background())
+			Expect(err).To(MatchError(os.ErrDeadlineExceeded))
+			Expect(isBrokenSource(err)).To(BeFalse())
+		})
+
+		It("stops waiting for QEMU's reply when its context ends, and leaves the monitor to the port gates", func() {
+			m, q := newFakeQMP()
+			s := newQEMUGuestStats(m)
+			sent := make(chan struct{})
+			late := make(chan struct{})
+			done := q.serve(func() {
+				q.send(fakeGreeting)
+				q.recv()
+				q.reply(`{"return": {}}`)
+				Expect(q.recv()).To(Equal(qomRequest(2, "qom-get", "guest-stats", "")))
+				close(sent)
+				<-late
+				q.reply(statsReply)
+				Expect(q.recv()).To(Equal(humanRequest(3, "hostfwd_add n0 tcp:0.0.0.0:8080-10.0.2.15:8080")))
+				q.reply(`{"return": ""}`)
+			})
+			ctx, cancel := context.WithCancel(context.Background())
+			go func() {
+				<-sent
+				cancel()
+			}()
+			began := time.Now()
+			_, err := s.Read(ctx)
+			Expect(err).To(MatchError(os.ErrDeadlineExceeded))
+			Expect(isBrokenSource(err)).To(BeFalse())
+			// The monitor's own timeout is ten seconds, and the read gave up
+			// well before it.
+			Expect(time.Since(began)).To(BeNumerically("<", time.Second))
+			close(late)
+			Expect(m.humanCommand("hostfwd_add n0 tcp:0.0.0.0:8080-10.0.2.15:8080")).To(Equal(""))
+			Eventually(done).Should(BeClosed())
+		})
+
+		It("stops waiting for the monitor when its context ends while a port gate's command holds it", func() {
+			m, q := newFakeQMP()
+			s := newQEMUGuestStats(m)
+			sent := make(chan struct{})
+			answer := make(chan struct{})
+			done := q.serve(func() {
+				q.send(fakeGreeting)
+				q.recv()
+				q.reply(`{"return": {}}`)
+				Expect(q.recv()).To(Equal(humanRequest(2, "hostfwd_add n0 tcp:0.0.0.0:8080-10.0.2.15:8080")))
+				close(sent)
+				<-answer
+				q.reply(`{"return": ""}`)
+			})
+			gate := make(chan error, 1)
+			go func() {
+				_, err := m.humanCommand("hostfwd_add n0 tcp:0.0.0.0:8080-10.0.2.15:8080")
+				gate <- err
+			}()
+			Eventually(sent).Should(BeClosed())
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			began := time.Now()
+			_, err := s.Read(ctx)
+			Expect(err).To(MatchError(context.DeadlineExceeded))
+			Expect(time.Since(began)).To(BeNumerically("<", time.Second))
+			close(answer)
+			Eventually(gate).Should(Receive(BeNil()))
+			Eventually(done).Should(BeClosed())
+		})
+
+		It("lets a poller stop at once while QEMU has not answered its read", func() {
+			m, q := newFakeQMP()
+			s := newQEMUGuestStats(m)
+			sent := make(chan struct{})
+			release := make(chan struct{})
+			done := q.serve(func() {
+				q.send(fakeGreeting)
+				q.recv()
+				q.reply(`{"return": {}}`)
+				Expect(q.recv()).To(Equal(qomRequest(2, "qom-set", "guest-stats-polling-interval", "5")))
+				q.reply(`{"return": {}}`)
+				Expect(q.recv()).To(Equal(qomRequest(3, "qom-get", "guest-stats", "")))
+				close(sent)
+				<-release
+			})
+			logs := &syncBuffer{}
+			out := &syncBuffer{}
+			ticks := make(chan time.Time)
+			poller := newMetricsPoller(s, 322961408, out, log.New(logs, "", 0))
+			poller.newTicker = func(time.Duration) (<-chan time.Time, func()) { return ticks, func() {} }
+			poller.prepare = s.Enable
+			poller.start()
+			defer poller.stop()
+			Eventually(ticks).Should(BeSent(time.Time{}))
+			Eventually(sent).Should(BeClosed())
+			began := time.Now()
+			poller.stop()
+			Expect(time.Since(began)).To(BeNumerically("<", time.Second))
+			Expect(out.String()).To(BeEmpty())
+			Expect(logs.String()).To(BeEmpty())
+			close(release)
+			Eventually(done).Should(BeClosed())
 		})
 	})
 })

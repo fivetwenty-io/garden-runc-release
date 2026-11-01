@@ -404,7 +404,8 @@ stat -L -c %d%r%i /proc/self/fd/3 /proc/self/fd/5 >`+shellQuote(filepath.Join(ou
 			`"drives":[{"drive_id":"vol0","path_on_host":"/proc/self/fd/3","is_root_device":false,"is_read_only":false,"cache_type":"Writeback","io_engine":"Sync"},` +
 			`{"drive_id":"root0","path_on_host":"/proc/self/fd/5","is_root_device":false,"is_read_only":false,"cache_type":"Unsafe","io_engine":"Sync","discard":true}],` +
 			`"machine-config":{"vcpu_count":1,"mem_size_mib":128},` +
-			`"network-interfaces":[{"iface_id":"eth0","guest_mac":"06:00:a9:fe:64:02","host_dev_name":"tap0"}]}`
+			`"network-interfaces":[{"iface_id":"eth0","guest_mac":"06:00:a9:fe:64:02","host_dev_name":"tap0"}],` +
+			`"balloon":{"amount_mib":0,"deflate_on_oom":true,"stats_polling_interval_s":5,"free_page_reporting":true}}`
 	)
 	goldenPDIQEMU := []string{
 		"--library-path", "@ART/qemu/lib", "@ART/qemu/qemu-system-x86_64-microvm",
@@ -424,8 +425,10 @@ stat -L -c %d%r%i /proc/self/fd/3 /proc/self/fd/5 >`+shellQuote(filepath.Join(ou
 		"-add-fd", "fd=3,set=3",
 		"-drive", "if=none,id=vol0,format=raw,file.driver=file,file.filename=/dev/fdset/3,cache=writeback,aio=threads,file.locking=off,file.auto-read-only=off,werror=report,rerror=report,discard=ignore",
 		"-device", "virtio-blk-device,drive=vol0,serial=rvm-vol0",
-		"-drive", "if=none,id=root0,file=/proc/self/fd/5,format=raw,cache=unsafe,aio=threads,file.locking=off,werror=report,rerror=report,discard=unmap,detect-zeroes=unmap",
+		"-chardev", "socket,id=qmp0,fd=5,server=off", "-mon", "chardev=qmp0,mode=control",
+		"-drive", "if=none,id=root0,file=/proc/self/fd/6,format=raw,cache=unsafe,aio=threads,file.locking=off,werror=report,rerror=report,discard=unmap,detect-zeroes=unmap",
 		"-device", "virtio-blk-device,drive=root0,serial=rvm-root",
+		"-device", "virtio-balloon-device,id=balloon0,deflate-on-oom=on,free-page-reporting=on",
 	}
 
 	It("gives QEMU the command line, /rvm/mounts, and /rvm/disks of before the registry, with the serials as the identities", func() {
@@ -437,7 +440,7 @@ stat -L -c %d%r%i /proc/self/fd/3 /proc/self/fd/5 >`+shellQuote(filepath.Join(ou
 
 	It("gives Firecracker the configuration, /rvm/mounts, and /rvm/disks of before the registry, with the identities Firecracker derives from the files it opens", func() {
 		argv, config, mounts, disks := capture(backend.VMFirecracker, "firecracker/firecracker")
-		Expect(argv).To(Equal("--no-api\n--config-file\n@WORK/fc.json\n"))
+		Expect(argv).To(Equal("--api-sock\n@WORK/fc.sock\n--config-file\n@WORK/fc.json\n"))
 		Expect(config).To(Equal(goldenPDIFC))
 		Expect(mounts).To(Equal(goldenPDIMounts))
 		raw, err := os.ReadFile(filepath.Join(out, "ids"))

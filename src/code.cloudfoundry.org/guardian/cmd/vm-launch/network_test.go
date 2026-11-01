@@ -478,6 +478,10 @@ var _ = Describe("guest network", func() {
 			Expect(err).NotTo(HaveOccurred())
 			task, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/proc/self/fd/3", 128, &network{}, nil, "", 0)
 			Expect(err).NotTo(HaveOccurred())
+			balloon := qemuBalloonArgs()
+			Expect(argv[len(argv)-2:]).To(Equal(balloon))
+			Expect(task[len(task)-2:]).To(Equal(balloon))
+			argv, task = argv[:len(argv)-2], task[:len(task)-2]
 			Expect(argv[:len(argv)-4]).To(Equal(task))
 			Expect(argv[len(argv)-4:]).To(Equal([]string{
 				"-chardev", "socket,id=qmp0,fd=4,server=off",
@@ -500,7 +504,7 @@ var _ = Describe("guest network", func() {
 				work := GinkgoT().TempDir()
 				argv, err := hypervisorArgv(backend.VMFirecracker, art, work, "/proc/self/fd/3", 128, n, nil, "", 0)
 				Expect(err).NotTo(HaveOccurred())
-				Expect(argv).To(Equal([]string{art + "/firecracker/firecracker", "--no-api", "--config-file", work + "/fc.json"}))
+				Expect(argv).To(Equal([]string{art + "/firecracker/firecracker", "--api-sock", work + "/fc.sock", "--config-file", work + "/fc.json"}))
 
 				raw, err := os.ReadFile(filepath.Join(work, "fc.json"))
 				Expect(err).NotTo(HaveOccurred())
@@ -691,8 +695,19 @@ echo "RVM_EXIT_$nonce=0"
 		return argvFile, qmpLog
 	}
 
-	qmpGreeting := `qmp_send '{"QMP": {"version": {}, "capabilities": []}}'` + "\n"
-	qmpCapabilities := `{"execute":"qmp_capabilities","id":1}`
+	// qmpHandshake is the greeting and the answers to the memory poller's
+	// first two requests, the capabilities and the qom-set that turns on the
+	// balloon's statistics. The poller sends them as soon as QEMU starts,
+	// before the guest reports any port, so they come first, and every
+	// forwarding rule's request comes after them.
+	qmpHandshake := `qmp_send '{"QMP": {"version": {}, "capabilities": []}}'
+qmp_recv
+qmp_reply '{"return": {}}'
+qmp_recv
+qmp_reply '{"return": {}}'
+`
+	qmpStart := `{"execute":"qmp_capabilities","id":1}` + "\n" +
+		`{"arguments":{"path":"/machine/peripheral/balloon0","property":"guest-stats-polling-interval","value":5},"execute":"qom-set","id":2}` + "\n"
 	hostfwdAdd := func(id, port int) string {
 		return fmt.Sprintf(`{"arguments":{"command-line":"hostfwd_add n0 tcp:0.0.0.0:%d-10.0.2.15:%d"},"execute":"human-monitor-command","id":%d}`, port, port, id)
 	}
@@ -700,7 +715,7 @@ echo "RVM_EXIT_$nonce=0"
 		return fmt.Sprintf(`{"arguments":{"command-line":"hostfwd_remove n0 tcp:0.0.0.0:%d"},"execute":"human-monitor-command","id":%d}`, port, id)
 	}
 
-	It("gives QEMU a QMP monitor and no forwarding rule for PORT, and neither without PORT", func() {
+	It("gives QEMU a QMP monitor and no forwarding rule for PORT, and the monitor without PORT too", func() {
 		port := freePort()
 		argvFile, _ := portHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), port, "")
 		GinkgoT().Setenv("PORT", strconv.Itoa(port))
@@ -714,8 +729,9 @@ echo "RVM_EXIT_$nonce=0"
 		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
 		withoutPort, err := os.ReadFile(argvFile)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(string(withoutPort)).To(HaveSuffix("\n-netdev\nuser,id=n0,net=10.0.2.0/24\n-device\nvirtio-net-device,netdev=n0\n"))
-		Expect(string(withoutPort)).NotTo(ContainSubstring("qmp"))
+		Expect(string(withoutPort)).To(HaveSuffix("\n-netdev\nuser,id=n0,net=10.0.2.0/24\n-device\nvirtio-net-device,netdev=n0\n-chardev\nsocket,id=qmp0,fd=4,server=off\n-mon\nchardev=qmp0,mode=control\n" +
+			"-device\nvirtio-balloon-device,id=balloon0,deflate-on-oom=on,free-page-reporting=on\n"))
+		Expect(string(withoutPort)).NotTo(ContainSubstring("hostfwd"))
 		Expect(os.ReadDir(tmp)).To(BeEmpty())
 	})
 
@@ -785,10 +801,8 @@ exit 3
 
 	It("adds QEMU's forwarding rule when the guest listens and removes it when it stops", func() {
 		port := freePort()
-		_, qmpLog := portHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), port, qmpGreeting+`await closed
+		_, qmpLog := portHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), port, qmpHandshake+`await closed
 listen 1
-qmp_recv
-qmp_reply '{"return": {}}'
 qmp_recv
 qmp_send '{"timestamp": {"seconds": 1, "microseconds": 2}, "event": "NIC_RX_FILTER_CHANGED", "data": {}}'
 qmp_reply '{"return": ""}'
@@ -801,7 +815,7 @@ sleep 0.3
 
 		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
 		Expect(gateLoops()).To(BeZero())
-		Expect(os.ReadFile(qmpLog)).To(Equal([]byte(qmpCapabilities + "\n" + hostfwdAdd(2, port) + "\n" + hostfwdRemove(3, port) + "\n")))
+		Expect(os.ReadFile(qmpLog)).To(Equal([]byte(qmpStart + hostfwdAdd(3, port) + "\n" + hostfwdRemove(4, port) + "\n")))
 		p := strconv.Itoa(port)
 		Expect(logBuf.String()).To(ContainSubstring("the guest listens on port " + p + "; it is open in the container\n"))
 		Expect(logBuf.String()).To(ContainSubstring("the guest no longer listens on port " + p + "; it is closed in the container\n"))
@@ -892,9 +906,7 @@ await open
 	It("adds and removes a QEMU forwarding rule for each port that the guest reports", func() {
 		first, second := freePort(), freePort()
 		f, s := strconv.Itoa(first), strconv.Itoa(second)
-		_, qmpLog := portHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), first, qmpGreeting+`listen 1
-qmp_recv
-qmp_reply '{"return": {}}'
+		_, qmpLog := portHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), first, qmpHandshake+`listen 1
 qmp_recv
 qmp_reply '{"return": ""}'
 listenp `+s+` 1
@@ -910,7 +922,7 @@ sleep 0.3
 
 		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
 		Expect(gateLoops()).To(BeZero())
-		Expect(os.ReadFile(qmpLog)).To(Equal([]byte(qmpCapabilities + "\n" + hostfwdAdd(2, first) + "\n" + hostfwdAdd(3, second) + "\n" + hostfwdRemove(4, first) + "\n")))
+		Expect(os.ReadFile(qmpLog)).To(Equal([]byte(qmpStart + hostfwdAdd(3, first) + "\n" + hostfwdAdd(4, second) + "\n" + hostfwdRemove(5, first) + "\n")))
 		Expect(logBuf.String()).To(ContainSubstring("the guest listens on port " + f + "; it is open in the container\n"))
 		Expect(logBuf.String()).To(ContainSubstring("the guest listens on port " + s + "; it is open in the container\n"))
 		Expect(logBuf.String()).To(ContainSubstring("the guest no longer listens on port " + f + "; it is closed in the container\n"))
@@ -936,9 +948,7 @@ sleep 0.3
 	// for a while after it.
 	drainStart := func() string {
 		return `trap '' TERM
-` + qmpGreeting + `listen 1
-qmp_recv
-qmp_reply '{"return": {}}'
+` + qmpHandshake + `listen 1
 qmp_recv
 qmp_reply '{"return": ""}'
 kill -TERM "$PPID"
@@ -958,7 +968,7 @@ sleep 0.3
 `)
 		cmd, stderr := runSignalledVM(backend.VMQemu, p)
 		Expect(cmd.ProcessState.ExitCode()).To(Equal(0), stderr)
-		Expect(os.ReadFile(qmpLog)).To(Equal([]byte(qmpCapabilities + "\n" + hostfwdAdd(2, port) + "\n" + hostfwdRemove(3, port) + "\n")))
+		Expect(os.ReadFile(qmpLog)).To(Equal([]byte(qmpStart + hostfwdAdd(3, port) + "\n" + hostfwdRemove(4, port) + "\n")))
 		lines := strings.SplitAfter(stderr, "\n")
 		received := slices.Index(lines, "vm-launch: received terminated, asking the guest command to stop\n")
 		closed := slices.Index(lines, "vm-launch: the guest no longer listens on port "+p+"; it is closed in the container\n")
@@ -979,7 +989,7 @@ exit 0
 `)
 		cmd, stderr := runSignalledVM(backend.VMQemu, p)
 		Expect(cmd.ProcessState.ExitCode()).To(Equal(0), stderr)
-		Expect(os.ReadFile(qmpLog)).To(Equal([]byte(qmpCapabilities + "\n" + hostfwdAdd(2, port) + "\n" + hostfwdRemove(3, port) + "\n")))
+		Expect(os.ReadFile(qmpLog)).To(Equal([]byte(qmpStart + hostfwdAdd(3, port) + "\n" + hostfwdRemove(4, port) + "\n")))
 		// The close is logged at shutDown, or at the gate's end when QEMU
 		// exits before the gate reads the reply.
 		lines := strings.SplitAfter(stderr, "\n")
@@ -1025,9 +1035,7 @@ await closed
 	It("names the port conflict when QEMU cannot add the forwarding rule, and keeps the guest running", func() {
 		port := freePort()
 		p := strconv.Itoa(port)
-		_, qmpLog := portHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), port, qmpGreeting+`listen 1
-qmp_recv
-qmp_reply '{"return": {}}'
+		_, qmpLog := portHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), port, qmpHandshake+`listen 1
 qmp_recv
 qmp_reply '{"return": "Could not set up host forwarding rule '"'"'tcp:0.0.0.0:`+p+`-10.0.2.15:`+p+`'"'"'\r\n"}'
 sleep 0.3
@@ -1035,7 +1043,7 @@ sleep 0.3
 		GinkgoT().Setenv("PORT", p)
 
 		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
-		Expect(os.ReadFile(qmpLog)).To(Equal([]byte(qmpCapabilities + "\n" + hostfwdAdd(2, port) + "\n")))
+		Expect(os.ReadFile(qmpLog)).To(Equal([]byte(qmpStart + hostfwdAdd(3, port) + "\n")))
 		Expect(logBuf.String()).To(ContainSubstring("the guest listens on port " + p + ", but vm-launch could not open it in the container: QEMU could not set up the forwarding rule: Could not set up host forwarding rule 'tcp:0.0.0.0:" + p + "-10.0.2.15:" + p + "'\n"))
 		Expect(logBuf.String()).To(ContainSubstring("port " + p + " already in use in this container; VM backends run one app process per container\n"))
 		Expect(logBuf.String()).NotTo(ContainSubstring("it is open in the container"))
@@ -1044,9 +1052,7 @@ sleep 0.3
 	It("logs a QMP error, keeps the port closed, and opens it at the next try", func() {
 		port := freePort()
 		p := strconv.Itoa(port)
-		_, qmpLog := portHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), port, qmpGreeting+`listen 1
-qmp_recv
-qmp_reply '{"return": {}}'
+		_, qmpLog := portHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), port, qmpHandshake+`listen 1
 qmp_recv
 qmp_reply '{"error": {"class": "GenericError", "desc": "no such netdev"}}'
 qmp_recv
@@ -1058,7 +1064,7 @@ sleep 0.3
 		GinkgoT().Setenv("PORT", p)
 
 		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
-		Expect(os.ReadFile(qmpLog)).To(Equal([]byte(qmpCapabilities + "\n" + hostfwdAdd(2, port) + "\n" + hostfwdRemove(3, port) + "\n" + hostfwdAdd(4, port) + "\n")))
+		Expect(os.ReadFile(qmpLog)).To(Equal([]byte(qmpStart + hostfwdAdd(3, port) + "\n" + hostfwdRemove(4, port) + "\n" + hostfwdAdd(5, port) + "\n")))
 		Expect(logBuf.String()).To(ContainSubstring("could not open it in the container: QMP human-monitor-command: GenericError: no such netdev\n"))
 		Expect(logBuf.String()).To(ContainSubstring("the guest listens on port " + p + "; it is open in the container\n"))
 		Expect(logBuf.String()).NotTo(ContainSubstring("already in use"))

@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -278,6 +279,71 @@ var _ = Describe("the firecracker balloon", func() {
 			Expect(src.Close()).To(Succeed())
 			_, err = src.Read(context.Background())
 			Expect(err).To(HaveOccurred())
+			Expect(isBrokenSource(err)).To(BeTrue())
+		})
+
+		It("says a socket that never appears is fatal, and a wait that its context ended is not", func() {
+			_, err := newFirecrackerStatsSource(context.Background(), sock, 150*time.Millisecond)
+			Expect(isBrokenSource(err)).To(BeTrue())
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			_, err = newFirecrackerStatsSource(ctx, sock, 10*time.Second)
+			Expect(isBrokenSource(err)).To(BeFalse())
+		})
+
+		It("fails for good once a read fails, and on every read after it", func() {
+			api = newFakeFirecrackerAPI(sock, func(c net.Conn, _ *http.Request) { _ = c.Close() })
+			src, err := newFirecrackerStatsSource(context.Background(), sock, time.Second)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = src.Read(context.Background())
+			Expect(isBrokenSource(err)).To(BeTrue())
+			_, err = src.Read(context.Background())
+			Expect(isBrokenSource(err)).To(BeTrue())
+		})
+
+		It("does not take a reply the guest has not filled in for a broken source", func() {
+			Expect(isBrokenSource(errFirecrackerStatsPending)).To(BeFalse())
+		})
+
+		It("fails for good when it never connected", func() {
+			_, err := (&firecrackerStatsSource{}).Read(context.Background())
+			Expect(err).To(MatchError(ContainSubstring("closed")))
+			Expect(isBrokenSource(err)).To(BeTrue())
+		})
+
+		It("connects a source made empty, and removes the socket's path", func() {
+			api = newFakeFirecrackerAPI(sock, func(c net.Conn, _ *http.Request) { replyJSON(c, 200, full) })
+			src := &firecrackerStatsSource{}
+			Expect(src.connect(context.Background(), sock, time.Second)).To(Succeed())
+			defer func() { _ = src.Close() }()
+			Expect(sock).NotTo(BeAnExistingFile())
+			Expect(src.Read(context.Background())).To(Equal(guestMemorySample{Total: 4000, Available: 3000, Free: 1000, Caches: 500}))
+		})
+
+		It("lets a poller stop at once while Firecracker has not answered its read", func() {
+			asked := make(chan struct{})
+			release := make(chan struct{})
+			api = newFakeFirecrackerAPI(sock, func(c net.Conn, _ *http.Request) {
+				close(asked)
+				<-release
+			})
+			src := &firecrackerStatsSource{}
+			logs, out := &syncBuffer{}, &syncBuffer{}
+			ticks := make(chan time.Time)
+			poller := newMetricsPoller(src, 1<<20, out, log.New(logs, "", 0))
+			poller.newTicker = func(time.Duration) (<-chan time.Time, func()) { return ticks, func() {} }
+			poller.prepare = func(ctx context.Context) error { return src.connect(ctx, sock, time.Second) }
+			poller.start()
+			defer poller.stop()
+			Eventually(ticks).Should(BeSent(time.Time{}))
+			Eventually(asked).Should(BeClosed())
+			began := time.Now()
+			poller.stop()
+			Expect(time.Since(began)).To(BeNumerically("<", time.Second))
+			Expect(out.String()).To(BeEmpty())
+			Expect(logs.String()).To(BeEmpty())
+			close(release)
+			Expect(src.Close()).To(Succeed())
 		})
 	})
 })

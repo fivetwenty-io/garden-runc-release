@@ -19,9 +19,18 @@ const (
 	// sample as fresh for 35 seconds, which is three and a half intervals.
 	metricsPollInterval = 10 * time.Second
 
-	// metricsReadTimeout bounds one read, so a source that stops answering
-	// cannot hold the poller past the next tick or make stop wait.
+	// metricsReadTimeout bounds one read, and one try to prepare the
+	// source, so a source that stops answering cannot hold the poller past
+	// the next tick. stop does not wait for it, because it ends the read's
+	// context, and both sources give up at once when it ends.
 	metricsReadTimeout = 5 * time.Second
+
+	// metricsBreakSettle is how long the poller waits, once its source has
+	// broken for good, before it logs that. A source breaks as the
+	// hypervisor exits, and vm-launch stops the poller soon after, so a
+	// hypervisor that simply ended gets no line about the metrics, and
+	// vm-launch's own exit line says what happened.
+	metricsBreakSettle = 2 * time.Second
 
 	// metricsReadFailuresBeforeLog is how many reads in a row must fail
 	// before the poller logs it. The guest answers nothing for the first
@@ -46,17 +55,34 @@ func isBrokenSource(err error) bool {
 	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrClosed)
 }
 
+// isPendingSample reports whether err means only that the guest has not
+// reported its statistics yet, which is no failure at all.
+func isPendingSample(err error) bool {
+	return errors.Is(err, errFirecrackerStatsPending)
+}
+
 // metricsPoller reads the guest's memory from its source every interval and
 // writes one line for each good sample to out, which is vm-launch's stderr.
 // A sample that fails its checks is dropped, and so is a read that fails. The
 // poller logs once when a run of such failures begins and once when it ends,
 // so a guest that misbehaves for an hour writes two lines and not hundreds.
+// A reply that the guest has not filled in yet is skipped and is not a
+// failure.
 type metricsPoller struct {
 	source     guestStatsSource
 	guestBytes uint64
 	out        io.Writer
 	logger     *log.Logger
 	interval   time.Duration
+	// breakSettle is metricsBreakSettle. Specs shorten it.
+	breakSettle time.Duration
+
+	// prepare, when set before start, readies the source before its first
+	// read: it turns on QEMU's statistics, or connects to Firecracker's API.
+	// The poller runs it at once when it starts, and again at each tick
+	// until it succeeds. An error that is fatal stops the poller, as a read's
+	// does, and any other counts as a failed read.
+	prepare func(ctx context.Context) error
 
 	// newTicker returns the channel of ticks and the function that releases
 	// it. Specs replace it with ticks they send themselves.
@@ -78,7 +104,7 @@ type metricsPoller struct {
 func newMetricsPoller(source guestStatsSource, guestBytes uint64, out io.Writer, logger *log.Logger) *metricsPoller {
 	return &metricsPoller{
 		source: source, guestBytes: guestBytes, out: out, logger: logger,
-		interval: metricsPollInterval,
+		interval: metricsPollInterval, breakSettle: metricsBreakSettle,
 		newTicker: func(d time.Duration) (<-chan time.Time, func()) {
 			t := time.NewTicker(d)
 			return t.C, t.Stop
@@ -119,18 +145,51 @@ func (p *metricsPoller) stop() {
 	<-done
 }
 
-// run polls on each tick until ctx ends or the source breaks.
+// run prepares the source, then polls on each tick until ctx ends or the
+// source breaks. A source that could not be prepared is prepared again at
+// the next tick, before that tick's read.
 func (p *metricsPoller) run(ctx context.Context, ticks <-chan time.Time) {
+	prepared := p.prepare == nil
+	if !prepared {
+		var goOn bool
+		if prepared, goOn = p.prepareSource(ctx); !goOn {
+			return
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticks:
+			if !prepared {
+				var goOn bool
+				if prepared, goOn = p.prepareSource(ctx); !goOn {
+					return
+				}
+				if !prepared {
+					continue
+				}
+			}
 			if !p.poll(ctx) {
 				return
 			}
 		}
 	}
+}
+
+// prepareSource runs prepare once. It reports whether the source is ready,
+// and whether the poller should go on.
+func (p *metricsPoller) prepareSource(ctx context.Context) (ready, goOn bool) {
+	prepareCtx, cancel := context.WithTimeout(ctx, metricsReadTimeout)
+	err := p.prepare(prepareCtx)
+	cancel()
+	if ctx.Err() != nil {
+		return false, false
+	}
+	if err != nil {
+		return false, p.failed(ctx, err)
+	}
+	return true, true
 }
 
 // poll does one read. It returns false when the poller should stop.
@@ -141,17 +200,11 @@ func (p *metricsPoller) poll(ctx context.Context) bool {
 	if ctx.Err() != nil {
 		return false
 	}
-	if err != nil {
-		if isBrokenSource(err) {
-			p.logger.Printf("stopping the guest memory metrics, as the hypervisor can no longer be read: %v", err)
-			return false
-		}
-		p.failures++
-		if p.failures == metricsReadFailuresBeforeLog {
-			p.logged = true
-			p.logger.Printf("the guest memory statistics are unavailable, and the last %d reads failed; the latest error is: %v", p.failures, err)
-		}
+	if isPendingSample(err) {
 		return true
+	}
+	if err != nil {
+		return p.failed(ctx, err)
 	}
 	if err := sample.check(p.guestBytes); err != nil {
 		p.failures++
@@ -168,5 +221,26 @@ func (p *metricsPoller) poll(ctx context.Context) bool {
 	// A failed write goes to the same stream the logger uses, so there is
 	// nowhere better to report it, and the next sample tries again.
 	_, _ = io.WriteString(p.out, sample.line())
+	return true
+}
+
+// failed counts err, the failure of a read or of prepare, in the current
+// run, and logs when the run is long enough. It returns false when err means
+// the source is broken for good, after one log line unless ctx ends within
+// breakSettle.
+func (p *metricsPoller) failed(ctx context.Context, err error) bool {
+	if isBrokenSource(err) {
+		select {
+		case <-ctx.Done():
+		case <-time.After(p.breakSettle):
+			p.logger.Printf("stopping the guest memory metrics, as the hypervisor can no longer be read: %v", err)
+		}
+		return false
+	}
+	p.failures++
+	if p.failures == metricsReadFailuresBeforeLog {
+		p.logged = true
+		p.logger.Printf("the guest memory statistics are unavailable, and the last %d reads failed; the latest error is: %v", p.failures, err)
+	}
 	return true
 }
