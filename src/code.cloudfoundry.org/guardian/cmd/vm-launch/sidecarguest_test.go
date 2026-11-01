@@ -80,21 +80,43 @@ func sectionProcs(dir string, scripts []string, appEnv string, sidecarEnvs ...st
 
 // sectionRun is the run section running in a real shell, with a FIFO as
 // the console that the spec writes console input to, and every guest path
-// it uses in a scratch directory.
+// it uses in a scratch directory. The shell reads the section from script,
+// so the nonce in its text is in no argv, as stage 2 reads /rvm/init. out,
+// the shell's standard output and error, stands in for the console that
+// the section writes to.
 type sectionRun struct {
-	cmd      *exec.Cmd
-	out      string
-	acks     string
-	root     string
-	mountLog string
-	console  *os.File
-	done     chan error
+	cmd         *exec.Cmd
+	out         string
+	acks        string
+	root        string
+	mountLog    string
+	logDir      string
+	events      string
+	script      string
+	consolePath string
+	console     *os.File
+	done        chan error
 }
 
-// startSection runs guestRunSection for procs in shell with stubGuestExec,
-// and then prints the status it left. With identity set, the boot pair is
-// pair, and mount logs its arguments in place of mounting. prepare, when it
-// is set, runs just before the shell starts.
+// sectionBusybox is the busybox whose tr and awk the run's framers run in
+// place of the guest's /bin/busybox: the guest's own when guestBusyboxEnv
+// names it, and otherwise the one on PATH. The spec skips where there is
+// neither.
+func sectionBusybox() string {
+	if os.Getenv(guestBusyboxEnv) != "" {
+		return guestBusybox()
+	}
+	path, err := exec.LookPath("busybox")
+	if err != nil {
+		Skip("no busybox on PATH and " + guestBusyboxEnv + " is not set, so the run section's framers cannot run")
+	}
+	return path
+}
+
+// startSection runs guestRunSetup and guestRunSection for procs in shell
+// with stubGuestExec, and then prints the status the section left. With
+// identity set, the boot pair is pair, and mount logs its arguments in place
+// of mounting. prepare, when it is set, runs just before the shell starts.
 func startSection(shell guestShell, procs []guestProcess, identity bool, pair testIdentityPair, prepare func(r *sectionRun)) *sectionRun {
 	dir := GinkgoT().TempDir()
 	r := &sectionRun{
@@ -102,6 +124,9 @@ func startSection(shell guestShell, procs []guestProcess, identity bool, pair te
 		acks:     filepath.Join(dir, "acks"),
 		root:     filepath.Join(dir, "root"),
 		mountLog: filepath.Join(dir, "mount.log"),
+		logDir:   filepath.Join(dir, "log"),
+		events:   filepath.Join(dir, "events"),
+		script:   filepath.Join(dir, "init"),
 		done:     make(chan error, 1),
 	}
 	Expect(os.Mkdir(r.root, 0o755)).To(Succeed())
@@ -116,10 +141,13 @@ func startSection(shell guestShell, procs []guestProcess, identity bool, pair te
 	Expect(err).NotTo(HaveOccurred())
 	DeferCleanup(func() { _ = console.Close() })
 	r.console = console
+	r.consolePath = fifo
 
-	section := guestRunSetup(identity) + guestRunSection(testNonce, procs, identity, stubGuestExec)
+	section := guestRunSetup(identity, procs) + guestRunSection(testNonce, procs, identity, stubGuestExec)
 	script := strings.NewReplacer(
-		guestEvents, filepath.Join(dir, "events"),
+		guestEvents, r.events,
+		guestLogDir, r.logDir,
+		"/bin/busybox ", sectionBusybox()+" ",
 		"</dev/console", "<"+fifo,
 		">/dev/console", ">>"+r.acks,
 		"/proc/self/oom_score_adj", filepath.Join(dir, "oom_score_adj"),
@@ -131,11 +159,12 @@ func startSection(shell guestShell, procs []guestProcess, identity bool, pair te
 	).Replace("RVM_NOFILE_SOFT=$(ulimit -S -n)\nRVM_NOFILE_HARD=$(ulimit -H -n)\n" + guestFailFunc +
 		`mount() { echo "mount $*" >>` + r.mountLog + `; }
 ` + section + "echo \"status=$rvm_status\"\n")
+	Expect(os.WriteFile(r.script, []byte(script), 0o600)).To(Succeed())
 
 	out, err := os.Create(r.out)
 	Expect(err).NotTo(HaveOccurred())
 	defer out.Close()
-	r.cmd = exec.Command(shell.argv[0], append(shell.argv[1:], "-c", script)...)
+	r.cmd = exec.Command(shell.argv[0], append(shell.argv[1:], r.script)...)
 	r.cmd.Env = []string{"PATH=" + probeToolsBin(shell)}
 	r.cmd.Stdout = out
 	r.cmd.Stderr = out
@@ -275,7 +304,7 @@ var _ = Describe("the run section", func() {
 			procs := sectionProcs(GinkgoT().TempDir(), []string{termScript(143), termScript(143), exitAfterScript(3, 0, 1)},
 				appEnv, "export B='one two'\nunset A\n", "export B=two\n")
 			r := startSection(shell, procs, false, testIdentityPair{}, nil)
-			Expect(r.finish(10*time.Second)).To(Equal("vm-launch guest: sidecar 2 exited with status 3; stopping the app and the other sidecar\nstatus=3\n"), shell.name)
+			Expect(r.finish(10*time.Second)).To(Equal(firstTag(testNonce)+"2 3\nvm-launch guest: sidecar 2 exited with status 3; stopping the app and the other sidecar\nstatus=3\n"), shell.name)
 
 			for i, want := range []string{"A=app B=base", "A=unset B=one two", "A=app B=two"} {
 				pid := strings.TrimSpace(processFile(procs, i, "pid"))
@@ -297,7 +326,7 @@ var _ = Describe("the run section", func() {
 			shell := shellOf()
 			procs := sectionProcs(GinkgoT().TempDir(), []string{exitAfterScript(0, 1), termScript(143)}, appEnv)
 			r := startSection(shell, procs, false, testIdentityPair{}, nil)
-			Expect(r.finish(10*time.Second)).To(Equal("vm-launch guest: the app exited with status 0; stopping the sidecar\nstatus=0\n"), shell.name)
+			Expect(r.finish(10*time.Second)).To(Equal(firstTag(testNonce)+"0 0\nvm-launch guest: the app exited with status 0; stopping the sidecar\nstatus=0\n"), shell.name)
 			Expect(processFile(procs, 1, "term")).To(Equal("term\n"))
 		},
 		shellEntries(""),
@@ -340,7 +369,7 @@ var _ = Describe("the run section", func() {
 		},
 		append(
 			shellEntries("after a sidecar's exit, with the first status", []string{termScript(143), deafScript, exitAfterScript(3, 0, 1)}, false,
-				"vm-launch guest: sidecar 2 exited with status 3; stopping the app and the other sidecar\n"+
+				firstTag(testNonce)+"2 3\nvm-launch guest: sidecar 2 exited with status 3; stopping the app and the other sidecar\n"+
 					"vm-launch guest: the app and its sidecars did not all exit within 6 seconds; ending the rest\nstatus=3\n"),
 			shellEntries("after a stop, with 137 for the app that SIGKILL ended", []string{deafScript, termScript(9)}, true,
 				"vm-launch guest: the app and its sidecars did not all exit within 6 seconds; ending the rest\nstatus=137\n")...,
@@ -351,7 +380,7 @@ var _ = Describe("the run section", func() {
 		Expect(guestWindDown + 2*time.Second).To(BeNumerically("<=", stopDeadline))
 		Expect(guestTimeoutSeconds).To(Equal(strconv.Itoa(int(guestWindDown / time.Second))))
 		Expect(guestWindDown % time.Second).To(BeZero())
-		Expect(guestEventLoop(sectionProcs(GinkgoT().TempDir(), []string{"exit 0", "exit 0"}, appEnv))).To(ContainSubstring("sleep " + guestTimeoutSeconds + " &\n"))
+		Expect(guestEventLoop(testNonce, sectionProcs(GinkgoT().TempDir(), []string{"exit 0", "exit 0"}, appEnv))).To(ContainSubstring("sleep " + guestTimeoutSeconds + " &\n"))
 	})
 
 	DescribeTable("runs the app alone and gives its status",
@@ -359,7 +388,7 @@ var _ = Describe("the run section", func() {
 			shell := shellOf()
 			procs := sectionProcs(GinkgoT().TempDir(), []string{startScript + "exit 5"}, appEnv)
 			r := startSection(shell, procs, false, testIdentityPair{}, nil)
-			Expect(r.finish(5*time.Second)).To(Equal("status=5\n"), shell.name)
+			Expect(r.finish(5*time.Second)).To(Equal(firstTag(testNonce)+"0 5\nstatus=5\n"), shell.name)
 			pid := strings.TrimSpace(processFile(procs, 0, "pid"))
 			Expect(processFile(procs, 0, "start")).To(HavePrefix("pid=" + pid + " "))
 		},
@@ -398,7 +427,7 @@ var _ = Describe("the run section", func() {
 			}
 
 			Expect(os.WriteFile(filepath.Join(procs[0].dir, "go"), nil, 0o600)).To(Succeed())
-			Expect(r.finish(10*time.Second)).To(Equal("status=0\n"), shell.name)
+			Expect(r.finish(10*time.Second)).To(Equal(firstTag(testNonce)+"0 0\nstatus=0\n"), shell.name)
 		},
 		shellEntries(""),
 	)
@@ -441,14 +470,18 @@ var _ = Describe("the run section", func() {
 		}
 	})
 
-	It("sets up the identity first only when it has one, and the FIFO, and leaves both out of the section", func() {
-		without, with := guestRunSetup(false), guestRunSetup(true)
+	It("sets up the identity first only when it has one, then the FIFO and every process's log FIFOs, and leaves all of them out of the section", func() {
+		procs := sectionProcs(GinkgoT().TempDir(), []string{"exit 0", "exit 0"}, appEnv)
+		without, with := guestRunSetup(false, procs), guestRunSetup(true, procs)
 		fifo := "mkfifo -m 0600 " + guestEvents + " || rvm_fail \"creating the event FIFO " + guestEvents + " failed\"\n"
-		Expect(without).To(Equal(fifo))
-		Expect(with).To(Equal(guestIdentitySetup + fifo))
-		section := guestRunSection(testNonce, sectionProcs(GinkgoT().TempDir(), []string{"exit 0"}, appEnv), true, stubGuestExec)
+		logs := "mkdir -m 0700 /rvm/log || rvm_fail \"creating the log FIFO directory /rvm/log failed\"\n" +
+			"mkfifo -m 0600 /rvm/log/0.out /rvm/log/0.err /rvm/log/1.out /rvm/log/1.err || rvm_fail \"creating the log FIFOs in /rvm/log failed\"\n"
+		Expect(without).To(Equal(fifo + logs))
+		Expect(with).To(Equal(guestIdentitySetup + fifo + logs))
+		section := guestRunSection(testNonce, procs, true, stubGuestExec)
 		Expect(section).NotTo(ContainSubstring(guestIdentitySetup))
 		Expect(section).NotTo(ContainSubstring("mkfifo"))
+		Expect(section).NotTo(ContainSubstring("mkdir"))
 		Expect(section).To(HavePrefix("command exec 4<>" + guestEvents + " || rvm_fail"))
 	})
 
