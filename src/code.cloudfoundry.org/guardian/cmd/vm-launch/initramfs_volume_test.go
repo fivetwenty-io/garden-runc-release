@@ -2941,11 +2941,22 @@ exit 0`)
 // a change has to change this digest on purpose.
 const goldenMke2fsConfSHA256 = "14c13f4289408325fed71bb93daecea347debae7fab0fd062288c9bd4867cd7e"
 
-// openFDCount returns the number of descriptors this process holds.
+// openFDCount returns the number of descriptors this process holds on files
+// and directories. It leaves out pipes, sockets, and anonymous inodes,
+// because the Go runtime keeps pairs of splice pipes in a pool that a garbage
+// collection empties at any moment, and a closing connection gives up its
+// socket the same way. Either would change the count under a spec that holds
+// none of them.
 func openFDCount() int {
 	entries, err := os.ReadDir("/proc/self/fd")
 	Expect(err).NotTo(HaveOccurred())
-	return len(entries)
+	n := 0
+	for _, e := range entries {
+		if link, err := os.Readlink(filepath.Join("/proc/self/fd", e.Name())); err == nil && strings.HasPrefix(link, "/") {
+			n++
+		}
+	}
+	return n
 }
 
 var _ = Describe("the guest filesystem tools", func() {
