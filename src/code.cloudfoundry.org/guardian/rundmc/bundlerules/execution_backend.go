@@ -23,6 +23,10 @@ const (
 	// directory, where the cell's runtime config installs the wrapper.
 	VMVirtiofsdPath = VMArtifactsMountPath + "/virtiofsd/virtiofsd-wrapper"
 
+	// VMStackMountPath is where the host stack image directory appears inside a
+	// vm-* container. It holds rootfs.squashfs.
+	VMStackMountPath = "/opt/garden-vm/stack"
+
 	// VMLaunchMountPath is where the host vm-launch binary appears inside a vm-* container.
 	VMLaunchMountPath = processes.VMLaunchPath
 
@@ -148,20 +152,29 @@ func (r ExecutionBackend) Apply(bndl goci.Bndl, spec spec.DesiredContainerSpec) 
 			nodes = append(nodes, blockNodes...)
 		}
 		bndl = withDeviceNodes(bndl, nodes...)
-		bndl = bndl.WithMounts(
-			specs.Mount{
+		mounts := []specs.Mount{
+			{
 				Destination: VMArtifactsMountPath,
 				Source:      r.ArtifactsDir,
 				Type:        "bind",
 				Options:     []string{"bind", "ro", "nosuid", "nodev"},
 			},
-			specs.Mount{
+			{
 				Destination: VMLaunchMountPath,
 				Source:      r.LaunchBin,
 				Type:        "bind",
 				Options:     []string{"bind", "ro", "nosuid", "nodev"},
 			},
-		)
+		}
+		if spec.VMStackDir != "" {
+			mounts = append(mounts, specs.Mount{
+				Destination: VMStackMountPath,
+				Source:      spec.VMStackDir,
+				Type:        "bind",
+				Options:     []string{"bind", "ro", "nosuid", "nodev", "noexec"},
+			})
+		}
+		bndl = bndl.WithMounts(mounts...)
 
 		// The bundle keeps its AppArmor profile. The process builder lifts it
 		// for the vm-launch process of a vm-qemu container only.
