@@ -99,7 +99,7 @@ var _ = Describe("stage 1 of the stack guest", func() {
 			Expect(os.WriteFile(filepath.Join(bin, name), []byte(script), 0o755)).To(Succeed())
 		}
 		stub("mkdir", `exec /bin/mkdir "$@"`)
-		for _, name := range []string{"mount", "chown", "hostname", "mke2fs"} {
+		for _, name := range []string{"mount", "umount", "chown", "hostname", "mke2fs"} {
 			stub(name, "exit 0")
 		}
 
@@ -138,6 +138,10 @@ var _ = Describe("stage 1 of the stack guest", func() {
 		script := strings.NewReplacer(
 			"reboot -nf", "echo REBOOT",
 			"mount -", filepath.Join(bin, "mount")+" -",
+			"umount /rvm/droplet /rvm/stack", filepath.Join(bin, "umount")+" "+dir+"/rvm/droplet "+dir+"/rvm/stack",
+			"/rvm/root/rvm/init", dir+"/rvm/root/rvm/init",
+			"/dev/console", "/dev/stdout",
+			"exec chroot . /bin/sh", "exec /bin/sh",
 			"mkdir ", filepath.Join(bin, "mkdir")+" ",
 			"chown ", filepath.Join(bin, "chown")+" ",
 			"hostname -F", filepath.Join(bin, "hostname")+" -F",
@@ -207,6 +211,50 @@ var _ = Describe("stage 1 of the stack guest", func() {
 		Expect(calls).To(Equal(want))
 		Expect(calls).NotTo(ContainSubstring("mke2fs"))
 		Expect(calls).NotTo(ContainSubstring("ext4"))
+	})
+
+	DescribeTable("falls back to the busybox guest, with the mode line, when the stack or the droplet cannot be used and the guest holds the busybox guest's files",
+		func(withDisk bool, failStep int, unusable func(), reason string) {
+			writeFile("rvm/fallback/init", "#!/bin/sh\necho \"busybox stage 2 with $(cat "+dir+"/rvm/env)\"\n", 0o755)
+			writeFile("rvm/fallback/env", "export FOR_BUSYBOX=1\n", 0o600)
+			writeFile("rvm/fallback/prep", ":\n", 0o644)
+			writeFile("rvm/env", "export FOR_STACK=1\n", 0o600)
+			writeFile("rvm/init", "the stack's stage 2\n", 0o755)
+			writeFile("rvm/root/bin/sh", "", 0o755)
+			writeFile("rvm/root/rvm/init", "", 0o755)
+			unusable()
+			vars, fail := withRoot(), ""
+			if !withDisk {
+				vars = withoutRoot
+			}
+			if failStep >= 0 {
+				fail = "RVM_TEST_FAIL=" + stackSteps()[failStep].call
+			}
+			out, calls := run(vars, fail)
+
+			Expect(out).To(Equal("busybox guest: "+paths.Replace(reason)+"\nbusybox stage 2 with export FOR_BUSYBOX=1\n"), out)
+			Expect(readFile("rvm/init")).To(ContainSubstring("busybox stage 2"))
+			Expect(calls).To(ContainSubstring("umount " + dir + "/rvm/droplet " + dir + "/rvm/stack\n"))
+			Expect(calls).NotTo(ContainSubstring("overlay " + dir + "/rvm/app"))
+			Expect(calls).NotTo(ContainSubstring("hostname -F"))
+			if withDisk {
+				Expect(calls).To(ContainSubstring("mount -t overlay -o lowerdir=/,upperdir=" + dir + "/rvm/disk/upper,workdir=" + dir + "/rvm/disk/work overlay " + dir + "/rvm/root\n"))
+			} else {
+				Expect(calls).NotTo(ContainSubstring("lowerdir=/,"))
+			}
+		},
+		Entry("on a root disk, a stack image that does not mount", true, 5, func() {}, "mounting the stack image /dev/vdb failed; the guest kernel needs squashfs with lz4"),
+		Entry("on a root disk, a droplet image that does not mount", true, 6, func() {}, "mounting the droplet image /dev/vdc failed; the guest kernel needs squashfs with lz4"),
+		Entry("without a root disk, a stack image that does not mount", false, 5, func() {}, "mounting the stack image /dev/vdb failed; the guest kernel needs squashfs with lz4"),
+		Entry("on a root disk, a stack image without /home/vcap", true, -1, func() {
+			Expect(os.RemoveAll(filepath.Join(dir, "rvm", "stack", "home"))).To(Succeed())
+		}, "the stack image has no /home/vcap directory to lay the droplet over"),
+	)
+
+	It("fails the boot with the mount's own line when the guest holds no busybox guest's files", func() {
+		out, calls := run(withRoot(), "RVM_TEST_FAIL="+stackSteps()[5].call)
+		Expect(out).To(Equal(failLine("mounting the stack image /dev/vdb failed; the guest kernel needs squashfs with lz4")))
+		Expect(calls).NotTo(ContainSubstring("umount"))
 	})
 
 	It("keeps the stack's CA bundle in a guest without one", func() {
