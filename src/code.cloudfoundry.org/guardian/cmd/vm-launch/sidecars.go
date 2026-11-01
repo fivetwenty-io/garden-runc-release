@@ -72,19 +72,23 @@ func parseSidecars(env map[string]string) ([]vmSidecar, error) {
 }
 
 // sidecarGuestFiles returns the two files that describe sc to the guest. argv
-// is the sidecar's arguments, each quoted as one sh word and joined by
-// spaces, so the guest can read it back with eval. env is the sidecar's
+// is the stack's launcher followed by the sidecar's arguments, each quoted as
+// one sh word and joined by spaces, so the guest can read it back with eval.
+// Rep sends a sidecar's arguments as a Diego run action holds them, without
+// the launcher that is the action's path, so the launcher goes in front of
+// them here, as it does for the app (see stackCommand). env is the sidecar's
 // environment changes as export lines for its env entries and unset lines for
 // its unset entries, in that order. Names on deny and names that are not shell
 // identifiers are left out, as they are for the app. A value with a NUL byte
 // is an error, because no process environment can carry one.
 func sidecarGuestFiles(sc vmSidecar, deny map[string]bool) (argv, env string, err error) {
-	words := make([]string, len(sc.Args))
+	words := make([]string, 0, 1+len(sc.Args))
+	words = append(words, sidecarQuote(stackLauncherPath))
 	for i, arg := range sc.Args {
 		if strings.IndexByte(arg, 0) >= 0 {
 			return "", "", fmt.Errorf("argument %d of a sidecar holds a NUL byte, which no process argument can carry", i)
 		}
-		words[i] = sidecarQuote(arg)
+		words = append(words, sidecarQuote(arg))
 	}
 
 	var b strings.Builder

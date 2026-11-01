@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
 	"os"
 	"path/filepath"
@@ -17,13 +18,19 @@ import (
 	. "github.com/onsi/gomega"
 )
 
-// realSidecarLauncher is the launcher of the sidecar guest's app. It reports
-// who it runs as, where, and the identity pair it finds, and then checks the
-// certificate each second and prints the pair again once a push has replaced
-// it. A stop's SIGTERM makes it exit 7, after the sleep it waits on ends.
-// The test stack has no sleep applet of its own, so the launcher runs
-// busybox's through the binary.
+// realSidecarLauncher is the sidecar guest's launcher, which runs the app and
+// the sidecar, as the CF launcher does. A sidecar comes with its command as
+// the launcher's second argument, which sh -c runs from the stack. The app
+// comes with an empty command, and the launcher then reports who it runs as,
+// where, and the identity pair it finds, checks the certificate each second,
+// and prints the pair again once a push has replaced it. A stop's SIGTERM
+// makes the app exit 7, after the sleep it waits on ends. The test stack has
+// no sleep applet of its own, so the launcher runs busybox's through the
+// binary.
 const realSidecarLauncher = `#!/bin/sh
+if [ -n "$2" ]; then
+	exec /bin/sh -c "$2"
+fi
 trap 'echo app-got-term; exit 7' TERM
 creds=/etc/cf-instance-credentials
 echo "app-id=$(id)"
@@ -45,8 +52,8 @@ while :; do
 done
 `
 
-// realSidecarScript is the sidecar's own script, which sh -c runs from the
-// stack. It reports who it runs as, where, and the variable its own
+// realSidecarScript is the sidecar's command, which the launcher runs. It
+// reports who it runs as, where, and the variable its own
 // environment sets, and a stop's SIGTERM makes it exit 0.
 const realSidecarScript = `trap 'echo sidecar-got-term; exit 0' TERM
 echo "sidecar-id=$(id)"
@@ -56,6 +63,27 @@ echo "sidecar-mark=$SIDECAR_MARK"
 echo sidecar-ready
 while :; do /bin/busybox sleep 1; done
 `
+
+// realSidecarFiles returns the guest files of one sidecar that runs command,
+// as vm-launch makes them from the CF_VM_SIDECARS that rep sets: a Diego run
+// action whose path is the launcher and whose arguments are the app
+// directory, the command, and empty metadata, with one variable of its own.
+func realSidecarFiles(command string) []guestSidecar {
+	desc, err := json.Marshal(map[string]any{
+		"version": sidecarsVersion,
+		"sidecars": []map[string]any{{
+			"args":       []string{"app", command, ""},
+			"env":        []string{"SIDECAR_MARK=from the sidecar env"},
+			"log_source": "APP/PROC/WEB/SIDECAR/PROBE",
+		}},
+	})
+	Expect(err).NotTo(HaveOccurred())
+	sidecars, err := parseSidecars(map[string]string{sidecarsEnvVar: string(desc)})
+	Expect(err).NotTo(HaveOccurred())
+	files, err := sidecarGuestFilesOf(sidecars, stackGuestDenylist(true))
+	Expect(err).NotTo(HaveOccurred())
+	return files
+}
 
 // allWriter passes guest output to w and calls fire once, from the console
 // goroutine, when the output so far holds every one of texts.
@@ -93,10 +121,10 @@ type realSidecarRun struct {
 }
 
 // superviseRealSidecar boots a stack guest under TCG through the
-// supervisor, as vm-launch runs QEMU, with realSidecarLauncher as its app,
-// one sidecar that runs realSidecarScript, and initial as the identity pair
-// in its initramfs. Once the guest has started its command, it pushes next
-// as push number 1. Once the output shows that the sidecar is ready and that
+// supervisor, as vm-launch runs QEMU, with realSidecarLauncher as its
+// launcher, one sidecar from CF_VM_SIDECARS that runs realSidecarScript
+// through it, and initial as the identity pair in its initramfs. Once the
+// guest has started its command, it pushes next as push number 1. Once the output shows that the sidecar is ready and that
 // the app has seen the pushed pair, it sends the supervisor SIGTERM.
 func superviseRealSidecar(initial, next testIdentityPair) realSidecarRun {
 	art := realArtifacts()
@@ -115,10 +143,7 @@ func superviseRealSidecar(initial, next testIdentityPair) realSidecarRun {
 		cwd:      "/home/vcap",
 		hostname: "stack-guest-0",
 		hosts:    []byte("127.0.0.1 localhost\n"),
-		sidecars: []guestSidecar{{
-			argv: shellJoin([]string{"/bin/sh", "-c", realSidecarScript}),
-			env:  "export SIDECAR_MARK='from the sidecar env'\n",
-		}},
+		sidecars: realSidecarFiles(realSidecarScript),
 		identity: &instanceIdentity{cert: initial.crt, key: initial.key},
 	}
 	g.drives, err = newGuestDrivesWithStack(backend.VMQemu, nil, nil, sd)

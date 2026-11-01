@@ -88,14 +88,14 @@ var _ = Describe("sidecars", func() {
 			return string(out)
 		}
 
-		DescribeTable("keeps an argument vector byte for byte through eval",
+		DescribeTable("puts the launcher in front of the arguments and keeps each byte for byte through eval",
 			func(shellOf func() guestShell) {
 				shell := shellOf()
 				argv, _, err := sidecarGuestFiles(vmSidecar{Args: nasty}, nil)
 				Expect(err).NotTo(HaveOccurred())
 
 				got := runIn(shell, `eval "set -- $1"; printf "%s\n" "$@"; echo "n=$#"`, argv)
-				want := strings.Join(nasty, "\n") + "\nn=" + "10\n"
+				want := stackLauncherPath + "\n" + strings.Join(nasty, "\n") + "\nn=" + "11\n"
 				Expect(got).To(Equal(want), shell.name)
 				Expect("/tmp/rvm-pwned").NotTo(BeAnExistingFile())
 			},

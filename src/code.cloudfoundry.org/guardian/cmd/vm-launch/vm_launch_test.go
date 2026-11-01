@@ -1653,8 +1653,8 @@ var _ = Describe("run with a stack image", func() {
 			Expect(built.stack).NotTo(BeNil())
 			sidecars, id := built.stack.sidecars, built.stack.identity
 			Expect(sidecars).To(Equal([]guestSidecar{
-				{argv: `'app' './side --port 8081' ''`},
-				{argv: `'app' './other '\''quoted'\'' $HOME' ''`, env: "export SIDE='1'\nunset LANG\n"},
+				{argv: `'/tmp/lifecycle/launcher' 'app' './side --port 8081' ''`},
+				{argv: `'/tmp/lifecycle/launcher' 'app' './other '\''quoted'\'' $HOME' ''`, env: "export SIDE='1'\nunset LANG\n"},
 			}))
 			Expect(id).NotTo(BeNil())
 			Expect(id.cert).To(Equal(certPEM))
@@ -1678,7 +1678,7 @@ var _ = Describe("run with a stack image", func() {
 			Expect(runWith(backend.VMQemu, launchArg)).To(Equal(0), logBuf.String())
 
 			sidecars, id := built.stack.sidecars, built.stack.identity
-			Expect(sidecars).To(Equal([]guestSidecar{{argv: `'app' './side' ''`}}))
+			Expect(sidecars).To(Equal([]guestSidecar{{argv: `'/tmp/lifecycle/launcher' 'app' './side' ''`}}))
 			Expect(id).To(BeNil())
 			Expect(built.env).NotTo(ContainSubstring("CF_INSTANCE_CERT"))
 			Expect(built.env).NotTo(ContainSubstring("CF_INSTANCE_KEY"))
