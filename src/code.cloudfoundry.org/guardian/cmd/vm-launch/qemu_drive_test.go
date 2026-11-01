@@ -631,3 +631,59 @@ var _ = Describe("QEMU arguments for a guest with shares", func() {
 		})
 	})
 })
+
+var _ = Describe("the QEMU stack and droplet drives against a real QEMU", func() {
+	// openReadOnly returns a new open sparse file of size bytes, opened
+	// read-only as vm-launch opens the stack and the droplet.
+	openReadOnly := func(size int64) *os.File {
+		path := filepath.Join(GinkgoT().TempDir(), "image")
+		Expect(os.WriteFile(path, nil, 0o600)).To(Succeed())
+		Expect(os.Truncate(path, size)).To(Succeed())
+		f, err := os.Open(path)
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(f.Close)
+		return f
+	}
+
+	// driveArgs returns the add-fd, drive, and device options of the stack
+	// and droplet drives of a guest that has only them, with files for the
+	// initramfs's place and the two images.
+	driveArgs := func(sd *stackDrives) ([]string, []*os.File) {
+		files, drives, initrdPath, _, rootPath := hypervisorFilesWithStack(nil, openSizedFile(0), nil, nil, sd)
+		argv, err := hypervisorArgvWithStack(backend.VMQemu, goldenArt, "/unused", initrdPath, goldenMemMiB, taskNetwork(), drives, rootPath, 0, sd)
+		Expect(err).NotTo(HaveOccurred())
+		var args []string
+		for i := 0; i+1 < len(argv); i++ {
+			if argv[i] == "-add-fd" || argv[i] == "-drive" || (argv[i] == "-device" && strings.HasPrefix(argv[i+1], "virtio-blk")) {
+				args = append(args, argv[i], argv[i+1])
+			}
+		}
+		Expect(args).To(HaveLen(12))
+		return args, files
+	}
+
+	qemuStopped := func(qemu string, args ...string) []string {
+		return append([]string{qemu, "-S", "-display", "none", "-M", "microvm,accel=tcg", "-nodefaults", "-no-user-config", "-monitor", "stdio"}, args...)
+	}
+
+	It("accepts both drives from read-only descriptors and reports each as read-only, with the size of its own image", func() {
+		qemu := realQEMU()
+		requireMicrovm(qemu)
+		args, files := driveArgs(&stackDrives{stack: openReadOnly(1 << 20), droplet: openReadOnly(2 << 20)})
+		code, stdout, stderr := runRealQEMU(qemuStopped(qemu, args...), files, "info block -v\nquit\n", 30*time.Second)
+		Expect(code).To(Equal(0), "QEMU rejected %q: %s", args, stderr)
+		Expect(stdout).To(MatchRegexp(`(?m)^stack0 \(#block\d+\): /dev/fdset/4 \(raw, read-only\)`))
+		Expect(stdout).To(MatchRegexp(`(?m)^droplet0 \(#block\d+\): /dev/fdset/5 \(raw, read-only\)`))
+		Expect(stdout).To(ContainSubstring("(1048576 bytes)"))
+		Expect(stdout).To(ContainSubstring("(2097152 bytes)"))
+	})
+
+	It("rejects a read-write descriptor for a read-only drive, so the check above can fail", func() {
+		qemu := realQEMU()
+		requireMicrovm(qemu)
+		args, files := driveArgs(&stackDrives{stack: openSizedFile(1 << 20), droplet: openSizedFile(1 << 20)})
+		code, _, stderr := runRealQEMU(qemuStopped(qemu, args...), files, "quit\n", 30*time.Second)
+		Expect(code).NotTo(Equal(0))
+		Expect(stderr).To(ContainSubstring("/dev/fdset/4"))
+	})
+})

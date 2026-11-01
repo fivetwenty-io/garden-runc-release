@@ -758,3 +758,172 @@ done
 		Expect(extLabel(root)).To(Equal("rvm-root"))
 	})
 })
+
+// goldenQEMUReadOnlyDrive is what the stack or the droplet adds to the QEMU
+// command line, for the image on file descriptor fd under the drive id and
+// serial.
+func goldenQEMUReadOnlyDrive(id, serial, fd string) []string {
+	return []string{
+		"-add-fd", "fd=" + fd + ",set=" + fd,
+		"-drive", "if=none,id=" + id + ",format=raw,file.driver=file,file.filename=/dev/fdset/" + fd + ",read-only=on,cache=writeback,aio=threads,file.locking=off,werror=report,rerror=report,discard=ignore",
+		"-device", "virtio-blk-device,drive=" + id + ",serial=" + serial,
+	}
+}
+
+// goldenFCReadOnlyDrive is the drives entry of the stack or the droplet, with
+// its image on file descriptor fd.
+func goldenFCReadOnlyDrive(id, fd string) string {
+	return `{"drive_id":"` + id + `","path_on_host":"/proc/self/fd/` + fd + `","is_root_device":false,"is_read_only":true,"cache_type":"Writeback","io_engine":"Sync"}`
+}
+
+var _ = Describe("hypervisor stack and droplet drives", func() {
+	task := &network{}
+	nw := &network{ports: []int{8080}}
+
+	stackFiles := func() *stackDrives {
+		return &stackDrives{stack: openSizedFile(1 << 20), droplet: openSizedFile(2 << 20)}
+	}
+
+	Describe("stackDriveFDs", func() {
+		DescribeTable("puts the stack and the droplet after every other file",
+			func(nVols int, monitor, root bool, stack, droplet int) {
+				s, d := stackDriveFDs(nVols, monitor, root)
+				Expect([]int{s, d}).To(Equal([]int{stack, droplet}))
+			},
+			Entry("with nothing else", 0, false, false, 4, 5),
+			Entry("after a root image", 0, false, true, 5, 6),
+			Entry("after a monitor and a root image", 0, true, true, 6, 7),
+			Entry("after one volume, a monitor, and a root image", 1, true, true, 7, 8),
+			Entry("after four volumes, a monitor, and a root image", 4, true, true, 10, 11),
+		)
+	})
+
+	Describe("hypervisorFilesWithStack", func() {
+		It("gives the same files, drives, and paths as hypervisorFiles for a nil stackDrives", func() {
+			initrd, monitor, root := openSizedFile(1), openSizedFile(1), openSizedFile(1)
+			atts := imageAttachments(openSizedFile(1<<20), openSizedFile(2<<20))
+			files, drives, initrdPath, monitorFD, rootPath := hypervisorFiles(atts, initrd, monitor, root)
+			wfiles, wdrives, winitrd, wmonitor, wroot := hypervisorFilesWithStack(atts, initrd, monitor, root, nil)
+			Expect(wfiles).To(Equal(files))
+			Expect(wdrives).To(Equal(drives))
+			Expect([]any{winitrd, wmonitor, wroot}).To(Equal([]any{initrdPath, monitorFD, rootPath}))
+		})
+
+		It("adds the stack and the droplet as the last two files and moves no other descriptor", func() {
+			initrd, monitor, root := openSizedFile(1), openSizedFile(1), openSizedFile(1)
+			vol := openSizedFile(1 << 20)
+			sd := stackFiles()
+			before, _, _, _, _ := hypervisorFiles(imageAttachments(vol), initrd, monitor, root)
+			files, drives, initrdPath, monitorFD, rootPath := hypervisorFilesWithStack(imageAttachments(vol), initrd, monitor, root, sd)
+			Expect(files).To(Equal(append(append([]*os.File(nil), before...), sd.stack, sd.droplet)))
+			Expect(drives).To(Equal(imageDrives(3)))
+			Expect([]any{initrdPath, monitorFD, rootPath}).To(Equal([]any{"/proc/self/fd/4", 5, "/proc/self/fd/6"}))
+			stack, droplet := stackDriveFDs(1, true, true)
+			Expect(files[stack-firstExtraFD]).To(BeIdenticalTo(sd.stack))
+			Expect(files[droplet-firstExtraFD]).To(BeIdenticalTo(sd.droplet))
+		})
+	})
+
+	Describe("QEMU", func() {
+		It("keeps the command line byte for byte for a nil stackDrives", func() {
+			for _, c := range []struct {
+				initrd  string
+				drives  []volumeDrive
+				root    string
+				monitor int
+				n       *network
+			}{
+				{goldenInitrd, nil, "", 0, task},
+				{goldenInitrd, nil, procSelfFD(4), 0, task},
+				{goldenVolumeInitrd, drivePathsFor(1), procSelfFD(6), 5, nw},
+			} {
+				plain, err := hypervisorArgv(backend.VMQemu, goldenArt, "/unused", c.initrd, goldenMemMiB, c.n, c.drives, c.root, c.monitor)
+				Expect(err).NotTo(HaveOccurred())
+				with, err := hypervisorArgvWithStack(backend.VMQemu, goldenArt, "/unused", c.initrd, goldenMemMiB, c.n, c.drives, c.root, c.monitor, nil)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(with).To(Equal(plain))
+			}
+		})
+
+		It("attaches the stack and the droplet as read-only drives with their serials after the root drive", func() {
+			argv, err := hypervisorArgvWithStack(backend.VMQemu, goldenArt, "/unused", goldenInitrd, goldenMemMiB, task, nil, procSelfFD(4), 0, stackFiles())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(argv).To(Equal(concat(goldenQEMUBase, goldenQEMUTaskNetdev, goldenQEMURootDrive("4"),
+				goldenQEMUReadOnlyDrive("stack0", "rvm-stack", "5"), goldenQEMUReadOnlyDrive("droplet0", "rvm-droplet", "6"))))
+			Expect(strings.Split(optionAfter(argv, "-drive", "id=stack0"), ",")).To(ContainElement("read-only=on"))
+			Expect(strings.Split(optionAfter(argv, "-drive", "id=droplet0"), ",")).To(ContainElement("read-only=on"))
+		})
+
+		It("leaves the volume, the monitor, and the root drive as they are and numbers the new descriptors after them", func() {
+			argv, err := hypervisorArgvWithStack(backend.VMQemu, goldenArt, "/unused", goldenVolumeInitrd, goldenMemMiB, nw, drivePathsFor(1), procSelfFD(6), 5, stackFiles())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(argv).To(Equal(concat(withInitrd(goldenQEMUBase, goldenVolumeInitrd), goldenQEMUNetdev, goldenQEMUDrive, goldenQEMUMonitor("5"),
+				goldenQEMURootDrive("6"), goldenQEMUReadOnlyDrive("stack0", "rvm-stack", "7"), goldenQEMUReadOnlyDrive("droplet0", "rvm-droplet", "8"))))
+		})
+
+		It("attaches them without a root image, straight after the initramfs", func() {
+			argv, err := hypervisorArgvWithStack(backend.VMQemu, goldenArt, "/unused", goldenInitrd, goldenMemMiB, task, nil, "", 0, stackFiles())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(argv).To(Equal(concat(goldenQEMUBase, goldenQEMUTaskNetdev,
+				goldenQEMUReadOnlyDrive("stack0", "rvm-stack", "4"), goldenQEMUReadOnlyDrive("droplet0", "rvm-droplet", "5"))))
+		})
+
+		It("names the same serials newGuestDrivesWithStack gives", func() {
+			sd := stackFiles()
+			drives, err := newGuestDrivesWithStack(backend.VMQemu, nil, nil, sd)
+			Expect(err).NotTo(HaveOccurred())
+			argv, err := hypervisorArgvWithStack(backend.VMQemu, goldenArt, "/unused", goldenInitrd, goldenMemMiB, task, nil, "", 0, sd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(optionAfter(argv, "-device", "drive=stack0")).To(HaveSuffix("serial=" + drives.stackID))
+			Expect(optionAfter(argv, "-device", "drive=droplet0")).To(HaveSuffix("serial=" + drives.dropletID))
+		})
+	})
+
+	Describe("Firecracker", func() {
+		config := func(initrd string, drives []volumeDrive, rootPath string, sd *stackDrives) string {
+			work := GinkgoT().TempDir()
+			_, err := hypervisorArgvWithStack(backend.VMFirecracker, goldenArt, work, initrd, goldenMemMiB, task, drives, rootPath, 0, sd)
+			Expect(err).NotTo(HaveOccurred())
+			raw, err := os.ReadFile(filepath.Join(work, "fc.json"))
+			Expect(err).NotTo(HaveOccurred())
+			return string(raw)
+		}
+
+		It("keeps the configuration byte for byte for a nil stackDrives", func() {
+			Expect(config(goldenInitrd, nil, "", nil)).To(Equal(goldenFCNet))
+			Expect(config(goldenVolumeInitrd, drivePathsFor(1), procSelfFD(5), nil)).To(Equal(fcConfigJSON(goldenVolumeInitrd, goldenMemMiB, task, drivePathsFor(1), procSelfFD(5))))
+		})
+
+		It("gives the stack and the droplet as read-only drives after the root drive", func() {
+			raw := config(goldenInitrd, nil, procSelfFD(4), stackFiles())
+			Expect(raw).To(Equal(strings.Replace(goldenFCNet, `"drives":[]`,
+				`"drives":[`+goldenFCRootDrive+`,`+goldenFCReadOnlyDrive("stack0", "5")+`,`+goldenFCReadOnlyDrive("droplet0", "6")+`]`, 1)))
+			var cfg struct {
+				Drives []firecrackerDrive `json:"drives"`
+			}
+			Expect(json.Unmarshal([]byte(raw), &cfg)).To(Succeed())
+			Expect(cfg.Drives).To(HaveLen(3))
+			for _, d := range cfg.Drives[1:] {
+				Expect(d.IsReadOnly).To(BeTrue(), d.DriveID)
+				Expect(d.IsRootDevice).To(BeFalse(), d.DriveID)
+			}
+			Expect(cfg.Drives[0].IsReadOnly).To(BeFalse())
+		})
+
+		It("numbers them after the volume and the root image, and leaves those entries as they are", func() {
+			raw := config(goldenVolumeInitrd, drivePathsFor(1), procSelfFD(5), stackFiles())
+			volumeEntry := goldenFCVolumeDrive(0, "3")
+			rootEntry := strings.Replace(goldenFCRootDrive, "/proc/self/fd/4", "/proc/self/fd/5", 1)
+			Expect(raw).To(ContainSubstring(`"drives":[` + volumeEntry + `,` + rootEntry + `,` + goldenFCReadOnlyDrive("stack0", "6") + `,` + goldenFCReadOnlyDrive("droplet0", "7") + `]`))
+		})
+
+		It("gives the stack and the droplet drive ids of their own", func() {
+			cfg := newFirecrackerConfigWithStack(goldenArt, procSelfFD(7), goldenMemMiB, task, drivePathsFor(4), procSelfFD(8), &stackFDs{stack: 9, droplet: 10})
+			var ids []string
+			for _, d := range cfg.Drives {
+				ids = append(ids, d.DriveID)
+			}
+			Expect(ids).To(Equal([]string{"vol0", "vol1", "vol2", "vol3", "root0", "stack0", "droplet0"}))
+		})
+	})
+})

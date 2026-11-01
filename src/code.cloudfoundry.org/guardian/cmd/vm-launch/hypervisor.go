@@ -311,6 +311,24 @@ func qemuVolumeDrive(id string, d volumeDrive) []string {
 	}
 }
 
+// qemuReadOnlyDrive returns the QEMU options that attach the image whose
+// inherited descriptor is fd as a read-only virtio-blk drive, with the drive
+// id id and the serial serial. It follows qemuVolumeDrive, with the
+// descriptor in a set of its own that the drive opens, so QEMU shares the
+// open file vm-launch checked. The drive is read-only, so QEMU opens the
+// file for reading only, and the descriptor has to be open read-only too, or
+// no set matches it. A guest write is refused by the device before it
+// reaches the image.
+func qemuReadOnlyDrive(id, serial string, fd int) []string {
+	n := strconv.Itoa(fd)
+	return []string{
+		"-add-fd", "fd=" + n + ",set=" + n,
+		"-drive", "if=none,id=" + id + ",format=raw,file.driver=file,file.filename=" + qemuFDSetPath(fd) +
+			",read-only=on,cache=writeback,aio=threads,file.locking=off,werror=report,rerror=report,discard=ignore",
+		"-device", "virtio-blk-device,drive=" + id + ",serial=" + serial,
+	}
+}
+
 // qemuFDSetPath is the path by which QEMU opens a duplicate of a descriptor
 // in the file descriptor set set.
 func qemuFDSetPath(set int) string {
@@ -361,6 +379,11 @@ const (
 	firstExtraFD  = 3
 	firstVolumeFD = firstExtraFD
 	rootDriveID   = "root0"
+
+	// stackDriveID and dropletDriveID name the read-only stack and droplet
+	// drives, on QEMU and on Firecracker alike.
+	stackDriveID   = "stack0"
+	dropletDriveID = "droplet0"
 )
 
 // volumeDriveID names the drive of the volume with volume index i, on QEMU
@@ -396,6 +419,30 @@ func volumeDrivePath(i int) string {
 // is the guest root image from createRootImage or nil, and rootPath is empty
 // without one.
 func hypervisorFiles(vols []*attachment, initrd, monitor, root *os.File) (files []*os.File, drives []volumeDrive, initrdPath string, monitorFD int, rootPath string) {
+	return hypervisorFilesWithStack(vols, initrd, monitor, root, nil)
+}
+
+// stackDriveFDs returns the file descriptors of the stack and droplet images
+// in a hypervisor that gets nVols volume disks, the initramfs, a monitor
+// socket when hasMonitor, and a root image when hasRoot, in that order, with
+// the stack and the droplet after them.
+func stackDriveFDs(nVols int, hasMonitor, hasRoot bool) (stack, droplet int) {
+	n := firstExtraFD + nVols + 1
+	if hasMonitor {
+		n++
+	}
+	if hasRoot {
+		n++
+	}
+	return n, n + 1
+}
+
+// hypervisorFilesWithStack is hypervisorFiles for a guest that also has the
+// stack and droplet images in sd, which come after the root image as the last
+// two files, so no other file's descriptor moves. A nil sd gives exactly what
+// hypervisorFiles gives. Both files of an sd are required (see
+// newGuestDrivesWithStack); a missing one is passed on as a nil file.
+func hypervisorFilesWithStack(vols []*attachment, initrd, monitor, root *os.File, sd *stackDrives) (files []*os.File, drives []volumeDrive, initrdPath string, monitorFD int, rootPath string) {
 	for _, att := range vols {
 		if att == nil || att.File == nil {
 			index := -1
@@ -418,6 +465,9 @@ func hypervisorFiles(vols []*attachment, initrd, monitor, root *os.File) (files 
 	if root != nil {
 		files = append(files, root)
 		rootPath = procSelfFD(firstExtraFD + len(files) - 1)
+	}
+	if sd != nil {
+		files = append(files, sd.stack, sd.droplet)
 	}
 	return files, drives, initrdPath, monitorFD, rootPath
 }
@@ -510,6 +560,14 @@ type firecrackerNetworkInterface struct {
 // limit. nw must be set; the port does not change the configuration, because
 // vm-launch itself, not Firecracker, forwards PORT.
 func newFirecrackerConfig(root, initrd string, memMiB int, nw *network, drives []volumeDrive, rootPath string) firecrackerConfig {
+	return newFirecrackerConfigWithStack(root, initrd, memMiB, nw, drives, rootPath, nil)
+}
+
+// newFirecrackerConfigWithStack is newFirecrackerConfig for a guest that also
+// has the stack and droplet images, as read-only drives on the descriptors
+// stack and droplet, after the root image and in that order. A nil sd gives
+// exactly the configuration newFirecrackerConfig gives.
+func newFirecrackerConfigWithStack(root, initrd string, memMiB int, nw *network, drives []volumeDrive, rootPath string, sd *stackFDs) firecrackerConfig {
 	cfg := firecrackerConfig{
 		BootSource: firecrackerBootSource{
 			KernelImagePath: filepath.Join(root, artVmlinux),
@@ -540,8 +598,29 @@ func newFirecrackerConfig(root, initrd string, memMiB int, nw *network, drives [
 			Discard:      true,
 		})
 	}
+	if sd != nil {
+		for _, d := range []struct {
+			id string
+			fd int
+		}{{stackDriveID, sd.stack}, {dropletDriveID, sd.droplet}} {
+			cfg.Drives = append(cfg.Drives, firecrackerDrive{
+				DriveID:      d.id,
+				PathOnHost:   procSelfFD(d.fd),
+				IsRootDevice: false,
+				IsReadOnly:   true,
+				CacheType:    fcDriveCacheType,
+				IOEngine:     fcDriveIOEngine,
+			})
+		}
+	}
 	cfg.NetworkInterfaces = []firecrackerNetworkInterface{{IfaceID: "eth0", GuestMAC: fcGuestMAC, HostDevName: fcTapName}}
 	return cfg
+}
+
+// stackFDs are the file descriptors the hypervisor gets the stack and droplet
+// images on.
+type stackFDs struct {
+	stack, droplet int
 }
 
 func firecrackerArgv(root, configPath string) []string {
@@ -565,6 +644,23 @@ func firecrackerArgv(root, configPath string) []string {
 // shares, which only QEMU serves, so Firecracker refuses them. QEMU refuses a
 // share list that checkShares rejects.
 func hypervisorArgv(kind backend.Kind, root, workDir, initrd string, memMiB int, nw *network, drives []volumeDrive, rootPath string, monitorFD int, shares ...shareSocket) ([]string, error) {
+	return hypervisorArgvWithStack(kind, root, workDir, initrd, memMiB, nw, drives, rootPath, monitorFD, nil, shares...)
+}
+
+// hypervisorArgvWithStack is hypervisorArgv for a guest that also has the
+// stack and droplet images in sd, which hypervisorFilesWithStack passes as
+// the two files after the root image. The hypervisor attaches both as
+// read-only virtio-blk drives after the root image, the stack first, so no
+// other drive moves. Only whether sd is nil matters here, because the
+// descriptors follow from the drives, the monitor, and the root image (see
+// stackDriveFDs). A nil sd gives exactly the command line or configuration
+// hypervisorArgv gives.
+func hypervisorArgvWithStack(kind backend.Kind, root, workDir, initrd string, memMiB int, nw *network, drives []volumeDrive, rootPath string, monitorFD int, sd *stackDrives, shares ...shareSocket) ([]string, error) {
+	var fds *stackFDs
+	if sd != nil {
+		stack, droplet := stackDriveFDs(len(drives), monitorFD > 0, rootPath != "")
+		fds = &stackFDs{stack: stack, droplet: droplet}
+	}
 	if len(drives) > maxVolumes {
 		return nil, fmt.Errorf("%d volume drives, over the %d a guest can have", len(drives), maxVolumes)
 	}
@@ -592,12 +688,16 @@ func hypervisorArgv(kind backend.Kind, root, workDir, initrd string, memMiB int,
 		if rootPath != "" {
 			argv = append(argv, qemuRootDrive(rootPath)...)
 		}
+		if fds != nil {
+			argv = append(argv, qemuReadOnlyDrive(stackDriveID, qemuStackSerial, fds.stack)...)
+			argv = append(argv, qemuReadOnlyDrive(dropletDriveID, qemuDropletSerial, fds.droplet)...)
+		}
 		return argv, nil
 	case backend.VMFirecracker:
 		if monitorFD != 0 {
 			return nil, errors.New("firecracker has no QMP monitor")
 		}
-		cfg, err := json.Marshal(newFirecrackerConfig(root, initrd, memMiB, nw, drives, rootPath))
+		cfg, err := json.Marshal(newFirecrackerConfigWithStack(root, initrd, memMiB, nw, drives, rootPath, fds))
 		if err != nil {
 			return nil, fmt.Errorf("encoding firecracker config: %w", err)
 		}
