@@ -214,39 +214,6 @@ func (b *Builder) Image(log lager.Logger, tarball string) (string, bool) {
 	return f.dir, true
 }
 
-// WarmUp builds the image of every listed tarball that exists and returns
-// when every build has finished or failed, so callers run it in a goroutine.
-// It goes through the same resolutions and entry locks as Image, so a create
-// that arrives during the warm-up waits on the build that the warm-up started.
-func (b *Builder) WarmUp() {
-	log := b.logger.Session("warm-up")
-	start := time.Now()
-	log.Info("started", lager.Data{"tarballs": b.tarballs})
-
-	type pending struct {
-		tarball string
-		f       *flight
-	}
-	var flights []pending
-	for _, path := range b.tarballs {
-		if _, err := os.Stat(path); err != nil {
-			log.Info("tarball-unavailable", lager.Data{"tarball": path, "error": err.Error()})
-			continue
-		}
-		flights = append(flights, pending{tarball: path, f: b.resolve(path)})
-	}
-
-	for _, p := range flights {
-		<-p.f.done
-		if p.f.err != nil {
-			log.Error("vm-stack-image-failed", p.f.err, lager.Data{"tarball": p.tarball})
-			continue
-		}
-		log.Info("vm-stack-image-ready", lager.Data{"tarball": p.tarball, "dir": p.f.dir, "elapsed": time.Since(start).String()})
-	}
-	log.Info("finished", lager.Data{"elapsed": time.Since(start).String()})
-}
-
 // Clean removes every cache entry whose key matches no listed tarball's
 // current key, which includes entries that an older build recipe made. It keeps the whole cache when it cannot hash a listed
 // tarball that exists, and it skips an entry whose lock another build holds.

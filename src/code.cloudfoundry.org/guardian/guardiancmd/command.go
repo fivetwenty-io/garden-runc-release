@@ -1092,17 +1092,15 @@ func (cmd *CommonCommand) checkVMStackFlags(kinds []backend.Kind) error {
 	return nil
 }
 
-// startVMStackWarmUp builds the stack images and then removes the stale ones in
-// the background, so that Garden's start and its ping never wait for a build.
-// It does nothing when no stack builder is configured.
-func (b *executionBackends) startVMStackWarmUp() {
+// startVMStackClean removes the stale stack images in the background, so that
+// Garden's start and its ping never wait for the cleanup. It builds nothing,
+// because the first create builds the image it needs. It does nothing when no
+// stack builder is configured.
+func (b *executionBackends) startVMStackClean() {
 	if b == nil || b.vmStacks == nil {
 		return
 	}
-	go func() {
-		b.vmStacks.WarmUp()
-		b.vmStacks.Clean()
-	}()
+	go b.vmStacks.Clean()
 }
 
 // logUnusedBlockVolumes notes that --vm-block-volumes has no effect because no

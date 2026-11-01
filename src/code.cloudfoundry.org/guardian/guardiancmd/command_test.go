@@ -6,6 +6,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"code.cloudfoundry.org/guardian/backend"
@@ -966,26 +967,34 @@ var _ = Describe("VM stack flags", func() {
 		})
 	})
 
-	Describe("startVMStackWarmUp", func() {
+	Describe("startVMStackClean", func() {
 		It("does nothing without a builder", func() {
 			var backends *executionBackends
-			backends.startVMStackWarmUp()
-			(&executionBackends{}).startVMStackWarmUp()
+			backends.startVMStackClean()
+			(&executionBackends{}).startVMStackClean()
 		})
 
-		It("warms up in the background and returns at once", func() {
+		It("cleans in the background and builds nothing", func() {
+			cacheDir := GinkgoT().TempDir()
+			tarball := filepath.Join(GinkgoT().TempDir(), "rootfs.tar")
+			Expect(os.WriteFile(tarball, []byte("rootfs"), 0644)).To(Succeed())
+			stale := filepath.Join(cacheDir, strings.Repeat("a", 64))
+			Expect(os.Mkdir(stale, 0755)).To(Succeed())
+
 			cmd.ExecutionBackends.Enabled = []string{"vm-qemu"}
 			cmd.ExecutionBackends.VMLaunchBin = launchBin
-			cmd.ExecutionBackends.VMStackTarballs = []string{filepath.Join(GinkgoT().TempDir(), "missing-rootfs.tar")}
-			cmd.ExecutionBackends.VMStackCacheDir = GinkgoT().TempDir()
+			cmd.ExecutionBackends.VMStackTarballs = []string{tarball}
+			cmd.ExecutionBackends.VMStackCacheDir = cacheDir
 
 			backends, err := cmd.wireExecutionBackends(log)
 			Expect(err).NotTo(HaveOccurred())
 
-			backends.startVMStackWarmUp()
-			Eventually(log).Should(gbytes.Say("warm-up.started"))
-			Eventually(log).Should(gbytes.Say("tarball-unavailable"))
-			Eventually(log).Should(gbytes.Say("warm-up.finished"))
+			backends.startVMStackClean()
+			Eventually(log).Should(gbytes.Say("removed"))
+			Expect(stale).NotTo(BeADirectory())
+			entries, err := os.ReadDir(cacheDir)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(entries).To(BeEmpty())
 		})
 	})
 })
