@@ -66,6 +66,21 @@ var guestEnvDenylist = map[string]bool{
 	platformOptionsEnv:        true,
 }
 
+// stackGuestEnvDenylist is guestEnvDenylist for a guest that runs the app on
+// the stack image, where the container's PATH and USER describe the guest's
+// own root file system and user, and so are kept. HOME, TMPDIR, DEPS_DIR,
+// PWD, and OLDPWD still name container paths, and the rest of the denylist
+// stays as it is.
+var stackGuestEnvDenylist = func() map[string]bool {
+	deny := make(map[string]bool, len(guestEnvDenylist))
+	for name := range guestEnvDenylist {
+		if name != "PATH" && name != "USER" {
+			deny[name] = true
+		}
+	}
+	return deny
+}()
+
 // shellOwnedNames are the variables that the guest's busybox sh sets for
 // itself when it runs /rvm/cmd: it ignores an inherited IFS, OPTIND, and
 // PPID, and sets SHLVL one above the inherited value. A value from /rvm/env
@@ -163,6 +178,20 @@ func lookupIn(env map[string]string) func(string) (string, bool) {
 // and a file over maxGuestEnvBytes are errors. No error or log line holds a
 // value.
 func buildGuestEnv(env map[string]string, guestMiB int, logger *log.Logger) (string, error) {
+	return buildGuestEnvDenying(env, guestMiB, logger, guestEnvDenylist)
+}
+
+// buildStackGuestEnv is buildGuestEnv for a guest that runs the app on the
+// stack image. It keeps PATH, USER, and LANG, which the stack's own root file
+// system makes meaningful, and still leaves out HOME, TMPDIR, DEPS_DIR, PWD,
+// and OLDPWD (see stackGuestEnvDenylist).
+func buildStackGuestEnv(env map[string]string, guestMiB int, logger *log.Logger) (string, error) {
+	return buildGuestEnvDenying(env, guestMiB, logger, stackGuestEnvDenylist)
+}
+
+// buildGuestEnvDenying is buildGuestEnv with deny in place of
+// guestEnvDenylist.
+func buildGuestEnvDenying(env map[string]string, guestMiB int, logger *log.Logger, deny map[string]bool) (string, error) {
 	vars := make(map[string]string, len(env))
 	for name, value := range env {
 		vars[name] = value
@@ -207,7 +236,7 @@ func buildGuestEnv(env map[string]string, guestMiB int, logger *log.Logger) (str
 			unusable = append(unusable, quoteForLog(name))
 			continue
 		}
-		if guestEnvDenylist[name] {
+		if deny[name] {
 			continue
 		}
 		if shellOwnedNames[name] {

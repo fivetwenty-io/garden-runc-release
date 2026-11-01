@@ -285,6 +285,48 @@ var _ = Describe("guest environment", func() {
 			}
 		})
 
+		Describe("buildStackGuestEnv", func() {
+			buildStack := func(env map[string]string) string {
+				envFile, err := buildStackGuestEnv(env, 320, logger)
+				Expect(err).NotTo(HaveOccurred())
+				return envFile
+			}
+
+			It("keeps PATH, USER, and LANG, and passes every other variable the guest environment passes", func() {
+				want := append(append([]string(nil), passed...), "PATH", "USER")
+				sort.Strings(want)
+				Expect(exportedNames(buildStack(container))).To(Equal(want))
+				Expect(want).To(ContainElements("PATH", "USER", "LANG"))
+			})
+
+			It("still leaves out HOME, TMPDIR, DEPS_DIR, PWD, and OLDPWD", func() {
+				names := exportedNames(buildStack(container))
+				for _, name := range []string{"HOME", "TMPDIR", "DEPS_DIR", "PWD", "OLDPWD"} {
+					Expect(names).NotTo(ContainElement(name))
+				}
+			})
+
+			It("still leaves out the certificate paths, the service binding paths, the platform options, and Garden's markers", func() {
+				names := exportedNames(buildStack(container))
+				for _, name := range []string{"CF_INSTANCE_CERT", "CF_INSTANCE_KEY", "CF_SYSTEM_CERT_PATH", "VCAP_PLATFORM_OPTIONS", "SERVICE_BINDING_ROOT", "VCAP_SERVICES_FILE_PATH"} {
+					Expect(names).NotTo(ContainElement(name))
+				}
+				Expect(buildStack(container)).NotTo(ContainSubstring("__GARDEN_"))
+			})
+
+			It("quotes the kept values and gives the same file as buildGuestEnv for an environment without PATH or USER", func() {
+				Expect(buildStack(map[string]string{"PATH": "/usr/local/bin:/usr/bin:/bin", "USER": "vcap", "A": "1"})).To(Equal("export A='1'\nexport PATH='/usr/local/bin:/usr/bin:/bin'\nexport USER='vcap'\n"))
+				plain := map[string]string{"A": "1", "B": "two words", "HOME": "/home/vcap", "LANG": "en_US.UTF-8"}
+				Expect(buildStack(plain)).To(Equal(build(plain)))
+			})
+
+			It("leaves the guest environment's own denylist alone", func() {
+				Expect(guestEnvDenylist).To(HaveKey("PATH"))
+				Expect(guestEnvDenylist).To(HaveKey("USER"))
+				Expect(build(map[string]string{"PATH": "/bin", "USER": "vcap"})).To(BeEmpty())
+			})
+		})
+
 		It("keeps an empty value set", func() {
 			envFile := build(map[string]string{"CF_INSTANCE_PORT": ""})
 			Expect(envFile).To(Equal("export CF_INSTANCE_PORT=''\n"))
