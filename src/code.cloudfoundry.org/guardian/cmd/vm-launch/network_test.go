@@ -504,7 +504,7 @@ var _ = Describe("guest network", func() {
 				work := GinkgoT().TempDir()
 				argv, err := hypervisorArgv(backend.VMFirecracker, art, work, "/proc/self/fd/3", 128, n, nil, "", 0)
 				Expect(err).NotTo(HaveOccurred())
-				Expect(argv).To(Equal([]string{art + "/firecracker/firecracker", "--api-sock", work + "/fc.sock", "--config-file", work + "/fc.json"}))
+				Expect(argv).To(Equal([]string{art + "/firecracker/firecracker", "--level", "Warn", "--api-sock", work + "/fc.sock", "--config-file", work + "/fc.json"}))
 
 				raw, err := os.ReadFile(filepath.Join(work, "fc.json"))
 				Expect(err).NotTo(HaveOccurred())

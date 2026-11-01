@@ -27,6 +27,10 @@ const (
 	fcAPISocketName               = "fc.sock"
 	fcStatsPath                   = "/balloon/statistics"
 
+	// fcLogLevel is the lowest level Firecracker logs at (see
+	// firecrackerAPIArgv).
+	fcLogLevel = "Warn"
+
 	// fcSocketWait is how long the source waits for Firecracker to create
 	// its API socket after the process starts.
 	fcSocketWait = 5 * time.Second
@@ -71,9 +75,13 @@ func firecrackerAPISocket(workDir string) string {
 
 // firecrackerAPIArgv returns the command line that boots Firecracker from
 // its config file and also serves its API on socketPath, which the statistics
-// source reads.
+// source reads. Firecracker writes its log to stdout, the guest console's
+// stream, and at its default level it logs two lines for every API request,
+// which the serial filter would pass on as the app's output once the guest
+// has started its command. Its log stays at fcLogLevel, so only its warnings
+// and errors reach the console.
 func firecrackerAPIArgv(root, configPath, socketPath string) []string {
-	return []string{filepath.Join(root, artFirecracker), "--api-sock", socketPath, "--config-file", configPath}
+	return []string{filepath.Join(root, artFirecracker), "--level", fcLogLevel, "--api-sock", socketPath, "--config-file", configPath}
 }
 
 // firecrackerStatsSource reads the balloon statistics over one kept

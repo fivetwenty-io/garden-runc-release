@@ -259,7 +259,7 @@ var _ = Describe("hypervisor volume drive", func() {
 		work := GinkgoT().TempDir()
 		argv, err := hypervisorArgv(backend.VMFirecracker, goldenArt, work, goldenVolumeInitrd, goldenMemMiB, task, drivePathsFor(1), "", 0)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(argv).To(Equal([]string{goldenArt + "/firecracker/firecracker", "--api-sock", work + "/fc.sock", "--config-file", work + "/fc.json"}))
+		Expect(argv).To(Equal([]string{goldenArt + "/firecracker/firecracker", "--level", "Warn", "--api-sock", work + "/fc.sock", "--config-file", work + "/fc.json"}))
 		raw, err := os.ReadFile(filepath.Join(work, "fc.json"))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(string(raw)).To(ContainSubstring(goldenFCDrive))
