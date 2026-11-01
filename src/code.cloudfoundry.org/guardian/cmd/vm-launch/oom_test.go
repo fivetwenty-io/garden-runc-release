@@ -296,25 +296,31 @@ exit 0
 		return run([]string{"--backend", string(backend.VMQemu), "--artifacts", art, "--", "/tmp/lifecycle/launcher", "app", "true", ""}, log.New(logBuf, "vm-launch: ", 0))
 	}
 
+	// oomLog is the log without the line that names the guest, which every
+	// launch writes before the hypervisor starts.
+	oomLog := func() string {
+		return regexp.MustCompile(`(?m)^vm-launch: busybox guest: .*\n`).ReplaceAllString(logBuf.String(), "")
+	}
+
 	It("writes the line, with the count and the guest size, before the exit status when the guest ran out of memory", func() {
 		code := runGuest(`echo "hello"
 echo "RVM_OOM_$nonce=2"
 echo "RVM_EXIT_$nonce=137"`)
 		Expect(code).To(Equal(137))
-		Expect(logBuf.String()).To(Equal("vm-launch: the guest ran out of memory: its kernel killed 2 processes; the guest has 320 MiB\n"))
+		Expect(oomLog()).To(Equal("vm-launch: the guest ran out of memory: its kernel killed 2 processes; the guest has 320 MiB\n"))
 	})
 
 	It("writes the line whatever the status, such as 0", func() {
 		code := runGuest(`echo "RVM_OOM_$nonce=1"
 echo "RVM_EXIT_$nonce=0"`)
 		Expect(code).To(Equal(0))
-		Expect(logBuf.String()).To(Equal("vm-launch: the guest ran out of memory: its kernel killed 1 process; the guest has 320 MiB\n"))
+		Expect(oomLog()).To(Equal("vm-launch: the guest ran out of memory: its kernel killed 1 process; the guest has 320 MiB\n"))
 	})
 
 	It("writes the line before a line that explains vm-launch's own exit status", func() {
 		code := runGuest(`echo "RVM_OOM_$nonce=2"`)
 		Expect(code).To(Equal(exitMissingMarker))
-		lines := strings.Split(strings.TrimSuffix(logBuf.String(), "\n"), "\n")
+		lines := strings.Split(strings.TrimSuffix(oomLog(), "\n"), "\n")
 		Expect(lines).To(HaveLen(2), logBuf.String())
 		Expect(lines[0]).To(HavePrefix("vm-launch: the guest ran out of memory"))
 		Expect(lines[1]).To(ContainSubstring("exiting " + strconv.Itoa(exitMissingMarker)))
