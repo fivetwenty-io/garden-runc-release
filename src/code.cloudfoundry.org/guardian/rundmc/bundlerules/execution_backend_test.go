@@ -255,6 +255,42 @@ var _ = Describe("ExecutionBackendRule", func() {
 		})
 	})
 
+	When("the backend is vm-firecracker with a stack image directory", func() {
+		BeforeEach(func() {
+			desiredSpec.ExecutionBackend = string(backend.VMFirecracker)
+			desiredSpec.VMStackDir = "/var/vcap/data/vm-runtime/stacks/abc"
+			touch("kernel/vmlinux")
+			touch("firecracker/firecracker")
+			touch("busybox")
+		})
+
+		It("binds the directory read-only after the artifacts and vm-launch binds", func() {
+			mounts := newBndl.Mounts()
+			Expect(mounts).To(HaveLen(4))
+			Expect(mounts[1].Destination).To(Equal("/opt/garden-vm/artifacts"))
+			Expect(mounts[2].Destination).To(Equal("/opt/garden-vm/vm-launch"))
+			Expect(mounts[3]).To(Equal(specs.Mount{
+				Destination: "/opt/garden-vm/stack",
+				Source:      "/var/vcap/data/vm-runtime/stacks/abc",
+				Type:        "bind",
+				Options:     []string{"bind", "ro", "nosuid", "nodev", "noexec"},
+			}))
+			Expect(bundlerules.VMStackMountPath).To(Equal("/opt/garden-vm/stack"))
+		})
+	})
+
+	When("the backend is oci-gvisor with a stack image directory", func() {
+		BeforeEach(func() {
+			desiredSpec.ExecutionBackend = string(backend.OCIGvisor)
+			desiredSpec.VMStackDir = "/var/vcap/data/vm-runtime/stacks/abc"
+		})
+
+		It("adds no mount", func() {
+			Expect(applyErr).NotTo(HaveOccurred())
+			Expect(newBndl.Mounts()).To(Equal(inputBndl.Mounts()))
+		})
+	})
+
 	When("the backend is vm-firecracker", func() {
 		BeforeEach(func() {
 			desiredSpec.ExecutionBackend = string(backend.VMFirecracker)

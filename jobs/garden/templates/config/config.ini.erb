@@ -309,6 +309,22 @@ end -%>
   vm_block_volumes = vm_volume_settings["garden.vm_block_volumes"]
   vm_volume_shares = vm_volume_settings["garden.vm_volume_shares"]
   vm_volume_sync_mounts = vm_volume_settings["garden.vm_volume_sync_mounts"]
+  vm_stack_tarballs = p("garden.vm_stack_tarballs")
+  unless vm_stack_tarballs.is_a?(Array)
+    raise "garden.vm_stack_tarballs must be a list of absolute paths, got #{vm_stack_tarballs.inspect}"
+  end
+  vm_stack_tarballs.each do |tarball|
+    unless tarball.is_a?(String) && tarball.start_with?("/")
+      raise "garden.vm_stack_tarballs must hold absolute paths, got #{tarball.inspect}"
+    end
+  end
+  vm_stack_wait_seconds = p("garden.vm_stack_wait_seconds")
+  unless vm_stack_wait_seconds.is_a?(Integer) && vm_stack_wait_seconds > 0
+    raise "garden.vm_stack_wait_seconds must be a positive whole number of seconds, got #{vm_stack_wait_seconds.inspect}"
+  end
+  if !vm_backend_enabled && !vm_stack_tarballs.empty?
+    raise "garden.vm_stack_tarballs requires a vm-* entry in garden.execution_backends, because only a VM container gets a stack image"
+  end
   if !vm_backend_enabled
     if vm_block_volumes
       raise "garden.vm_block_volumes requires a vm-* entry in garden.execution_backends, because only a VM container gets a block device"
@@ -338,6 +354,12 @@ end -%>
 <% end -%>
 <% unless vm_volume_sync_mounts -%>
   vm-volume-async-mounts = true
+<% end -%>
+<% vm_stack_tarballs.each do |tarball| -%>
+  vm-stack-tarball = <%= tarball %>
+<% end -%>
+<% unless vm_stack_tarballs.empty? -%>
+  vm-stack-wait = <%= vm_stack_wait_seconds %>s
 <% end -%>
 <% end -%>
 <% end -%>

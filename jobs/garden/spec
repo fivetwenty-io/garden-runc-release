@@ -322,6 +322,29 @@ properties:
       vm-* entry in garden.execution_backends.
     default: true
 
+  garden.vm_stack_tarballs:
+    description: |
+      Absolute paths of the stack rootfs tarballs, such as
+      /var/vcap/packages/cflinuxfs4/rootfs.tar, that Garden turns into
+      read-only squashfs stack images for vm-* containers. A VM container whose
+      rootfs is one of these tarballs gets its image bound read-only at
+      /opt/garden-vm/stack, and its guest runs the real stack. Garden builds
+      each image in the background at start and caches it under
+      /var/vcap/data/vm-runtime/stacks. The default, an empty list, builds
+      nothing and leaves every container as it is today. Each entry renders
+      one --vm-stack-tarball, and a non-empty list requires a vm-* entry in
+      garden.execution_backends.
+    default: []
+
+  garden.vm_stack_wait_seconds:
+    description: |
+      How long a VM container create waits for a stack image that is still
+      being built, in seconds. When the image is not ready in that time, the
+      container is created without it and starts the way it does without a
+      stack. It renders --vm-stack-wait, and only when garden.vm_stack_tarballs
+      is not empty.
+    default: 20
+
   garden.tcp_keepalive_time:
     description: Sets the `net.ipv4.tcp_keepalive_time` kernel parameter in containers. If not specified, the value from the linux init_net namespace is used.
 
