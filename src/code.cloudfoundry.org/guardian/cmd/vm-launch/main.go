@@ -321,6 +321,27 @@
 // without a volume or a monitor and 6 with one volume and a monitor;
 // vm-launch closes its copy of it, too, once the hypervisor has started.
 //
+// Stack guest: when the process is the CF launcher, Garden bound a stack
+// image that is a regular file holding an lz4 squashfs, and the app has no
+// volume, vm-launch builds a droplet image of /home/vcap in its work
+// directory with the mksquashfs in the artifacts directory, opens it
+// read-only, and unlinks it. It builds the droplet before it sizes the guest
+// root, so the root image gets only the quota the droplet leaves. The guest
+// then runs the launcher's whole argv on the stack, as uid 2000, with the
+// droplet laid over the stack's /home/vcap, so the start command may be
+// empty and the launcher detects it from the droplet. The guest also gets
+// the launcher itself, vm-launch's working directory, and the container's
+// hostname and /etc/hosts in its initramfs. The hypervisor gets the stack
+// and the droplet as two read-only drives after the guest root image, so no
+// other drive or file descriptor moves, and vm-launch closes its copies of
+// both once the hypervisor has started. When any of those conditions does
+// not hold, or the droplet image fails to build, vm-launch boots the busybox
+// guest described above, exactly as it would without a stack image. Either
+// way, one line just before the hypervisor starts names the guest and why:
+// the droplet's size and build time for the stack guest, and the condition
+// that failed for the busybox guest. A launcher with an empty start command
+// needs the stack guest, so without it vm-launch exits 125 after that line.
+//
 // Core dumps: vm-launch sets its RLIMIT_CORE to zero, soft and hard, and its
 // coredump_filter to zero before it does anything else, and the hypervisor
 // inherits both. Then vm-launch makes itself non-dumpable, which also keeps
@@ -477,6 +498,14 @@ type config struct {
 	artifacts string
 	command   string
 	credhub   credhubRetry
+	// args is the wrapped process argv after --, which the stack guest's
+	// launcher runs whole (see stackCommand).
+	args []string
+	// commandErr is why the busybox guest cannot run args when only the
+	// stack guest can, which is a CF launcher with an empty start command.
+	// command is then empty, and run exits with commandErr unless the guest
+	// is the stack guest.
+	commandErr error
 	// transparent makes the Firecracker port proxy dial the guest from its
 	// clients' addresses (see transparentSource).
 	transparent bool
@@ -608,6 +637,34 @@ func run(argv []string, logger *log.Logger) int {
 		fmt.Fprint(logger.Writer(), usage)
 		return exitLaunchError
 	}
+	// The guest runs the app on its stack only when the process is the CF
+	// launcher, Garden bound a usable stack image, the app has no volume,
+	// and the droplet image builds. Each condition is settled as soon as
+	// run can tell, and the first that fails gives the busybox guest, which
+	// is then exactly the guest of a launch without a stack image. guestMode
+	// is the line that names the guest and why, which run logs once the
+	// hypervisor is about to start.
+	stackImg, why := stackCandidate(cfg.args)
+	defer func() { closeFile(stackImg, "the stack image", logger) }()
+	guestMode := ""
+	// toBusybox settles on the busybox guest for the reason why. A launcher
+	// with an empty start command needs the stack guest, so it then gets the
+	// refusal that parseArgs held back, after the line that says why.
+	toBusybox := func(why string) bool {
+		closeFile(stackImg, "the stack image", logger)
+		stackImg = nil
+		guestMode = "busybox guest: " + why
+		if cfg.commandErr == nil {
+			return true
+		}
+		logger.Print(guestMode)
+		logger.Print(cfg.commandErr)
+		fmt.Fprint(logger.Writer(), usage)
+		return false
+	}
+	if stackImg == nil && !toBusybox(why) {
+		return exitLaunchError
+	}
 	if err := checkArtifacts(cfg.backend, cfg.artifacts); err != nil {
 		logger.Print(err)
 		return exitLaunchError
@@ -670,6 +727,33 @@ func run(argv []string, logger *log.Logger) int {
 		return exitLaunchError
 	}
 	defer tools.Close()
+	if stackImg != nil && len(vols) > 0 && !stackModeAllowsVolumes {
+		has := "a volume"
+		if len(vols) > 1 {
+			has = fmt.Sprintf("%d volumes", len(vols))
+		}
+		if !toBusybox("the app has " + has + ", which the stack guest does not mount yet") {
+			return exitLaunchError
+		}
+	}
+	// The stack guest's launcher, argv, working directory, and host files
+	// are gathered and checked here, so that a launch the stack guest could
+	// not run fails before anything is prepared. The launcher stays open
+	// until the initramfs is written.
+	var stack *guestStack
+	if stackImg != nil {
+		if stack, err = newGuestStack(cfg.args); err != nil {
+			logger.Print(err)
+			return exitLaunchError
+		}
+	}
+	closeLauncher := func() {
+		if stack != nil {
+			closeFile(stack.launcher.file, "the launcher", logger)
+			stack.launcher.file = nil
+		}
+	}
+	defer closeLauncher()
 	memMiB := guestMemory(lookupEnv, logger)
 	// The launcher derives DATABASE_URL from the resolved VCAP_SERVICES, so
 	// the references are resolved before buildGuestEnv.
@@ -692,10 +776,15 @@ func run(argv []string, logger *log.Logger) int {
 	if _, ok := env[sslCertFileEnv]; !ok && caBundle != nil {
 		env[sslCertFileEnv] = guestCABundlePath
 	}
-	envFile, err := buildGuestEnv(env, memMiB, logger)
-	if err != nil {
-		logger.Print(err)
-		return exitLaunchError
+	// The two guests keep different variables, so a launch that may still
+	// boot the stack guest builds its environment once the droplet image
+	// has settled the guest, after the work directory exists.
+	var envFile string
+	if stack == nil {
+		if envFile, err = buildGuestEnv(env, memMiB, logger); err != nil {
+			logger.Print(err)
+			return exitLaunchError
+		}
 	}
 	nofile, err := guestNofile(getNofile, logger)
 	if err != nil {
@@ -735,7 +824,35 @@ func run(argv []string, logger *log.Logger) int {
 		}
 	}()
 
-	nonce, err := newNonce()
+	// The droplet image is built before the guest root is sized, so the
+	// root image gets only the quota the droplet leaves. An image that does
+	// not build gives the busybox guest, whose environment is built then.
+	var droplet *os.File
+	defer func() { closeFile(droplet, "the droplet image", logger) }()
+	if stack != nil {
+		img, err := buildDropletImage(cfg.artifacts, dropletHome, workDir)
+		if err != nil {
+			closeLauncher()
+			stack = nil
+			if !toBusybox(strings.ReplaceAll(err.Error(), "\n", "; ")) {
+				return exitLaunchError
+			}
+			if envFile, err = buildGuestEnv(env, memMiB, logger); err != nil {
+				logger.Print(err)
+				return exitLaunchError
+			}
+		} else {
+			droplet = img.file
+			guestMode = fmt.Sprintf("stack guest: the launcher runs on the stack image, with a droplet image of %s that is %d bytes and took %s to build",
+				dropletHome, img.size, img.took.Round(time.Millisecond))
+			if envFile, err = buildStackGuestEnv(env, memMiB, logger); err != nil {
+				logger.Print(err)
+				return exitLaunchError
+			}
+		}
+	}
+
+	nonce, err := guestNonce()
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError
@@ -773,7 +890,7 @@ func run(argv []string, logger *log.Logger) int {
 	// The guest root image is sized from the quota the work directory has
 	// left. The guest tells its drives apart by identity, so the root may
 	// have any volume image's size.
-	rootSize, rootInodeRatio, err := rootDiskSize(workDir, lookupEnv, unix.Statfs, logger)
+	rootSize, rootInodeRatio, err := rootDiskSize(workDir, lookupEnv, workDirStatfs, logger)
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError
@@ -796,6 +913,10 @@ func run(argv []string, logger *log.Logger) int {
 		qemuMonitor = nil
 		closeFile(rootImg, "the guest root image", logger)
 		rootImg = nil
+		closeFile(stackImg, "the stack image", logger)
+		stackImg = nil
+		closeFile(droplet, "the droplet image", logger)
+		droplet = nil
 	}
 	defer closeInherited()
 	if rootSize > 0 {
@@ -810,7 +931,11 @@ func run(argv []string, logger *log.Logger) int {
 	// Firecracker it comes from the open files the hypervisor gets, so it is
 	// taken once every one of them exists. Drives that would share an
 	// identity are refused before the hypervisor starts.
-	drives, err := newGuestDrives(cfg.backend, prepared, rootImg)
+	var sd *stackDrives
+	if stack != nil {
+		sd = &stackDrives{stack: stackImg, droplet: droplet}
+	}
+	drives, err := newGuestDrivesWithStack(cfg.backend, prepared, rootImg, sd)
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError
@@ -828,10 +953,13 @@ func run(argv []string, logger *log.Logger) int {
 		rootInodeRatio: rootInodeRatio,
 		tools:          tools,
 		noVolumeSync:   !cfg.volumeSyncMounts,
+		stack:          stack,
 	})
-	// The archive holds the tools' bytes now, so the files close here. The
-	// deferred call covers the returns before this point.
+	// The archive holds the tools' and the launcher's bytes now, so the
+	// files close here. The deferred calls cover the returns before this
+	// point.
 	tools.Close()
+	closeLauncher()
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError
@@ -859,8 +987,8 @@ func run(argv []string, logger *log.Logger) int {
 	}
 	defer shareSrv.stop(0)
 	shareSrv.setGuestMemory(memMiB)
-	files, drivePaths, initrdPath, monitorFD, rootPath := hypervisorFiles(prepared.files(), initrd, qemuMonitor, rootImg)
-	hvArgv, err := hypervisorArgv(cfg.backend, cfg.artifacts, workDir, initrdPath, memMiB, nw, drivePaths, rootPath, monitorFD, shareSrv.sockets()...)
+	files, drivePaths, initrdPath, monitorFD, rootPath := hypervisorFilesWithStack(prepared.files(), initrd, qemuMonitor, rootImg, sd)
+	hvArgv, err := hypervisorArgvWithStack(cfg.backend, cfg.artifacts, workDir, initrdPath, memMiB, nw, drivePaths, rootPath, monitorFD, sd, shareSrv.sockets()...)
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError
@@ -884,6 +1012,7 @@ func run(argv []string, logger *log.Logger) int {
 		return exitLaunchError
 	}
 
+	logger.Print(guestMode)
 	cmd := newHypervisorCmd(hvArgv, files)
 	sup := supervisor{stdout: os.Stdout, logger: logger, signals: sigs, grace: killGrace, deadline: stopDeadline, started: closeInherited}
 	if len(shares) > 0 {
@@ -1039,7 +1168,15 @@ func parseArgs(argv []string) (config, error) {
 	}
 	cfg.artifacts = abs
 
-	cfg.command, cfg.credhub, err = guestCommand(fs.Args())
+	cfg.args = fs.Args()
+	cfg.command, cfg.credhub, err = guestCommand(cfg.args)
+	if errors.Is(err, errEmptyStartCommand) {
+		// The stack guest's launcher takes the start command from the
+		// droplet, so the refusal waits until run knows the guest. The
+		// launcher's CredHub flags still parse here.
+		cfg.commandErr = err
+		_, cfg.credhub, err = stackCommand(cfg.args)
+	}
 	if err != nil {
 		return config{}, err
 	}
@@ -1067,13 +1204,17 @@ func guestCommand(args []string) (string, credhubRetry, error) {
 	return command, retry, nil
 }
 
+// errEmptyStartCommand is wrappedCommand's refusal of a CF launcher argv
+// whose start command is empty, which only the stack guest can run.
+var errEmptyStartCommand = errors.New("empty start command: VM backends need an explicit command because the droplet's detected start command is not available in the guest")
+
 // wrappedCommand returns the shell command and the CredHub retry settings
 // for the wrapped process argv (see guestCommand).
 func wrappedCommand(args []string) (string, credhubRetry, error) {
 	if len(args) == 0 {
 		return "", credhubRetry{}, errors.New("no guest command given after --")
 	}
-	if filepath.Base(args[0]) != "launcher" {
+	if !isLauncher(args) {
 		return shellJoin(args), defaultCredhubRetry, nil
 	}
 	// The CF launcher takes APP-DIR START-COMMAND METADATA. An empty start
@@ -1083,7 +1224,7 @@ func wrappedCommand(args []string) (string, credhubRetry, error) {
 		return "", credhubRetry{}, fmt.Errorf("launcher argv has %d arguments, want APP-DIR START-COMMAND [METADATA]", len(args)-1)
 	}
 	if strings.TrimSpace(args[2]) == "" {
-		return "", credhubRetry{}, errors.New("empty start command: VM backends need an explicit command because the droplet's detected start command is not available in the guest")
+		return "", credhubRetry{}, errEmptyStartCommand
 	}
 	// The launcher parses its CredHub flags from the arguments after
 	// START-COMMAND, as vm-launch does here.
@@ -1104,7 +1245,7 @@ const stackLauncherPath = "/tmp/lifecycle/launcher"
 // start command itself. The start command may therefore be empty. The argv
 // starts with stackLauncherPath in place of the host's path to the launcher.
 func stackCommand(args []string) (argv string, retry credhubRetry, err error) {
-	if len(args) == 0 || filepath.Base(args[0]) != "launcher" {
+	if !isLauncher(args) {
 		return "", credhubRetry{}, errors.New("stack mode needs the CF launcher as the wrapped process")
 	}
 	if len(args) < 3 {
@@ -1116,6 +1257,92 @@ func stackCommand(args []string) (argv string, retry credhubRetry, err error) {
 	}
 	return shellJoin(append([]string{stackLauncherPath}, args[1:]...)), retry, nil
 }
+
+// isLauncher reports whether args is the CF launcher's argv.
+func isLauncher(args []string) bool {
+	return len(args) > 0 && filepath.Base(args[0]) == "launcher"
+}
+
+// stackCandidate returns the open stack image when the wrapped process argv
+// args is the CF launcher's and Garden bound a usable image (see
+// openStackImage), or no file and the reason the guest is the busybox guest.
+// The caller owns the returned file.
+func stackCandidate(args []string) (*os.File, string) {
+	if !isLauncher(args) {
+		return nil, "the process is not the CF launcher"
+	}
+	return openStackImage()
+}
+
+// Where vm-launch reads what the stack guest gets from the container. They
+// are variables so that specs can point them elsewhere.
+var (
+	// dropletHome is the app's home directory, which holds the droplet and
+	// which the droplet image packs.
+	dropletHome = "/home/vcap"
+	// containerHostsPath is the container's hosts file, which Garden writes
+	// and which the stack guest gets in place of the stack's.
+	containerHostsPath = "/etc/hosts"
+	// containerHostname returns the container's hostname, which Garden sets
+	// to the container's handle and which the stack guest takes as its own.
+	containerHostname = os.Hostname
+)
+
+// newGuestStack gathers what the stack guest's initramfs holds for the CF
+// launcher argv args: the launcher itself, opened and checked as a guest
+// tool is, its whole argv from stackCommand, vm-launch's working directory,
+// which Garden set to the app's home, and the container's hostname and hosts
+// file. It checks the result as newInitramfs will, so that a launcher argv
+// over the guest's limit fails before any drive exists. The caller closes the
+// launcher.
+func newGuestStack(args []string) (*guestStack, error) {
+	// The retry settings are the ones parseArgs took from the same flags.
+	argv, _, err := stackCommand(args)
+	if err != nil {
+		return nil, err
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, fmt.Errorf("reading the app's working directory for the stack guest: %w", err)
+	}
+	hostname, err := containerHostname()
+	if err != nil {
+		return nil, fmt.Errorf("reading the container's hostname for the stack guest: %w", err)
+	}
+	hosts, err := os.ReadFile(containerHostsPath)
+	if err != nil {
+		return nil, fmt.Errorf("reading the container's hosts file for the stack guest: %w", err)
+	}
+	dir, err := filepath.Abs(filepath.Dir(args[0]))
+	if err != nil {
+		return nil, fmt.Errorf("resolving the launcher's directory: %w", err)
+	}
+	realDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return nil, fmt.Errorf("resolving the launcher's directory %s: %w", dir, err)
+	}
+	// The launcher is not one of the guest filesystem tools, so the hint
+	// about their artifact does not apply to it.
+	launcher, err := openGuestTool(dir, realDir, filepath.Base(args[0]))
+	if err != nil {
+		return nil, errors.New(strings.TrimSuffix(err.Error(), noGuestToolsHint))
+	}
+	s := &guestStack{launcher: launcher, argv: argv, cwd: cwd, hostname: hostname, hosts: hosts}
+	if err := s.check(0); err != nil {
+		launcher.file.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// workDirStatfs is the statfs that sizes the guest root image from the
+// quota left in the work directory. Specs replace it to see what vm-launch
+// holds at that moment.
+var workDirStatfs = unix.Statfs
+
+// guestNonce returns the nonce of one launch's console markers. Specs
+// replace it to compare two launches' initramfs archives byte for byte.
+var guestNonce = newNonce
 
 // shellJoin quotes each argument for POSIX sh and joins them with spaces.
 func shellJoin(args []string) string {

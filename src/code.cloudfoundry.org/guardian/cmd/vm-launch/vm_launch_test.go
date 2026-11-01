@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -675,7 +676,21 @@ var _ = Describe("parseArgs", func() {
 	It("accepts the form garden wraps the CF launcher in", func() {
 		cfg, err := parseArgs([]string{"--backend", "vm-qemu", "--", "/tmp/lifecycle/launcher", "app", "echo hi && exit 3", ""})
 		Expect(err).NotTo(HaveOccurred())
-		Expect(cfg).To(Equal(config{backend: backend.VMQemu, artifacts: defaultArtifactsDir, command: "echo hi && exit 3", credhub: credhubRetry{attempts: 3, delay: time.Second}, volumeSyncMounts: true}))
+		Expect(cfg).To(Equal(config{backend: backend.VMQemu, artifacts: defaultArtifactsDir, command: "echo hi && exit 3", credhub: credhubRetry{attempts: 3, delay: time.Second},
+			args: []string{"/tmp/lifecycle/launcher", "app", "echo hi && exit 3", ""}, volumeSyncMounts: true}))
+	})
+
+	It("holds back the refusal of an empty start command, which only the stack guest can run, and still parses the CredHub flags", func() {
+		cfg, err := parseArgs([]string{"--backend", "vm-qemu", "--", "/tmp/lifecycle/launcher", "app", " ", "-credhubConnectAttempts=7", ""})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cfg.commandErr).To(MatchError(errEmptyStartCommand))
+		Expect(cfg.commandErr).To(MatchError(ContainSubstring("empty start command")))
+		Expect(cfg.command).To(BeEmpty())
+		Expect(cfg.credhub).To(Equal(credhubRetry{attempts: 7, delay: time.Second}))
+		Expect(cfg.args).To(Equal([]string{"/tmp/lifecycle/launcher", "app", " ", "-credhubConnectAttempts=7", ""}))
+
+		_, err = parseArgs([]string{"--backend", "vm-qemu", "--", "/tmp/lifecycle/launcher", "app", "", "-credhubRetryDelay=soon", ""})
+		Expect(err).To(MatchError(ContainSubstring("-credhubRetryDelay")))
 	})
 
 	It("takes --artifacts and makes it absolute", func() {
@@ -707,7 +722,6 @@ var _ = Describe("parseArgs", func() {
 		Entry("empty artifacts", []string{"--backend", "vm-qemu", "--artifacts", "", "--", "true"}, "--artifacts must not be empty"),
 		Entry("no command", []string{"--backend", "vm-qemu", "--"}, "no guest command"),
 		Entry("short launcher argv", []string{"--backend", "vm-qemu", "--", "/tmp/lifecycle/launcher", "app"}, "launcher argv has 1 arguments"),
-		Entry("empty start command", []string{"--backend", "vm-qemu", "--", "/tmp/lifecycle/launcher", "app", " ", ""}, "empty start command"),
 		Entry("transparent proxy for QEMU", []string{"--backend", "vm-qemu", "--transparent-proxy", "--", "true"}, "--transparent-proxy is for vm-firecracker only"),
 	)
 
@@ -1282,5 +1296,310 @@ var _ = Describe("stackCommand", func() {
 		cmd, _, err = wrappedCommand([]string{"/bin/echo", "a b"})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(cmd).To(Equal(`'/bin/echo' 'a b'`))
+	})
+})
+
+// heldFilesEndingIn counts this process's descriptors whose target ends
+// with suffix.
+func heldFilesEndingIn(suffix string) int {
+	entries, err := os.ReadDir("/proc/self/fd")
+	Expect(err).NotTo(HaveOccurred())
+	n := 0
+	for _, e := range entries {
+		if link, err := os.Readlink(filepath.Join("/proc/self/fd", e.Name())); err == nil && strings.HasSuffix(link, suffix) {
+			n++
+		}
+	}
+	return n
+}
+
+// readOnlyImageAt is fake hypervisor shell that fails unless its file
+// descriptor fd is open for reading only, its target matches the shell
+// pattern target, and its content is the file at want.
+func readOnlyImageAt(fd, target, want string) string {
+	return `case "$(readlink /proc/self/fd/` + fd + `)" in ` + target + `) ;; *) echo "fd ` + fd + ` is $(readlink /proc/self/fd/` + fd + `)" >&2; exit 1 ;; esac
+flags=$(awk '/^flags:/ { print $2 }' /proc/self/fdinfo/` + fd + `)
+[ $((flags & 3)) -eq 0 ] || { echo "fd ` + fd + ` is open with flags $flags, not for reading only" >&2; exit 1; }
+[ "$(sha256sum </proc/self/fd/` + fd + `)" = "$(sha256sum <` + shellQuote(want) + `)" ] || { echo "fd ` + fd + ` does not hold ` + want + `" >&2; exit 1; }
+`
+}
+
+// stackImagesReleased is fake hypervisor shell that waits up to five seconds
+// for its parent, vm-launch, to close its copies of the stack and droplet
+// images, and fails when it never does. The hypervisor's own copies stay
+// open.
+const stackImagesReleased = `n=0
+ls /proc/$PPID/fd >/dev/null 2>&1 || { echo "cannot read the descriptors of vm-launch" >&2; exit 1; }
+while for l in /proc/$PPID/fd/*; do readlink "$l"; done 2>/dev/null | grep -q -e 'rootfs.squashfs$' -e 'droplet.sqfs (deleted)$' -e '/launcher$'; do
+	n=$((n + 1))
+	[ "$n" -gt 100 ] && { echo "vm-launch still holds the stack image, the droplet image, or the launcher" >&2; exit 1; }
+	sleep 0.05
+done
+`
+
+var _ = Describe("run with a stack image", func() {
+	const (
+		hostname = "c0ffee00-1111-4222-8333-444455556666"
+		hosts    = "127.0.0.1 localhost\n10.255.7.9 " + hostname + "\n"
+		// dropletBuilder is a fake mksquashfs that writes a short file in
+		// place of the image, which names the directory it packs.
+		dropletBuilder = "#!/bin/sh\nprintf 'droplet of %s' \"$1\" >\"$2\"\n"
+	)
+
+	var (
+		art       string
+		tmp       string
+		dir       string
+		stackImg  string
+		home      string
+		launcher  string
+		logBuf    *bytes.Buffer
+		qemu      string
+		launchArg []string
+	)
+
+	BeforeEach(func() {
+		art = makeArtifacts()
+		qemu = filepath.Join(art, "qemu/ld-linux-x86-64.so.2")
+		Expect(os.WriteFile(filepath.Join(art, artMksquashfs), []byte(dropletBuilder), 0o755)).To(Succeed())
+		// Every other file of a spec lives in dir, outside the TMPDIR that
+		// the specs check for leftovers.
+		dir = GinkgoT().TempDir()
+		tmp = GinkgoT().TempDir()
+		GinkgoT().Setenv("TMPDIR", tmp)
+		GinkgoT().Setenv("VCAP_APPLICATION", `{"limits":{"mem":512}}`)
+		logBuf = &bytes.Buffer{}
+
+		stackImg = filepath.Join(dir, "rootfs.squashfs")
+		writeSuperblock(stackImg, squashfsMagic, squashfsCompressorLZ4)
+		home = filepath.Join(dir, "home")
+		Expect(os.MkdirAll(filepath.Join(home, "app"), 0o755)).To(Succeed())
+		Expect(os.WriteFile(filepath.Join(dir, "hosts"), []byte(hosts), 0o644)).To(Succeed())
+		launcher = filepath.Join(dir, "lifecycle", "launcher")
+		Expect(os.MkdirAll(filepath.Dir(launcher), 0o755)).To(Succeed())
+		Expect(os.WriteFile(launcher, []byte("#!/bin/sh\necho the launcher\n"), 0o755)).To(Succeed())
+		launchArg = []string{launcher, "app", "", ""}
+
+		savedImage, savedHome, savedHosts, savedHostname, savedNonce, savedStatfs := stackImagePath, dropletHome, containerHostsPath, containerHostname, guestNonce, workDirStatfs
+		DeferCleanup(func() {
+			stackImagePath, dropletHome, containerHostsPath, containerHostname, guestNonce, workDirStatfs = savedImage, savedHome, savedHosts, savedHostname, savedNonce, savedStatfs
+		})
+		stackImagePath = stackImg
+		dropletHome = home
+		containerHostsPath = filepath.Join(dir, "hosts")
+		containerHostname = func() (string, error) { return hostname, nil }
+		guestNonce = func() (string, error) { return testNonce, nil }
+	})
+
+	runWith := func(kind backend.Kind, args []string) int {
+		return run(append([]string{"--backend", string(kind), "--artifacts", art, "--"}, args...), log.New(logBuf, "", 0))
+	}
+
+	// guestOf runs a QEMU guest for args and returns the initramfs and the
+	// command line its fake hypervisor got.
+	guestOf := func(args []string) (initrd, argv []byte) {
+		GinkgoHelper()
+		initrdCopy := filepath.Join(art, "initrd-copy")
+		argvFile := writeFakeHypervisor(qemu, `cp "$initrd" `+shellQuote(initrdCopy)+" || exit 1\n")
+		Expect(runWith(backend.VMQemu, args)).To(Equal(0), logBuf.String())
+		initrd, err := os.ReadFile(initrdCopy)
+		Expect(err).NotTo(HaveOccurred())
+		argv, err = os.ReadFile(argvFile)
+		Expect(err).NotTo(HaveOccurred())
+		return initrd, argv
+	}
+
+	// todaysGuestOf is guestOf for a container without a stack image, whose
+	// guest is the busybox guest of every launch before the stack guest.
+	todaysGuestOf := func(args []string) (initrd, argv []byte) {
+		GinkgoHelper()
+		stackImagePath = filepath.Join(dir, "none", "rootfs.squashfs")
+		defer func() { stackImagePath = stackImg }()
+		return guestOf(args)
+	}
+
+	// expectTodaysGuest checks that args give the busybox guest byte for
+	// byte, with the mode line that says why.
+	expectTodaysGuest := func(args []string, why string) {
+		GinkgoHelper()
+		initrd, argv := guestOf(args)
+		Expect(logBuf.String()).To(ContainSubstring("busybox guest: " + why + "\n"))
+		Expect(logBuf.String()).NotTo(ContainSubstring("stack guest:"))
+		Expect(strings.Count(logBuf.String(), "guest: ")).To(Equal(1), logBuf.String())
+		Expect(argv).NotTo(ContainSubstring("rvm-stack"))
+		_, byName := archiveEntries(initrd)
+		Expect(string(byName["init"].data)).To(Equal(guestRootInit))
+		Expect(byName).NotTo(HaveKey("rvm/lifecycle/launcher"))
+		Expect(byName).NotTo(HaveKey("rvm/argv"))
+
+		wantInitrd, wantArgv := todaysGuestOf(args)
+		Expect(initrd).To(Equal(wantInitrd))
+		Expect(argv).To(Equal(wantArgv))
+		Expect(heldFilesEndingIn("rootfs.squashfs")).To(BeZero())
+		Expect(os.ReadDir(tmp)).To(BeEmpty())
+	}
+
+	It("gives QEMU the stack and the droplet as read-only drives after the root image, and a guest that runs the launcher's whole argv", func() {
+		GinkgoT().Setenv("VCAP_APPLICATION", `{"limits":{"disk":64}}`)
+		want := filepath.Join(dir, "droplet")
+		Expect(os.WriteFile(want, []byte("droplet of "+home), 0o644)).To(Succeed())
+		initrdCopy := filepath.Join(art, "initrd-copy")
+		argvFile := writeFakeHypervisor(qemu, `cp "$initrd" `+shellQuote(initrdCopy)+` || exit 1
+`+initramfsAt("3")+rootImageAt("4", (64-rootDiskHeadroomMiB)*bytesPerMiB)+
+			readOnlyImageAt("5", "*/rootfs.squashfs", stackImg)+
+			readOnlyImageAt("6", `*/droplet.sqfs\ \(deleted\)`, want)+
+			noFilesUnder(tmp)+initramfsReleased+rootImageReleased+stackImagesReleased)
+		Expect(runWith(backend.VMQemu, launchArg)).To(Equal(0), logBuf.String())
+
+		argv, err := os.ReadFile(argvFile)
+		Expect(err).NotTo(HaveOccurred())
+		drives := append(append(goldenQEMURootDrive("4"), qemuReadOnlyDrive(stackDriveID, qemuStackSerial, 5)...), qemuReadOnlyDrive(dropletDriveID, qemuDropletSerial, 6)...)
+		Expect(string(argv)).To(HaveSuffix("\n" + strings.Join(drives, "\n") + "\n"))
+
+		raw, err := os.ReadFile(initrdCopy)
+		Expect(err).NotTo(HaveOccurred())
+		_, byName := archiveEntries(raw)
+		Expect(string(byName["init"].data)).To(Equal(guestStackInit))
+		Expect(string(byName["rvm/init"].data)).To(Equal(stackInitScript(testNonce)))
+		Expect(string(byName["rvm/lifecycle/launcher"].data)).To(Equal("#!/bin/sh\necho the launcher\n"))
+		Expect(string(byName["rvm/argv"].data)).To(Equal(`'/tmp/lifecycle/launcher' 'app' '' ''`))
+		cwd, err := os.Getwd()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(byName["rvm/cwd"].data)).To(Equal(cwd))
+		Expect(string(byName["rvm/hosts"].data)).To(Equal(hosts))
+		Expect(string(byName["rvm/hostname"].data)).To(Equal(hostname + "\n"))
+		Expect(string(byName["rvm/disks"].data)).To(Equal("RVM_ROOT_ID=rvm-root\nRVM_ROOT_SECTORS=65536\nRVM_ROOT_INODE_RATIO=16384\nRVM_VOLUMES=0\nRVM_STACK_ID=rvm-stack\nRVM_DROPLET_ID=rvm-droplet\n"))
+
+		Expect(logBuf.String()).To(MatchRegexp(`(?m)^stack guest: the launcher runs on the stack image, with a droplet image of ` + regexp.QuoteMeta(home) + ` that is ` + strconv.Itoa(len("droplet of "+home)) + ` bytes and took \S+ to build$`))
+		Expect(strings.Count(logBuf.String(), "guest: ")).To(Equal(1), logBuf.String())
+		Expect(os.ReadDir(tmp)).To(BeEmpty())
+		Expect(heldFilesEndingIn("rootfs.squashfs")).To(BeZero())
+		Expect(heldFilesEndingIn("droplet.sqfs (deleted)")).To(BeZero())
+	})
+
+	It("gives Firecracker the stack and the droplet as read-only drives after the volumes and the root", func() {
+		letFirecrackerSeeVMLaunch()
+		fcCopy := filepath.Join(art, "fc-copy.json")
+		writeFakeHypervisor(filepath.Join(art, "firecracker/firecracker"),
+			`p=; for a in "$@"; do [ "$p" = --config-file ] && cp "$a" `+shellQuote(fcCopy)+`; p=$a; done
+`+initramfsAt("3")+readOnlyImageAt("4", "*/rootfs.squashfs", stackImg)+stackImagesReleased)
+		Expect(runWith(backend.VMFirecracker, []string{launcher, "app", "./server", "{}"})).To(Equal(0), logBuf.String())
+
+		raw, err := os.ReadFile(fcCopy)
+		Expect(err).NotTo(HaveOccurred())
+		var cfg struct {
+			Drives []firecrackerDrive `json:"drives"`
+		}
+		Expect(json.Unmarshal(raw, &cfg)).To(Succeed())
+		Expect(cfg.Drives).To(HaveLen(2))
+		Expect(cfg.Drives[0].PathOnHost).To(Equal("/proc/self/fd/4"))
+		Expect(cfg.Drives[1].PathOnHost).To(Equal("/proc/self/fd/5"))
+		for _, d := range cfg.Drives {
+			Expect(d.IsReadOnly).To(BeTrue(), d.DriveID)
+			Expect(d.IsRootDevice).To(BeFalse(), d.DriveID)
+		}
+		Expect(logBuf.String()).To(ContainSubstring("stack guest: "))
+	})
+
+	It("builds the droplet image before it sizes the guest root, so the root gets only the quota the droplet leaves", func() {
+		GinkgoT().Setenv("VCAP_APPLICATION", `{"limits":{"disk":64}}`)
+		held := -1
+		workDirStatfs = func(path string, st *unix.Statfs_t) error {
+			held = heldFilesEndingIn("droplet.sqfs (deleted)")
+			return unix.Statfs(path, st)
+		}
+		writeFakeHypervisor(qemu, "")
+		Expect(runWith(backend.VMQemu, launchArg)).To(Equal(0), logBuf.String())
+		Expect(held).To(Equal(1))
+	})
+
+	It("keeps today's guest for a process that is not the CF launcher", func() {
+		expectTodaysGuest([]string{"/bin/sh", "-c", "echo hi"}, "the process is not the CF launcher")
+	})
+
+	It("keeps today's guest when the container has no stack image", func() {
+		stackImagePath = filepath.Join(dir, "none", "rootfs.squashfs")
+		_, argv := guestOf([]string{launcher, "app", "true", ""})
+		Expect(argv).NotTo(ContainSubstring("rvm-stack"))
+		Expect(logBuf.String()).To(ContainSubstring("busybox guest: the stack image cannot be opened: open " + stackImagePath + ": no such file or directory\n"))
+	})
+
+	It("keeps today's guest when the stack image is not an lz4 squashfs", func() {
+		Expect(os.Remove(stackImg)).To(Succeed())
+		writeSuperblock(stackImg, squashfsMagic, 1)
+		expectTodaysGuest([]string{launcher, "app", "true", ""}, "the stack image "+stackImg+" uses squashfs compressor 1, and the guest reads only lz4")
+	})
+
+	It("keeps today's guest when the droplet image does not build, with the tool's output on the line", func() {
+		Expect(os.WriteFile(filepath.Join(art, artMksquashfs), []byte("#!/bin/sh\necho 'cannot read the droplet' >&2\nexit 1\n"), 0o755)).To(Succeed())
+		expectTodaysGuest([]string{launcher, "app", "true", ""}, "building the droplet image with "+filepath.Join(art, artMksquashfs)+": exit status 1; cannot read the droplet")
+	})
+
+	It("keeps today's guest for an app with a volume", func() {
+		volDir := filepath.Join(dir, "volume")
+		infoDir := filepath.Join(dir, "info")
+		Expect(os.Mkdir(volDir, 0o755)).To(Succeed())
+		Expect(os.Mkdir(infoDir, 0o755)).To(Succeed())
+		savedInfo, savedOpts := mountInfoPath, defaultImageOptions
+		DeferCleanup(func() { mountInfoPath, defaultImageOptions = savedInfo, savedOpts })
+		mountInfoPath = filepath.Join(infoDir, "mountinfo")
+		Expect(os.WriteFile(mountInfoPath, []byte(mountinfoLine(40, volDir, "fuse.juicefs")), 0o644)).To(Succeed())
+		defaultImageOptions.IsMountRoot = alwaysMountRoot
+		GinkgoT().Setenv("CF_INSTANCE_INDEX", "2")
+		GinkgoT().Setenv("VCAP_APPLICATION", vcapApp)
+		GinkgoT().Setenv("VCAP_SERVICES", vcapWith(map[string][]string{"juicefs": {mountJSON(volDir, "rw")}}))
+		img := filepath.Join(volDir, "rvm-disk-"+testAppID+"-web-2.img")
+
+		initrd, argv := guestOf([]string{launcher, "app", "true", ""})
+		Expect(logBuf.String()).To(ContainSubstring("busybox guest: the app has a volume, which the stack guest does not mount yet\n"))
+		Expect(argv).NotTo(ContainSubstring("rvm-stack"))
+		Expect(heldFilesEndingIn("rootfs.squashfs")).To(BeZero())
+		// Each launch starts from no image, so both create it alike.
+		Expect(os.Remove(img)).To(Succeed())
+		wantInitrd, wantArgv := todaysGuestOf([]string{launcher, "app", "true", ""})
+		Expect(initrd).To(Equal(wantInitrd))
+		Expect(argv).To(Equal(wantArgv))
+	})
+
+	It("refuses an empty start command after the line that says why when the guest is the busybox guest", func() {
+		stackImagePath = filepath.Join(dir, "none", "rootfs.squashfs")
+		argvFile := writeFakeHypervisor(qemu, "")
+		Expect(runWith(backend.VMQemu, launchArg)).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(HavePrefix("busybox guest: the stack image cannot be opened: "))
+		Expect(logBuf.String()).To(HaveSuffix("\n" + errEmptyStartCommand.Error() + "\n" + usage))
+		Expect(argvFile).NotTo(BeAnExistingFile())
+
+		logBuf.Reset()
+		stackImagePath = stackImg
+		Expect(os.WriteFile(filepath.Join(art, artMksquashfs), []byte("#!/bin/sh\nexit 1\n"), 0o755)).To(Succeed())
+		Expect(runWith(backend.VMQemu, launchArg)).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(ContainSubstring("busybox guest: building the droplet image with "))
+		Expect(logBuf.String()).To(ContainSubstring(errEmptyStartCommand.Error()))
+		Expect(argvFile).NotTo(BeAnExistingFile())
+		Expect(os.ReadDir(tmp)).To(BeEmpty())
+		Expect(heldFilesEndingIn("rootfs.squashfs")).To(BeZero())
+		Expect(heldFilesEndingIn("/launcher")).To(BeZero())
+	})
+
+	It("exits 125 for a launcher argv over the guest's limit before it makes a work directory", func() {
+		argvFile := writeFakeHypervisor(qemu, "")
+		Expect(runWith(backend.VMQemu, []string{launcher, "app", "true", strings.Repeat("m", maxGuestCommandBytes)})).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(ContainSubstring("the launcher's argv is "))
+		Expect(argvFile).NotTo(BeAnExistingFile())
+		Expect(os.ReadDir(tmp)).To(BeEmpty())
+		Expect(heldFilesEndingIn("rootfs.squashfs")).To(BeZero())
+		Expect(heldFilesEndingIn("/launcher")).To(BeZero())
+	})
+
+	It("closes the stack image, the droplet image, and the launcher when the hypervisor cannot be started", func() {
+		Expect(os.Remove(qemu)).To(Succeed())
+		Expect(os.WriteFile(qemu, []byte("not runnable"), 0o644)).To(Succeed())
+		Expect(runWith(backend.VMQemu, launchArg)).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(ContainSubstring("starting hypervisor"))
+		Expect(logBuf.String()).To(ContainSubstring("stack guest: "))
+		Expect(heldFilesEndingIn("rootfs.squashfs")).To(BeZero())
+		Expect(heldFilesEndingIn("droplet.sqfs (deleted)")).To(BeZero())
+		Expect(heldFilesEndingIn("/launcher")).To(BeZero())
+		Expect(heldInitramfs()).To(BeZero())
 	})
 })
