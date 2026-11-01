@@ -224,3 +224,15 @@ func (c *systemCerts) busyboxSteps(cw *cpioWriter) []func() error {
 func (c *systemCerts) fileStep(cw *cpioWriter, name string, f systemCertFile) func() error {
 	return func() error { return cw.File(name, 0o644, int64(len(f.data)), strings.NewReader(string(f.data))) }
 }
+
+// fallbackPrep is the commands that give the busybox guest the trusted
+// certificate files from guestSystemCertsStage at their own path, which the
+// guest that falls back runs as root on the initramfs. Without certificates
+// it is a no-op.
+func (c *systemCerts) fallbackPrep() string {
+	if c == nil {
+		return ":\n"
+	}
+	q := shellQuote(c.dir)
+	return "mkdir -p " + q + " && cp " + guestSystemCertsStage + "/* " + q + "/ && chmod 0644 " + q + "/*\n"
+}

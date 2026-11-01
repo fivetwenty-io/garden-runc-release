@@ -1811,6 +1811,11 @@ type guestStack struct {
 	// systemCerts are the trusted certificate files that the app finds at
 	// CF_SYSTEM_CERT_PATH, or nil for an app without any.
 	systemCerts *systemCerts
+	// fallbackEnv, when fallback is set, is the environment file of the
+	// busybox guest that stage 1 falls back to if it cannot mount the stack
+	// or the droplet image (see guestFallbackFunc).
+	fallbackEnv string
+	fallback    bool
 }
 
 // guestSidecar is one sidecar's two files in the stack guest. argv is its
@@ -2248,6 +2253,7 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, g 
 	}
 	if g.stack != nil {
 		steps = append(steps, g.stack.archiveSteps(cw, file)...)
+		steps = append(steps, g.stack.fallbackSteps(cw, file, g.nonce)...)
 	} else {
 		steps = append(steps, g.systemCerts.busyboxSteps(cw)...)
 	}

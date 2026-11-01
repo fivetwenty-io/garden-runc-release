@@ -915,6 +915,15 @@ func run(argv []string, logger *log.Logger) int {
 			logger.Print(err)
 			return exitLaunchError
 		}
+		// An app without sidecars can run in the busybox guest, so a stack
+		// or droplet image that stage 1 cannot mount sends the guest there.
+		if len(sidecars) == 0 {
+			if stack.fallbackEnv, err = buildGuestEnvWithCerts(env, memMiB, sysCerts.dirOf(), log.New(io.Discard, "", 0)); err != nil {
+				logger.Print(err)
+				return exitLaunchError
+			}
+			stack.fallback = true
+		}
 	}
 
 	nonce, err := guestNonce()

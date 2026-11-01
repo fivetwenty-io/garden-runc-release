@@ -3,6 +3,7 @@
 package main
 
 import (
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -306,6 +307,13 @@ func bootRealStackGuest(argv []string, withRoot bool, env string) string {
 // bootRealStackGuestWithCerts is bootRealStackGuest for a guest that also
 // holds the trusted certificate files certs.
 func bootRealStackGuestWithCerts(argv []string, withRoot bool, env string, certs *systemCerts) string {
+	return bootRealStackGuestTweaked(argv, withRoot, env, certs, nil)
+}
+
+// bootRealStackGuestTweaked is bootRealStackGuestWithCerts for a spec that
+// changes the guest's contents or its stack and droplet drives with tweak,
+// which may be nil, before the guest is built.
+func bootRealStackGuestTweaked(argv []string, withRoot bool, env string, certs *systemCerts, tweak func(g *guestContents, sd *stackDrives)) string {
 	art := realArtifacts()
 	qemu := realQEMU()
 	requireMicrovm(qemu)
@@ -330,6 +338,9 @@ func bootRealStackGuestWithCerts(argv []string, withRoot bool, env string, certs
 	if withRoot {
 		withRealRoot(&g)
 		root = realRootImage()
+	}
+	if tweak != nil {
+		tweak(&g, sd)
 	}
 	g.drives, err = newGuestDrivesWithStack(backend.VMQemu, nil, root, sd)
 	Expect(err).NotTo(HaveOccurred())
@@ -385,6 +396,33 @@ var _ = Describe("the stack guest against a real QEMU", func() {
 		Expect(out).To(MatchRegexp(`(?m)^app-certwrite=denied$`), out)
 		Expect(out).To(ContainSubstring(exitTag(testNonce) + "0"))
 	})
+
+	DescribeTable("falls back to the busybox guest, which runs the container's command, when the stack image does not mount",
+		func(withRoot bool) {
+			argv := []string{stackLauncherPath, "/home/vcap/app", "", `{"start_command":"./app","process_type":"web"}`}
+			out := bootRealStackGuestTweaked(argv, withRoot, "export FOR_STACK=1\n", nil, func(g *guestContents, sd *stackDrives) {
+				// The superblock is gone, so the squashfs mount fails.
+				image, err := io.ReadAll(io.NewSectionReader(sd.stack, 0, 1<<30))
+				Expect(err).NotTo(HaveOccurred())
+				copy(image, make([]byte, 4096))
+				corrupt := writeTempFile("corrupt-stack", string(image))
+				f, err := os.Open(corrupt)
+				Expect(err).NotTo(HaveOccurred())
+				DeferCleanup(f.Close)
+				sd.stack = f
+
+				g.command = `echo "fallback-ran uid=$(id -u) busybox=${FOR_BUSYBOX:-unset} stack=${FOR_STACK:-unset}"`
+				g.stack.fallback, g.stack.fallbackEnv = true, "export FOR_BUSYBOX=1\n"
+			})
+
+			Expect(out).To(MatchRegexp(`(?m)^busybox guest: mounting the stack image /dev/vd[a-z] failed`), out)
+			Expect(out).To(MatchRegexp(`(?m)^fallback-ran uid=0 busybox=1 stack=unset$`), out)
+			Expect(out).NotTo(ContainSubstring("app-id="), out)
+			Expect(out).To(ContainSubstring(exitTag(testNonce) + "0"))
+		},
+		Entry("on a guest root disk", true),
+		Entry("with the guest root in RAM", false),
+	)
 
 	It("gives the launcher the app's loader variables only after setpriv has dropped to vcap, so a library that does not exist never reaches a program that runs as root", func() {
 		argv := []string{stackLauncherPath, "/home/vcap/app", "", `{"start_command":"./app","process_type":"web"}`}
