@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"code.cloudfoundry.org/guardian/backend"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -369,7 +370,8 @@ func bootBalloonFill(withShare bool) realFillRun {
 	var run realFillRun
 	runRealBalloonGuest(func(qmp *os.File) ([]string, []*os.File) {
 		files, drives, initrdPath, monitorFD, rootPath := hypervisorFiles(nil, marked, qmp, root)
-		argv := withRealRootDrive(qemuArgv(art, initrdPath, realBalloonGuestMiB, g.nw, drives, monitorFD, shares...), rootPath)
+		argv, err := hypervisorArgvWithStack(backend.VMQemu, art, GinkgoT().TempDir(), initrdPath, realBalloonGuestMiB, g.nw, drives, rootPath, monitorFD, nil, shares...)
+		Expect(err).NotTo(HaveOccurred())
 		return markedArgv(tcgArgv(qemu, argv)), files
 	}, func(h *realBalloon) {
 		run = driveBalloonFill(h)
@@ -451,7 +453,8 @@ var _ = Describe("a real QEMU guest with the virtio balloon", func() {
 
 		runRealBalloonGuest(func(qmp *os.File) ([]string, []*os.File) {
 			files, drives, initrdPath, monitorFD, rootPath := hypervisorFiles(imageAttachments(vols...), marked, qmp, root)
-			argv := withRealRootDrive(qemuArgv(art, initrdPath, realBalloonGuestMiB, g.nw, drives, monitorFD), rootPath)
+			argv, err := hypervisorArgvWithStack(backend.VMQemu, art, GinkgoT().TempDir(), initrdPath, realBalloonGuestMiB, g.nw, drives, rootPath, monitorFD, nil)
+			Expect(err).NotTo(HaveOccurred())
 			return markedArgv(tcgArgv(qemu, argv)), files
 		}, func(h *realBalloon) {
 			// Stage 1 compares every drive's serial and size with /rvm/disks
