@@ -416,6 +416,112 @@ cp %[5]s "$out"
 		})
 	})
 
+	Describe("the whole-image check", func() {
+		var (
+			checks  string
+			verdict string
+		)
+
+		// writeUnsquashfs writes a fake unsquashfs that records its flag and
+		// fails when the verdict file holds the word fail.
+		writeUnsquashfs := func() string {
+			path := filepath.Join(work, "unsquashfs")
+			script := fmt.Sprintf(`#!/bin/sh
+echo "$1" >> %[1]s
+if [ "$(cat %[2]s 2>/dev/null)" = fail ]; then
+  echo "SQUASHFS error: unable to read inode table" >&2
+  exit 1
+fi
+`, checks, verdict)
+			Expect(os.WriteFile(path, []byte(script), 0755)).To(Succeed())
+			return path
+		}
+
+		checkCount := func() int {
+			data, err := os.ReadFile(checks)
+			if os.IsNotExist(err) {
+				return 0
+			}
+			Expect(err).NotTo(HaveOccurred())
+			return strings.Count(string(data), "\n")
+		}
+
+		BeforeEach(func() {
+			checks = filepath.Join(work, "checks")
+			verdict = filepath.Join(work, "verdict")
+			config.Unsquashfs = writeUnsquashfs()
+		})
+
+		It("trusts an image it just built and does not run unsquashfs on it", func() {
+			b := New(config)
+			_, ok := b.Image(logger, tarball)
+			Expect(ok).To(BeTrue())
+			_, ok = b.Image(logger, tarball)
+			Expect(ok).To(BeTrue())
+			Expect(runCount()).To(Equal(1))
+			Expect(checkCount()).To(Equal(0))
+		})
+
+		It("checks an image from an earlier process once and then trusts it", func() {
+			_, ok := New(config).Image(logger, tarball)
+			Expect(ok).To(BeTrue())
+
+			b := New(config)
+			for range 3 {
+				_, ok = b.Image(logger, tarball)
+				Expect(ok).To(BeTrue())
+			}
+			Expect(runCount()).To(Equal(1))
+			data, err := os.ReadFile(checks)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(strings.Fields(string(data))).To(Equal([]string{"-s", "-ll"}))
+		})
+
+		It("removes an image that passes the superblock test and fails the listing, and builds it again", func() {
+			_, ok := New(config).Image(logger, tarball)
+			Expect(ok).To(BeTrue())
+			image := filepath.Join(cacheDir, keyOf(tarball), imageName)
+			Expect(os.WriteFile(verdict, []byte("fail"), 0644)).To(Succeed())
+			before := must(statID(image))
+
+			b := New(config)
+			dir, ok := b.Image(logger, tarball)
+			Expect(ok).To(BeTrue())
+			Expect(dir).To(Equal(filepath.Join(cacheDir, keyOf(tarball))))
+			Expect(runCount()).To(Equal(2))
+			Expect(must(statID(image))).NotTo(Equal(before))
+			Expect(string(logger.Buffer().Contents())).To(ContainSubstring("unable to read inode table"))
+			Expect(logger.LogMessages()).To(ContainElement(HaveSuffix("removing-bad-image")))
+		})
+
+		It("does not take the fast path to an image the process has not checked", func() {
+			dir := filepath.Join(cacheDir, keyOf(tarball))
+			Expect(os.MkdirAll(dir, 0755)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(dir, imageName), fakeImage(lz4CompressorID, 4096, 4096), 0644)).To(Succeed())
+			Expect(os.WriteFile(verdict, []byte("fail"), 0644)).To(Succeed())
+
+			// Prime the hash so that the fast path would hand the old image out.
+			b := New(config)
+			_, err := b.key(logger, tarball)
+			Expect(err).NotTo(HaveOccurred())
+			_, ready := b.ready(tarball)
+			Expect(ready).To(BeFalse())
+		})
+
+		It("backs off when the rebuild fails too", func() {
+			writeFake(0, "exit 1")
+			dir := filepath.Join(cacheDir, keyOf(tarball))
+			Expect(os.MkdirAll(dir, 0755)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(dir, imageName), fakeImage(lz4CompressorID, 4096, 4096), 0644)).To(Succeed())
+			Expect(os.WriteFile(verdict, []byte("fail"), 0644)).To(Succeed())
+
+			b := New(config)
+			_, ok := b.Image(logger, tarball)
+			Expect(ok).To(BeFalse())
+			Expect(b.failures).To(HaveLen(1))
+		})
+	})
+
 	Describe("WarmUp", func() {
 		It("builds every listed tarball that exists and returns once the builds finish", func() {
 			config.Tarballs = append(config.Tarballs, filepath.Join(work, "missing.tar"))
@@ -648,6 +754,34 @@ cp %[5]s "$out"
 			Expect(got).To(HaveKeyWithValue("bin/su", "-rwsr-xr-x 0/0"))
 			Expect(got).To(HaveKeyWithValue("bin/sh", "lrwxrwxrwx 0/0"))
 			Expect(got).To(HaveKeyWithValue("bin/su-link", "-rwsr-xr-x 0/0"))
+		})
+
+		It("rebuilds an image whose inode table is damaged and whose superblock is intact", func() {
+			Expect(os.WriteFile(tarball, paxStack(), 0644)).To(Succeed())
+			config.Sqfstar = filepath.Join(art, "sqfstar")
+			config.Unsquashfs = filepath.Join(art, "unsquashfs")
+			dir, ok := New(config).Image(logger, tarball)
+			Expect(ok).To(BeTrue(), string(logger.Buffer().Contents()))
+			image := filepath.Join(dir, imageName)
+
+			// The inode table start is a 64-bit field at offset 64 of the superblock.
+			f, err := os.OpenFile(image, os.O_RDWR, 0)
+			Expect(err).NotTo(HaveOccurred())
+			start := make([]byte, 8)
+			_, err = f.ReadAt(start, 64)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = f.WriteAt(bytes.Repeat([]byte{0xff}, 16), int64(binary.LittleEndian.Uint64(start))+2)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(f.Close()).To(Succeed())
+			Expect(checkImagePath(image)).To(Succeed())
+			Expect(exec.Command(config.Unsquashfs, "-ll", image).Run()).NotTo(Succeed())
+
+			logger = lagertest.NewTestLogger("vmstack")
+			config.Logger = logger
+			dir, ok = New(config).Image(logger, tarball)
+			Expect(ok).To(BeTrue(), string(logger.Buffer().Contents()))
+			Expect(logger.LogMessages()).To(ContainElement(HaveSuffix("removing-bad-image")))
+			Expect(exec.Command(config.Unsquashfs, "-ll", filepath.Join(dir, imageName)).Run()).To(Succeed())
 		})
 	})
 })

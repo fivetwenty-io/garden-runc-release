@@ -31,6 +31,7 @@ const (
 	failureBackoff  = 60 * time.Second
 	maxBackoff      = 15 * time.Minute
 	buildTimeout    = 30 * time.Minute
+	verifyTimeout   = 5 * time.Minute
 	maxHashAttempts = 5
 	maxToolOutput   = 64 * 1024
 )
@@ -59,6 +60,11 @@ type Config struct {
 	// tarball's own sha256 and the build recipe, which is the recipe version,
 	// the sqfstar options, and the sqfstar binary's sha256.
 	CacheDir string
+	// Unsquashfs is the path of the static unsquashfs binary. When it is set,
+	// the builder checks the whole of each cached image once per process
+	// before it hands the image out, and rebuilds an image that fails. When
+	// it is empty, the builder trusts an image whose superblock is sound.
+	Unsquashfs string
 	// Tarballs lists the only tarballs the builder will build.
 	Tarballs []string
 	// Wait bounds how long Image waits for a build that is running.
@@ -71,12 +77,13 @@ type Config struct {
 // cache entry keeps a second Garden process from building the same image at
 // the same time.
 type Builder struct {
-	sqfstar  string
-	cacheDir string
-	wait     time.Duration
-	logger   lager.Logger
-	tarballs []string
-	listed   map[string]bool
+	sqfstar    string
+	unsquashfs string
+	cacheDir   string
+	wait       time.Duration
+	logger     lager.Logger
+	tarballs   []string
+	listed     map[string]bool
 
 	// backoff is how long the first failed build keeps the next one from
 	// starting. Each further failure of the same key doubles it, up to
@@ -85,6 +92,8 @@ type Builder struct {
 	// timeout bounds one run of sqfstar, so a hung build cannot hold its
 	// entry's lock for good.
 	timeout time.Duration
+	// verifyTimeout bounds one whole-image check the same way.
+	verifyTimeout time.Duration
 	// afterHash, when set, runs after each hash of a tarball and before the
 	// second stat, so a spec can rewrite the tarball part way.
 	afterHash func(path string)
@@ -95,6 +104,9 @@ type Builder struct {
 	resolves map[string]*flight
 	builds   map[string]*flight
 	failures map[string]failure
+	// verified holds the keys whose images passed the whole-image check in
+	// this process.
+	verified map[string]bool
 }
 
 // failure records the last failed build of a key and how long it keeps the
@@ -137,17 +149,20 @@ func New(config Config) *Builder {
 	}
 
 	b := &Builder{
-		sqfstar:  config.Sqfstar,
-		cacheDir: filepath.Clean(config.CacheDir),
-		wait:     config.Wait,
-		logger:   logger,
-		listed:   map[string]bool{},
-		backoff:  failureBackoff,
-		timeout:  buildTimeout,
-		hashes:   map[string]hashed{},
-		resolves: map[string]*flight{},
-		builds:   map[string]*flight{},
-		failures: map[string]failure{},
+		sqfstar:       config.Sqfstar,
+		unsquashfs:    config.Unsquashfs,
+		cacheDir:      filepath.Clean(config.CacheDir),
+		wait:          config.Wait,
+		logger:        logger,
+		listed:        map[string]bool{},
+		backoff:       failureBackoff,
+		timeout:       buildTimeout,
+		verifyTimeout: verifyTimeout,
+		hashes:        map[string]hashed{},
+		resolves:      map[string]*flight{},
+		builds:        map[string]*flight{},
+		failures:      map[string]failure{},
+		verified:      map[string]bool{},
 	}
 	for _, tarball := range config.Tarballs {
 		path := filepath.Clean(tarball)
@@ -319,8 +334,9 @@ func (b *Builder) ready(path string) (string, bool) {
 		return "", false
 	}
 
-	dir := filepath.Join(b.cacheDir, entryKey(h.sum, recipe))
-	if checkImagePath(filepath.Join(dir, imageName)) != nil {
+	key := entryKey(h.sum, recipe)
+	dir := filepath.Join(b.cacheDir, key)
+	if checkImagePath(filepath.Join(dir, imageName)) != nil || !b.isVerified(key) {
 		return "", false
 	}
 	return dir, true
@@ -503,7 +519,7 @@ func (b *Builder) build(log lager.Logger, e entry, tarball string) (string, erro
 	key := e.key
 	dir := filepath.Join(b.cacheDir, key)
 	image := filepath.Join(dir, imageName)
-	if checkImagePath(image) == nil {
+	if checkImagePath(image) == nil && b.isVerified(key) {
 		return dir, nil
 	}
 
@@ -558,9 +574,15 @@ func (b *Builder) buildLocked(log lager.Logger, e entry, tarball string) error {
 
 	// Another Garden process may have finished the image while this one
 	// waited for the lock.
-	if err := checkImagePath(image); err == nil {
+	err = checkImagePath(image)
+	if err == nil && !b.isVerified(key) {
+		err = b.verifyImage(image)
+	}
+	if err == nil {
+		b.markVerified(key)
 		return nil
-	} else if !errors.Is(err, fs.ErrNotExist) {
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
 		log.Info("removing-bad-image", lager.Data{"image": image, "reason": err.Error()})
 		if err := os.Remove(image); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
@@ -583,7 +605,63 @@ func (b *Builder) buildLocked(log lager.Logger, e entry, tarball string) error {
 		return err
 	}
 
+	b.markVerified(key)
 	log.Info("built", lager.Data{"tarball": tarball, "image": image, "build-time": time.Since(start).String()})
+	return nil
+}
+
+func (b *Builder) isVerified(key string) bool {
+	if b.unsquashfs == "" {
+		return true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.verified[key]
+}
+
+func (b *Builder) markVerified(key string) {
+	b.mu.Lock()
+	b.verified[key] = true
+	b.mu.Unlock()
+}
+
+// verifyImage checks the whole of a cached image, which the superblock test
+// cannot do. It has unsquashfs read the superblock and then list every
+// directory, which walks all of the image's metadata, and it reads the file
+// to its end so that a medium error in a data block shows up as well. It does
+// nothing when no unsquashfs is configured.
+func (b *Builder) verifyImage(image string) error {
+	if b.unsquashfs == "" {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), b.verifyTimeout)
+	defer cancel()
+
+	for _, flag := range []string{"-s", "-ll"} {
+		output := &tailBuffer{max: maxToolOutput}
+		cmd := exec.CommandContext(ctx, niceBinary, "-n", "10", b.unsquashfs, flag, image)
+		cmd.Stdout = output
+		cmd.Stderr = output
+		cmd.WaitDelay = 10 * time.Second
+		if err := cmd.Run(); err != nil {
+			if ctx.Err() != nil {
+				err = fmt.Errorf("%w after %s", err, b.verifyTimeout)
+			}
+			// The error is formatted without %w so that a missing unsquashfs
+			// binary reads as a failed check, not as a missing image.
+			return fmt.Errorf("unsquashfs %s %s: %v: %s", flag, image, err, strings.TrimSpace(output.String()))
+		}
+	}
+
+	f, err := os.Open(image)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := io.Copy(io.Discard, f); err != nil {
+		return fmt.Errorf("read %s: %w", image, err)
+	}
 	return nil
 }
 
