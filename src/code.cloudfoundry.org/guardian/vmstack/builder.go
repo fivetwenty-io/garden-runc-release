@@ -17,11 +17,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"code.cloudfoundry.org/lager/v3"
-	"golang.org/x/sys/unix"
 )
 
 const (
@@ -564,19 +562,14 @@ func (b *Builder) lockPath(key string) string {
 // Clean unlinks lock files, so once the lock is held lockEntry checks that
 // the path still names the locked file and starts over when it does not.
 func lockEntry(path string, wait bool) (*os.File, error) {
-	how := unix.LOCK_EX
-	if !wait {
-		how |= unix.LOCK_NB
-	}
-
 	for {
 		f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0600)
 		if err != nil {
 			return nil, err
 		}
-		if err := flock(f, how); err != nil {
+		if err := lockFile(f, wait); err != nil {
 			f.Close()
-			if errors.Is(err, unix.EWOULDBLOCK) {
+			if errors.Is(err, errLocked) {
 				return nil, errLocked
 			}
 			return nil, fmt.Errorf("lock %s: %w", path, err)
@@ -594,15 +587,6 @@ func lockEntry(path string, wait bool) (*os.File, error) {
 		f.Close()
 		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return nil, err
-		}
-	}
-}
-
-func flock(f *os.File, how int) error {
-	for {
-		err := unix.Flock(int(f.Fd()), how)
-		if err != unix.EINTR {
-			return err
 		}
 	}
 }
@@ -647,19 +631,6 @@ func fileIDOf(f *os.File) (fileID, error) {
 		return fileID{}, err
 	}
 	return idOf(info)
-}
-
-func idOf(info fs.FileInfo) (fileID, error) {
-	st, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return fileID{}, fmt.Errorf("%s has no device and inode", info.Name())
-	}
-	return fileID{
-		dev:   uint64(st.Dev),
-		ino:   st.Ino,
-		size:  info.Size(),
-		mtime: info.ModTime().UnixNano(),
-	}, nil
 }
 
 func isKey(name string) bool {
