@@ -6,6 +6,8 @@ import (
 	"io"
 	"sync"
 	"time"
+
+	"code.cloudfoundry.org/garden"
 )
 
 // vmMetricsLinePrefix begins every stderr line vm-launch writes for one
@@ -388,4 +390,88 @@ func (m *vmSampleStore[T]) Remove(handle string) {
 	defer m.mu.Unlock()
 
 	delete(m.samples, handle)
+}
+
+// vmCPUGrace is added to the time over which a rise in the guest's CPU counter
+// is bounded, so that a reading taken soon after the last one has room for the
+// jitter of the guest's sampling.
+const vmCPUGrace = 10 * time.Second
+
+// vmCPUSource says where a vmCPUCounter's last figure came from.
+type vmCPUSource int
+
+const (
+	vmCPUFromCgroup vmCPUSource = iota
+	vmCPUFromGuest
+	vmCPUHeld
+)
+
+// vmCPUCounter is the CPU counter that Metrics reports for one VM container.
+// It starts from the cgroup, moves on to the guest's figures on top of the
+// cgroup's last reading, and holds its last figure when the guest's samples
+// go stale. It never decreases in any of its three fields.
+type vmCPUCounter struct {
+	mu sync.Mutex
+
+	source   vmCPUSource
+	offset   garden.ContainerCPUStat
+	guest    vmCPUSample
+	at       time.Time
+	reported garden.ContainerCPUStat
+}
+
+func (v *vmCPUCounter) mode() vmCPUSource {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	return v.source
+}
+
+// report returns the figure for a reading at now, given the cgroup's figure,
+// the container's guest sample when it is fresh, the container's age, and the
+// number of vCPUs that bound the guest's rise.
+func (v *vmCPUCounter) report(cgroup garden.ContainerCPUStat, sample vmCPUSample, fresh bool, now time.Time, age time.Duration, cores int) garden.ContainerCPUStat {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if !fresh {
+		if v.source == vmCPUFromCgroup {
+			v.reported = vmCPUMax(v.reported, cgroup)
+			return v.reported
+		}
+
+		v.source = vmCPUHeld
+		return v.reported
+	}
+
+	var window time.Duration
+	if v.source == vmCPUFromCgroup {
+		v.offset = vmCPUMax(v.reported, cgroup)
+		window = age
+	} else {
+		window = now.Sub(v.at)
+	}
+
+	// A guest's vCPUs run at most cores times as fast as the clock, and twice
+	// that leaves room for the clocks' disagreement.
+	limit := 2 * uint64(cores) * uint64(max(window, 0)+vmCPUGrace)
+
+	v.guest = vmCPUSample{
+		User:   min(max(sample.User, v.guest.User), v.guest.User+limit),
+		System: min(max(sample.System, v.guest.System), v.guest.System+limit),
+	}
+	v.at = now
+	v.source = vmCPUFromGuest
+
+	v.reported = vmCPUMax(v.reported, garden.ContainerCPUStat{
+		Usage:  v.offset.Usage + v.guest.User + v.guest.System,
+		User:   v.offset.User + v.guest.User,
+		System: v.offset.System + v.guest.System,
+	})
+
+	return v.reported
+}
+
+func vmCPUMax(a, b garden.ContainerCPUStat) garden.ContainerCPUStat {
+	return garden.ContainerCPUStat{Usage: max(a.Usage, b.Usage), User: max(a.User, b.User), System: max(a.System, b.System)}
 }

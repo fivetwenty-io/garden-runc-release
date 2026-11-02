@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -170,6 +171,13 @@ type Containerizer struct {
 	// guestCPU holds the newest guest CPU sample of each VM container, which
 	// Metrics uses in place of the cgroup's CPU time while the sample is fresh.
 	guestCPU vmGuestCPU
+
+	// guestCPUCounters holds, for each VM container, the counter that Metrics
+	// has reported, so that it never decreases (see vmCPUCounter), and
+	// guestCPUCores, when it is set, is the number of vCPUs that bounds how
+	// fast a guest's counter may rise; zero means the host's.
+	guestCPUCounters sync.Map
+	guestCPUCores    int
 }
 
 // Option configures a Containerizer collaborator that only some deployments need.
@@ -796,6 +804,7 @@ func (c *Containerizer) Destroy(log lager.Logger, handle string) error {
 
 	c.guestMemory.Remove(handle)
 	c.guestCPU.Remove(handle)
+	c.guestCPUCounters.Delete(handle)
 	c.guestFigure.Delete(handle)
 
 	// The cgroup removal fails while any process of the container is left,
@@ -939,7 +948,7 @@ func (c *Containerizer) Metrics(log lager.Logger, handle string) (gardener.Actua
 
 	if backend.IsVM(backend.FromBundle(bundle)) {
 		c.applyGuestMemory(log, handle, &actualContainerMetrics)
-		c.applyGuestCPU(handle, &actualContainerMetrics)
+		c.applyGuestCPU(log, handle, containerMetrics.Age, &actualContainerMetrics)
 	}
 
 	return actualContainerMetrics, nil
@@ -972,22 +981,45 @@ func (c *Containerizer) applyGuestMemory(log lager.Logger, handle string, metric
 	metrics.Memory.TotalUsageTowardLimit = used
 }
 
-// applyGuestCPU replaces the cgroup's CPU time with the guest's, the time its
-// vCPUs spent in user and in system mode, while the container has a fresh
-// sample. The cgroup of a VM container holds the hypervisor and counts the
-// guest's idle time and interrupts, so its figure says little about the app.
-// Without a fresh sample the cgroup figure stays. The entitlement is the
+// applyGuestCPU reports the guest's CPU time in place of the cgroup's, the
+// time its vCPUs spent in user and in system mode. The cgroup of a VM
+// container holds the hypervisor and counts the guest's idle time and
+// interrupts, so its figure says little about the app. The entitlement is the
 // container's and does not change.
-func (c *Containerizer) applyGuestCPU(handle string, metrics *gardener.ActualContainerMetrics) {
+//
+// The executor reads this counter from the start of the container, and the
+// consumers of Diego's metrics take the difference between two readings, so
+// the counter must never decrease. Until the container has a guest sample the
+// cgroup figure is reported. The first guest sample is added to the last
+// cgroup figure, so the counter carries on from it. From then on the cgroup is
+// not used again. While the sample is stale the last figure is held, and when
+// a fresh sample returns the counter moves on by what the guest used since.
+// The guest counter's rise since the last reading is bounded by what the
+// vCPUs could have run in the time, so a figure that a command in the guest
+// forged cannot overflow the consumers' arithmetic.
+func (c *Containerizer) applyGuestCPU(log lager.Logger, handle string, age time.Duration, metrics *gardener.ActualContainerMetrics) {
+	loaded, _ := c.guestCPUCounters.LoadOrStore(handle, &vmCPUCounter{})
+	counter := loaded.(*vmCPUCounter)
+
 	sample, fresh := c.guestCPU.Fresh(handle)
-	if !fresh {
-		return
+	now := c.guestCPU.clock()
+
+	cores := c.guestCPUCores
+	if cores <= 0 {
+		cores = runtime.NumCPU()
 	}
 
-	metrics.CPU = garden.ContainerCPUStat{
-		Usage:  sample.User + sample.System,
-		User:   sample.User,
-		System: sample.System,
+	previous := counter.mode()
+	reported := counter.report(metrics.CPU, sample, fresh, now, age, cores)
+	metrics.CPU = reported
+
+	if current := counter.mode(); current != previous {
+		switch current {
+		case vmCPUFromGuest:
+			log.Info("vm-cpu-from-guest", lager.Data{"handle": handle})
+		case vmCPUHeld:
+			log.Info("vm-cpu-held", lager.Data{"handle": handle})
+		}
 	}
 }
 

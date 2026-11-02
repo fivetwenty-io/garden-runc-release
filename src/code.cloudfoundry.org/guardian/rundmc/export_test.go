@@ -30,3 +30,9 @@ func SetGuestMemoryClock(c *Containerizer, now func() time.Time) {
 func SetGuestCPUClock(c *Containerizer, now func() time.Time) {
 	c.guestCPU.now = now
 }
+
+// SetGuestCPUCores makes the bound on how fast a guest's CPU counter may rise
+// use cores vCPUs in place of the host's.
+func SetGuestCPUCores(c *Containerizer, cores int) {
+	c.guestCPUCores = cores
+}
