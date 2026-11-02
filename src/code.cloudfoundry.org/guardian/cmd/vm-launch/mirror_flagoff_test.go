@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"strings"
 
@@ -13,9 +15,13 @@ import (
 	. "github.com/onsi/gomega"
 )
 
-// flagOffGolden holds the digest and size of each initramfs archive below,
-// as the launch built them before mirrored mounts existed. The spec that
-// reads it writes it afresh when VM_LAUNCH_UPDATE_FLAG_OFF_GOLDEN is set.
+// flagOffGolden holds the digest and size of each initramfs archive below.
+// They were recorded at 4bf9c53, before mirrored mounts existed, where the
+// last three guests were built with buildStackGuestEnvWithCerts,
+// buildImageGuestEnvWithCerts, and sidecarGuestFilesOf, which the mirror
+// work wraps. The spec that reads the file writes it afresh when
+// VM_LAUNCH_UPDATE_FLAG_OFF_GOLDEN is set, and the commit that does so says
+// which change to the guest moved the digests.
 const flagOffGolden = "testdata/flag-off-initramfs.sha256"
 
 var _ = Describe("the initramfs without mirrored mounts", func() {
@@ -43,6 +49,37 @@ var _ = Describe("the initramfs without mirrored mounts", func() {
 		volumes.drives.volumes = qemuImageDrives(defaultImageSize)
 		sidecar := stack()
 		sidecar.stack.sidecars = []guestSidecar{{argv: "'/tmp/lifecycle/launcher' 'x'", env: "export A='b'\n"}}
+
+		// The guests below go through the same builders that the launch
+		// uses, with mirrored mounts off, so the environment, the sidecar
+		// files, and the identity's place in the guest are all pinned.
+		discard := log.New(io.Discard, "", 0)
+		env := map[string]string{
+			"APP":                     "one",
+			"SERVICE_BINDING_ROOT":    "/etc/cf-service-bindings",
+			"VCAP_SERVICES_FILE_PATH": "/etc/cf-service-bindings/vcap-services",
+			instanceCertEnv:           "/etc/cf-instance-credentials/instance.crt",
+			instanceKeyEnv:            "/etc/cf-instance-credentials/instance.key",
+		}
+		pair := &instanceIdentity{cert: []byte("certificate\n"), key: []byte("key\n")}
+		identity := stack()
+		identity.stack.identity = pair
+		identity.env, err = buildStackGuestEnvKeeping(env, 512, true, "", nil, discard)
+		Expect(err).NotTo(HaveOccurred())
+		image := stack()
+		image.stack.image = &guestImage{uid: 1000, gid: 1001}
+		image.drives.dropletID = ""
+		image.stack.identity = pair
+		image.env, err = buildImageGuestEnvKeeping(env, 512, true, "", nil, discard)
+		Expect(err).NotTo(HaveOccurred())
+		built := stack()
+		built.env, err = buildStackGuestEnvKeeping(env, 512, false, "", nil, discard)
+		Expect(err).NotTo(HaveOccurred())
+		built.stack.sidecars, err = sidecarGuestFilesMirroring([]vmSidecar{
+			{Args: []string{"x"}, Env: []string{"A=b", "SERVICE_BINDING_ROOT=/srv/bindings"}, Unset: []string{"APP"}},
+			{Args: []string{"y"}},
+		}, stackGuestDenylist(false), env, nil)
+		Expect(err).NotTo(HaveOccurred())
 		guests := []struct {
 			name  string
 			guest guestContents
@@ -52,6 +89,9 @@ var _ = Describe("the initramfs without mirrored mounts", func() {
 			{"stack-fallback", fallback},
 			{"stack-volumes", volumes},
 			{"stack-sidecar", sidecar},
+			{"stack-identity", identity},
+			{"image-identity", image},
+			{"stack-sidecars-built", built},
 		}
 
 		var got strings.Builder
