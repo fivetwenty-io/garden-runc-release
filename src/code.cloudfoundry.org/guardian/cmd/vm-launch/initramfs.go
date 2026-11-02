@@ -1822,6 +1822,10 @@ type guestContents struct {
 	// that runs /rvm/cmd on busybox. The stack and droplet drives' identities
 	// are in drives.
 	stack *guestStack
+	// agent is the guest agent for cf ssh (see guestagent.go), or nil for a
+	// guest without one. Stage 2 starts it before the start tag, and a
+	// stack guest's busybox fallback starts it in busybox mode.
+	agent *guestAgentFiles
 }
 
 // guestStack is the part of the initramfs of a guest with a stack that the
@@ -2299,9 +2303,31 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, g 
 			file(bundle, 0o644, string(g.caBundle)),
 		)
 	}
+	stackFile := file
+	if g.agent != nil {
+		mode := g.agent.mode
+		if stage2, err = withGuestAgentStart(stage2, g.nonce, mode); err != nil {
+			return err
+		}
+		steps = append(steps, g.agent.archiveSteps(cw, file)...)
+		// The busybox fallback's stage 2 starts the agent too, in busybox
+		// mode, because its command runs in the initramfs.
+		stackFile = func(name string, perm uint32, content string) func() error {
+			if name != strings.TrimPrefix(guestFallbackInit, "/") {
+				return file(name, perm, content)
+			}
+			return func() error {
+				fallback, err := withGuestAgentStart(content, g.nonce, agentModeBusybox)
+				if err != nil {
+					return err
+				}
+				return file(name, perm, fallback)()
+			}
+		}
+	}
 	if g.stack != nil {
 		steps = append(steps, g.stack.archiveSteps(cw, file)...)
-		steps = append(steps, g.stack.fallbackSteps(cw, file, g.nonce, len(g.vols) > 0)...)
+		steps = append(steps, g.stack.fallbackSteps(cw, stackFile, g.nonce, len(g.vols) > 0)...)
 	} else {
 		steps = append(steps, g.systemCerts.busyboxSteps(cw)...)
 	}
@@ -2319,4 +2345,36 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, g 
 		}
 	}
 	return nil
+}
+
+// archiveSteps adds the agent's directory, binary, and configuration, all
+// of them root's alone.
+func (a *guestAgentFiles) archiveSteps(cw *cpioWriter, file func(name string, perm uint32, content string) func() error) []func() error {
+	return []func() error{
+		func() error { return cw.Dir(strings.TrimPrefix(guestAgentDir, "/"), 0o700) },
+		func() error {
+			return cw.File(strings.TrimPrefix(guestAgentBin, "/"), 0o700, a.bin.size, io.NewSectionReader(a.bin.file, 0, a.bin.size))
+		},
+		file(strings.TrimPrefix(guestAgentConfig, "/"), 0o600, a.config),
+	}
+}
+
+// guestAgentStart is the line of stage 2 that starts the agent in mode, in
+// the background, with no input. Its output is the console's, on which it
+// writes only when it cannot start.
+func guestAgentStart(mode string) string {
+	return guestAgentBin + " " + guestAgentCommand + " " + mode + " </dev/null &\n"
+}
+
+// withGuestAgentStart returns stage 2 with the agent's start line just
+// before the start tag, after every setup step, so the agent starts once
+// the network, the limits, and the volumes are in place, and before the
+// app does. Stage 2 has exactly one start tag line, and anything else is
+// refused.
+func withGuestAgentStart(stage2, nonce, mode string) (string, error) {
+	tag := "echo " + startTag(nonce) + "\n"
+	if n := strings.Count(stage2, tag); n != 1 {
+		return "", fmt.Errorf("stage 2 has %d start tag lines, and the guest agent starts before exactly one", n)
+	}
+	return strings.Replace(stage2, tag, guestAgentStart(mode)+tag, 1), nil
 }

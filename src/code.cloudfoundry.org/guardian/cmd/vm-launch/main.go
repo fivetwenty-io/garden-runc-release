@@ -548,7 +548,7 @@ const qemuSandboxFlag = "qemu-sandbox"
 // container may run on (see guestVCPUCount).
 const maxVCPUsFlag = "max-vcpus"
 
-const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--qemu-sandbox=OPTIONS] [--max-vcpus N] [--image-user USER [--image-default-env NAMES]] [--artifacts DIR] -- PATH [ARGS...]\n"
+const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--qemu-sandbox=OPTIONS] [--max-vcpus N] [--guest-agent] [--image-user USER [--image-default-env NAMES]] [--artifacts DIR] -- PATH [ARGS...]\n"
 
 type config struct {
 	backend   backend.Kind
@@ -582,6 +582,9 @@ type config struct {
 	// maxVCPUs is the operator's cap on the guest's vCPU count, or 0 for
 	// none (see maxVCPUsFlag).
 	maxVCPUs int
+	// guestAgent gives the guest the agent that runs cf ssh sessions in it
+	// (see guestAgentFlag).
+	guestAgent bool
 	// image, when set, makes this a launch of the Docker image guest (see
 	// imageguest.go).
 	image *imageConfig
@@ -604,16 +607,27 @@ func init() {
 }
 
 func main() {
+	// Garden binds vm-launch over /bin/bash when the guest agent is on, and
+	// under that name it is the shim that runs a cf ssh session in the
+	// guest.
+	if isGuestShell(os.Args[0]) {
+		os.Exit(runGuestShell(os.Args[1:]))
+	}
 	logger := log.New(os.Stderr, "vm-launch: ", 0)
 	os.Exit(dispatch(os.Args[1:], logger))
 }
 
-// dispatch runs the relay when argv starts with "relay", and otherwise runs
-// the launch. The relay is a sidecar's log process in the container. It skips
-// the core dump and boot setup, and makes itself undumpable on its own.
+// dispatch runs the relay when argv starts with "relay", the guest agent
+// when it starts with "guest-agent", and otherwise the launch. The relay is
+// a sidecar's log process in the container. It skips the core dump and boot
+// setup, and makes itself undumpable on its own. The guest agent runs in
+// the guest, where stage 2 starts it.
 func dispatch(argv []string, logger *log.Logger) int {
 	if len(argv) > 0 && argv[0] == "relay" {
 		return runRelay(argv[1:])
+	}
+	if len(argv) > 0 && argv[0] == guestAgentCommand {
+		return runGuestAgent(argv[1:])
 	}
 	return run(argv, logger)
 }
@@ -996,6 +1010,17 @@ func run(argv []string, logger *log.Logger) int {
 		}
 	}()
 
+	// The guest agent's relay listens from here on, so a cf ssh session that
+	// starts while the guest boots waits for the agent rather than failing.
+	var agent *hostAgent
+	if cfg.guestAgent {
+		if agent, err = newHostAgent(cfg.backend, workDir, agentSocketPath, logger); err != nil {
+			logger.Print(err)
+			return exitLaunchError
+		}
+		defer agent.close()
+	}
+
 	// The droplet image is built before the guest root is sized, so the
 	// root image gets only the quota the droplet leaves. An image that does
 	// not build gives the busybox guest, whose environment is built then.
@@ -1140,6 +1165,7 @@ func run(argv []string, logger *log.Logger) int {
 		stackImg = nil
 		closeFile(droplet, "the droplet image", logger)
 		droplet = nil
+		agent.closeDevice()
 	}
 	defer closeInherited()
 	if rootSize > 0 {
@@ -1163,6 +1189,11 @@ func run(argv []string, logger *log.Logger) int {
 		logger.Print(err)
 		return exitLaunchError
 	}
+	agentFiles, err := agent.guestFiles(stack)
+	if err != nil {
+		logger.Print(err)
+		return exitLaunchError
+	}
 	initrd, err = buildGuestInitramfs(filepath.Join(cfg.artifacts, artBusybox), guestContents{
 		command:        cfg.command,
 		nonce:          nonce,
@@ -1178,6 +1209,7 @@ func run(argv []string, logger *log.Logger) int {
 		tools:          tools,
 		noVolumeSync:   !cfg.volumeSyncMounts,
 		stack:          stack,
+		agent:          agentFiles,
 	})
 	// The archive holds the tools' and the launcher's bytes now, so the
 	// files close here. The deferred calls cover the returns before this
@@ -1225,6 +1257,10 @@ func run(argv []string, logger *log.Logger) int {
 		if cfg.qemuSandbox == "" {
 			logger.Print("the QEMU sandbox is off")
 		}
+	}
+	if files, hvArgv, err = agent.hypervisor(cfg.backend, workDir, files, hvArgv); err != nil {
+		logger.Print(err)
+		return exitLaunchError
 	}
 
 	select {
@@ -1524,6 +1560,7 @@ func parseArgs(argv []string) (config, error) {
 	syncMounts := fs.Bool(volumeSyncMountsFlag, true, "mount every volume image with sync and dirsync; with =false, an image whose filesystem has a journal mounts without them")
 	sandbox := fs.String(qemuSandboxFlag, qemuSandbox, "the value of QEMU's -sandbox option, which turns on its seccomp filter; empty turns the sandbox off")
 	maxVCPUs := fs.Int(maxVCPUsFlag, 0, "the most vCPUs a guest gets; 0 gives it one for each CPU the container may run on")
+	guestAgent := fs.Bool(guestAgentFlag, false, "run cf ssh sessions in the guest through a guest agent, reached over vsock")
 	imageUser := fs.String(imageUserFlag, "", "run the CF launcher on the Docker image that Garden bound into the container, as this user")
 	imageDefaults := fs.String(imageDefaultEnvFlag, "", "the names among HOME, PATH, and USER that hold Garden's defaults, which the Docker image's user replaces")
 	if err := fs.Parse(argv); err != nil {
@@ -1533,7 +1570,7 @@ func parseArgs(argv []string) (config, error) {
 		return config{}, fmt.Errorf("--%s must be 0 or more, got %d", maxVCPUsFlag, *maxVCPUs)
 	}
 
-	cfg := config{backend: backend.Kind(*kind), transparent: *transparent, allowVolumeShares: *allowShares, volumeSyncMounts: *syncMounts, qemuSandbox: *sandbox, maxVCPUs: *maxVCPUs}
+	cfg := config{backend: backend.Kind(*kind), transparent: *transparent, allowVolumeShares: *allowShares, volumeSyncMounts: *syncMounts, qemuSandbox: *sandbox, maxVCPUs: *maxVCPUs, guestAgent: *guestAgent}
 	virtiofsdSet, imageSet, imageDefaultsSet := false, false, false
 	fs.Visit(func(f *flag.Flag) {
 		virtiofsdSet = virtiofsdSet || f.Name == virtiofsdFlag
