@@ -209,8 +209,10 @@ func helloWithWrongKey(cid uint32) error {
 // through the supervisor, with the QEMU vsock device that vm-launch
 // reserves. Once QEMU runs, it runs three shim sessions, forwards a port
 // the guest does not declare, and tries the agent with a wrong key, and
-// then stops the guest with SIGTERM.
-func superviseRealAgent() realAgentRun {
+// then stops the guest with SIGTERM. With denyChildVsock, the supervisor
+// starts QEMU under the filter that denies vsock sockets, as
+// --deny-child-vsock makes it.
+func superviseRealAgent(denyChildVsock bool) realAgentRun {
 	art := realArtifacts()
 	qemu := realQEMU()
 	requireMicrovm(qemu)
@@ -288,6 +290,7 @@ func superviseRealAgent() realAgentRun {
 				agent.closeDevice()
 				close(running)
 			},
+			prepare: withVsockDenial(nil, denyChildVsock),
 		}
 		kill := func() {
 			select {
@@ -367,8 +370,18 @@ func superviseRealAgent() realAgentRun {
 }
 
 var _ = Describe("the guest agent against a real QEMU", func() {
+	It("runs a cf ssh session through the guest agent when QEMU starts unable to create a vsock socket and vm-launch keeps the call", func() {
+		r := superviseRealAgent(true)
+		all := "out: " + r.out + "\nlog: " + r.log
+
+		Expect(r.res.markerFound).To(BeTrue(), all)
+		Expect(r.out).To(ContainSubstring("app-listening\n"), all)
+		Expect(r.identity.err).NotTo(HaveOccurred(), all)
+		Expect(r.identity.exit).To(Equal(agentExit{Code: 0}), "%+v\n%s", r.identity, all)
+	})
+
 	It("runs cf ssh sessions through the guest agent in the stack guest as the app's user, with the lifecycle's shell, forwards a port the guest does not declare, and refuses a wrong key", func() {
-		r := superviseRealAgent()
+		r := superviseRealAgent(false)
 		all := "out: " + r.out + "\nlog: " + r.log
 
 		Expect(r.res.markerFound).To(BeTrue(), all)
