@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -538,11 +539,13 @@ exit 0`)
 			// The replacement starts its wait, with the wait vm-launch gives
 			// it, once the holder's guest command runs.
 			waited := make(chan waitedImage, 1)
+			waiterLog := &safeBuffer{}
 			go func() {
 				defer GinkgoRecover()
 				Eventually(f.started, 20*time.Second, 10*time.Millisecond).Should(BeAnExistingFile())
 				id := handoffIdentity{ProcessID: handoffProcessID, Token: waiterToken}
-				o := imageOptions{Size: defaultImageSize, LockWait: lockWait, LockPoll: 20 * time.Millisecond, IsMountRoot: alwaysMountRoot, Handoff: &id}
+				o := imageOptions{Size: defaultImageSize, LockWait: lockWait, LockPoll: 20 * time.Millisecond, IsMountRoot: alwaysMountRoot, Handoff: &id,
+					Logf: log.New(waiterLog, "", 0).Printf}
 				w, err := openVolumeImage(&guestVolume{ContainerDir: volDir, ImageName: filepath.Base(img)}, o, nil)
 				if err == nil {
 					Expect(os.WriteFile(f.waiterLocked, nil, 0o600)).To(Succeed())
@@ -560,6 +563,11 @@ exit 0`)
 			DeferCleanup(w.img.Close)
 			Expect(w.at).To(BeTemporally("<", returned.Add(5*time.Second)))
 			Expect(reqPath).NotTo(BeAnExistingFile(), "the replacement left its request behind")
+			// Each side says when the lock changed hands, and only the side
+			// that waited says it took the lock.
+			Expect(logBuf.String()).To(ContainSubstring("released volume image " + img + ", so an instance that waits for it can take it\n"))
+			Expect(logBuf.String()).NotTo(ContainSubstring("holds the lock now"))
+			Expect(waiterLog.String()).To(MatchRegexp(`volume image ` + regexp.QuoteMeta(img) + `: this instance holds the lock now, \S+ after it first asked for it\n`))
 		},
 			Entry("on QEMU", backend.VMQemu, qemuHypervisor),
 			Entry("on Firecracker", backend.VMFirecracker, firecrackerHypervisor),

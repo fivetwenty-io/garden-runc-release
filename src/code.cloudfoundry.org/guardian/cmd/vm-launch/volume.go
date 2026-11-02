@@ -696,6 +696,10 @@ func (pv preparedVolumes) release(logger *log.Logger) {
 	for i := len(pv) - 1; i >= 0; i-- {
 		if err := pv[i].Attachment.Release(); err != nil {
 			logger.Printf("releasing the volume disk: %v", err)
+		} else if pv[i].watch != nil {
+			// A launch that takes part in the handoff says when its lock
+			// went, so that the logs of the two sides of a handoff line up.
+			logger.Printf("released volume image %s, so an instance that waits for it can take it", pv[i].watch.path)
 		}
 		if err := pv[i].watch.Close(); err != nil {
 			logger.Printf("closing the volume's handoff watch: %v", err)

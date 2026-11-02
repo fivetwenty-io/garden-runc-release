@@ -292,6 +292,7 @@ type handoffRequester struct {
 
 	seq    uint64
 	wrote  time.Time
+	asked  time.Time
 	failed bool
 }
 
@@ -317,6 +318,7 @@ func (r *handoffRequester) refresh() {
 		r.logf("asking the instance that holds volume image %s to hand it over: %v; this instance waits for the lock without asking", r.path, err)
 	case err == nil:
 		if r.seq == 0 {
+			r.asked = r.wrote
 			r.logf("volume image %s is locked; asking the instance that holds it to hand it over, which it does when it is an earlier instance of this process", r.path)
 		}
 		r.seq++
@@ -333,6 +335,16 @@ func (r *handoffRequester) withdraw() {
 	if req, ok := readHandoffRequest(r.dirfd, r.name); ok && req.Token == r.id.Token {
 		_ = unix.Unlinkat(r.dirfd, r.name, 0)
 	}
+}
+
+// took logs, when this launch asked for the image, that the lock is now its
+// own and how long after its first request that came, so that the logs of
+// the two sides of a handoff line up.
+func (r *handoffRequester) took() {
+	if r == nil || r.seq == 0 {
+		return
+	}
+	r.logf("volume image %s: this instance holds the lock now, %v after it first asked for it", r.path, time.Since(r.asked).Round(time.Millisecond))
 }
 
 // handoffWatch is the holding side of one image: the volume root, opened
