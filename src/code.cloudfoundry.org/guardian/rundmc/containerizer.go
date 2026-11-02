@@ -1009,11 +1009,13 @@ func (c *Containerizer) applyGuestMemory(log lager.Logger, handle string, metric
 // could have run in the time, so a figure that a command in the guest forged
 // cannot overflow the consumers' arithmetic.
 func (c *Containerizer) applyGuestCPU(log lager.Logger, handle string, age time.Duration, metrics *gardener.ActualContainerMetrics) {
-	loaded, existed := c.guestCPUCounters.LoadOrStore(handle, &vmCPUCounter{})
+	made := &vmCPUCounter{}
+	loaded, existed := c.guestCPUCounters.LoadOrStore(handle, made)
 	if !existed && !c.bundleExists(log, handle) {
 		// Destroy ran between the bundle's lookup and now, and its removal
-		// of the counter came first.
-		c.guestCPUCounters.Delete(handle)
+		// of the counter came first. The counter goes only if it is still
+		// ours, since a new container may have taken the handle.
+		c.guestCPUCounters.CompareAndDelete(handle, made)
 		return
 	}
 	counter := loaded.(*vmCPUCounter)
