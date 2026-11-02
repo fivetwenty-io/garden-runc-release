@@ -1417,6 +1417,20 @@ var _ = Describe("the volume flags of the wrapped vm-launch", func() {
 		})
 	})
 
+	Describe("VMLaunchMirrorMountsFlags", func() {
+		It("passes nothing when mirroring is off, which vm-launch does without a flag", func() {
+			Expect(processes.VMLaunchMirrorMountsFlags(false)).To(BeEmpty())
+		})
+
+		It("passes the flag when mirroring is on", func() {
+			Expect(processes.VMLaunchMirrorMountsFlags(true)).To(Equal([]string{"--mirror-mounts"}))
+		})
+
+		It("names the flag vm-launch reads", func() {
+			Expect(processes.VMLaunchMirrorMountsFlag).To(Equal("--mirror-mounts"))
+		})
+	})
+
 	Context("when no flag is set", func() {
 		It("builds the argv it built before: the path, then vm-launch's own arguments", func() {
 			Expect(build().Args).To(Equal(append([]string{processes.VMLaunchPath}, launcherArgs...)))

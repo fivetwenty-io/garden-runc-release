@@ -569,6 +569,11 @@ var _ = Describe("execution backend flags", func() {
 			Expect(parse("--vm-volume-async-mounts").ExecutionBackends.VMVolumeAsyncMounts).To(BeTrue())
 		})
 
+		It("turns mount mirroring on with --vm-mirror-mounts and keeps it off by default", func() {
+			Expect(parse().ExecutionBackends.VMMirrorMounts).To(BeFalse())
+			Expect(parse("--vm-mirror-mounts").ExecutionBackends.VMMirrorMounts).To(BeTrue())
+		})
+
 		It("reads both settings from the ini file the job renders", func() {
 			ini := filepath.Join(GinkgoT().TempDir(), "config.ini")
 			Expect(os.WriteFile(ini, []byte("[server]\n  vm-volume-shares = true\n  vm-volume-async-mounts = true\n"), 0o600)).To(Succeed())
@@ -641,6 +646,33 @@ var _ = Describe("execution backend flags", func() {
 				}))
 			})
 
+			It("passes only --mirror-mounts when mirroring is on", func() {
+				cmd.ExecutionBackends.VMMirrorMounts = true
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vmLaunchFlags).To(Equal([]string{"--mirror-mounts"}))
+			})
+
+			It("passes --mirror-mounts last, after the volume, sandbox, and CPU flags", func() {
+				cmd.ExecutionBackends.VMVolumeShares = true
+				cmd.ExecutionBackends.VMVolumeAsyncMounts = true
+				cmd.ExecutionBackends.VMQemuSandbox = "on,spawn=deny"
+				cmd.ExecutionBackends.VMMaxVCPUs = 4
+				cmd.ExecutionBackends.VMMirrorMounts = true
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vmLaunchFlags).To(Equal([]string{
+					"--allow-volume-shares",
+					"--virtiofsd-path", "/opt/garden-vm/artifacts/virtiofsd/virtiofsd-wrapper",
+					"--volume-sync-mounts=false",
+					"--qemu-sandbox=on,spawn=deny",
+					"--max-vcpus", "4",
+					"--mirror-mounts",
+				}))
+			})
+
 			It("passes nothing when the vm-* backends were dropped for want of a kvm gid", func() {
 				cmd.ExecutionBackends.VMVolumeShares = true
 				lookupKVMGroup = func(name string) (*user.Group, error) { return nil, user.UnknownGroupError(name) }
@@ -655,6 +687,7 @@ var _ = Describe("execution backend flags", func() {
 		It("passes nothing and says so when only oci-gvisor is enabled", func() {
 			cmd.ExecutionBackends.VMVolumeShares = true
 			cmd.ExecutionBackends.VMVolumeAsyncMounts = true
+			cmd.ExecutionBackends.VMMirrorMounts = true
 			cmd.ExecutionBackends.Enabled = []string{"oci-gvisor"}
 			cmd.Containerd.Socket = "/run/containerd.sock"
 
@@ -663,6 +696,7 @@ var _ = Describe("execution backend flags", func() {
 			Expect(backends.vmLaunchFlags).To(BeEmpty())
 			Expect(log).To(gbytes.Say("volume-shares-unused-without-a-vm-backend"))
 			Expect(log).To(gbytes.Say("volume-async-mounts-unused-without-a-vm-backend"))
+			Expect(log).To(gbytes.Say("mirror-mounts-unused-without-a-vm-backend"))
 		})
 
 		It("passes nothing when no backend is enabled", func() {

@@ -339,6 +339,18 @@ properties:
       vm-* entry in garden.execution_backends.
     default: true
 
+  garden.vm_mirror_mounts:
+    description: |
+      Carry the bind mounts of a vm-* container into its guest by rule.
+      vm-launch reads the container's own mount table and mounts each bind
+      mount that Garden and Diego put into the container, such as the file
+      based service bindings at /etc/cf-service-bindings, in the guest at the
+      same path. The default, false, mirrors nothing. The job renders
+      vm-mirror-mounts only when the value is true, and Garden then passes
+      --mirror-mounts to vm-launch, so the default changes no argument.
+      Setting true requires a vm-* entry in garden.execution_backends.
+    default: false
+
   garden.vm_qemu_sandbox:
     description: |
       The value of QEMU's -sandbox option for a vm-qemu container, which turns

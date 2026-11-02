@@ -87,6 +87,12 @@ const (
 	// flag only for a positive cap.
 	VMLaunchMaxVCPUsFlag = "--max-vcpus"
 
+	// VMLaunchMirrorMountsFlag tells vm-launch to carry the bind mounts in its
+	// container's mount table into the guest at the same paths. vm-launch
+	// defaults to mirroring nothing, so VMLaunchMirrorMountsFlags passes the
+	// flag only when the operator turns it on.
+	VMLaunchMirrorMountsFlag = "--mirror-mounts"
+
 	// portEnvPrefix starts the environment entry that names the port of a
 	// process that serves one. vm-launch forwards ports only when the entry
 	// is present, whatever its value, and exits when the value is no port.
@@ -227,6 +233,16 @@ func VMLaunchCPUFlags(maxVCPUs uint) []string {
 		return nil
 	}
 	return []string{VMLaunchMaxVCPUsFlag, strconv.FormatUint(uint64(maxVCPUs), 10)}
+}
+
+// VMLaunchMirrorMountsFlags returns the vm-launch flag that carries the
+// operator's mount mirroring setting. It returns none when mirroring is off,
+// which is the default, so that vm-launch gets the arguments it gets today.
+func VMLaunchMirrorMountsFlags(on bool) []string {
+	if !on {
+		return nil
+	}
+	return []string{VMLaunchMirrorMountsFlag}
 }
 
 // WithVMLaunchFlags makes BuildProcess pass flags to the vm-launch process
