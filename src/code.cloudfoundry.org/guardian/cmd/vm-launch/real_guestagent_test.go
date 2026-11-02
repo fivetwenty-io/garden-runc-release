@@ -125,6 +125,7 @@ type realAgentRun struct {
 	log        string
 	identity   realAgentShimRun
 	profile    realAgentShimRun
+	oom        realAgentShimRun
 	piped      realAgentShimRun
 	terminal   realAgentShimRun
 	forward    string
@@ -317,6 +318,7 @@ func superviseRealAgent() realAgentRun {
 			}
 			defer empty.Close()
 			run.identity = runRealAgentShim(socket, empty, []string{"-c", `id -u; id -g; cat /home/vcap/app/from-the-droplet; pwd; echo "$FROM_SHIM"`}, []string{"FROM_SHIM=from the shim", "PATH=/usr/bin:/bin"})
+			run.oom = runRealAgentShim(socket, empty, []string{"-c", `cat /proc/self/oom_score_adj /proc/$PPID/oom_score_adj`}, []string{"PATH=/usr/bin:/bin"})
 			run.profile = runRealAgentShim(socket, empty, []string{"-c", `/tmp/lifecycle/shell /home/vcap/app 'echo "$FROM_BUILDPACK_PROFILE $FROM_APP_PROFILE"; pwd'`}, []string{"HOME=/home/vcap", "PATH=/usr/bin:/bin"})
 			piped, err := os.Open(writeTempFile("piped", "piped in\n"))
 			if err != nil {
@@ -383,6 +385,12 @@ var _ = Describe("the guest agent against a real QEMU", func() {
 		Expect(r.profile.err).NotTo(HaveOccurred(), all)
 		Expect(r.profile.exit).To(Equal(agentExit{Code: 0}), "%+v\n%s", r.profile, all)
 		Expect(r.profile.stdout).To(Equal("buildpack-profile app-profile\n/home/vcap/app\n"), "%+v\n%s", r.profile, all)
+
+		// The session runs with the app's oom_score_adj, and the agent that
+		// started it with -1000, so the guest kernel never ends the agent.
+		Expect(r.oom.err).NotTo(HaveOccurred(), all)
+		Expect(r.oom.exit).To(Equal(agentExit{Code: 0}), "%+v\n%s", r.oom, all)
+		Expect(r.oom.stdout).To(Equal("0\n-1000\n"), "%+v\n%s", r.oom, all)
 
 		// Input reaches the process and its exit code comes back.
 		Expect(r.piped.err).NotTo(HaveOccurred(), all)

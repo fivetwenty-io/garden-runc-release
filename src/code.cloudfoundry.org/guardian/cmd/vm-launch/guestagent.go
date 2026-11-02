@@ -117,8 +117,9 @@ type guestAgent struct {
 	// shell runs a line as root, with -c and the line after it, in baseEnv.
 	shell   []string
 	baseEnv []string
-	// prefix comes before every line. It sets the open-files limit, as
-	// the run section does for the app.
+	// prefix comes before every line. It sets the session's oom_score_adj
+	// back to 0 from the agent's -1000, and the open-files limit, as the
+	// run section does for the app.
 	prefix string
 	runDir string
 	// ptmx and ptsDir are where the agent opens a terminal.
@@ -142,7 +143,7 @@ func newGuestAgent(mode string, cfg guestAgentConfigFile, logger *log.Logger) (*
 		envPaths: []string{"/rvm/env"},
 		shell:    []string{"/bin/busybox", "sh"},
 		baseEnv:  []string{"PATH=/bin"},
-		prefix:   ". /rvm/limits && " + guestSetLimits + " && ",
+		prefix:   "echo 0 >/proc/self/oom_score_adj && . /rvm/limits && " + guestSetLimits + " && ",
 		runDir:   guestAgentRunDir,
 		ptmx:     "/dev/pts/ptmx",
 		ptsDir:   "/dev/pts",

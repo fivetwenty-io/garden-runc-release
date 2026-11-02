@@ -2372,9 +2372,13 @@ func (a *guestAgentFiles) archiveSteps(cw *cpioWriter, file func(name string, pe
 
 // guestAgentStart is the line of stage 2 that starts the agent in mode, in
 // the background, with no input. Its output is the console's, on which it
-// writes only when it cannot start.
+// writes only when it cannot start. The agent sets its oom_score_adj to
+// -1000 first, as the wrappers do, so the guest kernel never ends it and
+// leaves the app with no cf ssh until it restarts. Its memory is bounded by
+// its session and handshake limits, and each session sets its own back to
+// 0 (see newGuestAgent).
 func guestAgentStart(mode string) string {
-	return guestAgentBin + " " + guestAgentCommand + " " + mode + " </dev/null &\n"
+	return "( echo -1000 >/proc/self/oom_score_adj; exec " + guestAgentBin + " " + guestAgentCommand + " " + mode + " ) </dev/null &\n"
 }
 
 // withGuestAgentStart returns stage 2 with the agent's start line just

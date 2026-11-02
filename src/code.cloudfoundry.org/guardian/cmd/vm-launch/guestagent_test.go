@@ -450,7 +450,7 @@ var _ = Describe("the guest agent", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect([]any{stack.root, stack.cwd, stack.uid, stack.gid}).To(Equal([]any{guestAppRoot, "/home/vcap", 2000, 2000}))
 		Expect(stack.envPaths).To(Equal([]string{"/rvm/env"}))
-		Expect(stack.prefix).To(Equal(". /rvm/limits && " + guestSetLimits + " && "))
+		Expect(stack.prefix).To(Equal("echo 0 >/proc/self/oom_score_adj && . /rvm/limits && " + guestSetLimits + " && "))
 		p := guestProcess{argvPath: "/rvm/agent/run/1/argv", envPaths: []string{"/rvm/agent/run/1/env", "/rvm/env"}, dir: "/home/vcap"}
 		Expect(stack.exec(p)).To(Equal(stackExec(p)))
 
@@ -960,7 +960,7 @@ var _ = Describe("the guest agent's initramfs", func() {
 	}
 
 	startLine := func(mode string) string {
-		return "/rvm/agent/vm-launch guest-agent " + mode + " </dev/null &\necho " + startTag(testNonce) + "\n"
+		return "( echo -1000 >/proc/self/oom_score_adj; exec /rvm/agent/vm-launch guest-agent " + mode + " ) </dev/null &\necho " + startTag(testNonce) + "\n"
 	}
 
 	It("starts the agent just before the start tag, and refuses a stage 2 without exactly one", func() {
