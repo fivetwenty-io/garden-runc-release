@@ -694,12 +694,18 @@ func (pv preparedVolumes) handoffWatches() []*handoffWatch {
 // is what a waiting instance takes over.
 func (pv preparedVolumes) release(logger *log.Logger) {
 	for i := len(pv) - 1; i >= 0; i-- {
-		if err := pv[i].Attachment.Release(); err != nil {
-			logger.Printf("releasing the volume disk: %v", err)
-		} else if pv[i].watch != nil {
+		err := pv[i].Attachment.Release()
+		switch {
+		case pv[i].watch != nil && err != nil:
+			// The release of an image closes its descriptor, and the lock
+			// goes with it even when the close reports an error.
+			logger.Printf("released volume image %s, so an instance that waits for it can take it; the release reported: %v", pv[i].watch.path, err)
+		case pv[i].watch != nil:
 			// A launch that takes part in the handoff says when its lock
 			// went, so that the logs of the two sides of a handoff line up.
 			logger.Printf("released volume image %s, so an instance that waits for it can take it", pv[i].watch.path)
+		case err != nil:
+			logger.Printf("releasing the volume disk: %v", err)
 		}
 		if err := pv[i].watch.Close(); err != nil {
 			logger.Printf("closing the volume's handoff watch: %v", err)

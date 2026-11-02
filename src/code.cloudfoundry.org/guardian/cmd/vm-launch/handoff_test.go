@@ -450,6 +450,30 @@ var _ = Describe("the handoff identity of a volume", func() {
 		Expect(pv.handoffWatches()[0].path).To(Equal(filepath.Join(dir, handoffImageName)))
 	})
 
+	It("logs that a watched image went, with the error, when its release reports one", func() {
+		requireOpenat2()
+		dir := GinkgoT().TempDir()
+		logBuf := &safeBuffer{}
+		p := fake("JuiceFS-like")
+		p.prepare = func(req prepareRequest) (*attachment, error) {
+			img, err := os.OpenFile(filepath.Join(dir, handoffImageName), os.O_RDWR|os.O_CREATE, 0o600)
+			Expect(err).NotTo(HaveOccurred())
+			release := func() error {
+				Expect(img.Close()).To(Succeed())
+				return errors.New("the fake close failed")
+			}
+			return &attachment{File: img, Release: release}, nil
+		}
+		var pv preparedVolumes
+		v := selectedVolume{Volume: guestVolume{ContainerDir: dir, ImageName: handoffImageName, ProcessID: handoffProcessID},
+			Provider: p, Mount: mountRecord{ContainerDir: dir, MountID: mountIDOf(dir)}}
+		_, err := pv.prepare(v, nil, nil, logger)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(pv.handoffWatches()).To(HaveLen(1))
+		pv.release(log.New(logBuf, "", 0))
+		Expect(logBuf.String()).To(Equal("released volume image " + filepath.Join(dir, handoffImageName) + ", so an instance that waits for it can take it; the release reported: the fake close failed\n"))
+	})
+
 	It("keeps the disk without a watch when the volume root cannot be opened again", func() {
 		requireOpenat2()
 		dir := GinkgoT().TempDir()
