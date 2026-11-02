@@ -928,24 +928,6 @@ var _ = Describe("Rundmc", func() {
 						Expect(usage()).To(Equal(uint64(50)))
 					})
 
-					It("leaves no counter behind when a Metrics call races the container's destruction", func() {
-						run()
-						calls := 0
-						bundle := bundleFor(map[string]string{backend.AnnotationKey: string(kind)})
-						bundle.Spec.Linux = &specs.Linux{Resources: &specs.LinuxResources{}}
-						fakeOCIRuntime.BundleInfoStub = func(lager.Logger, string) (string, goci.Bndl, error) {
-							calls++
-							if calls == 1 {
-								return "/bundle", bundle, nil
-							}
-
-							return "", goci.Bndl{}, garden.ContainerNotFoundError{Handle: "some-handle"}
-						}
-
-						Expect(cpu()).To(Equal(cgroupCPU))
-						Expect(rundmc.HasGuestCPUCounter(containerizer, "some-handle")).To(BeFalse())
-					})
-
 					It("reports the cgroup figure when the launcher wrote no sample", func() {
 						lines = nil
 
@@ -1301,6 +1283,24 @@ var _ = Describe("Rundmc", func() {
 						log := logger.(*lagertest.TestLogger).Buffer()
 						Expect(log).To(gbytes.Say("vm-cpu-from-guest"))
 						Expect(log).To(gbytes.Say("vm-cpu-held"))
+					})
+
+					It("leaves no counter behind when a Metrics call races the container's destruction", func() {
+						run()
+						calls := 0
+						bundle := bundleFor(map[string]string{backend.AnnotationKey: string(kind)})
+						bundle.Spec.Linux = &specs.Linux{Resources: &specs.LinuxResources{}}
+						fakeOCIRuntime.BundleInfoStub = func(lager.Logger, string) (string, goci.Bndl, error) {
+							calls++
+							if calls == 1 {
+								return "/bundle", bundle, nil
+							}
+
+							return "", goci.Bndl{}, garden.ContainerNotFoundError{Handle: "some-handle"}
+						}
+
+						Expect(cpu()).To(Equal(cgroupCPU))
+						Expect(rundmc.HasGuestCPUCounter(containerizer, "some-handle")).To(BeFalse())
 					})
 
 					It("reports the cgroup figure when the launcher wrote no sample", func() {
