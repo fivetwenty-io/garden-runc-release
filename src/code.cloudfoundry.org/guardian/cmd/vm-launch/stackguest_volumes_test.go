@@ -34,7 +34,7 @@ var _ = Describe("the volumes of the stack guest", func() {
 			Expect(initScript(testNonce, true)).NotTo(ContainSubstring(guestAppRoot + "$rvm_vpath"))
 		})
 
-		It("is the stack guest's own with the volume setup and the binds before the start tag, and the stack teardown after the command", func() {
+		It("is the stack guest's own with the volume setup and the binds before the start tag, and the stack teardown after the run section", func() {
 			s := &guestStack{}
 			plain := s.initScript(testNonce)
 			Expect(plain).NotTo(ContainSubstring("/rvm/mounts"))
@@ -46,9 +46,11 @@ var _ = Describe("the volumes of the stack guest", func() {
 			binds := strings.Index(script, guestStackVolumeSetup+guestStackVolumeBinds)
 			Expect(binds).To(BeNumerically(">", 0))
 			Expect(binds + len(guestStackVolumeSetup+guestStackVolumeBinds)).To(BeNumerically("<=", start))
+			procs := s.processes()
 			Expect(script).To(Equal(strings.NewReplacer(
 				setup, setup+guestStackVolumeSetup+guestStackVolumeBinds,
-				guestOOMReport(testNonce), guestOOMReport(testNonce)+guestStackVolumeTeardown,
+				guestRunSection(testNonce, procs, false, stackExec), guestRunSectionWithin(testNonce, procs, false, stackExec, guestVolumeTimeoutSeconds),
+				guestOOMReport(testNonce), guestOOMReport(testNonce)+guestStackRunVolumeTeardown,
 			).Replace(plain)))
 			Expect(script).NotTo(ContainSubstring(guestVolumeSetup))
 		})

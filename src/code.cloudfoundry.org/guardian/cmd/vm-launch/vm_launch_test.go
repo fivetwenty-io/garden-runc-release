@@ -1668,7 +1668,7 @@ var _ = Describe("run with a stack image", func() {
 		Expect(string(byName["init"].data)).To(Equal(guestStackInit))
 		stage2 := string(byName["rvm/init"].data)
 		Expect(stage2).To(ContainSubstring(guestStackVolumeSetup + guestStackVolumeBinds))
-		Expect(stage2).To(ContainSubstring(guestStackVolumeTeardown))
+		Expect(stage2).To(ContainSubstring(guestStackRunVolumeTeardown))
 		Expect(string(byName["rvm/mounts"].data)).To(ContainSubstring("RVM_VOL0_KIND=share\nRVM_VOL0_PATH=" + shellQuote(volDir) + "\n"))
 		Expect(string(byName["rvm/disks"].data)).To(ContainSubstring("RVM_VOL0_KIND=share\n"))
 		// The busybox guest that stage 1 falls back to mounts the share
@@ -1725,7 +1725,7 @@ var _ = Describe("run with a stack image", func() {
 		Expect(string(byName["init"].data)).To(Equal(guestStackInit))
 		stage2 := string(byName["rvm/init"].data)
 		Expect(stage2).To(ContainSubstring(guestStackVolumeSetup + guestStackVolumeBinds))
-		Expect(stage2).To(ContainSubstring(guestStackVolumeTeardown))
+		Expect(stage2).To(ContainSubstring(guestStackRunVolumeTeardown))
 		Expect(string(byName["rvm/mounts"].data)).To(ContainSubstring("RVM_VOL0_KIND=block\nRVM_VOL0_PATH=" + shellQuote(volDir) + "\n"))
 		Expect(string(byName["rvm/mounts"].data)).NotTo(ContainSubstring("RVM_VOL0_IMAGE"))
 		Expect(string(byName["rvm/disks"].data)).To(ContainSubstring("RVM_VOL0_KIND=block\nRVM_VOL0_ID=" + qemuVolumeSerial(0) + "\n"))
@@ -1802,7 +1802,7 @@ cp "$initrd" `+shellQuote(initrdCopy)+` || exit 1
 		Expect(string(byName["init"].data)).To(Equal(guestStackInit))
 		stage2 := string(byName["rvm/init"].data)
 		Expect(stage2).To(ContainSubstring(guestStackVolumeSetup + guestStackVolumeBinds))
-		Expect(stage2).To(ContainSubstring(guestStackVolumeTeardown))
+		Expect(stage2).To(ContainSubstring(guestStackRunVolumeTeardown))
 		Expect(string(byName["rvm/mounts"].data)).To(ContainSubstring("RVM_VOL0_KIND=image\nRVM_VOL0_PATH=" + shellQuote(volDir) + "\n"))
 		Expect(string(byName["rvm/disks"].data)).To(ContainSubstring("RVM_VOL0_KIND=image\nRVM_VOL0_ID=" + qemuVolumeSerial(0) + "\n"))
 		// The busybox guest that stage 1 falls back to mounts the volume
