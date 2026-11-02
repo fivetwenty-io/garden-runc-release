@@ -45,22 +45,72 @@ func allowsDomain(rules []specs.LinuxSyscall, domain uint64) bool {
 	return false
 }
 
+// ioUringRefused is the rule that Deny adds to a profile that allows the
+// io_uring calls.
+func ioUringRefused() specs.LinuxSyscall {
+	eperm := uint(1)
+	return specs.LinuxSyscall{
+		Names:    []string{"io_uring_setup", "io_uring_enter", "io_uring_register"},
+		Action:   specs.ActErrno,
+		ErrnoRet: &eperm,
+	}
+}
+
 var _ = Describe("Deny", func() {
-	It("gives a container that has no profile one that allows every call but socket(2) for AF_VSOCK", func() {
+	It("gives a container that has no profile one that allows every call but socket(2) for AF_VSOCK and the io_uring calls, on x86_64 alone", func() {
 		profile := Deny(nil)
 
 		eperm := uint(1)
 		Expect(profile).To(Equal(&specs.LinuxSeccomp{
 			DefaultAction: specs.ActAllow,
-			Architectures: []specs.Arch{specs.ArchX86_64, specs.ArchX86, specs.ArchX32},
-			Syscalls: []specs.LinuxSyscall{{
-				Names:    []string{"socket"},
-				Action:   specs.ActErrno,
-				ErrnoRet: &eperm,
-				Args:     []specs.LinuxSeccompArg{{Index: 0, Value: 0xffffffff, ValueTwo: 40, Op: specs.OpMaskedEqual}},
-			}},
+			Architectures: []specs.Arch{specs.ArchX86_64},
+			Syscalls: []specs.LinuxSyscall{
+				ioUringRefused(),
+				{
+					Names:    []string{"socket"},
+					Action:   specs.ActErrno,
+					ErrnoRet: &eperm,
+					Args:     []specs.LinuxSeccompArg{{Index: 0, Value: 0xffffffff, ValueTwo: 40, Op: specs.OpMaskedEqual}},
+				},
+			},
 		}))
 		Expect(Denies(profile)).To(BeTrue())
+	})
+
+	It("drops 32-bit x86 and x32 from the profile's architectures, and keeps the others in order", func() {
+		profile := allowListProfile()
+		profile.Architectures = []specs.Arch{specs.ArchX86, specs.ArchAARCH64, specs.ArchX86_64, specs.ArchX32, specs.ArchARM}
+
+		Expect(Deny(profile).Architectures).To(Equal([]specs.Arch{specs.ArchAARCH64, specs.ArchX86_64, specs.ArchARM}))
+		Expect(Deny(allowListProfile()).Architectures).To(Equal([]specs.Arch{specs.ArchX86_64}))
+	})
+
+	It("strips the io_uring calls from the rules of an allow-list profile that allows them, and leaves its other calls alone", func() {
+		profile := allowListProfile()
+		profile.Syscalls = append(profile.Syscalls,
+			specs.LinuxSyscall{Names: []string{"io_uring_setup", "io_uring_enter", "write"}, Action: specs.ActAllow},
+			specs.LinuxSyscall{Names: []string{"io_uring_register"}, Action: specs.ActAllow},
+		)
+		Expect(Denies(Deny(allowListProfile()))).To(BeTrue())
+		Expect(Denies(profile)).To(BeFalse())
+
+		denied := Deny(profile)
+		Expect(denied.Syscalls[len(denied.Syscalls)-1]).To(Equal(specs.LinuxSyscall{Names: []string{"write"}, Action: specs.ActAllow}))
+		for _, rule := range denied.Syscalls {
+			Expect(rule.Names).NotTo(ContainElements("io_uring_setup", "io_uring_enter", "io_uring_register"))
+		}
+		Expect(Denies(denied)).To(BeTrue())
+	})
+
+	It("replaces the io_uring rules of a profile that allows every call by default with its own", func() {
+		profile := &specs.LinuxSeccomp{
+			DefaultAction: specs.ActAllow,
+			Syscalls:      []specs.LinuxSyscall{{Names: []string{"io_uring_setup", "kexec_load"}, Action: specs.ActKillProcess}},
+		}
+
+		denied := Deny(profile)
+		Expect(denied.Syscalls[:2]).To(Equal([]specs.LinuxSyscall{{Names: []string{"kexec_load"}, Action: specs.ActKillProcess}, ioUringRefused()}))
+		Expect(Denies(denied)).To(BeTrue())
 	})
 
 	It("replaces the allow-list profile's socket(2) rule, in its place, with rules that leave out AF_VSOCK", func() {
@@ -77,6 +127,7 @@ var _ = Describe("Deny", func() {
 		}
 		Expect(profile.Syscalls[33].Names).To(Equal([]string{"socketcall"}))
 		Expect(profile.Syscalls[35].Names).To(Equal([]string{"clone3"}))
+		Expect(profile.Architectures).To(Equal([]specs.Arch{specs.ArchX86_64}))
 		Expect(Denies(profile)).To(BeTrue())
 	})
 
@@ -141,32 +192,51 @@ var _ = Describe("Deny", func() {
 		}
 
 		denied := Deny(profile)
-		Expect(denied.Syscalls).To(HaveLen(2))
+		Expect(denied.Syscalls).To(HaveLen(3))
 		Expect(denied.Syscalls[0].Names).To(Equal([]string{"kexec_load"}))
-		Expect(isDenyRule(denied.Syscalls[1])).To(BeTrue())
+		Expect(denied.Syscalls[1]).To(Equal(ioUringRefused()))
+		Expect(isDenyRule(denied.Syscalls[2])).To(BeTrue())
 		Expect(Denies(denied)).To(BeTrue())
-		Expect(Allow(denied)).To(Equal(profile))
+
+		allowed := Allow(denied)
+		Expect(allowed.Syscalls).To(Equal([]specs.LinuxSyscall{profile.Syscalls[0], ioUringRefused()}))
+		Expect(Denies(allowed)).To(BeFalse())
+	})
+
+	It("adds no second socket(2) rule to a profile that allows every call by default and already denies AF_VSOCK through it", func() {
+		profile := &specs.LinuxSeccomp{
+			DefaultAction: specs.ActAllow,
+			Syscalls:      []specs.LinuxSyscall{{Names: []string{"socket"}, Action: specs.ActErrno}},
+		}
+
+		Expect(Deny(profile).Syscalls).To(Equal([]specs.LinuxSyscall{profile.Syscalls[0], ioUringRefused()}))
 	})
 })
 
 var _ = Describe("Allow", func() {
-	It("undoes Deny for the allow-list profile, so that its rules are the ones it had", func() {
+	It("undoes the socket(2) part of Deny for the allow-list profile, so that its rules are the ones it had, and keeps 32-bit x86 and x32 out", func() {
 		profile := allowListProfile()
-		Expect(Allow(Deny(profile))).To(Equal(profile))
-		Expect(marshal(Allow(Deny(profile)))).To(Equal(marshal(profile)))
+		want := allowListProfile()
+		want.Architectures = []specs.Arch{specs.ArchX86_64}
+		Expect(Allow(Deny(profile))).To(Equal(want))
+		Expect(marshal(Allow(Deny(profile)))).To(Equal(marshal(want)))
 		Expect(Denies(Allow(Deny(profile)))).To(BeFalse())
 	})
 
-	It("gives back no profile for the one Deny gives a container that has none", func() {
-		Expect(Allow(Deny(nil))).To(BeNil())
+	It("keeps the io_uring calls refused in the profile Deny gives a container that has none", func() {
+		Expect(Allow(Deny(nil))).To(Equal(&specs.LinuxSeccomp{
+			DefaultAction: specs.ActAllow,
+			Architectures: []specs.Arch{specs.ArchX86_64},
+			Syscalls:      []specs.LinuxSyscall{ioUringRefused()},
+		}))
 		Expect(Allow(nil)).To(BeNil())
 	})
 
-	It("keeps a profile that allows every call by default when it has other rules", func() {
+	It("keeps the other rules of a profile that allows every call by default", func() {
 		denied := Deny(nil)
 		denied.Syscalls = append(denied.Syscalls, specs.LinuxSyscall{Names: []string{"kexec_load"}, Action: specs.ActErrno})
 
-		Expect(Allow(denied).Syscalls).To(Equal([]specs.LinuxSyscall{{Names: []string{"kexec_load"}, Action: specs.ActErrno}}))
+		Expect(Allow(denied).Syscalls).To(Equal([]specs.LinuxSyscall{ioUringRefused(), {Names: []string{"kexec_load"}, Action: specs.ActErrno}}))
 	})
 })
 
@@ -182,10 +252,39 @@ var _ = Describe("Denies", func() {
 		Expect(Denies(profile)).To(BeFalse())
 	})
 
-	It("is true for an allow-list profile that has no rule for socket(2)", func() {
+	It("is true for an allow-list profile that has no rule for socket(2) and lists neither 32-bit x86 nor x32", func() {
 		profile := allowListProfile()
 		profile.Syscalls = append(profile.Syscalls[:1], profile.Syscalls[2:]...)
+		profile.Architectures = []specs.Arch{specs.ArchX86_64, specs.ArchAARCH64}
 		Expect(Denies(profile)).To(BeTrue())
+	})
+
+	It("is false for a profile that lists 32-bit x86 or x32, whose programs reach the socket through socketcall(2)", func() {
+		for _, arch := range []specs.Arch{specs.ArchX86, specs.ArchX32} {
+			profile := Deny(allowListProfile())
+			profile.Architectures = append(profile.Architectures, arch)
+			Expect(Denies(profile)).To(BeFalse(), "with %s", arch)
+			Expect(Denies(Deny(profile))).To(BeTrue(), "after Deny with %s", arch)
+		}
+	})
+
+	It("is false for a profile that lets io_uring_setup(2) through, even only for some arguments", func() {
+		profile := Deny(nil)
+		profile.Syscalls = profile.Syscalls[1:]
+		Expect(Denies(profile)).To(BeFalse())
+
+		profile = Deny(nil)
+		profile.Syscalls[0].Args = []specs.LinuxSeccompArg{{Index: 1, Value: 0, Op: specs.OpEqualTo}}
+		Expect(Denies(profile)).To(BeFalse())
+
+		profile = Deny(allowListProfile())
+		profile.Syscalls = append(profile.Syscalls, specs.LinuxSyscall{Names: []string{"io_uring_setup"}, Action: specs.ActAllow, Args: []specs.LinuxSeccompArg{{Index: 0, Value: 8, Op: specs.OpLessThan}}})
+		Expect(Denies(profile)).To(BeFalse())
+		Expect(Denies(Deny(profile))).To(BeTrue())
+
+		profile = Deny(nil)
+		profile.Syscalls[0].Action = specs.ActTrace
+		Expect(Denies(profile)).To(BeFalse())
 	})
 
 	It("is false when a rule without conditions allows socket(2) beside the narrower ones, because it wins in libseccomp", func() {
@@ -194,10 +293,10 @@ var _ = Describe("Denies", func() {
 		Expect(Denies(profile)).To(BeFalse())
 	})
 
-	It("is true for a default-allow profile with an errno rule for socket(2) whatever its arguments", func() {
+	It("is true for a default-allow profile with an errno rule for socket(2) whatever its arguments and one for io_uring_setup(2)", func() {
 		profile := &specs.LinuxSeccomp{
 			DefaultAction: specs.ActAllow,
-			Syscalls:      []specs.LinuxSyscall{{Names: []string{"socket"}, Action: specs.ActErrno}},
+			Syscalls:      []specs.LinuxSyscall{{Names: []string{"socket", "io_uring_setup"}, Action: specs.ActErrno}},
 		}
 		Expect(Denies(profile)).To(BeTrue())
 	})
