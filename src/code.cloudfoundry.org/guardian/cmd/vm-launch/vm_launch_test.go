@@ -1654,34 +1654,26 @@ var _ = Describe("run with a stack image", func() {
 		return initrd, argv
 	}
 
-	// withoutWorkDir hides the work directory that a launch names in the
-	// virtiofs socket path of its command line, which differs from one
-	// launch to the next though the guest is the same.
-	withoutWorkDir := func(argv []byte) string {
-		return regexp.MustCompile(regexpQuote(tmp)+`/vm-launch-[^/]+/`).ReplaceAllString(string(argv), "WORKDIR/")
-	}
-
-	It("keeps today's guest for an app with a share, because the stack guest does not mount shares yet", func() {
+	It("boots the stack guest for an app with a share, which stage 2 mounts over virtiofs and binds into the app root without changing its owner", func() {
 		volDir, flags, gone := withShare()
-		args := []string{launcher, "app", "true", ""}
-		initrd, argv := shareGuestOf(args, flags, gone)
-		Expect(logBuf.String()).To(ContainSubstring("busybox guest: the volume at " + quoteForLog(volDir) + " is a share, which the stack guest does not mount yet\n"))
-		Expect(logBuf.String()).NotTo(ContainSubstring("stack guest:"))
+		initrd, argv := shareGuestOf([]string{launcher, "app", "true", ""}, flags, gone)
+		Expect(logBuf.String()).To(ContainSubstring("stack guest: "))
+		Expect(logBuf.String()).NotTo(ContainSubstring("busybox guest:"))
 		Expect(strings.Count(logBuf.String(), "guest: ")).To(Equal(1), logBuf.String())
-		Expect(argv).NotTo(ContainSubstring("rvm-stack"))
+		Expect(argv).To(ContainSubstring("serial=" + qemuStackSerial))
+		Expect(argv).To(ContainSubstring("memory-backend-memfd,id=" + qemuMemoryID))
 		Expect(argv).To(ContainSubstring("vhost-user-fs-device,chardev=fs0,tag=rvm-vol0\n"))
+		Expect(argv).NotTo(ContainSubstring("serial=" + qemuVolumeSerial(0)))
 		_, byName := archiveEntries(initrd)
-		Expect(string(byName["init"].data)).To(Equal(guestRootInit))
-		Expect(byName).NotTo(HaveKey("rvm/lifecycle/launcher"))
-		Expect(byName).NotTo(HaveKey("rvm/argv"))
-
-		// A container without a stack image gets the same guest.
-		stackImagePath = filepath.Join(dir, "none", "rootfs.squashfs")
-		logBuf.Reset()
-		wantInitrd, wantArgv := shareGuestOf(args, flags, gone)
-		Expect(logBuf.String()).NotTo(ContainSubstring("stack guest:"))
-		Expect(initrd).To(Equal(wantInitrd))
-		Expect(withoutWorkDir(argv)).To(Equal(withoutWorkDir(wantArgv)))
+		Expect(string(byName["init"].data)).To(Equal(guestStackInit))
+		stage2 := string(byName["rvm/init"].data)
+		Expect(stage2).To(ContainSubstring(guestStackVolumeSetup + guestStackVolumeBinds))
+		Expect(stage2).To(ContainSubstring(guestStackVolumeTeardown))
+		Expect(string(byName["rvm/mounts"].data)).To(ContainSubstring("RVM_VOL0_KIND=share\nRVM_VOL0_PATH=" + shellQuote(volDir) + "\n"))
+		Expect(string(byName["rvm/disks"].data)).To(ContainSubstring("RVM_VOL0_KIND=share\n"))
+		// The busybox guest that stage 1 falls back to mounts the share
+		// too, as it always has.
+		Expect(string(byName[strings.TrimPrefix(guestFallbackInit, "/")].data)).To(Equal(initScript(testNonce, true)))
 		Expect(heldFilesEndingIn("rootfs.squashfs")).To(BeZero())
 		Expect(workDirsIn(tmp)).To(BeEmpty())
 	})
@@ -1721,35 +1713,82 @@ var _ = Describe("run with a stack image", func() {
 		return volDir
 	}
 
-	It("keeps today's guest for an app with a BOSH disk, because the stack guest does not mount block volumes yet", func() {
+	It("boots the stack guest for an app with a BOSH disk, which stage 2 mounts as a block volume and binds into the app root", func() {
 		volDir := withBoshDisk()
-		args := []string{launcher, "app", "true", ""}
-		initrd, argv := guestOf(args)
-		Expect(logBuf.String()).To(ContainSubstring("busybox guest: the volume at " + quoteForLog(volDir) + " is a BOSH disk, which the stack guest does not mount yet\n"))
-		Expect(logBuf.String()).NotTo(ContainSubstring("stack guest:"))
+		initrd, argv := guestOf([]string{launcher, "app", "true", ""})
+		Expect(logBuf.String()).To(ContainSubstring("stack guest: "))
+		Expect(logBuf.String()).NotTo(ContainSubstring("busybox guest:"))
 		Expect(strings.Count(logBuf.String(), "guest: ")).To(Equal(1), logBuf.String())
-		Expect(argv).NotTo(ContainSubstring("rvm-stack"))
+		Expect(argv).To(ContainSubstring("serial=" + qemuStackSerial))
+		Expect(argv).To(ContainSubstring("serial=" + qemuVolumeSerial(0)))
 		_, byName := archiveEntries(initrd)
-		Expect(string(byName["init"].data)).To(Equal(guestRootInit))
-		Expect(byName).NotTo(HaveKey("rvm/lifecycle/launcher"))
-		Expect(byName).NotTo(HaveKey("rvm/argv"))
-
-		wantInitrd, wantArgv := todaysGuestOf(args)
-		Expect(initrd).To(Equal(wantInitrd))
-		Expect(argv).To(Equal(wantArgv))
+		Expect(string(byName["init"].data)).To(Equal(guestStackInit))
+		stage2 := string(byName["rvm/init"].data)
+		Expect(stage2).To(ContainSubstring(guestStackVolumeSetup + guestStackVolumeBinds))
+		Expect(stage2).To(ContainSubstring(guestStackVolumeTeardown))
+		Expect(string(byName["rvm/mounts"].data)).To(ContainSubstring("RVM_VOL0_KIND=block\nRVM_VOL0_PATH=" + shellQuote(volDir) + "\n"))
+		Expect(string(byName["rvm/mounts"].data)).NotTo(ContainSubstring("RVM_VOL0_IMAGE"))
+		Expect(string(byName["rvm/disks"].data)).To(ContainSubstring("RVM_VOL0_KIND=block\nRVM_VOL0_ID=" + qemuVolumeSerial(0) + "\n"))
+		Expect(string(byName[strings.TrimPrefix(guestFallbackInit, "/")].data)).To(Equal(initScript(testNonce, true)))
 		Expect(heldFilesEndingIn("rootfs.squashfs")).To(BeZero())
 	})
 
-	It("exits 125 for an app with sidecars and a share, because sidecars run only in the stack guest and the share keeps the busybox guest", func() {
-		volDir, flags, gone := withShare()
+	It("boots the stack guest on Firecracker for an app with a BOSH disk, with the disk's drive before the stack and the droplet", func() {
+		withBoshDisk()
+		letFirecrackerSeeVMLaunch()
+		fcCopy := filepath.Join(art, "fc-copy.json")
+		initrdCopy := filepath.Join(art, "initrd-copy")
+		writeFakeHypervisor(filepath.Join(art, "firecracker/firecracker"),
+			`p=; for a in "$@"; do [ "$p" = --config-file ] && cp "$a" `+shellQuote(fcCopy)+`; p=$a; done
+cp "$initrd" `+shellQuote(initrdCopy)+` || exit 1
+`)
+		Expect(runWith(backend.VMFirecracker, []string{launcher, "app", "true", ""})).To(Equal(0), logBuf.String())
+		Expect(logBuf.String()).To(ContainSubstring("stack guest: "))
+		Expect(logBuf.String()).NotTo(ContainSubstring("busybox guest:"))
+
+		raw, err := os.ReadFile(fcCopy)
+		Expect(err).NotTo(HaveOccurred())
+		var cfg struct {
+			Drives []firecrackerDrive `json:"drives"`
+		}
+		Expect(json.Unmarshal(raw, &cfg)).To(Succeed())
+		var ids []string
+		for _, d := range cfg.Drives {
+			ids = append(ids, d.DriveID)
+		}
+		Expect(ids).To(Equal([]string{volumeDriveID(0), stackDriveID, dropletDriveID}))
+		Expect(cfg.Drives[0].IsReadOnly).To(BeFalse())
+
+		initrd, err := os.ReadFile(initrdCopy)
+		Expect(err).NotTo(HaveOccurred())
+		_, byName := archiveEntries(initrd)
+		Expect(string(byName["init"].data)).To(Equal(guestStackInit))
+		Expect(string(byName["rvm/init"].data)).To(ContainSubstring(guestStackVolumeBinds))
+		Expect(string(byName["rvm/mounts"].data)).To(ContainSubstring("RVM_VOL0_KIND=block\n"))
+	})
+
+	It("runs an app with sidecars and a share in the stack guest, which runs the sidecars beside the app", func() {
+		_, flags, gone := withShare()
 		GinkgoT().Setenv(sidecarsEnvVar, `{"version":1,"sidecars":[{"args":["app","./side",""]}]}`)
 		argvFile := writeShareHypervisor(qemu, "", "", gone)
 		argv := append(append([]string{"--backend", string(backend.VMQemu), "--artifacts", art}, flags...), "--", launcher, "app", "true", "")
-		Expect(run(argv, log.New(logBuf, "", 0))).To(Equal(exitLaunchError))
-		Expect(logBuf.String()).To(Equal("this app has 1 sidecar, which runs only in the stack guest; the volume at " + quoteForLog(volDir) + " is a share, which the stack guest does not mount yet\n"))
-		Expect(argvFile).NotTo(BeAnExistingFile())
+		Expect(run(argv, log.New(logBuf, "", 0))).To(Equal(0), logBuf.String())
+		Expect(logBuf.String()).To(MatchRegexp(`(?m)^stack guest: .*; 1 sidecar runs beside the app, with the log source ""$`))
+		Expect(logBuf.String()).NotTo(ContainSubstring("busybox guest:"))
+		Expect(argvFile).To(BeAnExistingFile())
 		Expect(heldFilesEndingIn("rootfs.squashfs")).To(BeZero())
 		Expect(workDirsIn(tmp)).To(BeEmpty())
+	})
+
+	It("runs an app with sidecars and a BOSH disk in the stack guest, which runs the sidecars beside the app", func() {
+		withBoshDisk()
+		GinkgoT().Setenv(sidecarsEnvVar, `{"version":1,"sidecars":[{"args":["app","./side",""]}]}`)
+		argvFile := writeFakeHypervisor(qemu, "")
+		Expect(runWith(backend.VMQemu, []string{launcher, "app", "true", ""})).To(Equal(0), logBuf.String())
+		Expect(logBuf.String()).To(MatchRegexp(`(?m)^stack guest: .*; 1 sidecar runs beside the app, with the log source ""$`))
+		Expect(logBuf.String()).NotTo(ContainSubstring("busybox guest:"))
+		Expect(argvFile).To(BeAnExistingFile())
+		Expect(heldFilesEndingIn("rootfs.squashfs")).To(BeZero())
 	})
 
 	It("boots the stack guest for an app with a private disk image, which stage 2 mounts, binds into the app root, and formats for vcap", func() {

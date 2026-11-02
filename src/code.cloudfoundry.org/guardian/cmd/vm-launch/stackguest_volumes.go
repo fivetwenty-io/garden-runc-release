@@ -2,59 +2,7 @@
 
 package main
 
-import (
-	"fmt"
-	"strings"
-)
-
-// stackModeAllowsVolumes reports whether an app with the volumes in selected
-// may boot the stack guest, and, when it may not, why, as the reason that
-// follows "busybox guest: " in the mode line. The stack guest mounts a
-// private disk image as the busybox guest does and binds it into the app
-// root (see guestStackVolumeBinds). It does not yet serve a share or mount a
-// BOSH disk, so an app with either keeps the busybox guest, and the reason
-// names the first such volume in volume order. A volume without a provider,
-// which findVolumeProviders never returns, keeps the busybox guest too,
-// since the stack guest cannot tell what kind of disk it is.
-func stackModeAllowsVolumes(selected []selectedVolume) (bool, string) {
-	for _, v := range selected {
-		path := quoteForLog(v.Volume.ContainerDir)
-		switch {
-		case v.Volume.Settings.Mode == volumeShare:
-			return false, "the volume at " + path + " is a share, which the stack guest does not mount yet"
-		case v.Provider == nil:
-			return false, "the volume at " + path + " has no provider, so the stack guest cannot tell what kind of disk it is"
-		case privateMode(v.Provider.Capabilities(v.Mount)) == attachBlock:
-			return false, "the volume at " + path + " is a BOSH disk, which the stack guest does not mount yet"
-		}
-	}
-	return true, ""
-}
-
-// checkStackVolumes refuses a stack guest with a volume that is not a
-// private disk image, which is a share or a block volume, as volumesOnDrives
-// pairs the volumes with their drives. It holds whatever run decided, so the
-// initramfs of a stack guest never asks stage 2 to mount a volume that it
-// would not bind into the app root. Volumes that volumesOnDrives refuses are
-// an error too.
-func checkStackVolumes(g guestContents) error {
-	if len(g.vols) == 0 {
-		return nil
-	}
-	pairs, err := volumesOnDrives(g)
-	if err != nil {
-		return err
-	}
-	for n, p := range pairs {
-		switch {
-		case p.drive == nil:
-			return fmt.Errorf("a guest with a stack mounts only private disk images, and volume %d at %s is a share", n, quoteForLog(p.vol.ContainerDir))
-		case p.drive.kind != driveImage:
-			return fmt.Errorf("a guest with a stack mounts only private disk images, and volume %d at %s is on a %s drive", n, quoteForLog(p.vol.ContainerDir), p.drive.kind)
-		}
-	}
-	return nil
-}
+import "strings"
 
 // guestStackVolumeMke2fsArgs are guestVolumeMke2fsArgs for the stack guest,
 // whose app runs as uid guestAppUID. root_owner gives the root directory of
@@ -112,18 +60,24 @@ const guestStackVolumeWalk = `rvm_vwalk() {
 // line that names both. A bind that fails ends the boot with a line that
 // names the path too.
 //
-// Before the bind, a volume whose top directory belongs to root:root, as
-// one that the busybox guest formatted does, gets that directory alone given
-// to guestAppUID, never what it holds, so that the app can create files at
-// the top of its volume as it can on a volume that the stack guest
-// formatted. Any other owner stays as it is. The step never fails the boot,
-// and a stat or a chown that fails prints a line that names the path and
-// leaves the volume as it was, because the app may still use the volume's
-// subdirectories, and the status the app exits with is its own.
+// Before the bind, an image or block volume whose top directory belongs to
+// root:root, as one that the busybox guest or the BOSH disk driver formatted
+// does, gets that directory alone given to guestAppUID, never what it
+// holds, so that the app can create files at the top of its volume as it
+// can on a volume that the stack guest formatted. Any other owner stays as
+// it is. The step never fails the boot, and a stat or a chown that fails
+// prints a line that names the path and leaves the volume as it was,
+// because the app may still use the volume's subdirectories, and the status
+// the app exits with is its own. A share keeps its owner. virtiofsd runs as
+// the app's uid without CAP_CHOWN, so a chown through it always fails, and
+// every file that a guest made on a share already belongs to that uid, as
+// a container's files there do.
 const guestStackVolumeBinds = guestStackVolumeWalk + `rvm_vi=0
 while [ "$rvm_vi" -lt "$RVM_VOLUMES" ]; do
-	eval "rvm_vpath=\${RVM_VOL${rvm_vi}_PATH:-}"
-	if ! rvm_vown=$(stat -c %u:%g "$rvm_vpath" 2>&1); then
+	eval "rvm_vkind=\${RVM_VOL${rvm_vi}_KIND:-} rvm_vpath=\${RVM_VOL${rvm_vi}_PATH:-}"
+	if [ "$rvm_vkind" = ` + volumeKindShare + ` ]; then
+		:
+	elif ! rvm_vown=$(stat -c %u:%g "$rvm_vpath" 2>&1); then
 		echo "vm-launch guest setup: reading the owner of the volume at $rvm_vpath failed (${rvm_vown:-it gave no reason}); leaving its owner as it is"
 	elif [ "$rvm_vown" = 0:0 ]; then
 		rvm_verr=$(chown ` + guestAppUID + `:` + guestAppUID + ` "$rvm_vpath" 2>&1) || echo "vm-launch guest setup: giving the top directory of the volume at $rvm_vpath to uid ` + guestAppUID + ` failed (${rvm_verr:-it gave no reason}); the app may not create files there"
@@ -135,28 +89,21 @@ while [ "$rvm_vi" -lt "$RVM_VOLUMES" ]; do
 done
 `
 
-// guestStackVolumeUnbinds unmounts each volume's bind in the app root, last
-// first, the reverse of the order guestStackVolumeBinds made them in. The app
-// could write to the app root while it ran, so before each unmount it walks
-// the path again with rvm_vwalk and checks that the directory there is the
-// volume's own top directory, by device and inode, which only the bind can
-// show in the app root. A path that now crosses a symbolic link, such as one
-// the app made after it moved a directory on the way, and a directory that is
-// no longer the volume's are never unmounted, since that would unmount
-// whatever else is there, and they count as a bind that does not unmount. A
-// bind that stays mounted would keep the volume's filesystem mounted after
-// the volume's own unmount, so it is never cleanly unmounted. A bind that
-// does not unmount therefore prints a line that names the volume's path,
-// with the reason, and counts as a volume that did not unmount, which turns
-// a status of 0 into guestFlushFailStatus. It runs once the processes the
-// command left are stopped, because a process that still has a file open or
-// its working directory on a volume, such as a sidecar or a child of the app,
-// keeps the bind busy, and with no process left, nothing can change the app
-// root between the check and the unmount.
-const guestStackVolumeUnbinds = `rvm_vi=$RVM_VOLUMES
-while [ "$rvm_vi" -gt 0 ]; do
-	rvm_vi=$((rvm_vi - 1))
-	eval "rvm_vpath=\$RVM_VOL${rvm_vi}_PATH"
+// guestStackVolumeUnbind defines rvm_vunbind, which unmounts the bind of the
+// volume at rvm_vpath in the app root. The app could write to the app root
+// while it ran, so before the unmount it walks the path again with rvm_vwalk
+// and checks that the directory there is the volume's own top directory, by
+// device and inode, which only the bind can show in the app root. A path
+// that now crosses a symbolic link, such as one the app made after it moved
+// a directory on the way, and a directory that is no longer the volume's are
+// never unmounted, since that would unmount whatever else is there, and they
+// count as a bind that does not unmount. A bind that stays mounted would
+// keep the volume's filesystem mounted after the volume's own unmount, so it
+// is never cleanly unmounted. A bind that does not unmount therefore prints
+// a line that names the volume's path, with the reason, and counts as a
+// volume that did not unmount, which turns a status of 0 into
+// guestFlushFailStatus.
+const guestStackVolumeUnbind = `rvm_vunbind() {
 	if ! rvm_vwalk; then
 		echo "vm-launch guest: the path of the volume at $rvm_vpath in the app root now crosses the symbolic link ${rvm_vat#` + guestAppRoot + `}, so the guest cannot unbind the volume or unmount it cleanly"
 		rvm_vbad=1
@@ -173,15 +120,35 @@ while [ "$rvm_vi" -gt 0 ]; do
 		echo "vm-launch guest: unbinding the volume at $rvm_vpath from the app root failed (${rvm_verr:-it gave no reason}), so the guest cannot unmount the volume cleanly"
 		rvm_vbad=1
 	fi
-done
+}
 `
 
+// guestVolumeLastFlush is the line of guestVolumeTeardownUnmount that starts
+// a volume's last flush, once the pass has picked the volume, which
+// guestVolumeTeardownUnmount holds once, as a spec checks.
+const guestVolumeLastFlush = "\t\tif ! rvm_verr=$(sync -f \"$rvm_vpath\" 2>&1); then\n"
+
+// guestStackVolumeTeardownUnmount is guestVolumeTeardownUnmount for the stack
+// guest. It is the same text with a call to rvm_vunbind (see
+// guestStackVolumeUnbind) before guestVolumeLastFlush, so each volume's bind
+// is unmounted in the volume's own pass, right before its last flush and
+// unmount. The image and block volumes therefore finish before any share is
+// unbound, and a share whose virtiofsd hangs, which a stat of the share's
+// top directory would wait for, never keeps a drive volume from its last
+// flush, as it never does in the busybox guest. vm-launch refuses a volume
+// path under another (see checkNotNested), so no unbind depends on another.
+var guestStackVolumeTeardownUnmount = strings.Replace(guestVolumeTeardownUnmount, guestVolumeLastFlush, "\t\trvm_vunbind\n"+guestVolumeLastFlush, 1)
+
 // guestStackVolumeTeardown is guestVolumeTeardown for the stack guest. Once
-// the processes the command left are stopped, and before any volume's last
-// flush and unmount, it unbinds the volumes (see guestStackVolumeUnbinds).
-// The teardown goes on to flush and unmount every volume whether or not
-// each unbind succeeded.
-const guestStackVolumeTeardown = guestVolumeTeardownStop + guestStackVolumeUnbinds + guestVolumeTeardownUnmount
+// the processes the command left are stopped, it flushes and unmounts every
+// volume as the busybox guest does, and unbinds each volume first (see
+// guestStackVolumeTeardownUnmount). It waits for the stop because a process
+// that still has a file open or its working directory on a volume, such as
+// a sidecar or a child of the app, keeps the bind busy, and with no process
+// left, nothing can change the app root between an unbind's check and its
+// unmount. The teardown flushes and unmounts every volume whether or not its
+// unbind succeeded.
+var guestStackVolumeTeardown = guestVolumeTeardownStop + guestStackVolumeUnbind + guestStackVolumeTeardownUnmount
 
 // guestStackRunVolumeTeardown is guestStackVolumeTeardown after a run section
 // (see guestRunSection). It sends SIGKILL to the processes that are left
@@ -190,4 +157,4 @@ const guestStackVolumeTeardown = guestVolumeTeardownStop + guestStackVolumeUnbin
 // grace, as a container's processes get theirs before Garden ends the rest.
 // Its only wait is guestTeardownKillWait, which the section's
 // guestVolumeWindDown leaves room for before the host's stop deadline.
-const guestStackRunVolumeTeardown = guestVolumeTeardownFlush + guestVolumeTeardownKill + guestStackVolumeUnbinds + guestVolumeTeardownUnmount
+var guestStackRunVolumeTeardown = guestVolumeTeardownFlush + guestVolumeTeardownKill + guestStackVolumeUnbind + guestStackVolumeTeardownUnmount

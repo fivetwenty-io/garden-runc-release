@@ -1870,8 +1870,7 @@ const maxGuestHostnameBytes = 64
 // the 2 MiB that the launcher's execve can carry with the default stack
 // limit. The argv must not be empty, the working directory must be an
 // absolute path that the guest's $(cat) reads back unchanged, and the
-// hostname must be one hostname -F sets as it is. Which volumes the stack
-// guest mounts is checkStackVolumes's to decide.
+// hostname must be one hostname -F sets as it is.
 func (s *guestStack) check() error {
 	switch {
 	case s.launcher.file == nil || s.launcher.size <= 0:
@@ -2197,8 +2196,7 @@ func addSeals(f *os.File, seals int) error {
 // guestStack.initScriptWithVolumes).
 // A hard open-files limit of 0 is an error, because it is a limit no caller
 // can have meant: vm-launch itself could not run under it. So are drives
-// that disksFile rejects, a stack that guestStack.check rejects, and a stack
-// guest with volumes that checkStackVolumes rejects.
+// that disksFile rejects and a stack that guestStack.check rejects.
 func writeInitramfs(dst *os.File, busyboxPath string, g guestContents) error {
 	if g.nw == nil {
 		return errors.New("writing the initramfs: no guest network")
@@ -2240,9 +2238,6 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, g 
 	stage1, stage2 := guestRootInit, initScript(g.nonce, len(g.vols) > 0)
 	if g.stack != nil {
 		if err := g.stack.check(); err != nil {
-			return err
-		}
-		if err := checkStackVolumes(g); err != nil {
 			return err
 		}
 		stage1, stage2 = guestStackInit, g.stack.initScriptWithVolumes(g.nonce, len(g.vols) > 0)

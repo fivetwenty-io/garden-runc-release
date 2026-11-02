@@ -1218,6 +1218,15 @@ var _ = Describe("the launch's prepare of a volume", func() {
 		return selectedVolume{Volume: guestVolume{ContainerDir: "/data", Index: index}, Provider: p, Mount: mountRecord{ContainerDir: "/data", FSType: "fuse.fake"}}
 	}
 
+	It("refuses a volume without a provider before anything else, so a launch with it exits 125", func() {
+		var pv preparedVolumes
+		att, err := pv.prepare(volumeAt(nil, 0), nil, nil, log.New(io.Discard, "", 0))
+		Expect(err).To(MatchError(`the volume at "/data" has no volume provider, so vm-launch cannot tell how to attach it`))
+		Expect(att).To(BeNil())
+		Expect(pv).To(BeEmpty())
+		Expect(stepExitCode(err)).To(Equal(exitLaunchError))
+	})
+
 	Describe("the provider's instance limit", func() {
 		var (
 			p      *fakeDiskProvider
