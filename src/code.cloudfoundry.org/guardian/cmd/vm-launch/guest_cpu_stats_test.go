@@ -377,11 +377,19 @@ var _ = Describe("the guest CPU watcher", func() {
 // was given.
 type gateWriter struct {
 	release chan struct{}
+	entered chan struct{}
 	mu      sync.Mutex
 	got     []string
 }
 
 func (g *gateWriter) Write(p []byte) (int, error) {
+	if g.entered != nil {
+		select {
+		case g.entered <- struct{}{}:
+		default:
+		}
+	}
+
 	<-g.release
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -411,15 +419,29 @@ var _ = Describe("the CPU reporter", func() {
 		Eventually(gate.lines).Should(Equal([]string{guestCPULine(7, 3)}))
 	})
 
-	It("writes the line that waits when it is closed", func() {
-		gate := &gateWriter{release: make(chan struct{})}
-		close(gate.release)
-		r := newCPUReporter(gate)
+	It("writes the line that waits when it is closed, once a blocked write returns", func() {
+		// The writer picks between the end and a waiting line at random when
+		// both are ready, so a close that did not write the line would lose
+		// it in about half of these rounds.
+		for round := 0; round < 40; round++ {
+			gate := &gateWriter{release: make(chan struct{}), entered: make(chan struct{}, 1)}
+			r := newCPUReporter(gate)
 
-		r.report(4, 2)
-		r.close()
+			r.report(1, 1)
+			Eventually(gate.entered).Should(Receive())
+			r.report(4, 2)
 
-		Expect(gate.lines()).To(ContainElement(guestCPULine(4, 2)))
+			closed := make(chan struct{})
+			go func() {
+				defer close(closed)
+				r.close()
+			}()
+			Eventually(r.done).Should(BeClosed())
+			close(gate.release)
+
+			Eventually(closed).Should(BeClosed())
+			Eventually(gate.lines).Should(ContainElement(guestCPULine(4, 2)), "round %d", round)
+		}
 	})
 
 	It("does not block the caller while the writer is blocked, and delivers the newest figures afterwards", func() {
