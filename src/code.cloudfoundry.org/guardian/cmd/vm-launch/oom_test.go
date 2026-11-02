@@ -307,14 +307,14 @@ exit 0
 echo "RVM_OOM_$nonce=2"
 echo "RVM_EXIT_$nonce=137"`)
 		Expect(code).To(Equal(137))
-		Expect(oomLog()).To(Equal("vm-launch: the guest ran out of memory: its kernel killed 2 processes; the guest has 320 MiB\n"))
+		Expect(oomLog()).To(Equal("vm-launch: the guest ran out of memory: its kernel killed 2 processes; the guest has 383 MiB\n"))
 	})
 
 	It("writes the line whatever the status, such as 0", func() {
 		code := runGuest(`echo "RVM_OOM_$nonce=1"
 echo "RVM_EXIT_$nonce=0"`)
 		Expect(code).To(Equal(0))
-		Expect(oomLog()).To(Equal("vm-launch: the guest ran out of memory: its kernel killed 1 process; the guest has 320 MiB\n"))
+		Expect(oomLog()).To(Equal("vm-launch: the guest ran out of memory: its kernel killed 1 process; the guest has 383 MiB\n"))
 	})
 
 	It("writes the line before a line that explains vm-launch's own exit status", func() {

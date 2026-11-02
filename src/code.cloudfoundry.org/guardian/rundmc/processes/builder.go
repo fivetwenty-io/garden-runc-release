@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"code.cloudfoundry.org/garden"
@@ -69,6 +70,11 @@ const (
 	// journalled image volume with sync and dirsync. vm-launch defaults to true,
 	// so VMLaunchVolumeFlags passes the flag only to turn that off.
 	VMLaunchVolumeSyncMountsFlag = "--volume-sync-mounts"
+
+	// VMLaunchMaxVCPUsFlag gives vm-launch the operator's cap on the vCPUs of
+	// a guest. vm-launch defaults to no cap, so VMLaunchCPUFlags passes the
+	// flag only for a positive cap.
+	VMLaunchMaxVCPUsFlag = "--max-vcpus"
 
 	// portEnvPrefix starts the environment entry that names the port of a
 	// process that serves one. vm-launch forwards ports only when the entry
@@ -195,11 +201,23 @@ func VMLaunchVolumeFlags(allowShares bool, virtiofsdPath string, syncMounts bool
 	return flags
 }
 
+// VMLaunchCPUFlags returns the vm-launch flags that carry the operator's CPU
+// setting. It returns none for the default of 0, which leaves a guest one
+// vCPU for each CPU its container may run on, so that vm-launch gets the
+// arguments it gets today. For a positive maxVCPUs it returns
+// VMLaunchMaxVCPUsFlag and the cap.
+func VMLaunchCPUFlags(maxVCPUs uint) []string {
+	if maxVCPUs == 0 {
+		return nil
+	}
+	return []string{VMLaunchMaxVCPUsFlag, strconv.FormatUint(uint64(maxVCPUs), 10)}
+}
+
 // WithVMLaunchFlags makes BuildProcess pass flags to the vm-launch process
 // that the containerizer wrapped in a vm-* container, after the transparent
 // proxy flag when it adds one and before vm-launch's own arguments. It never
-// adds them to any other process. VMLaunchVolumeFlags builds the usual list.
-// The builder keeps a copy.
+// adds them to any other process. VMLaunchVolumeFlags builds the volume part of the usual list
+// and VMLaunchCPUFlags the CPU part. The builder keeps a copy.
 func WithVMLaunchFlags(flags ...string) Option {
 	kept := append([]string(nil), flags...)
 	return func(p *ProcBuilder) {

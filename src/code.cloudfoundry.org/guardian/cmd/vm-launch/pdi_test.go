@@ -334,7 +334,6 @@ var _ = Describe("the JuiceFS volume path", func() {
 		mountInfoPath = writeTempFile("mountinfo", mountinfoLine(40, volDir, "fuse.juicefs"))
 		GinkgoT().Setenv("TMPDIR", tmp)
 		GinkgoT().Setenv("CF_INSTANCE_INDEX", "2")
-		GinkgoT().Setenv("MEMORY_LIMIT", "256m")
 		GinkgoT().Setenv("VCAP_APPLICATION", `{"application_id":"`+testAppID+`","process_type":"web","name":"app","limits":{"disk":64}}`)
 		GinkgoT().Setenv("VCAP_SERVICES", vcapWith(map[string][]string{"juicefs": {mountJSON(volDir, "rw")}}))
 		logBuf = &bytes.Buffer{}
@@ -347,6 +346,12 @@ var _ = Describe("the JuiceFS volume path", func() {
 	})
 
 	runVM := func(kind backend.Kind) int {
+		// The limit gives either hypervisor the floor of 128 MiB.
+		limit := "256m"
+		if kind == backend.VMFirecracker {
+			limit = "224m"
+		}
+		GinkgoT().Setenv("MEMORY_LIMIT", limit)
 		return run([]string{"--backend", string(kind), "--artifacts", art, "--", "/tmp/lifecycle/launcher", "app", "true", ""},
 			log.New(logBuf, "", 0))
 	}
