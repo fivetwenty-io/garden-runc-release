@@ -35,6 +35,12 @@ import (
 // they call run in this process many times, and a process that is not
 // dumpable can no longer write its own coredump_filter as a non-root user.
 func TestMain(m *testing.M) {
+	if os.Getenv(helperVsockProbe) != "" {
+		os.Exit(vsockProbe())
+	}
+	if os.Getenv(helperDenyVsock) != "" {
+		os.Exit(denyVsockHelper())
+	}
 	if art := os.Getenv(helperTransparentRun); art != "" {
 		os.Exit(transparentRun(art))
 	}
