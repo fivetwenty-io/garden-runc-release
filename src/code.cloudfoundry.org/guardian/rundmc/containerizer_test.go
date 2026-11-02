@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -627,6 +628,108 @@ var _ = Describe("Rundmc", func() {
 					}
 					_, _, first, _ := fakeOCIRuntime.ExecArgsForCall(0)
 					Expect(first.Path).To(Equal("/bin/sh"))
+				})
+
+				Context("when the wrapped launcher reports that the hypervisor died without a guest status", func() {
+					const diedLine = "vm-launch: the hypervisor ended without a guest status\n"
+
+					var (
+						cgroupRoot string
+						stderr     *bytes.Buffer
+					)
+
+					BeforeEach(func() {
+						cgroupRoot = GinkgoT().TempDir()
+						stderr = new(bytes.Buffer)
+						fakeOCIRuntime.BundleInfoReturns("/bundle", goci.Bndl{Spec: specs.Spec{
+							Version:     "test-version",
+							Annotations: map[string]string{backend.AnnotationKey: string(kind)},
+							Linux:       &specs.Linux{CgroupsPath: "/garden/good/some-handle"},
+						}}, nil)
+						fakeOCIRuntime.ExecStub = func(_ lager.Logger, _ string, _ garden.ProcessSpec, io garden.ProcessIO) (garden.Process, error) {
+							_, _ = io.Stderr.Write([]byte("hypervisor died from killed; exiting 137\n" + diedLine))
+							inner := new(gardenfakes.FakeProcess)
+							inner.WaitReturns(137, nil)
+							return inner, nil
+						}
+					})
+
+					write := func(dir string, files map[string]string) {
+						Expect(os.MkdirAll(dir, 0o755)).To(Succeed())
+						for name, content := range files {
+							Expect(os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644)).To(Succeed())
+						}
+					}
+
+					wait := func() {
+						process, err := containerizer.Run(logger, "some-handle", launcherSpec(), garden.ProcessIO{Stderr: stderr})
+						Expect(err).NotTo(HaveOccurred())
+						status, err := process.Wait()
+						Expect(err).NotTo(HaveOccurred())
+						Expect(status).To(Equal(137))
+						_, _ = process.Wait()
+					}
+
+					It("pins the prefix that vm-launch writes", func() {
+						Expect(rundmc.HypervisorDiedPrefix).To(Equal("vm-launch: the hypervisor ended without a guest status"))
+					})
+
+					It("logs the memory files of the container's cgroup v2 directory once, and passes the stderr on", func() {
+						DeferCleanup(rundmc.SetVMCgroup(cgroupRoot, true))
+						write(filepath.Join(cgroupRoot, "garden/good/some-handle"), map[string]string{
+							"memory.events":  "low 0\nhigh 0\nmax 9\noom 1\noom_kill 1\n",
+							"memory.max":     "1207959552\n",
+							"memory.current": "1207000000\n",
+						})
+
+						wait()
+
+						Expect(stderr.String()).To(Equal("hypervisor died from killed; exiting 137\n" + diedLine))
+						entries := 0
+						for _, entry := range logger.(*lagertest.TestLogger).LogMessages() {
+							if strings.HasSuffix(entry, ".vm-hypervisor-died") {
+								entries++
+							}
+						}
+						Expect(entries).To(Equal(1))
+						Expect(logger).To(gbytes.Say(`"cgroup":"memory.events=\[low 0 high 0 max 9 oom 1 oom_kill 1\] memory.max=\[1207959552\] memory.current=\[1207000000\]"`))
+						Expect(logger).To(gbytes.Say(`"exit-status":137`))
+					})
+
+					It("logs the memory files of the container's memory cgroup on cgroup v1", func() {
+						DeferCleanup(rundmc.SetVMCgroup(cgroupRoot, false))
+						write(filepath.Join(cgroupRoot, "memory/garden/good/some-handle"), map[string]string{
+							"memory.oom_control":    "oom_kill_disable 0\nunder_oom 0\noom_kill 1\n",
+							"memory.limit_in_bytes": "1207959552\n",
+							"memory.failcnt":        "42\n",
+						})
+
+						wait()
+
+						Expect(logger).To(gbytes.Say(`"cgroup":"memory.oom_control=\[oom_kill_disable 0 under_oom 0 oom_kill 1\] memory.limit_in_bytes=\[1207959552\] memory.failcnt=\[42\]"`))
+					})
+
+					It("says so when the cgroup has no memory files", func() {
+						DeferCleanup(rundmc.SetVMCgroup(cgroupRoot, true))
+
+						wait()
+
+						Expect(logger).To(gbytes.Say(`"cgroup":"no memory files under ` + filepath.Join(cgroupRoot, "garden/good/some-handle")))
+					})
+
+					It("logs nothing when the launcher wrote no such line", func() {
+						DeferCleanup(rundmc.SetVMCgroup(cgroupRoot, true))
+						fakeOCIRuntime.ExecStub = func(_ lager.Logger, _ string, _ garden.ProcessSpec, io garden.ProcessIO) (garden.Process, error) {
+							_, _ = io.Stderr.Write([]byte("vm-launch: some other note\n"))
+							return new(gardenfakes.FakeProcess), nil
+						}
+
+						process, err := containerizer.Run(logger, "some-handle", launcherSpec(), garden.ProcessIO{Stderr: stderr})
+						Expect(err).NotTo(HaveOccurred())
+						_, _ = process.Wait()
+
+						Expect(logger.(*lagertest.TestLogger).LogMessages()).NotTo(ContainElement(HaveSuffix(".vm-hypervisor-died")))
+					})
 				})
 
 				Context("when the wrapped launcher reports a guest OOM on stderr", func() {

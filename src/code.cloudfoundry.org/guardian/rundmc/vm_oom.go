@@ -14,11 +14,18 @@ import (
 // and pins the same text in its own specs.
 const vmOOMLinePrefix = "vm-launch: the guest ran out of memory"
 
+// vmHypervisorDiedPrefix begins the stderr line vm-launch writes when the
+// hypervisor ended and the guest had reported no status, which is how a
+// hypervisor that the container's cgroup killed for memory ends. cmd/vm-launch
+// writes the line and pins the same text in its own specs.
+const vmHypervisorDiedPrefix = "vm-launch: the hypervisor ended without a guest status"
+
 // oomLineScanner passes every byte through to next and remembers whether a
-// line began with vmOOMLinePrefix. It keeps a match position and no data, so
-// its memory does not grow with the length of a line.
+// line began with prefix. It keeps a match position and no data, so its memory
+// does not grow with the length of a line.
 type oomLineScanner struct {
-	next io.Writer
+	next   io.Writer
+	prefix string
 
 	mu      sync.Mutex
 	matched int // prefix bytes matched on this line, or -1 once the line cannot match
@@ -26,7 +33,11 @@ type oomLineScanner struct {
 }
 
 func newOOMLineScanner(next io.Writer) *oomLineScanner {
-	return &oomLineScanner{next: next}
+	return newLineScanner(next, vmOOMLinePrefix)
+}
+
+func newLineScanner(next io.Writer, prefix string) *oomLineScanner {
+	return &oomLineScanner{next: next, prefix: prefix}
 }
 
 func (s *oomLineScanner) Write(p []byte) (int, error) {
@@ -47,11 +58,11 @@ func (s *oomLineScanner) scan(p []byte) {
 		switch {
 		case b == '\n':
 			s.matched = 0
-		case s.matched < 0 || s.matched >= len(vmOOMLinePrefix):
+		case s.matched < 0 || s.matched >= len(s.prefix):
 			// Mid-line, either past the prefix or already off it.
-		case b == vmOOMLinePrefix[s.matched]:
+		case b == s.prefix[s.matched]:
 			s.matched++
-			if s.matched == len(vmOOMLinePrefix) {
+			if s.matched == len(s.prefix) {
 				s.seen = true
 			}
 		default:
@@ -69,16 +80,18 @@ func (s *oomLineScanner) Seen() bool {
 }
 
 // runVMLauncher runs the wrapped vm-launch process with a filter and a scanner
-// on its stderr. The filter takes vm-launch's guest memory lines out of the
+// on its stderr, and a second scanner for the line that says the hypervisor
+// died. The filter takes vm-launch's guest memory lines out of the
 // stream and stores them for Metrics, and the scanner behind it sees the
 // remaining bytes. The returned process records a guest OOM when it ends.
-func (c *Containerizer) runVMLauncher(log lager.Logger, handle string, spec garden.ProcessSpec, pio garden.ProcessIO) (garden.Process, error) {
+func (c *Containerizer) runVMLauncher(log lager.Logger, handle, cgroupPath string, spec garden.ProcessSpec, pio garden.ProcessIO) (garden.Process, error) {
 	scanner := newOOMLineScanner(pio.Stderr)
+	died := newLineScanner(scanner, vmHypervisorDiedPrefix)
 
 	// The process is the source of its samples, so it exists before the
 	// filter that records them.
-	launched := &vmLaunchProcess{log: log, handle: handle, scanner: scanner, events: c.events, memory: &c.guestMemory}
-	launched.filter = newVMMetricsFilter(scanner,
+	launched := &vmLaunchProcess{log: log, handle: handle, scanner: scanner, died: died, cgroupPath: cgroupPath, events: c.events, memory: &c.guestMemory}
+	launched.filter = newVMMetricsFilter(died,
 		func(sample vmMemorySample) { c.guestMemory.Record(handle, launched, sample) },
 		func(dropped int) {
 			if dropped == 1 {
@@ -103,7 +116,10 @@ func (c *Containerizer) runVMLauncher(log lager.Logger, handle string, spec gard
 // ended, Wait releases what the filter still holds, removes the container's
 // guest memory sample if this process wrote it, and records a guest OOM in the
 // container's events if the scanner saw the report, so it is in the event
-// store before the exit status travels back to the caller.
+// store before the exit status travels back to the caller. When vm-launch
+// said that the hypervisor died without a guest status, it also logs the
+// container's cgroup memory files, because the cgroup holds the cause of a
+// hypervisor that its memory limit killed, and vm-launch cannot read it.
 type vmLaunchProcess struct {
 	garden.Process
 
@@ -114,7 +130,13 @@ type vmLaunchProcess struct {
 	events  EventStore
 	memory  *vmGuestMemory
 
-	once sync.Once
+	// died sees the hypervisor-died line, and cgroupPath is the container's
+	// cgroup path from its bundle.
+	died       interface{ Seen() bool }
+	cgroupPath string
+
+	once     sync.Once
+	diedOnce sync.Once
 }
 
 func (p *vmLaunchProcess) Wait() (int, error) {
@@ -130,6 +152,12 @@ func (p *vmLaunchProcess) Wait() (int, error) {
 			if recordErr := p.events.OnEvent(p.handle, event.NewOOMEvent(p.handle).Message); recordErr != nil {
 				p.log.Error("record-guest-oom-failed", recordErr)
 			}
+		})
+	}
+
+	if p.died.Seen() {
+		p.diedOnce.Do(func() {
+			p.log.Info("vm-hypervisor-died", lager.Data{"handle": p.handle, "exit-status": status, "cgroup": vmCgroupMemory(p.cgroupPath)})
 		})
 	}
 

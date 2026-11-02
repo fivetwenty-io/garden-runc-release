@@ -371,7 +371,7 @@ func (c *Containerizer) Run(log lager.Logger, handle string, spec garden.Process
 		spec = asVMImageHostUser(bundle, spec)
 
 		if isVM {
-			return c.runVMLauncher(log, handle, spec, io)
+			return c.runVMLauncher(log, handle, cgroupPathOf(bundle), spec, io)
 		}
 	}
 
@@ -470,6 +470,15 @@ func vmImageLaunchFlags(bundle goci.Bndl, spec garden.ProcessSpec) []string {
 // In a Docker image guest container the wrapped launcher also gets the image
 // user and the missing defaults (see vmImageLaunchFlags) before vm-launch's
 // own arguments.
+// cgroupPathOf returns the cgroup path the bundle gives its container, or the
+// empty string when it gives none.
+func cgroupPathOf(bundle goci.Bndl) string {
+	if bundle.Spec.Linux == nil {
+		return ""
+	}
+	return bundle.Spec.Linux.CgroupsPath
+}
+
 func (c *Containerizer) wrapVMLauncher(log lager.Logger, bundle goci.Bndl, spec garden.ProcessSpec) (garden.ProcessSpec, bool) {
 	kind := backend.FromBundle(bundle)
 	if !backend.IsVM(kind) {
