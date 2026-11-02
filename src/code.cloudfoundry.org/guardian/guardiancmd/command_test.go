@@ -694,21 +694,26 @@ var _ = Describe("execution backend flags", func() {
 		})
 
 		Context("with the guest agent on", func() {
-			var originalVsock string
+			var (
+				originalVsock  string
+				originalDevice [2]uint32
+			)
 
 			BeforeEach(func() {
 				cmd.ExecutionBackends.Enabled = []string{"vm-qemu"}
 				cmd.ExecutionBackends.VMLaunchBin = launchBin
 				cmd.ExecutionBackends.VMGuestAgent = true
-				originalVsock = hostVhostVsockPath
+				originalVsock, originalDevice = hostVhostVsockPath, hostVhostVsockDevice
 			})
 
 			AfterEach(func() {
-				hostVhostVsockPath = originalVsock
+				hostVhostVsockPath, hostVhostVsockDevice = originalVsock, originalDevice
 			})
 
 			It("gives vm-qemu containers /dev/vhost-vsock when the host has the character device", func() {
+				// /dev/null stands in for the device, with its own numbers.
 				hostVhostVsockPath = "/dev/null"
+				hostVhostVsockDevice = [2]uint32{1, 3}
 
 				backends, err := cmd.wireExecutionBackends(log)
 				Expect(err).NotTo(HaveOccurred())
@@ -734,6 +739,15 @@ var _ = Describe("execution backend flags", func() {
 				Expect(err).NotTo(HaveOccurred())
 				Expect(backends.vhostVsock).To(BeFalse())
 				Expect(log).To(gbytes.Say(`guest-agent-vhost-vsock-unavailable.*not a character device`))
+			})
+
+			It("gives no container /dev/vhost-vsock when the host's character device has other numbers", func() {
+				hostVhostVsockPath = "/dev/null"
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vhostVsock).To(BeFalse())
+				Expect(log).To(gbytes.Say(`guest-agent-vhost-vsock-unavailable.*device 1:3 is not vhost-vsock, which is 10:241`))
 			})
 
 			It("does not look for /dev/vhost-vsock when vm-qemu is not enabled", func() {

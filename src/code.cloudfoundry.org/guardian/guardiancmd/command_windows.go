@@ -175,3 +175,8 @@ func (cmd *CommonCommand) computeRuncRoot() string {
 func (cmd *CommonCommand) wireCpuThrottlingService(log lager.Logger, containerizer *rundmc.Containerizer, memoryProvider throttle.MemoryProvider, cpuEntitlementPerShare float64) (Service, error) {
 	return &NoopService{}, nil
 }
+
+// charDeviceNumbers says that Windows has no character devices.
+func charDeviceNumbers(path string) (uint32, uint32, error) {
+	return 0, 0, errors.New("windows has no character devices")
+}

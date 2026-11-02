@@ -401,3 +401,17 @@ func (cmd *CommonCommand) wireCpuThrottlingService(log lager.Logger, containeriz
 
 	return throttle.NewPollingService(log, throttle.NewCompositeRunnable(throttler, sharesBalancer), ticker.C), nil
 }
+
+// charDeviceNumbers returns the major and minor number of the character
+// device at path.
+func charDeviceNumbers(path string) (uint32, uint32, error) {
+	var st unix.Stat_t
+	if err := unix.Stat(path, &st); err != nil {
+		return 0, 0, &os.PathError{Op: "stat", Path: path, Err: err}
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFCHR {
+		return 0, 0, errors.New("not a character device")
+	}
+	rdev := uint64(st.Rdev)
+	return unix.Major(rdev), unix.Minor(rdev), nil
+}

@@ -977,16 +977,22 @@ func (b *executionBackends) tapGroup() (uint32, bool) {
 // lookupKVMGroup resolves the host group that owns /dev/kvm. Tests replace it.
 var lookupKVMGroup = user.LookupGroup
 
-// hostVhostVsockPath is the host's vhost-vsock device. Tests replace it.
-var hostVhostVsockPath = "/dev/vhost-vsock"
+// hostVhostVsockPath is the host's vhost-vsock device, and
+// hostVhostVsockDevice is its major and minor number, 10:241, which is
+// VHOST_VSOCK_MINOR on the misc major. Tests replace both.
+var (
+	hostVhostVsockPath   = "/dev/vhost-vsock"
+	hostVhostVsockDevice = [2]uint32{10, 241}
+)
 
 // hostHasVhostVsock reports whether the host has its vhost-vsock device,
-// which is a character device, and logs once at start-up when it does not,
-// because then no vm-qemu guest on the cell gets the guest agent.
+// which is a character device with vhost-vsock's numbers, and logs once at
+// start-up when it does not, because then no vm-qemu guest on the cell gets
+// the guest agent.
 func hostHasVhostVsock(log lager.Logger) bool {
-	info, err := os.Stat(hostVhostVsockPath)
-	if err == nil && info.Mode()&os.ModeCharDevice == 0 {
-		err = errors.New("not a character device")
+	major, minor, err := charDeviceNumbers(hostVhostVsockPath)
+	if want := hostVhostVsockDevice; err == nil && (major != want[0] || minor != want[1]) {
+		err = fmt.Errorf("device %d:%d is not vhost-vsock, which is %d:%d", major, minor, want[0], want[1])
 	}
 	if err != nil {
 		log.Info("guest-agent-vhost-vsock-unavailable", lager.Data{"path": hostVhostVsockPath, "error": err.Error()})
