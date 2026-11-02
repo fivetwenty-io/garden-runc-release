@@ -1952,8 +1952,10 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 			}
 			// Unlike a signal, a request that cannot reach the guest is not
 			// forwarded to the hypervisor, which would end the guest without
-			// its teardown.
-			if err := stdin.stop(stopTag(nonce)); err != nil {
+			// its teardown. tryStop keeps the console when it wrote nothing,
+			// so a later signal still asks the guest to stop and the
+			// identity pushes go on.
+			if err := stdin.tryStop(stopTag(nonce)); err != nil {
 				s.logger.Printf("%s, but sending the stop request to the guest failed: %v; this instance keeps the volumes until it is stopped", reason, err)
 				continue
 			}

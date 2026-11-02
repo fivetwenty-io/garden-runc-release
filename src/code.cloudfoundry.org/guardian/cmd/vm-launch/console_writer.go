@@ -33,7 +33,8 @@ var errConsoleStopped = errors.New("the guest console takes no more pushes, beca
 // rest of its lines when a stop begins, so a stop reaches the pipe after at
 // most one more chunk. Chunks hold whole lines, so the stop request always
 // starts a line of its own, and the guest discards the frame it cut short.
-// Once stop has begun, every push fails at once.
+// Once stop has begun, every push fails at once, unless a tryStop that
+// wrote nothing gives the console back.
 //
 // A write of at most PIPE_BUF bytes to a pipe is atomic, so a chunk is either
 // written whole or not at all, and a stop that cuts a blocked chunk short
@@ -47,9 +48,11 @@ type consoleWriter struct {
 	// lock, so that a push gives way between chunks.
 	stopping atomic.Bool
 	// wake is closed when stopping is set, which ends a push's pause at
-	// once.
-	wake     chan struct{}
-	wakeOnce sync.Once
+	// once. wakeMu guards wake and woken, because a tryStop that writes
+	// nothing puts a fresh channel in its place.
+	wakeMu sync.Mutex
+	wake   chan struct{}
+	woken  bool
 
 	// mu is held for each write. done, which mu guards, is set once stop or
 	// close has taken it.
@@ -70,11 +73,12 @@ func (w *consoleWriter) push(lines []string) error {
 	if err != nil {
 		return err
 	}
+	wake := w.wakeChan()
 	for i, c := range chunks {
 		if i > 0 {
 			pause := time.NewTimer(w.pace)
 			select {
-			case <-w.wake:
+			case <-wake:
 				pause.Stop()
 				return errConsoleStopped
 			case <-pause.C:
@@ -113,9 +117,24 @@ func (w *consoleWriter) writeChunk(c []byte) error {
 
 // stop writes line and a newline, the stop request, with a deadline of
 // stopRequestTimeout, ahead of the rest of any push. It runs once: a second
-// stop, or a stop after close, fails without writing. stop and close must
-// not run at the same time, because each cuts the other's write short.
+// stop, or a stop after close, fails without writing. stop, tryStop, and
+// close must not run at the same time, because each cuts the other's write
+// short.
 func (w *consoleWriter) stop(line string) error {
+	return w.writeStop(line, false)
+}
+
+// tryStop writes the stop request as stop does, but when the write fails
+// before any of the line reaches the console, it leaves the writer as it was
+// before, so a later stop or push still works. The stop request is far
+// shorter than PIPE_BUF, so a write to a pipe puts all of it there or none.
+// A write that fails after part of the line went out leaves the writer
+// stopped, as stop does, because a later line would run on from that part.
+func (w *consoleWriter) tryStop(line string) error {
+	return w.writeStop(line, true)
+}
+
+func (w *consoleWriter) writeStop(line string, keep bool) error {
 	w.halt()
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -124,9 +143,15 @@ func (w *consoleWriter) stop(line string) error {
 	}
 	w.done = true
 	if err := w.f.SetWriteDeadline(time.Now().Add(stopRequestTimeout)); err != nil && !errors.Is(err, os.ErrNoDeadline) {
+		if keep {
+			w.resume()
+		}
 		return err
 	}
-	_, err := w.f.WriteString(line + "\n")
+	n, err := w.f.WriteString(line + "\n")
+	if err != nil && n == 0 && keep {
+		w.resume()
+	}
 	return err
 }
 
@@ -144,10 +169,34 @@ func (w *consoleWriter) close() error {
 // moves into the past.
 func (w *consoleWriter) halt() {
 	w.stopping.Store(true)
-	w.wakeOnce.Do(func() { close(w.wake) })
+	w.wakeMu.Lock()
+	if !w.woken {
+		close(w.wake)
+		w.woken = true
+	}
+	w.wakeMu.Unlock()
 	// A file without deadlines cannot be cut short, and its write ends on
 	// its own.
 	_ = w.f.SetWriteDeadline(time.Unix(1, 0))
+}
+
+// resume undoes halt and the start of a stop that wrote nothing, so that
+// pushes and a stop work again. A push that halt ended stays ended, and its
+// caller sends it again. The caller holds mu.
+func (w *consoleWriter) resume() {
+	w.done = false
+	w.wakeMu.Lock()
+	w.wake, w.woken = make(chan struct{}), false
+	w.wakeMu.Unlock()
+	w.stopping.Store(false)
+	_ = w.f.SetWriteDeadline(time.Time{})
+}
+
+// wakeChan returns the channel that the next halt closes.
+func (w *consoleWriter) wakeChan() <-chan struct{} {
+	w.wakeMu.Lock()
+	defer w.wakeMu.Unlock()
+	return w.wake
 }
 
 // consoleChunks packs lines, each followed by a newline, into chunks of at

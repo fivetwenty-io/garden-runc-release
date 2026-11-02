@@ -599,6 +599,49 @@ var _ = Describe("the supervisor's handoff", func() {
 		Expect(logBuf.String()).To(MatchRegexp(`^` + regexp.QuoteMeta(reason) + `, but sending the stop request to the guest failed: write \S+: broken pipe; this instance keeps the volumes until it is stopped\n$`))
 	}, SpecTimeout(handoffSpecTimeout))
 
+	It("keeps the console for a later signal's stop request and for pushes when the handoff's stop request times out", func(ctx SpecContext) {
+		gate := filepath.Join(dir, "gate")
+		filled := make(chan error, 1)
+		later := make(chan error, 1)
+		last := "RVM_CRED_" + testNonce + "=end 1"
+		sup.onConsole = func(w *consoleWriter) {
+			// Nothing reads the guest's console until the gate opens, so a
+			// push far bigger than the pipe fills it, and the handoff's stop
+			// request then finds no room and runs out its deadline.
+			w.pace = 0
+			go func() { filled <- w.push(pushLines(2000)) }()
+			go func() {
+				defer GinkgoRecover()
+				time.Sleep(300 * time.Millisecond)
+				Expect(offer(5 * time.Second)).To(BeTrue())
+				Eventually(logBuf.String, 5*time.Second).Should(ContainSubstring("but sending the stop request"))
+				appendTo(gate, "go\n")
+				later <- w.push([]string{last})
+				signals <- syscall.SIGTERM
+			}()
+		}
+		// Once the gate opens, the fake hypervisor copies its console input
+		// to stdin, and its command ends when the stop request arrives. The
+		// shell gives a background command /dev/null in place of its stdin,
+		// so the copy reads the console through another descriptor.
+		res, err := sup.run(exec.Command("/bin/sh", "-c", `trap 'exit 99' TERM INT; `+startLine+
+			`while [ ! -e '`+gate+`' ]; do sleep 0.02; done; exec 3<&0; cat <&3 >>'`+stdin+`' 2>/dev/null & `+
+			`while ! grep -qxF '`+stopTag(testNonce)+`' '`+stdin+`' 2>/dev/null; do sleep 0.02; done; `+exitLine("0")), testNonce)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(codeOf(res)).To(Equal(0), logBuf.String())
+		Expect(res.handedOff).To(BeFalse())
+		Expect(res.received).To(Equal(syscall.SIGTERM))
+		Expect(filled).To(Receive(MatchError(errConsoleStopped)))
+		Expect(later).To(Receive(BeNil()))
+		got, err := os.ReadFile(stdin)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(got)).To(HaveSuffix(last + "\n" + stopLine))
+		before := got[:len(got)-len(last)-1-len(stopLine)]
+		Expect(len(before) % consoleChunk).To(BeZero())
+		Expect(joinLines(pushLines(2000))).To(HavePrefix(string(before)))
+		Expect(logBuf.String()).To(MatchRegexp(`^` + regexp.QuoteMeta(reason) + `, but sending the stop request to the guest failed: write \S+: i/o timeout; this instance keeps the volumes until it is stopped\nreceived terminated, asking the guest command to stop\n$`))
+	}, SpecTimeout(handoffSpecTimeout))
+
 	It("kills the hypervisor at the deadline when the guest command does not stop, and exits as after SIGTERM", func(ctx SpecContext) {
 		sup.deadline = 300 * time.Millisecond
 		sup.stdout = writerFunc(func(p []byte) (int, error) {
