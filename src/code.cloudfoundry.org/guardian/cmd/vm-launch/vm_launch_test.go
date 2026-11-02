@@ -775,11 +775,18 @@ var _ = Describe("hypervisor command lines", func() {
 			art + "/qemu/qemu-system-x86_64-microvm", "-L", art + "/qemu/share",
 			"-M", "microvm,accel=kvm,dump-guest-core=off", "-cpu", "host", "-smp", "1", "-m", "128",
 			"-nodefaults", "-no-user-config", "-nographic", "-serial", "stdio", "-no-reboot",
+			"-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny",
 			"-kernel", art + "/kernel/bzImage", "-initrd", "/proc/self/fd/3",
 			"-append", "console=ttyS0 reboot=t panic=-1 rdinit=/init pci=off quiet",
 			"-netdev", "user,id=n0,net=10.0.2.0/24", "-device", "virtio-net-device,netdev=n0",
 			"-device", "virtio-balloon-device,id=balloon0,deflate-on-oom=on,free-page-reporting=on",
 		}))
+	})
+
+	It("turns on QEMU's seccomp sandbox and denies spawning, privilege changes, obsolete calls, and resource control", func() {
+		argv, err := hypervisorArgv(backend.VMQemu, art, "/unused", "/proc/self/fd/3", 128, taskNetwork(), nil, "", 0)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(optionAfter(argv, "-sandbox", "")).To(Equal("on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"))
 	})
 
 	It("writes the Firecracker config and builds its command line", func() {

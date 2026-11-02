@@ -236,11 +236,8 @@ var _ = Describe("ProcBuilder", func() {
 		}
 
 		Describe("the AppArmor profile of the wrapped vm-launch process", func() {
-			// runc applies the container's profile to an exec'd process unless
-			// the process names a non-empty profile, so an empty profile here
-			// would leave QEMU confined.
-			It("is set to unconfined in a vm-qemu bundle, until a confined QEMU has been checked on a cell", func() {
-				Expect(preparedProc.ApparmorProfile).To(Equal("unconfined"))
+			It("is the bundle's profile in a vm-qemu bundle, so QEMU stays confined", func() {
+				Expect(preparedProc.ApparmorProfile).To(Equal("default-profile"))
 			})
 
 			Context("in a vm-qemu bundle without an AppArmor profile", func() {
@@ -248,7 +245,7 @@ var _ = Describe("ProcBuilder", func() {
 					bndl = bndl.WithApparmorProfile("")
 				})
 
-				It("names no profile, because there is nothing to lift", func() {
+				It("names no profile", func() {
 					Expect(preparedProc.ApparmorProfile).To(BeEmpty())
 				})
 			})

@@ -85,6 +85,13 @@ func guestMemory(lookupEnv func(string) (string, bool), logger *log.Logger) int 
 	return guest
 }
 
+// qemuSandbox is QEMU's -sandbox option: its own seccomp filter. It denies the
+// obsolete system calls, the privilege changes (setuid and the like), spawning
+// a process (fork and exec), and changes to resource limits and priorities.
+// QEMU as vm-launch starts it needs none of them: the user-mode network runs
+// in process, and no helper script or child process is configured.
+const qemuSandbox = "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"
+
 // qemuMachine is QEMU's -M option: the microvm machine under KVM, with guest
 // RAM left out of any core dump of QEMU.
 const qemuMachine = "microvm,accel=kvm,dump-guest-core=off"
@@ -196,6 +203,7 @@ func qemuArgv(root, initrd string, memMiB int, nw *network, drives []volumeDrive
 		"-nographic",
 		"-serial", "stdio",
 		"-no-reboot",
+		"-sandbox", qemuSandbox,
 		"-kernel", art(artBzImage),
 		"-initrd", initrd,
 		"-append", qemuKernelArgs,

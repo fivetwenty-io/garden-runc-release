@@ -79,12 +79,6 @@ const (
 	// permissions say. It is the one capability a helper process (pea) of a
 	// vm-* container may keep (see VMPeaCapabilities).
 	CapDacOverride = "CAP_DAC_OVERRIDE"
-
-	// unconfinedApparmorProfile is the AppArmor label every policy namespace
-	// provides without a loaded profile. runc applies the container's profile
-	// to an exec'd process unless the process names a non-empty profile of its
-	// own, so lifting the profile for one process means naming this label.
-	unconfinedApparmorProfile = "unconfined"
 )
 
 // ErrKVMPrimaryGid is returned by CheckUser when a process in a vm-* container
@@ -254,9 +248,8 @@ func (p *ProcBuilder) CheckUser(bndl goci.Bndl, spec garden.ProcessSpec, user *u
 // can acquire the kvm gid by itself, and the kvm gid is removed from the
 // supplementary gids the image gives the user, so Garden does not hand it out
 // either. Only the vm-launch process that carries the containerizer's
-// provenance marker gets the kvm gid and, in a vm-qemu bundle, runs without
-// the bundle's AppArmor profile, and in a vm-firecracker bundle with PORT in
-// its environment gets CAP_NET_RAW in every capability set, ambient
+// provenance marker gets the kvm gid, and in a vm-firecracker bundle with PORT
+// in its environment gets CAP_NET_RAW in every capability set, ambient
 // included, so that it holds the capability as the non-root app user, and
 // the --transparent-proxy flag before its own arguments (vm-launch keeps the
 // hypervisor from inheriting the capability). That wrapped vm-launch also
@@ -275,20 +268,6 @@ func (p *ProcBuilder) BuildProcess(bndl goci.Bndl, spec garden.ProcessSpec, user
 	}
 
 	additionalGIDs := p.supplementaryGids(user.Sgids, vm, wrapped)
-
-	apparmorProfile := bndl.Process().ApparmorProfile
-	if wrapped && kind == backend.VMQemu && apparmorProfile != "" {
-		// QEMU runs unconfined. The lift dates from before the default AppArmor
-		// profile allowed signals between processes in the same container,
-		// which covers the SIGUSR1 QEMU uses to kick its vCPU threads. We keep
-		// it until a confined QEMU has been checked on a cell. An empty profile
-		// would leave the container's profile in place, so the process names
-		// the unconfined label instead. QEMU inherits it, and the container's
-		// other processes keep the bundle's profile. A bundle without a
-		// profile has nothing to lift, and naming a label on a host without
-		// AppArmor would fail the exec.
-		apparmorProfile = unconfinedApparmorProfile
-	}
 
 	capabilities := p.capabilities(bndl, user.Gid)
 	if vm {
@@ -322,7 +301,7 @@ func (p *ProcBuilder) BuildProcess(bndl goci.Bndl, spec garden.ProcessSpec, user
 		Capabilities:    capabilities,
 		Rlimits:         toRlimits(spec.Limits),
 		Terminal:        spec.TTY != nil,
-		ApparmorProfile: apparmorProfile,
+		ApparmorProfile: bndl.Process().ApparmorProfile,
 		NoNewPrivileges: bndl.Process().NoNewPrivileges || vm,
 	}
 }
