@@ -897,6 +897,14 @@ func run(argv []string, logger *log.Logger) int {
 		stack.image = &guestImage{uid: imgUser.uid, gid: imgUser.gid}
 		stack.cwd = "/"
 	}
+	// The busybox guest gets the container's hostname and hosts file as the
+	// stack guest does. A file vm-launch cannot read is logged and left out,
+	// because the guest booted without one before.
+	var hosts []byte
+	var hostname string
+	if stack == nil {
+		hosts, hostname = readContainerHostFiles(logger)
+	}
 	closeLauncher := func() {
 		if stack != nil {
 			closeFile(stack.launcher.file, "the launcher", logger)
@@ -1178,6 +1186,8 @@ func run(argv []string, logger *log.Logger) int {
 		tools:          tools,
 		noVolumeSync:   !cfg.volumeSyncMounts,
 		stack:          stack,
+		hosts:          hosts,
+		hostname:       hostname,
 	})
 	// The archive holds the tools' and the launcher's bytes now, so the
 	// files close here. The deferred calls cover the returns before this
@@ -1696,6 +1706,26 @@ var (
 	// to the container's handle and which the stack guest takes as its own.
 	containerHostname = os.Hostname
 )
+
+// readContainerHostFiles returns the container's hosts file and hostname for
+// the busybox guest. Each one that cannot be read, or that the guest could not
+// use as it is, is logged and returned empty, so the guest boots without it.
+func readContainerHostFiles(logger *log.Logger) ([]byte, string) {
+	hosts, err := os.ReadFile(containerHostsPath)
+	if err != nil {
+		logger.Printf("the busybox guest gets no /etc/hosts: reading the container's hosts file failed: %v", err)
+		hosts = nil
+	}
+	hostname, err := containerHostname()
+	if err == nil && (hostname == "" || len(hostname) > maxGuestHostnameBytes || strings.Trim(hostname, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-") != "") {
+		err = fmt.Errorf("%q is not 1 to %d letters, digits, dots, and hyphens", hostname, maxGuestHostnameBytes)
+	}
+	if err != nil {
+		logger.Printf("the busybox guest gets no /etc/hostname: the container's hostname is unusable: %v", err)
+		hostname = ""
+	}
+	return hosts, hostname
+}
 
 // newGuestStack gathers what the stack guest's initramfs holds for the CF
 // launcher argv args: the launcher itself, opened and checked as a guest

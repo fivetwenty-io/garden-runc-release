@@ -486,6 +486,21 @@ ls -ld /etc/ssl/certs/ca-certificates.crt`)
 		Expect(out).To(ContainSubstring(exitTag(testNonce) + "0"))
 	})
 
+	It("gives the command the container's /etc/hosts and sets the guest's hostname from /etc/hostname", func() {
+		g := taskGuest(`echo "hostname=$(hostname)"
+echo "etc_hostname=$(cat /etc/hostname)"
+cat /etc/hosts
+echo "resolved=$(grep -c ' busybox-handle$' /etc/hosts)"`)
+		g.hosts = []byte("127.0.0.1 localhost\n10.255.9.4 busybox-handle\n")
+		g.hostname = "busybox-handle"
+		out := bootRealGuest(g)
+		Expect(out).To(MatchRegexp(`(?m)^hostname=busybox-handle\r?$`))
+		Expect(out).To(MatchRegexp(`(?m)^etc_hostname=busybox-handle\r?$`))
+		Expect(out).To(MatchRegexp(`(?m)^10\.255\.9\.4 busybox-handle\r?$`))
+		Expect(out).To(MatchRegexp(`(?m)^resolved=1\r?$`))
+		Expect(out).To(ContainSubstring(exitTag(testNonce) + "0"))
+	})
+
 	It("boots with the vCPUs and the memory that vm-launch derives, and the command sees both", func() {
 		logger := log.New(GinkgoWriter, "", 0)
 		memMiB := guestMemory(backend.VMQemu, envMap(map[string]string{"MEMORY_LIMIT": "384m"}), logger)
