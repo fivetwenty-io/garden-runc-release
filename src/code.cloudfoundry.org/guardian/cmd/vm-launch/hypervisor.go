@@ -943,6 +943,7 @@ type serialFilter struct {
 	fileOKTag  []byte
 	fileBadTag []byte
 	fileOnTag  []byte
+	mirrorOff  []byte
 	logTag     []byte
 	firstTag   []byte
 	listen     func(port int, up bool)
@@ -958,7 +959,10 @@ type serialFilter struct {
 	oomKills int
 	credOff  bool
 	fileOn   bool
-	writeErr error
+	// mirrorDropped is set once a guest that fell back to the busybox guest
+	// said that it removed its mirrored mounts (see mirrorOffTag).
+	mirrorDropped bool
+	writeErr      error
 
 	// lineStart reports whether the console byte before pending ended a
 	// line, which a log frame's tag needs at pending[0].
@@ -1019,6 +1023,13 @@ func (f *serialFilter) onFileAck(nonce string, ack func(seq int, ok bool)) {
 	f.fileBadTag = []byte(fileBadTag(nonce))
 	f.fileOnTag = []byte(fileOnTag(nonce))
 	f.fileAck = ack
+}
+
+// onMirror makes the filter swallow the line before the start tag with
+// which a stack guest that fell back to the busybox guest says that it
+// removed its mirrored mounts, and set mirrorDropped.
+func (f *serialFilter) onMirror(nonce string) {
+	f.mirrorOff = []byte(mirrorOffTag(nonce))
 }
 
 // onFrames makes the filter split the guest's log frames and swallow its
@@ -1090,6 +1101,10 @@ func (f *serialFilter) processBoot(eof bool) {
 		}
 		if f.credOffTag != nil && bytes.Contains(line, f.credOffTag) {
 			f.credOff = true
+			continue
+		}
+		if f.mirrorOff != nil && bytes.Contains(line, f.mirrorOff) {
+			f.mirrorDropped = true
 			continue
 		}
 		if f.fileOnTag != nil && bytes.Contains(line, f.fileOnTag) {
@@ -1777,6 +1792,9 @@ type supervisor struct {
 	// Otherwise the supervisor logs that the guest gets no changes to its
 	// mirrored files.
 	onFileConsole func(w *consoleWriter)
+	// mirrored says that the guest holds mirrored mounts, so the supervisor
+	// logs it when a fallback to the busybox guest removed them.
+	mirrored bool
 	// reported, when set, runs once the supervisor has acted on the guest's
 	// status line, so a spec can send a signal that comes after it. It must
 	// not block. vm-launch leaves it unset.
@@ -1869,6 +1887,9 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 	if s.fileAck != nil {
 		filter.onFileAck(nonce, s.fileAck)
 	}
+	if s.mirrored {
+		filter.onMirror(nonce)
+	}
 	type ended struct{ copyErr, waitErr error }
 	done := make(chan ended, 1)
 	go func() {
@@ -1958,12 +1979,17 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 			} else if s.onConsole != nil && !signalled && !isClosed(filter.exited) {
 				s.onConsole(stdin)
 			}
-			// A guest that could not turn off its echo, and a stack guest
-			// that fell back to the busybox guest, never says that it takes
-			// file pushes.
-			if s.onFileConsole != nil && (!filter.fileOn || filter.credOff) {
+			// A stack guest that fell back to the busybox guest removed its
+			// mirrored mounts and takes no file pushes, and a guest that
+			// could not turn off its echo never says that it takes them.
+			if filter.mirrorDropped {
+				s.logger.Println("the guest fell back to the busybox guest, which runs its command as root, so it removed the container's mirrored mounts before it ran it")
+			}
+			switch {
+			case s.onFileConsole == nil || filter.mirrorDropped:
+			case !filter.fileOn || filter.credOff:
 				s.logger.Println("the guest did not say that it takes pushes of mirrored files, so vm-launch pushes it no changes to them; the guest keeps the copies it booted with")
-			} else if s.onFileConsole != nil && !signalled && !isClosed(filter.exited) {
+			case !signalled && !isClosed(filter.exited):
 				s.onFileConsole(stdin)
 			}
 		case <-markerSeen:

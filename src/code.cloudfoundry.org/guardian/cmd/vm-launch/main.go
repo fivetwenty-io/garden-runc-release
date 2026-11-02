@@ -487,6 +487,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -1063,7 +1064,7 @@ func run(argv []string, logger *log.Logger) int {
 		if stack.image != nil {
 			deny = imageGuestDenylist(identity != nil)
 		}
-		files, err := sidecarGuestFilesOf(sidecars, denylistKeeping(deny, mirror.keptEnv(env)))
+		files, err := sidecarGuestFilesMirroring(sidecars, deny, env, mirror)
 		if err != nil {
 			logger.Print(err)
 			return exitLaunchError
@@ -1347,6 +1348,7 @@ func run(argv []string, logger *log.Logger) int {
 	// A guest with mirrored files gets each change to them in the same way,
 	// once it has said that it takes the pushes.
 	stopMirror := func() {}
+	sup.mirrored = mirror != nil
 	if mirror.watching() {
 		stopMirror = watchMirror(&sup, nonce, mirror, logger)
 	}
@@ -1447,19 +1449,56 @@ func guestExtrasLine(sidecars []vmSidecar, id *instanceIdentity) string {
 // with deny as the denylist of their environment files. It returns nil for
 // an app without sidecars.
 func sidecarGuestFilesOf(sidecars []vmSidecar, deny map[string]bool) ([]guestSidecar, error) {
+	return sidecarGuestFilesMirroring(sidecars, deny, nil, nil)
+}
+
+// sidecarGuestFilesMirroring is sidecarGuestFilesOf for a guest with
+// mirrored mounts. Each sidecar's environment file keeps the variables that
+// name a path in a mirrored mount in the sidecar's own environment, which is
+// appEnv with the sidecar's entries applied (see mountMirror.keptEnv). A
+// sidecar that points one of them outside the mirrored mounts while the app
+// keeps it gets an unset line for it, so it never inherits the app's value
+// in place of its own.
+func sidecarGuestFilesMirroring(sidecars []vmSidecar, deny map[string]bool, appEnv map[string]string, m *mountMirror) ([]guestSidecar, error) {
 	if len(sidecars) == 0 {
 		return nil, nil
 	}
+	appKeep := m.keptEnv(appEnv)
 	files := make([]guestSidecar, 0, len(sidecars))
 	for i, sc := range sidecars {
-		argv, env, err := sidecarGuestFiles(sc, deny)
+		keep := m.keptEnv(sidecarEnvOf(appEnv, sc))
+		argv, env, err := sidecarGuestFiles(sc, denylistKeeping(deny, keep))
 		if err != nil {
 			// The guest numbers the sidecars from 1, because the app is 0.
 			return nil, fmt.Errorf("sidecar %d: %w", i+1, err)
 		}
+		for _, name := range appKeep {
+			if !slices.Contains(keep, name) {
+				env += "unset " + name + "\n"
+			}
+		}
 		files = append(files, guestSidecar{argv: argv, env: env})
 	}
 	return files, nil
+}
+
+// sidecarEnvOf returns appEnv with the entries and unsets of sc applied, as
+// the sidecar's environment is in the guest. An entry without = is left out
+// here, because sidecarGuestFiles refuses it.
+func sidecarEnvOf(appEnv map[string]string, sc vmSidecar) map[string]string {
+	env := make(map[string]string, len(appEnv)+len(sc.Env))
+	for name, value := range appEnv {
+		env[name] = value
+	}
+	for _, entry := range sc.Env {
+		if name, value, ok := strings.Cut(entry, "="); ok {
+			env[name] = value
+		}
+	}
+	for _, name := range sc.Unset {
+		delete(env, name)
+	}
+	return env
 }
 
 // buildGuestInitramfs is newInitramfs. Specs replace it to see the guest

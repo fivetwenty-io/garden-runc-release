@@ -75,6 +75,10 @@ type mirrorWatcher struct {
 	mu      sync.Mutex
 	seq     int
 	pending *mirrorPush
+	// next is the index in files where the search for the next file to push
+	// starts, which is just after the file pushed last, so that a file that
+	// changes all the time cannot keep the others waiting.
+	next int
 	// want holds, for each file whose content differs from what the guest
 	// holds, the content and mode to push, by watched number.
 	want map[int]mirrorWant
@@ -147,6 +151,12 @@ func (w *mirrorWatcher) applyAck() {
 	w.logger.Printf("the guest installed push %d of the mirrored file %s, %d bytes", p.seq, quoteForLog(p.file.path), len(p.data))
 }
 
+// mirrorPermUnknown is the perm of a watched file whose content in the guest
+// vm-launch no longer knows, because it gave up on a push of it that the
+// guest may have installed. No file's permission bits equal it, so the next
+// change to the file is pushed whatever its content.
+const mirrorPermUnknown = ^uint32(0)
+
 // tick does one pass of the watch.
 func (w *mirrorWatcher) tick() {
 	w.mu.Lock()
@@ -164,6 +174,7 @@ func (w *mirrorWatcher) tick() {
 			if p.attempts > credMaxResends {
 				w.pending = nil
 				delete(w.want, p.file.number)
+				p.file.perm = mirrorPermUnknown
 				w.logger.Printf("giving up on push %d of the mirrored file %s after %d tries; waiting for the next change", p.seq, quoteForLog(p.file.path), p.attempts)
 				return
 			}
@@ -173,8 +184,11 @@ func (w *mirrorWatcher) tick() {
 			return
 		}
 	}
-	for _, f := range w.files {
+	for i := range w.files {
+		idx := (w.next + i) % len(w.files)
+		f := w.files[idx]
 		if want, ok := w.want[f.number]; ok {
+			w.next = idx + 1
 			w.seq++
 			w.send(&mirrorPush{seq: w.seq, file: f, data: want.data, perm: want.perm})
 			return
@@ -183,7 +197,10 @@ func (w *mirrorWatcher) tick() {
 }
 
 // look stats f and, when it changed, reads it and records whether the guest
-// needs it. The caller holds the lock.
+// needs it. While a push of f is in flight, the guest is about to hold that
+// push's content, so a read is compared with it and not with what the guest
+// held before: a file that changes and then changes back before the guest
+// answers is pushed back. The caller holds the lock.
 func (w *mirrorWatcher) look(f *mirrorWatched) {
 	state, ok := statMirrorFile(f.path)
 	if !ok {
@@ -215,7 +232,11 @@ func (w *mirrorWatcher) look(f *mirrorWatched) {
 	}
 	delete(w.refused, f.number)
 	f.state = read
-	if bytes.Equal(data, f.data) && perm == f.perm {
+	held, heldPerm := f.data, f.perm
+	if p := w.pending; p != nil && p.file == f {
+		held, heldPerm = p.data, p.perm
+	}
+	if bytes.Equal(data, held) && perm == heldPerm {
 		delete(w.want, f.number)
 		return
 	}

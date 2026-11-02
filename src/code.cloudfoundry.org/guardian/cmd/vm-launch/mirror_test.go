@@ -160,8 +160,41 @@ var _ = Describe("mirrored mounts", func() {
 			m, err := readMountMirror(table, nil, logger)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(m).To(BeNil())
-			Expect(logBuf.String()).To(ContainSubstring("not mirroring the mount at " + quoteForLog(dir+"/link") + " into the guest: opening it"))
-			Expect(logBuf.String()).To(ContainSubstring("vm-launch follows no symbolic links on the path of a mirrored mount"))
+			Expect(logBuf.String()).To(ContainSubstring("not mirroring the mount at " + quoteForLog(dir+"/link") + " into the guest: it is a symbolic link, and vm-launch follows no symbolic links on the path of a mirrored mount"))
+		})
+
+		It("holds back a mount whose root is a FIFO at once, without opening it for reading", func() {
+			Expect(unix.Mkfifo(filepath.Join(dir, "pipe"), 0o600)).To(Succeed())
+			table := writeMountTable(dir, mountInfoLine(5, dir+"/pipe", "ro", "ext4"))
+			done := make(chan struct{})
+			var m *mountMirror
+			var err error
+			go func() {
+				defer GinkgoRecover()
+				defer close(done)
+				m, err = readMountMirror(table, nil, logger)
+			}()
+			// An open for reading of a FIFO with no writer would block
+			// until one came.
+			Eventually(done, 5*time.Second).Should(BeClosed())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(m).To(BeNil())
+			Expect(logBuf.String()).To(ContainSubstring("not mirroring the mount at " + quoteForLog(dir+"/pipe") + " into the guest: it is neither a regular file nor a directory"))
+		})
+
+		It("watches each file from the state it had when vm-launch read it", func() {
+			write("watched.txt", "as read", 0o644)
+			table := writeMountTable(dir, mountInfoLine(5, dir+"/watched.txt", "ro", "ext4"))
+			m, err := readMountMirror(table, nil, logger)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(m.watched).To(HaveLen(1))
+			Expect(m.watched[0].state).To(Equal(m.mounts[0].entries[0].state))
+			Expect(m.watched[0].state.size).To(Equal(int64(len("as read"))))
+
+			read := fileState{dev: 1, ino: 2, size: 3, modTimeNs: 4}
+			later := &mountMirror{mounts: []mirrorMount{{path: "/etc/x", entries: []mirrorEntry{{kind: mirrorFile, perm: 0o644, data: []byte("abc"), state: read}}}}}
+			later.number()
+			Expect(later.watched[0].state).To(Equal(read), "number takes the state of the read, and does not stat the file again")
 		})
 
 		It("fails on a mount table it cannot parse", func() {
@@ -202,6 +235,38 @@ var _ = Describe("mirrored mounts", func() {
 		Expect(mirrorDenied("/etc/cf-service-bindings", "ext4")).To(BeFalse())
 		Expect(mirrorDenied("/developer", "ext4")).To(BeFalse())
 	})
+
+	DescribeTable("denies the programs, libraries, and loader that the guest's root runs in the app root, and Diego's own assets",
+		func(p string) {
+			Expect(mirrorDenied(p, "ext4")).To(BeTrue())
+		},
+		Entry("setpriv", "/usr/bin/setpriv"),
+		Entry("all of /usr", "/usr"),
+		Entry("a program in /bin", "/bin/sh"),
+		Entry("a program in /sbin", "/sbin/x"),
+		Entry("the C library", "/lib/x86_64-linux-gnu/libc.so.6"),
+		Entry("the 64-bit loader", "/lib64/ld-linux-x86-64.so.2"),
+		Entry("/lib32", "/lib32/x"),
+		Entry("/libx32", "/libx32/x"),
+		Entry("the loader's preload list", "/etc/ld.so.preload"),
+		Entry("the loader's cache", "/etc/ld.so.cache"),
+		Entry("a file the loader's configuration includes", "/etc/ld.so.conf.d/x.conf"),
+		Entry("Diego's assets", "/etc/cf-assets/envoy_config/envoy.yaml"),
+		Entry("/etc, which holds the loader's files", "/etc"),
+		Entry("/tmp, which holds Garden's files", "/tmp"),
+		Entry("/opt, which holds vm-launch's files", "/opt"),
+	)
+
+	DescribeTable("mirrors the paths beside the denied ones",
+		func(p string) {
+			Expect(mirrorDenied(p, "ext4")).To(BeFalse())
+		},
+		Entry("the service bindings", "/etc/cf-service-bindings"),
+		Entry("a file that only starts like the loader's", "/etc/ldap.conf"),
+		Entry("a directory that only starts like /lib", "/library"),
+		Entry("a directory in /tmp that is not Garden's", "/tmp/app-data"),
+		Entry("a directory in /opt that is not vm-launch's", "/opt/app"),
+	)
 
 	Describe("the guest's side", func() {
 		mirror := func() *mountMirror {
@@ -272,6 +337,78 @@ var _ = Describe("mirrored mounts", func() {
 			plain := s.initScript(testNonce)
 			Expect(plain).NotTo(ContainSubstring("rvm_file"))
 			Expect(plain).NotTo(ContainSubstring(guestIdentityEchoCheck(testNonce)))
+		})
+
+		It("removes the staged copies for the busybox guest and says so, and has nothing to remove without a mirror", func() {
+			var none *mountMirror
+			Expect(none.fallbackPrep(testNonce)).To(BeEmpty())
+
+			stage := filepath.Join(dir, "mirror")
+			next := filepath.Join(dir, "mirror-next")
+			console := filepath.Join(dir, "console")
+			Expect(os.MkdirAll(filepath.Join(stage, "1", "svc"), 0o755)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(stage, "1", "svc", "uri"), []byte("postgres://"), 0o644)).To(Succeed())
+			Expect(os.Mkdir(next, 0o700)).To(Succeed())
+			prep := mirror().fallbackPrep(testNonce)
+			Expect(prep).To(HavePrefix("rm -rf " + guestMirrorStage + " " + guestMirrorNext + " || rvm_fail "))
+			// The longer path goes first, because the stage's path is a
+			// prefix of it.
+			script := strings.NewReplacer(guestMirrorNext, next, guestMirrorStage, stage, "/dev/console", console).Replace(prep)
+			out, err := exec.Command(guestBusybox(), "sh", "-c", `rvm_fail() { echo "failed: $1"; exit 1; }`+"\n"+script).CombinedOutput()
+			Expect(err).NotTo(HaveOccurred(), string(out))
+			Expect(string(out)).To(BeEmpty())
+			Expect(stage).NotTo(BeAnExistingFile())
+			Expect(next).NotTo(BeAnExistingFile())
+			Expect(os.ReadFile(console)).To(Equal([]byte(mirrorOffTag(testNonce) + "\n")))
+		})
+	})
+
+	Describe("the initramfs of a stack guest that can fall back to the busybox guest", func() {
+		stackGuest := func(m *mountMirror) guestContents {
+			f, err := os.Open(writeTempFile("launcher", "#!/bin/sh\n"))
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(f.Close)
+			g := taskGuest("")
+			g.drives.stackID, g.drives.dropletID = qemuStackSerial, qemuDropletSerial
+			g.stack = &guestStack{
+				launcher: guestTool{name: "launcher", file: f, size: int64(len("#!/bin/sh\n"))},
+				argv:     shellJoin([]string{stackLauncherPath, "/home/vcap/app", "", ""}),
+				cwd:      "/home/vcap/app",
+				hostname: "stack-guest-0",
+				hosts:    []byte("127.0.0.1 localhost\n"),
+				fallback: true,
+				mirror:   m,
+			}
+			return g
+		}
+		archive := func(g guestContents) ([]string, map[string]cpioEntry) {
+			var archive bytes.Buffer
+			Expect(writeInitramfsArchive(&archive, strings.NewReader("busybox"), int64(len("busybox")), g)).To(Succeed())
+			return archiveEntries(archive.Bytes())
+		}
+		prepName := strings.TrimPrefix(guestFallbackPrep, "/")
+
+		It("holds nothing of the mirror without one", func() {
+			names, byName := archive(stackGuest(nil))
+			for _, n := range names {
+				Expect(n).NotTo(HavePrefix("rvm/mirror"))
+			}
+			script := string(byName["rvm/init"].data)
+			for _, s := range []string{fileTag(testNonce), fileOnTag(testNonce), mirrorOffTag(testNonce), "rvm_file", guestIdentityEchoCheck(testNonce)} {
+				Expect(script).NotTo(ContainSubstring(s))
+			}
+			Expect(string(byName[prepName].data)).To(Equal((*systemCerts)(nil).fallbackPrep()), "the busybox guest's preparation is the certificates' alone")
+		})
+
+		It("removes the mirrored mounts before the busybox guest's other preparation", func() {
+			m := &mountMirror{mounts: []mirrorMount{{path: "/etc/cf-service-bindings", dir: true, entries: []mirrorEntry{
+				{kind: mirrorDir, perm: 0o755},
+				{rel: "uri", kind: mirrorFile, perm: 0o644, data: []byte("postgres://")},
+			}}}}
+			m.number()
+			names, byName := archive(stackGuest(m))
+			Expect(names).To(ContainElements("rvm/mirror", "rvm/mirror/1", "rvm/mirror/1/uri"))
+			Expect(string(byName[prepName].data)).To(Equal(m.fallbackPrep(testNonce) + (*systemCerts)(nil).fallbackPrep()))
 		})
 	})
 
@@ -459,19 +596,64 @@ var _ = Describe("mirrored mounts", func() {
 			Expect(pushes).To(HaveLen(n))
 		})
 
-		It("replaces the push in flight with a newer change, and pushes the next file after it", func() {
+		It("replaces the push in flight with a newer change, and takes the changed files in turn", func() {
 			rewrite("one", "ONE", 0o644)
 			rewrite("two", "TWO", 0o644)
 			w.tick()
 			rewrite("one", "ONE again", 0o644)
 			w.tick()
-			Expect(pushes).To(Equal([]pushed{{1, 1, "ONE", 0o644}, {2, 1, "ONE again", 0o644}}))
+			Expect(pushes).To(Equal([]pushed{{1, 1, "ONE", 0o644}, {2, 2, "TWO", 0o644}}))
 			w.acked(1, true)
 			w.tick()
 			Expect(pushes).To(HaveLen(2), "an answer to a replaced push does not count")
 			w.acked(2, true)
 			w.tick()
-			Expect(pushes).To(Equal([]pushed{{1, 1, "ONE", 0o644}, {2, 1, "ONE again", 0o644}, {3, 2, "TWO", 0o644}}))
+			Expect(pushes).To(Equal([]pushed{{1, 1, "ONE", 0o644}, {2, 2, "TWO", 0o644}, {3, 1, "ONE again", 0o644}}))
+		})
+
+		It("pushes a file back when it changes back before the guest answers the push of the change", func() {
+			rewrite("one", "ONE", 0o644)
+			w.tick()
+			rewrite("one", "one", 0o644)
+			w.tick()
+			Expect(pushes).To(Equal([]pushed{{1, 1, "ONE", 0o644}, {2, 1, "one", 0o644}}))
+			w.acked(1, true)
+			w.tick()
+			Expect(pushes).To(HaveLen(2), "an answer to the replaced push does not count")
+			w.acked(2, true)
+			w.tick()
+			Expect(pushes).To(HaveLen(2))
+			Expect(files[0].data).To(Equal([]byte("one")))
+		})
+
+		It("pushes the next change after it gave up, even one back to the content it pushed before", func() {
+			rewrite("one", "ONE", 0o644)
+			w.tick()
+			for range credMaxResends + 1 {
+				now = now.Add(credAckTimeout)
+				w.tick()
+			}
+			Expect(logBuf.String()).To(ContainSubstring("giving up on push 1 of the mirrored file"))
+			n := len(pushes)
+			// The guest may hold ONE or one, so vm-launch no longer knows
+			// which, and pushes the next change whatever it is.
+			rewrite("one", "one", 0o644)
+			w.tick()
+			Expect(pushes).To(HaveLen(n + 1))
+			Expect(pushes[n]).To(Equal(pushed{2, 1, "one", 0o644}))
+		})
+
+		It("gives every changed file a turn while another changes after each push", func() {
+			rewrite("one", "ONE 1", 0o644)
+			rewrite("two", "TWO", 0o644)
+			w.tick()
+			w.acked(1, true)
+			rewrite("one", "ONE 2", 0o644)
+			w.tick()
+			w.acked(2, true)
+			rewrite("one", "ONE 3", 0o644)
+			w.tick()
+			Expect(pushes).To(Equal([]pushed{{1, 1, "ONE 1", 0o644}, {2, 2, "TWO", 0o644}, {3, 1, "ONE 3", 0o644}}))
 		})
 
 		It("keeps the guest's copy of a file that grows too large or goes away, with one line each", func() {
@@ -507,6 +689,28 @@ var _ = Describe("mirrored mounts", func() {
 			Expect(out.String()).To(Equal("a\nb" + credOKTag(testNonce) + "5\n"))
 		})
 
+		It("swallows the word of a guest that fell back to the busybox guest that it removed its mirrored mounts, only for a guest with them", func() {
+			var out bytes.Buffer
+			f := newSerialFilter(&out, testNonce)
+			f.onFileAck(testNonce, func(int, bool) {})
+			f.onMirror(testNonce)
+			_, _ = io.WriteString(f, "boot\r\nbusybox guest: no stack\r\n"+mirrorOffTag(testNonce)+"\r\n")
+			Expect(f.mirrorDropped).To(BeTrue())
+			Expect(string(f.bootLog)).To(Equal("boot\r\nbusybox guest: no stack\r\n"))
+			_, _ = io.WriteString(f, start+"a\r\n"+marker)
+			f.finish()
+			Expect(f.fileOn).To(BeFalse())
+			Expect(out.String()).To(Equal("a\n"))
+
+			out.Reset()
+			plain := newSerialFilter(&out, testNonce)
+			_, _ = io.WriteString(plain, "boot\r\n"+mirrorOffTag(testNonce)+"\r\n")
+			Expect(plain.mirrorDropped).To(BeFalse())
+			Expect(string(plain.bootLog)).To(Equal("boot\r\n" + mirrorOffTag(testNonce) + "\r\n"))
+			_, _ = io.WriteString(plain, start+marker)
+			plain.finish()
+		})
+
 		It("leaves fileOn unset for a guest that never says so", func() {
 			var out bytes.Buffer
 			f := newSerialFilter(&out, testNonce)
@@ -532,6 +736,36 @@ var _ = Describe("mirrored mounts", func() {
 		Expect(image).To(ContainSubstring("VCAP_SERVICES_FILE_PATH="))
 		Expect(image).NotTo(ContainSubstring("SERVICE_BINDING_ROOT="))
 		Expect(stackGuestDenylist(false)["SERVICE_BINDING_ROOT"]).To(BeTrue(), "the shared deny list is never changed")
+	})
+
+	It("keeps a binding variable in each sidecar's environment from the sidecar's own value", func() {
+		m := &mountMirror{mounts: []mirrorMount{{path: "/etc/cf-service-bindings", dir: true}}}
+		appEnv := map[string]string{"SERVICE_BINDING_ROOT": "/etc/cf-service-bindings"}
+		deny := stackGuestDenylist(false)
+		sidecars := []vmSidecar{
+			{Args: []string{"inherits"}},
+			{Args: []string{"outside"}, Env: []string{"SERVICE_BINDING_ROOT=/elsewhere"}},
+			{Args: []string{"inside"}, Env: []string{"SERVICE_BINDING_ROOT=/etc/cf-service-bindings/other", "VCAP_SERVICES_FILE_PATH=/etc/cf-service-bindings/vcap_services"}},
+			{Args: []string{"unsets"}, Unset: []string{"SERVICE_BINDING_ROOT"}},
+		}
+		files, err := sidecarGuestFilesMirroring(sidecars, deny, appEnv, m)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(files).To(HaveLen(4))
+		Expect(files[0].env).To(BeEmpty(), "a sidecar without its own value inherits the app's")
+		Expect(files[1].env).To(Equal("unset SERVICE_BINDING_ROOT\n"), "a sidecar's value outside the mirrored mounts never reaches the guest, and the app's does not take its place")
+		Expect(files[2].env).To(Equal("export SERVICE_BINDING_ROOT=" + sidecarQuote("/etc/cf-service-bindings/other") + "\n" +
+			"export VCAP_SERVICES_FILE_PATH=" + sidecarQuote("/etc/cf-service-bindings/vcap_services") + "\n"))
+		Expect(files[3].env).To(Equal("unset SERVICE_BINDING_ROOT\n"))
+
+		plain, err := sidecarGuestFilesOf(sidecars, deny)
+		Expect(err).NotTo(HaveOccurred())
+		withoutMirror, err := sidecarGuestFilesMirroring(sidecars, deny, appEnv, nil)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(withoutMirror).To(Equal(plain))
+		for _, f := range plain {
+			Expect(f.env).NotTo(ContainSubstring("export SERVICE_BINDING_ROOT"))
+			Expect(f.env).NotTo(ContainSubstring("VCAP_SERVICES_FILE_PATH"))
+		}
 	})
 
 	It("takes --mirror-mounts, off by default", func() {

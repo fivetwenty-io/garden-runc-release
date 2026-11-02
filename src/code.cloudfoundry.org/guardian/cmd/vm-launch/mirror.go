@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -61,13 +62,22 @@ var mirrorDeniedFSTypes = map[string]bool{
 	"securityfs": true, "sysfs": true, "tracefs": true,
 }
 
-// mirrorDeniedDirs are the paths whose mounts the guest never gets, at them
-// or below them: the guest's own proc, sysfs, devices, and shell, and the
-// paths of Garden and vm-launch. A path that starts with mirrorDeniedPrefix
-// is Garden's too.
-var mirrorDeniedDirs = []string{"/proc", "/sys", "/dev", "/bin", "/rvm", "/opt/garden-vm"}
+// mirrorDeniedDirs are the paths whose mounts the guest never gets, at them,
+// below them, or above them. They are the guest's own proc, sysfs, and
+// devices, the programs, libraries, and loader that the guest's root runs in
+// the app root before it drops to the app's user (see guestStackSetpriv), the
+// paths of Garden and vm-launch, and Garden's Envoy configuration, whose
+// copy of the instance identity key reaches the guest on a path of its own.
+var mirrorDeniedDirs = []string{
+	"/proc", "/sys", "/dev",
+	"/bin", "/sbin", "/usr", "/lib", "/lib32", "/lib64", "/libx32",
+	"/rvm", "/opt/garden-vm", "/etc/cf-assets",
+}
 
-const mirrorDeniedPrefix = "/tmp/garden-"
+// mirrorDeniedPrefixes are the path prefixes whose mounts the guest never
+// gets, which are Garden's paths in /tmp and the dynamic loader's
+// configuration and cache, and mounts above them are denied too.
+var mirrorDeniedPrefixes = []string{"/tmp/garden-", "/etc/ld.so."}
 
 // mirrorNetworkFSTypes are the network filesystems, which a copy at boot
 // would let go stale. A filesystem type that starts with "fuse." is one too.
@@ -117,9 +127,9 @@ type mirrorMount struct {
 // mirrorEntry is one directory, regular file, or symbolic link of a mirrored
 // mount, at rel below the mount's root, with its permission bits and owner
 // as the container shows them. A file has its bytes in data and a link its
-// target in target. place marks the empty entry that stands in for another
-// mount point (see readMirrorMount). watch is the number of the watched
-// file, or 0.
+// target in target. state is a file's state as vm-launch read it. place
+// marks the empty entry that stands in for another mount point (see
+// readMirrorMount). watch is the number of the watched file, or 0.
 type mirrorEntry struct {
 	rel      string
 	kind     mirrorKind
@@ -127,6 +137,7 @@ type mirrorEntry struct {
 	uid, gid uint32
 	data     []byte
 	target   string
+	state    fileState
 	place    bool
 	watch    int
 }
@@ -178,12 +189,19 @@ func mirrorPathUsable(p string) bool {
 }
 
 // mirrorDenied reports whether the guest never gets a mount of fsType at p.
+// A mount above a denied path is denied as well, because its copy would put
+// content of the container's at that path too.
 func mirrorDenied(p, fsType string) bool {
-	if p == "/" || mirrorDeniedFSTypes[fsType] || strings.HasPrefix(p, mirrorDeniedPrefix) {
+	if p == "/" || mirrorDeniedFSTypes[fsType] {
 		return true
 	}
 	for _, dir := range mirrorDeniedDirs {
-		if underDir(p, dir) {
+		if underDir(p, dir) || underDir(dir, p) {
+			return true
+		}
+	}
+	for _, prefix := range mirrorDeniedPrefixes {
+		if strings.HasPrefix(p, prefix) || underDir(path.Dir(prefix), p) {
 			return true
 		}
 	}
@@ -341,14 +359,17 @@ func dedicatedBelow(p string, dirs []string) (string, bool) {
 // readMirrorMount reads the mount at p without following a symbolic link
 // anywhere on the way: openat2 refuses one in p itself, and every entry below
 // it is opened with O_NOFOLLOW relative to its directory, so a link is copied
-// as a link and never read through. points are every mount point in the
+// as a link and never read through. Each is opened with O_PATH first, and
+// only a directory or a regular file is then opened again for reading, so a
+// FIFO or a device in the mount, or one swapped in during the walk, is never
+// opened (see reopenMirrorFD). points are every mount point in the
 // table. An entry that is another mount point is copied as an empty
 // directory or file, so that the guest has a place to bind that mount at,
 // and its content is never read by this walk. special counts the entries
 // left out.
 func readMirrorMount(p string, points map[string]bool) (mm mirrorMount, special int, err error) {
-	fd, err := openat2Retry(unix.AT_FDCWD, p, &unix.OpenHow{
-		Flags:   unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_CLOEXEC | unix.O_NONBLOCK,
+	pfd, err := openat2Retry(unix.AT_FDCWD, p, &unix.OpenHow{
+		Flags:   unix.O_PATH | unix.O_NOFOLLOW | unix.O_CLOEXEC,
 		Resolve: unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS,
 	})
 	if err != nil {
@@ -357,10 +378,9 @@ func readMirrorMount(p string, points map[string]bool) (mm mirrorMount, special 
 		}
 		return mirrorMount{}, 0, fmt.Errorf("opening it: %w", err)
 	}
-	f := os.NewFile(uintptr(fd), p)
-	defer f.Close()
+	defer unix.Close(pfd)
 	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
+	if err := unix.Fstat(pfd, &st); err != nil {
 		return mirrorMount{}, 0, fmt.Errorf("reading its attributes: %w", err)
 	}
 	mm.path = p
@@ -369,14 +389,24 @@ func readMirrorMount(p string, points map[string]bool) (mm mirrorMount, special 
 		if st.Size > mirrorFileMaxBytes {
 			return mirrorMount{}, 0, errMirrorTooLarge
 		}
+		f, err := reopenMirrorFD(pfd, unix.O_RDONLY|unix.O_NONBLOCK, p)
+		if err != nil {
+			return mirrorMount{}, 0, fmt.Errorf("opening it: %w", err)
+		}
 		data, err := readMirrorData(f, mirrorFileMaxBytes)
+		f.Close()
 		if err != nil {
 			return mirrorMount{}, 0, err
 		}
 		mm.bytes = int64(len(data))
-		mm.entries = []mirrorEntry{{kind: mirrorFile, perm: st.Mode & 0o777, uid: st.Uid, gid: st.Gid, data: data}}
+		mm.entries = []mirrorEntry{{kind: mirrorFile, perm: st.Mode & 0o777, uid: st.Uid, gid: st.Gid, data: data, state: fileStateOf(&st)}}
 		return mm, 0, nil
 	case unix.S_IFDIR:
+		f, err := reopenMirrorFD(pfd, unix.O_RDONLY|unix.O_DIRECTORY, p)
+		if err != nil {
+			return mirrorMount{}, 0, fmt.Errorf("opening it: %w", err)
+		}
+		defer f.Close()
 		mm.dir = true
 		mm.entries = []mirrorEntry{{kind: mirrorDir, perm: st.Mode & 0o777, uid: st.Uid, gid: st.Gid}}
 		w := &mirrorWalk{mount: &mm, points: points}
@@ -384,8 +414,33 @@ func readMirrorMount(p string, points map[string]bool) (mm mirrorMount, special 
 			return mirrorMount{}, 0, err
 		}
 		return mm, w.special, nil
+	case unix.S_IFLNK:
+		// openat2 hands back the link itself, not ELOOP, for a link at the
+		// end of p opened with O_PATH and O_NOFOLLOW.
+		return mirrorMount{}, 0, errors.New("it is a symbolic link, and vm-launch follows no symbolic links on the path of a mirrored mount")
 	}
 	return mirrorMount{}, 0, errors.New("it is neither a regular file nor a directory")
+}
+
+// reopenMirrorFD opens the file that the O_PATH descriptor pfd holds again,
+// with flags, through /proc/self/fd. That open reaches the inode pfd holds,
+// whatever now sits at its path, so a file whose type was checked on pfd
+// cannot be swapped for a FIFO or a device before it is read.
+func reopenMirrorFD(pfd, flags int, name string) (*os.File, error) {
+	for {
+		fd, err := unix.Open("/proc/self/fd/"+strconv.Itoa(pfd), flags|unix.O_CLOEXEC, 0)
+		if err == nil {
+			return os.NewFile(uintptr(fd), name), nil
+		}
+		if !errors.Is(err, unix.EINTR) {
+			return nil, err
+		}
+	}
+}
+
+// fileStateOf returns the state that st describes.
+func fileStateOf(st *unix.Stat_t) fileState {
+	return fileState{dev: uint64(st.Dev), ino: st.Ino, size: st.Size, modTimeNs: st.Mtim.Nano()} //nolint:unconvert // the widths differ by architecture
 }
 
 // readMirrorData reads at most max bytes of f, and errMirrorTooLarge for a
@@ -433,83 +488,89 @@ func (w *mirrorWalk) dir(dir *os.File, rel string) error {
 		if rel != "" {
 			child = rel + "/" + name
 		}
-		var st unix.Stat_t
-		if err := unix.Fstatat(dirFD, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		pfd, err := unix.Openat(dirFD, name, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if err != nil {
 			w.special++
 			continue
 		}
-		e := mirrorEntry{rel: child, perm: st.Mode & 0o777, uid: st.Uid, gid: st.Gid}
-		if w.points[w.mount.path+"/"+child] {
-			// Another mount's place, which that mount fills if the guest
-			// gets it.
-			e.kind, e.place = mirrorFile, true
-			if st.Mode&unix.S_IFMT == unix.S_IFDIR {
-				e.kind = mirrorDir
-			}
-			if err := w.add(e); err != nil {
-				return err
-			}
-			continue
-		}
-		switch st.Mode & unix.S_IFMT {
-		case unix.S_IFDIR:
-			fd, err := unix.Openat(dirFD, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-			if err != nil {
-				w.special++
-				continue
-			}
-			sub := os.NewFile(uintptr(fd), name)
-			e.kind = mirrorDir
-			err = w.add(e)
-			if err == nil {
-				err = w.dir(sub, child)
-			}
-			sub.Close()
-			if err != nil {
-				return err
-			}
-		case unix.S_IFREG:
-			if st.Size > mirrorFileMaxBytes {
-				return errMirrorTooLarge
-			}
-			fd, err := unix.Openat(dirFD, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
-			if err != nil {
-				w.special++
-				continue
-			}
-			file := os.NewFile(uintptr(fd), name)
-			data, err := readMirrorData(file, mirrorFileMaxBytes)
-			file.Close()
-			if errors.Is(err, errMirrorTooLarge) {
-				return err
-			}
-			if err != nil {
-				w.special++
-				continue
-			}
-			e.kind, e.data = mirrorFile, data
-			if err := w.add(e); err != nil {
-				return err
-			}
-		case unix.S_IFLNK:
-			target, err := readlinkAt(dirFD, name)
-			if err != nil {
-				w.special++
-				continue
-			}
-			e.kind, e.target = mirrorLink, target
-			if err := w.add(e); err != nil {
-				return err
-			}
-		default:
-			w.special++
+		err = w.entry(pfd, name, child)
+		unix.Close(pfd)
+		if err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
+// entry reads the entry name, at child below the mount's root, which pfd
+// holds open with O_PATH, and opens it again for reading only once its type
+// is known to be a directory or a regular file.
+func (w *mirrorWalk) entry(pfd int, name, child string) error {
+	var st unix.Stat_t
+	if err := unix.Fstat(pfd, &st); err != nil {
+		w.special++
+		return nil
+	}
+	e := mirrorEntry{rel: child, perm: st.Mode & 0o777, uid: st.Uid, gid: st.Gid}
+	if w.points[w.mount.path+"/"+child] {
+		// Another mount's place, which that mount fills if the guest gets
+		// it.
+		e.kind, e.place = mirrorFile, true
+		if st.Mode&unix.S_IFMT == unix.S_IFDIR {
+			e.kind = mirrorDir
+		}
+		return w.add(e)
+	}
+	switch st.Mode & unix.S_IFMT {
+	case unix.S_IFDIR:
+		sub, err := reopenMirrorFD(pfd, unix.O_RDONLY|unix.O_DIRECTORY, name)
+		if err != nil {
+			w.special++
+			return nil
+		}
+		defer sub.Close()
+		e.kind = mirrorDir
+		if err := w.add(e); err != nil {
+			return err
+		}
+		return w.dir(sub, child)
+	case unix.S_IFREG:
+		if st.Size > mirrorFileMaxBytes {
+			return errMirrorTooLarge
+		}
+		file, err := reopenMirrorFD(pfd, unix.O_RDONLY|unix.O_NONBLOCK, name)
+		if err != nil {
+			w.special++
+			return nil
+		}
+		data, err := readMirrorData(file, mirrorFileMaxBytes)
+		file.Close()
+		if errors.Is(err, errMirrorTooLarge) {
+			return err
+		}
+		if err != nil {
+			w.special++
+			return nil
+		}
+		e.kind, e.data, e.state = mirrorFile, data, fileStateOf(&st)
+		return w.add(e)
+	case unix.S_IFLNK:
+		// An O_PATH descriptor of a link names the link itself, which
+		// readlinkat reads with an empty name.
+		target, err := readlinkAt(pfd, "")
+		if err != nil {
+			w.special++
+			return nil
+		}
+		e.kind, e.target = mirrorLink, target
+		return w.add(e)
+	}
+	w.special++
+	return nil
+}
+
 // readlinkAt returns the target of the symbolic link name in the directory
-// dirFD.
+// dirFD, or of the link dirFD holds with O_PATH when name is empty.
 func readlinkAt(dirFD int, name string) (string, error) {
 	for size := 256; size <= 1<<16; size *= 4 {
 		buf := make([]byte, size)
@@ -544,9 +605,9 @@ func (m *mountMirror) number() {
 			if mm.dir {
 				w.path, w.guest = mm.path+"/"+e.rel, stage+"/"+e.rel
 			}
-			if state, ok := statMirrorFile(w.path); ok {
-				w.state = state
-			}
+			// The state comes from the open that read data, so a change
+			// after that read still differs from it.
+			w.state = e.state
 			e.watch = w.number
 			m.watched = append(m.watched, w)
 		}
@@ -610,32 +671,37 @@ func statMirrorFile(p string) (fileState, bool) {
 	if err := unix.Fstat(fd, &st); err != nil || st.Mode&unix.S_IFMT != unix.S_IFREG {
 		return fileState{}, false
 	}
-	return fileState{dev: uint64(st.Dev), ino: st.Ino, size: st.Size, modTimeNs: st.Mtim.Nano()}, true //nolint:unconvert // the widths differ by architecture
+	return fileStateOf(&st), true
 }
 
 // readMirrorFile reads the regular file at p, at most max bytes of it,
-// without following a symbolic link, and returns its state and permission
-// bits as it was read.
+// without following a symbolic link and without opening anything but a
+// regular file for reading (see reopenMirrorFD), and returns its state and
+// permission bits as it was read.
 func readMirrorFile(p string, max int64) ([]byte, fileState, uint32, error) {
-	fd, err := openat2Retry(unix.AT_FDCWD, p, &unix.OpenHow{
-		Flags:   unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_CLOEXEC | unix.O_NONBLOCK,
+	pfd, err := openat2Retry(unix.AT_FDCWD, p, &unix.OpenHow{
+		Flags:   unix.O_PATH | unix.O_NOFOLLOW | unix.O_CLOEXEC,
 		Resolve: unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS,
 	})
 	if err != nil {
 		return nil, fileState{}, 0, err
 	}
-	f := os.NewFile(uintptr(fd), p)
-	defer f.Close()
+	defer unix.Close(pfd)
 	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
+	if err := unix.Fstat(pfd, &st); err != nil {
 		return nil, fileState{}, 0, err
 	}
 	if st.Mode&unix.S_IFMT != unix.S_IFREG {
 		return nil, fileState{}, 0, errNotRegular
 	}
+	f, err := reopenMirrorFD(pfd, unix.O_RDONLY|unix.O_NONBLOCK, p)
+	if err != nil {
+		return nil, fileState{}, 0, err
+	}
+	defer f.Close()
 	data, err := readMirrorData(f, max)
 	if err != nil {
 		return nil, fileState{}, 0, err
 	}
-	return data, fileState{dev: uint64(st.Dev), ino: st.Ino, size: st.Size, modTimeNs: st.Mtim.Nano()}, st.Mode & 0o777, nil //nolint:unconvert // the widths differ by architecture
+	return data, fileStateOf(&st), st.Mode & 0o777, nil
 }

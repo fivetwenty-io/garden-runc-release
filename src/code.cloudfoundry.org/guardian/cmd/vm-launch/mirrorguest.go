@@ -28,6 +28,25 @@ func fileBadTag(nonce string) string { return "RVM_FILEBAD_" + nonce + "=" }
 // guest that never says so (see mountMirror.guestSetup).
 func fileOnTag(nonce string) string { return "RVM_FILEON_" + nonce }
 
+// mirrorOffTag returns the tag of the console output line, before the start
+// tag, with which a stack guest that fell back to the busybox guest says that
+// it removed its mirrored mounts (see mountMirror.fallbackPrep).
+func mirrorOffTag(nonce string) string { return "RVM_MIRROROFF_" + nonce }
+
+// fallbackPrep is the commands with which a stack guest that falls back to
+// the busybox guest removes the staged copies of its mirrored mounts and
+// says so on the console. The busybox guest runs its command as root on the
+// initramfs, where the copies are, so it gets none of them, as it gets none
+// at launch. A nil mirror has no commands, which leaves the fallback as it
+// is without mirrored mounts.
+func (m *mountMirror) fallbackPrep(nonce string) string {
+	if m == nil {
+		return ""
+	}
+	return "rm -rf " + guestMirrorStage + " " + guestMirrorNext + ` || rvm_fail "removing the mirrored mounts for the busybox guest failed"
+echo ` + mirrorOffTag(nonce) + " >/dev/console 2>/dev/null || echo " + mirrorOffTag(nonce) + "\n"
+}
+
 // Symlink adds a symbolic link to target.
 func (c *cpioWriter) Symlink(name, target string) error {
 	return c.ownedSymlink(name, target, 0, 0)
