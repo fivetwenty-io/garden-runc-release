@@ -504,9 +504,9 @@ func initScript(nonce string, volume bool) string {
 	return stage2Script(nonce, volume, false, "", "")
 }
 
-// stackInitScript is the guest /rvm/init of a guest with a stack, which
-// guestStackInit runs on the initramfs. It is initScript without volumes and
-// with three differences. It mounts no /dev/shm of its own, because the app
+// stackInitScript is the guest /rvm/init of a guest with a stack and no
+// volumes, which guestStackInit runs on the initramfs. It is initScript
+// without volumes and with three differences. It mounts no /dev/shm of its own, because the app
 // sees only the one stage 1 mounted in the app root. It checks /rvm/argv and
 // /rvm/cwd after /rvm/env (see guestStackChecks). And it runs the launcher
 // in the app root (see guestStackRunCommand) in place of /rvm/cmd.
@@ -518,7 +518,10 @@ func stackInitScript(nonce string) string {
 // run section (see guestRunSection), stage 2 adds checks to its setup steps
 // and runs the section after the start tag in place of the command, its
 // status, and the stop reader, whose part the section's control reader
-// takes.
+// takes. A stack guest with volumes mounts them as initScript does, binds
+// them into the app root, and unbinds them in its teardown (see
+// guestStackVolumeSetup, guestStackVolumeBinds, and
+// guestStackVolumeTeardown).
 func stage2Script(nonce string, volume, stack bool, checks, section string) string {
 	setup := guestFailFunc + guestConsoleSetup
 	if !stack {
@@ -531,7 +534,10 @@ func stage2Script(nonce string, volume, stack bool, checks, section string) stri
 		command = guestStackRunCommand
 	}
 	setup += checks
-	if volume {
+	switch {
+	case volume && stack:
+		setup += guestStackVolumeSetup + guestStackVolumeBinds
+	case volume:
 		setup += guestVolumeSetup
 	}
 	run := guestListenWatch(nonce)
@@ -542,7 +548,10 @@ func stage2Script(nonce string, volume, stack bool, checks, section string) stri
 		run += section
 	}
 	run += guestListenStop + guestOOMReport(nonce)
-	if volume {
+	switch {
+	case volume && stack:
+		run += guestStackVolumeTeardown
+	case volume:
 		run += guestVolumeTeardown
 	}
 	exit := "echo " + exitTag(nonce) + "$rvm_status"
@@ -1429,7 +1438,14 @@ const (
 // adds little to the teardown's time, because it writes what the later
 // flush would otherwise write, and a deadline that ends the guest during
 // the waits loses only what the leftover processes wrote after it.
-const guestVolumeTeardown = guestOtherProcesses + `rvm_vi=$RVM_VOLUMES
+const guestVolumeTeardown = guestVolumeTeardownStop + guestVolumeTeardownUnmount
+
+// guestVolumeTeardownStop is the part of guestVolumeTeardown that flushes the
+// drive volumes early and stops the processes the command left. It ends by
+// clearing rvm_vbad, which guestVolumeTeardownUnmount sets for a volume that
+// does not flush or unmount, and which the stack guest's teardown also sets
+// for a bind that does not unmount (see guestStackVolumeTeardown).
+const guestVolumeTeardownStop = guestOtherProcesses + `rvm_vi=$RVM_VOLUMES
 while [ "$rvm_vi" -gt 0 ]; do
 	rvm_vi=$((rvm_vi - 1))
 	eval "rvm_vkind=\${RVM_VOL${rvm_vi}_KIND:-} rvm_vpath=\$RVM_VOL${rvm_vi}_PATH"
@@ -1452,7 +1468,11 @@ while [ "$rvm_n" -lt ` + guestTeardownKillPolls + ` ] && rvm_others; do
 done
 rvm_others && echo "vm-launch guest: processes were still running ` + guestTeardownKillSeconds + ` second after SIGKILL, so what they write after the flush may be lost"
 rvm_vbad=
-for rvm_vpass in drive other; do
+`
+
+// guestVolumeTeardownUnmount is the part of guestVolumeTeardown that flushes
+// and unmounts every volume and decides the status.
+const guestVolumeTeardownUnmount = `for rvm_vpass in drive other; do
 	rvm_vi=$RVM_VOLUMES
 	while [ "$rvm_vi" -gt 0 ]; do
 		rvm_vi=$((rvm_vi - 1))
@@ -1838,12 +1858,10 @@ const maxGuestHostnameBytes = 64
 // the 2 MiB that the launcher's execve can carry with the default stack
 // limit. The argv must not be empty, the working directory must be an
 // absolute path that the guest's $(cat) reads back unchanged, and the
-// hostname must be one hostname -F sets as it is. The stack guest mounts no
-// volumes while stackModeAllowsVolumes is false, so volumes are an error.
-func (s *guestStack) check(volumes int) error {
+// hostname must be one hostname -F sets as it is. Which volumes the stack
+// guest mounts is checkStackVolumes's to decide.
+func (s *guestStack) check() error {
 	switch {
-	case volumes > 0 && !stackModeAllowsVolumes:
-		return fmt.Errorf("a guest with a stack mounts no volumes, and this one has %d", volumes)
 	case s.launcher.file == nil || s.launcher.size <= 0:
 		return errors.New("a guest with a stack needs the launcher, and it has none")
 	case s.argv == "":
@@ -2164,10 +2182,11 @@ func addSeals(f *os.File, seals int) error {
 // launcher at /rvm/lifecycle/launcher, /rvm/argv, /rvm/cwd, /rvm/hosts, and
 // /rvm/hostname, with each sidecar's files and the identity pair when it has
 // them, and its two stages are guestStackInit and the stack's stage 2 (see
-// guestStack.initScript).
+// guestStack.initScriptWithVolumes).
 // A hard open-files limit of 0 is an error, because it is a limit no caller
 // can have meant: vm-launch itself could not run under it. So are drives
-// that disksFile rejects and a stack that guestStack.check rejects.
+// that disksFile rejects, a stack that guestStack.check rejects, and a stack
+// guest with volumes that checkStackVolumes rejects.
 func writeInitramfs(dst *os.File, busyboxPath string, g guestContents) error {
 	if g.nw == nil {
 		return errors.New("writing the initramfs: no guest network")
@@ -2208,10 +2227,13 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, g 
 	}
 	stage1, stage2 := guestRootInit, initScript(g.nonce, len(g.vols) > 0)
 	if g.stack != nil {
-		if err := g.stack.check(len(g.vols)); err != nil {
+		if err := g.stack.check(); err != nil {
 			return err
 		}
-		stage1, stage2 = guestStackInit, g.stack.initScript(g.nonce)
+		if err := checkStackVolumes(g); err != nil {
+			return err
+		}
+		stage1, stage2 = guestStackInit, g.stack.initScriptWithVolumes(g.nonce, len(g.vols) > 0)
 	}
 	steps := []func() error{
 		func() error { return cw.Dir("bin", 0o755) },
@@ -2253,7 +2275,7 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, g 
 	}
 	if g.stack != nil {
 		steps = append(steps, g.stack.archiveSteps(cw, file)...)
-		steps = append(steps, g.stack.fallbackSteps(cw, file, g.nonce)...)
+		steps = append(steps, g.stack.fallbackSteps(cw, file, g.nonce, len(g.vols) > 0)...)
 	} else {
 		steps = append(steps, g.systemCerts.busyboxSteps(cw)...)
 	}

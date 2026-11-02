@@ -4,11 +4,6 @@ package main
 
 import "strings"
 
-// stackModeAllowsVolumes reports whether an app with a volume may boot the
-// stack guest. Until stage 2 binds each volume into the app root and unbinds
-// it before the volume teardown, a volume app keeps the busybox guest.
-const stackModeAllowsVolumes = false
-
 // Paths of the stack guest. The app root is where stage 1 assembles the
 // stack, the droplet, and their writable layers, and where stage 2 runs the
 // app through chroot. The initramfs holds the launcher below guestLifecycle,
@@ -46,17 +41,22 @@ const (
 )
 
 // guestFallbackFunc defines rvm_fallback, which stage 1 calls with the
-// reason when the stack or the droplet image cannot be used. Without the
-// fallback files it is rvm_fail. With them, it prints the reason as
+// reason when the stack or the droplet image cannot be used, and then with
+// its own arguments, which are the volumes' devices. Without the fallback
+// files it is rvm_fail. With them, it prints the reason as
 // "busybox guest: <reason>" on the console, which is the mode line of a
 // launch that settled on the busybox guest, unmounts what stage 1 mounted of
 // the images, and replaces the guest's stage 2 and environment with the
 // busybox guest's. A guest with a root disk then enters the overlay root on
 // the formatted disk as guestRootSetup does, and a guest without one runs
-// stage 2 on the initramfs. Both end in exec, so the function never returns.
+// stage 2 on the initramfs. Either way the busybox guest's stage 2 gets the
+// volumes' devices, as it does from guestRootInit, and mounts the volumes
+// itself. Both end in exec, so the function never returns.
 const guestFallbackFunc = `rvm_fallback() {
-	[ -r ` + guestFallbackInit + ` ] || rvm_fail "$1"
-	echo "busybox guest: $1" >/dev/console 2>/dev/null || echo "busybox guest: $1"
+	rvm_why=$1
+	shift
+	[ -r ` + guestFallbackInit + ` ] || rvm_fail "$rvm_why"
+	echo "busybox guest: $rvm_why" >/dev/console 2>/dev/null || echo "busybox guest: $rvm_why"
 	umount /rvm/droplet /rvm/stack 2>/dev/null
 	cp ` + guestFallbackInit + ` ` + guestStage2 + ` && cp ` + guestFallbackEnv + ` /rvm/env && . ` + guestFallbackPrep + ` || rvm_fail "installing the busybox guest's files failed"
 	if [ -n "$rvm_root" ]; then
@@ -66,9 +66,9 @@ const guestFallbackFunc = `rvm_fallback() {
 			mount -o move "/$rvm_m" "/rvm/root/$rvm_m" || rvm_fail "moving /$rvm_m into the overlay root of the busybox guest failed"
 		done
 		cd /rvm/root && mount -o move . / || rvm_fail "moving the overlay root of the busybox guest onto / failed"
-		exec chroot . /bin/sh ` + guestStage2 + `
+		exec chroot . /bin/sh ` + guestStage2 + ` "$@"
 	fi
-	exec /bin/sh ` + guestStage2 + `
+	exec /bin/sh ` + guestStage2 + ` "$@"
 }
 `
 
@@ -123,7 +123,9 @@ const guestRootFormat = `	dd if="$rvm_root" of=` + guestRootHead + ` bs=4096 cou
 // Every step that fails calls rvm_fail with a line that names it, so the
 // boot ends before stage 2 and vm-launch shows the console. The three steps
 // that find the stack or the droplet unusable call rvm_fallback instead,
-// which is rvm_fail in a guest that cannot fall back.
+// which is rvm_fail in a guest that cannot fall back, and pass it the
+// volumes' devices that stage 1 holds as its arguments. The volumes are
+// stage 2's to mount in either guest, so the branch never touches them.
 const guestStackSetup = guestFallbackFunc + `[ -n "${rvm_stack:-}" ] || rvm_fail "/rvm/disks names no stack drive, so the guest has no stack to run the app on"
 [ -n "${rvm_droplet:-}" ] || rvm_fail "/rvm/disks names no droplet drive, so the guest has no droplet to run"
 [ -n "$rvm_devtmpfs" ] || rvm_fail "mounting devtmpfs at /dev failed"
@@ -135,9 +137,9 @@ else
 fi
 mkdir /rvm/disk/upper /rvm/disk/work /rvm/disk/home-upper /rvm/disk/home-work || rvm_fail "creating the overlay directories failed"
 chown ` + guestAppUID + `:` + guestAppUID + ` /rvm/disk/home-upper || rvm_fail "giving the upper directory of /home/vcap to uid ` + guestAppUID + ` failed"
-mount -t squashfs -o ro "$rvm_stack" /rvm/stack || rvm_fallback "mounting the stack image $rvm_stack failed; the guest kernel needs squashfs with lz4"
-mount -t squashfs -o ro "$rvm_droplet" /rvm/droplet || rvm_fallback "mounting the droplet image $rvm_droplet failed; the guest kernel needs squashfs with lz4"
-[ -d /rvm/stack/home/vcap ] || rvm_fallback "the stack image has no /home/vcap directory to lay the droplet over"
+mount -t squashfs -o ro "$rvm_stack" /rvm/stack || rvm_fallback "mounting the stack image $rvm_stack failed; the guest kernel needs squashfs with lz4" "$@"
+mount -t squashfs -o ro "$rvm_droplet" /rvm/droplet || rvm_fallback "mounting the droplet image $rvm_droplet failed; the guest kernel needs squashfs with lz4" "$@"
+[ -d /rvm/stack/home/vcap ] || rvm_fallback "the stack image has no /home/vcap directory to lay the droplet over" "$@"
 mount -t overlay -o lowerdir=/rvm/stack,upperdir=/rvm/disk/upper,workdir=/rvm/disk/work overlay ` + guestAppRoot + ` || rvm_fail "mounting the app root overlay over the stack failed; the guest kernel needs overlayfs"
 mount -t overlay -o lowerdir=/rvm/droplet:/rvm/stack/home/vcap,upperdir=/rvm/disk/home-upper,workdir=/rvm/disk/home-work overlay ` + guestAppRoot + `/home/vcap || rvm_fail "mounting the droplet overlay at /home/vcap in the app root failed"
 mkdir -p ` + guestAppRoot + `/proc ` + guestAppRoot + `/sys ` + guestAppRoot + `/dev ` + guestAppRoot + `/tmp/lifecycle || rvm_fail "creating the mount points in the app root failed"
@@ -177,9 +179,17 @@ func (s *guestStack) hasAppRoot() bool { return s != nil }
 // stack guest runs stackInitScript, whose app shares the console with stage
 // 2.
 func (s *guestStack) initScript(nonce string) string {
+	return s.initScriptWithVolumes(nonce, false)
+}
+
+// initScriptWithVolumes is initScript for a guest that mounts volumes when
+// volume is set. Stage 2 then mounts them as the busybox guest's does and
+// binds each into the app root, and its teardown unbinds them before it
+// unmounts them (see guestStackVolumeBinds and guestStackVolumeTeardown).
+func (s *guestStack) initScriptWithVolumes(nonce string, volume bool) string {
 	certs := guestSystemCertsSetup(s.systemCerts)
 	if len(s.sidecars) == 0 && s.identity == nil {
-		return stage2Script(nonce, false, true, certs, "")
+		return stage2Script(nonce, volume, true, certs, "")
 	}
 	procs := s.processes()
 	checks := guestSidecarChecks(len(s.sidecars))
@@ -187,7 +197,7 @@ func (s *guestStack) initScript(nonce string) string {
 		checks += guestIdentityEchoCheck(nonce)
 	}
 	checks += certs + guestRunSetup(s.identity != nil, procs)
-	return stage2Script(nonce, false, true, checks, guestRunSection(nonce, procs, s.identity != nil, stackExec))
+	return stage2Script(nonce, volume, true, checks, guestRunSection(nonce, procs, s.identity != nil, stackExec))
 }
 
 // processes returns the app, from /rvm/argv and the guest environment, and
@@ -245,15 +255,16 @@ func guestSidecarChecks(sidecars int) string {
 }
 
 // fallbackSteps adds, for a guest that can fall back to the busybox guest,
-// the busybox guest's stage 2 for nonce, its environment with mode 0600, and
-// the commands that install its trusted certificates, below guestFallbackDir.
-func (s *guestStack) fallbackSteps(cw *cpioWriter, file func(name string, perm uint32, content string) func() error, nonce string) []func() error {
+// the busybox guest's stage 2 for nonce, which mounts the volumes when volume
+// is set, its environment with mode 0600, and the commands that install its
+// trusted certificates, below guestFallbackDir.
+func (s *guestStack) fallbackSteps(cw *cpioWriter, file func(name string, perm uint32, content string) func() error, nonce string, volume bool) []func() error {
 	if !s.fallback {
 		return nil
 	}
 	return []func() error{
 		func() error { return cw.Dir(strings.TrimPrefix(guestFallbackDir, "/"), 0o755) },
-		file(strings.TrimPrefix(guestFallbackInit, "/"), 0o755, initScript(nonce, false)),
+		file(strings.TrimPrefix(guestFallbackInit, "/"), 0o755, initScript(nonce, volume)),
 		file(strings.TrimPrefix(guestFallbackEnv, "/"), 0o600, s.fallbackEnv),
 		file(strings.TrimPrefix(guestFallbackPrep, "/"), 0o644, s.systemCerts.fallbackPrep()),
 	}
