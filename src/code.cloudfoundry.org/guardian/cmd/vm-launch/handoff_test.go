@@ -640,22 +640,30 @@ var _ = Describe("the supervisor's handoff", func() {
 
 	It("keeps the console for a later signal's stop request and for pushes when the handoff's stop request times out", func(ctx SpecContext) {
 		gate := filepath.Join(dir, "gate")
-		filled := make(chan error, 1)
-		later := make(chan error, 1)
-		last := "RVM_CRED_" + testNonce + "=end 1"
+		pushed := make(chan error, 1)
+		var fill []string
+		// The push after the handoff has three chunks with pauses between
+		// them.
+		later := append(pushLines(5), "RVM_CRED_"+testNonce+"=end 1")
 		sup.onConsole = func(w *consoleWriter) {
 			// Nothing reads the guest's console until the gate opens, so a
-			// push far bigger than the pipe fills it, and the handoff's stop
-			// request then finds no room and runs out its deadline.
-			w.pace = 0
-			go func() { filled <- w.push(pushLines(2000)) }()
+			// push twice the size of the pipe fills it, and the handoff's
+			// stop request then finds no room and runs out its deadline. The
+			// fill's chunk deadline is far off, so only the stop request
+			// ends its blocked write, however late the handoff comes.
+			w.pace, w.chunkTimeout = 0, time.Minute
+			fill = fillLines(w.f)
+			filled := make(chan error, 1)
+			go func() { filled <- w.push(fill) }()
 			go func() {
 				defer GinkgoRecover()
 				time.Sleep(300 * time.Millisecond)
 				Expect(offer(5 * time.Second)).To(BeTrue())
 				Eventually(logBuf.String, 5*time.Second).Should(ContainSubstring("but sending the stop request"))
+				Eventually(filled, 5*time.Second).Should(Receive(MatchError(errConsoleStopped)))
 				appendTo(gate, "go\n")
-				later <- w.push([]string{last})
+				w.pace = 20 * time.Millisecond
+				pushed <- w.push(later)
 				signals <- syscall.SIGTERM
 			}()
 		}
@@ -670,14 +678,13 @@ var _ = Describe("the supervisor's handoff", func() {
 		Expect(codeOf(res)).To(Equal(0), logBuf.String())
 		Expect(res.handedOff).To(BeFalse())
 		Expect(res.received).To(Equal(syscall.SIGTERM))
-		Expect(filled).To(Receive(MatchError(errConsoleStopped)))
-		Expect(later).To(Receive(BeNil()))
+		Expect(pushed).To(Receive(BeNil()))
 		got, err := os.ReadFile(stdin)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(string(got)).To(HaveSuffix(last + "\n" + stopLine))
-		before := got[:len(got)-len(last)-1-len(stopLine)]
+		Expect(string(got)).To(HaveSuffix(string(joinLines(later)) + stopLine))
+		before := got[:len(got)-len(joinLines(later))-len(stopLine)]
 		Expect(len(before) % consoleChunk).To(BeZero())
-		Expect(joinLines(pushLines(2000))).To(HavePrefix(string(before)))
+		Expect(joinLines(fill)).To(HavePrefix(string(before)))
 		Expect(logBuf.String()).To(MatchRegexp(`^` + regexp.QuoteMeta(reason) + `, but sending the stop request to the guest failed: write \S+: i/o timeout; this instance keeps the volumes until it is stopped\nreceived terminated, asking the guest command to stop\n$`))
 	}, SpecTimeout(handoffSpecTimeout))
 

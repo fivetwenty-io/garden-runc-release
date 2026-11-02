@@ -43,6 +43,9 @@ type consoleWriter struct {
 	f     *os.File
 	chunk int
 	pace  time.Duration
+	// chunkTimeout bounds the write of one chunk, so that a push never
+	// waits for good on a guest that reads none of its console.
+	chunkTimeout time.Duration
 
 	// stopping is set when stop or close begins, before either takes the
 	// lock, so that a push gives way between chunks.
@@ -61,7 +64,7 @@ type consoleWriter struct {
 }
 
 func newConsoleWriter(f *os.File) *consoleWriter {
-	return &consoleWriter{f: f, chunk: consoleChunk, pace: consolePace, wake: make(chan struct{})}
+	return &consoleWriter{f: f, chunk: consoleChunk, pace: consolePace, chunkTimeout: stopRequestTimeout, wake: make(chan struct{})}
 }
 
 // push writes lines, each followed by a newline, in paced chunks. It fails
@@ -97,7 +100,7 @@ func (w *consoleWriter) writeChunk(c []byte) error {
 	if w.done || w.stopping.Load() {
 		return errConsoleStopped
 	}
-	if err := w.f.SetWriteDeadline(time.Now().Add(stopRequestTimeout)); err != nil && !errors.Is(err, os.ErrNoDeadline) {
+	if err := w.f.SetWriteDeadline(time.Now().Add(w.chunkTimeout)); err != nil && !errors.Is(err, os.ErrNoDeadline) {
 		return err
 	}
 	// A stop that began after the check above moves the deadline into the
