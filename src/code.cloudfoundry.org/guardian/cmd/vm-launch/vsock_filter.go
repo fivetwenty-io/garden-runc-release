@@ -15,12 +15,13 @@ import (
 )
 
 // When the operator denies vsock sockets to container processes, Garden's
-// seccomp profiles deny socket(AF_VSOCK) to every container but a vm-qemu
-// container with the guest agent, whose vm-launch relays cf ssh sessions to
-// the agent over vsock. The profile belongs to the whole container, so Garden
-// runs every other process there through denyVsockCommand, and passes
-// denyChildVsockFlag to the wrapped vm-launch, which then starts each of its
-// own children under the same filter. Only vm-launch itself keeps the call.
+// seccomp profiles deny socket(AF_VSOCK) and io_uring to every container but
+// a vm-qemu container with the guest agent, whose vm-launch relays cf ssh
+// sessions to the agent over vsock. The profile belongs to the whole
+// container, so Garden runs every other process there, the container's init
+// included, through denyVsockCommand, and passes denyChildVsockFlag to the
+// wrapped vm-launch, which then starts each of its own children under the
+// same filter. Only vm-launch itself keeps the call.
 
 // denyVsockCommand is the command that installs the filter and then execs
 // the command after "--" (see runDenyVsock). Garden names it
@@ -61,16 +62,20 @@ type vsockFilterArch struct {
 	socket []uint32
 	// socketcall is the number of socketcall(2), or 0 where there is none.
 	socketcall uint32
+	// ioUringSetup lists the numbers of io_uring_setup(2). An io_uring can
+	// create a socket in the kernel without the socket(2) call that the
+	// filter sees, so the filter refuses the ring itself.
+	ioUringSetup []uint32
 }
 
 // vsockFilterArches are x86-64 with its x32 calls, i386, which an x86-64
 // kernel runs 32-bit programs with, arm64, and 32-bit arm, which an arm64
 // kernel may run.
 var vsockFilterArches = []vsockFilterArch{
-	{arch: unix.AUDIT_ARCH_X86_64, socket: []uint32{41, x32SyscallBit | 41}},
-	{arch: unix.AUDIT_ARCH_I386, socket: []uint32{359}, socketcall: 102},
-	{arch: unix.AUDIT_ARCH_AARCH64, socket: []uint32{198}},
-	{arch: auditArchARM, socket: []uint32{281}},
+	{arch: unix.AUDIT_ARCH_X86_64, socket: []uint32{41, x32SyscallBit | 41}, ioUringSetup: []uint32{425, x32SyscallBit | 425}},
+	{arch: unix.AUDIT_ARCH_I386, socket: []uint32{359}, socketcall: 102, ioUringSetup: []uint32{425}},
+	{arch: unix.AUDIT_ARCH_AARCH64, socket: []uint32{198}, ioUringSetup: []uint32{425}},
+	{arch: auditArchARM, socket: []uint32{281}, ioUringSetup: []uint32{425}},
 }
 
 // vsockFilter returns the classic BPF program of the seccomp filter that
@@ -79,9 +84,12 @@ var vsockFilterArches = []vsockFilterArch{
 // are AF_VSOCK, whatever the high bits hold, because the kernel reads only the
 // low bits. An i386 socketcall(2) that creates a socket fails for every
 // domain, because its arguments sit in memory that the filter cannot read;
-// i386 programs on current kernels call socket(2) itself. Every other call,
-// and every call of another architecture, goes on to the filters already
-// installed.
+// i386 programs on current kernels call socket(2) itself. io_uring_setup(2)
+// fails with EPERM too. Every other call, and every call of another
+// architecture, goes on to the filters already installed. Garden's profile
+// for the container leaves out i386 and x32, which kills a call made through
+// either before this filter decides anything, so the filter's rules for them
+// matter only where the filter runs under another profile.
 func vsockFilter() []bpf.Instruction {
 	const (
 		domainLabel     = "domain"
@@ -116,6 +124,9 @@ func vsockFilter() []bpf.Instruction {
 		}
 		if a.socketcall != 0 {
 			jumpIf(a.socketcall, socketcallLabel, "")
+		}
+		for _, nr := range a.ioUringSetup {
+			jumpIf(nr, denyLabel, "")
 		}
 		emit(bpf.RetConstant{Val: unix.SECCOMP_RET_ALLOW})
 	}
@@ -171,11 +182,31 @@ func installVsockFilter(flags uintptr) error {
 	if err := setNoNewPrivs(); err != nil {
 		return err
 	}
-	if _, _, errno := unix.Syscall(unix.SYS_SECCOMP, unix.SECCOMP_SET_MODE_FILTER, flags, uintptr(unsafe.Pointer(&prog))); errno != 0 {
+	r1, _, errno := unix.Syscall(unix.SYS_SECCOMP, unix.SECCOMP_SET_MODE_FILTER, flags, uintptr(unsafe.Pointer(&prog)))
+	return seccompInstalled(r1, errno)
+}
+
+// seccompInstalled turns what seccomp(SECCOMP_SET_MODE_FILTER) returned into
+// an error. With unix.SECCOMP_FILTER_FLAG_TSYNC, a thread that cannot take
+// the filter makes the call install nothing and return that thread's id with
+// no errno, so any result but 0 is a failure.
+func seccompInstalled(r1 uintptr, errno syscall.Errno) error {
+	if errno != 0 {
 		return fmt.Errorf("installing the vsock filter: %w", os.NewSyscallError("seccomp", errno))
+	}
+	if r1 != 0 {
+		return fmt.Errorf("installing the vsock filter: thread %d could not take it, so no thread has it", r1)
 	}
 	return nil
 }
+
+// vsockDenialError is a failure to install the filter for a child, which
+// startConfinedAs reports as a failure to deny vsock rather than one to
+// confine the child's capabilities.
+type vsockDenialError struct{ err error }
+
+func (e vsockDenialError) Error() string { return e.err.Error() }
+func (e vsockDenialError) Unwrap() error { return e.err }
 
 // denyThreadVsock installs the filter on the calling thread alone, so that a
 // process that thread starts runs under it while vm-launch keeps the call.
@@ -194,7 +225,10 @@ func withVsockDenial(prepare func() error, deny bool) func() error {
 				return err
 			}
 		}
-		return denyThreadVsock()
+		if err := denyThreadVsock(); err != nil {
+			return vsockDenialError{err: err}
+		}
+		return nil
 	}
 }
 
@@ -205,6 +239,11 @@ func withVsockDenial(prepare func() error, deny bool) func() error {
 // fails: 126 when the filter or the exec fails, and 127 when there is no
 // such command, as a shell does. It never runs the command without the
 // filter.
+//
+// The lookup is the one runc makes: exec.LookPath refuses, with exec.ErrDot,
+// a bare name that only a relative PATH entry such as "." finds, as runc's
+// does. A command that is missing fails here, with 127, once the process has
+// started, where runc would have failed to start the process.
 func runDenyVsock(argv []string) int {
 	if len(argv) < 2 || argv[0] != "--" {
 		fmt.Fprintf(os.Stderr, "vm-launch: %s: usage: %s -- PATH [ARG...]\n", denyVsockCommand, denyVsockCommand)

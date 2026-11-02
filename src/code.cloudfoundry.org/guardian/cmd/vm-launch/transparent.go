@@ -405,7 +405,10 @@ func startConfinedAs(cmd *exec.Cmd, prepare func() error, what string) (release 
 	go func() {
 		runtime.LockOSThread()
 		err := prepare()
-		if err != nil {
+		var denial vsockDenialError
+		if errors.As(err, &denial) {
+			err = fmt.Errorf("denying vsock sockets to %s: %w", what, denial.err)
+		} else if err != nil {
 			err = fmt.Errorf("confining %s's capabilities: %w", what, err)
 		} else {
 			err = cmd.Start()
