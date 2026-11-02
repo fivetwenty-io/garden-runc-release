@@ -940,10 +940,14 @@ type serialFilter struct {
 	credOKTag  []byte
 	credBadTag []byte
 	credOffTag []byte
+	fileOKTag  []byte
+	fileBadTag []byte
+	fileOnTag  []byte
 	logTag     []byte
 	firstTag   []byte
 	listen     func(port int, up bool)
 	credAck    func(seq int, ok bool)
+	fileAck    func(seq int, ok bool)
 	logs       func(index int, stream byte, line string)
 	firstExit  func(index, status int)
 
@@ -953,6 +957,7 @@ type serialFilter struct {
 	status   int
 	oomKills int
 	credOff  bool
+	fileOn   bool
 	writeErr error
 
 	// lineStart reports whether the console byte before pending ended a
@@ -1002,6 +1007,18 @@ func (f *serialFilter) onCredAck(nonce string, ack func(seq int, ok bool)) {
 	f.credBadTag = []byte(credBadTag(nonce))
 	f.credOffTag = []byte(credOffTag(nonce))
 	f.credAck = ack
+}
+
+// onFileAck makes the filter pass the guest's acknowledgements of pushes of
+// mirrored files to ack, with ok set for a file the guest installed, as
+// onCredAck does for the identity pushes. It also swallows the line before
+// the start tag with which the guest says that it takes those pushes (see
+// fileOnTag) and sets fileOn.
+func (f *serialFilter) onFileAck(nonce string, ack func(seq int, ok bool)) {
+	f.fileOKTag = []byte(fileOKTag(nonce))
+	f.fileBadTag = []byte(fileBadTag(nonce))
+	f.fileOnTag = []byte(fileOnTag(nonce))
+	f.fileAck = ack
 }
 
 // onFrames makes the filter split the guest's log frames and swallow its
@@ -1073,6 +1090,10 @@ func (f *serialFilter) processBoot(eof bool) {
 		}
 		if f.credOffTag != nil && bytes.Contains(line, f.credOffTag) {
 			f.credOff = true
+			continue
+		}
+		if f.fileOnTag != nil && bytes.Contains(line, f.fileOnTag) {
+			f.fileOn = true
 			continue
 		}
 		f.keepBootLog(line)
@@ -1153,6 +1174,8 @@ const (
 	lineListen
 	lineCredOK
 	lineCredBad
+	lineFileOK
+	lineFileBad
 	lineLog
 	lineFirst
 	lineKinds
@@ -1162,7 +1185,7 @@ const (
 // the command runs, other than the exit marker, with nil for a kind it does
 // not look for.
 func (f *serialFilter) lineTags() [lineKinds][]byte {
-	return [lineKinds][]byte{lineOOM: f.oomTag, lineListen: f.listenTag, lineCredOK: f.credOKTag, lineCredBad: f.credBadTag, lineLog: f.logTag, lineFirst: f.firstTag}
+	return [lineKinds][]byte{lineOOM: f.oomTag, lineListen: f.listenTag, lineCredOK: f.credOKTag, lineCredBad: f.credBadTag, lineFileOK: f.fileOKTag, lineFileBad: f.fileBadTag, lineLog: f.logTag, lineFirst: f.firstTag}
 }
 
 // indexLine returns the index in pending of the first tag of a line that the
@@ -1214,6 +1237,10 @@ func (f *serialFilter) processLine(kind, idx int, eof bool) bool {
 		return f.processCount(f.credOKTag, idx, eof, func(seq int) { f.credAck(seq, true) })
 	case lineCredBad:
 		return f.processCount(f.credBadTag, idx, eof, func(seq int) { f.credAck(seq, false) })
+	case lineFileOK:
+		return f.processCount(f.fileOKTag, idx, eof, func(seq int) { f.fileAck(seq, true) })
+	case lineFileBad:
+		return f.processCount(f.fileBadTag, idx, eof, func(seq int) { f.fileAck(seq, false) })
 	case lineLog:
 		return f.processFrame(idx, eof)
 	default:
@@ -1741,6 +1768,15 @@ type supervisor struct {
 	// goroutine. The writer refuses pushes once the stop request is written
 	// and once run returns.
 	onConsole func(w *consoleWriter)
+	// fileAck, when set, gets the guest's acknowledgements of pushes of
+	// mirrored files (see serialFilter). It must not block.
+	fileAck func(seq int, ok bool)
+	// onFileConsole, when set, gets the writer of the guest's console input
+	// as onConsole does, for the pushes of mirrored files, and only when the
+	// guest said before its start tag that it takes them (see fileOnTag).
+	// Otherwise the supervisor logs that the guest gets no changes to its
+	// mirrored files.
+	onFileConsole func(w *consoleWriter)
 	// reported, when set, runs once the supervisor has acted on the guest's
 	// status line, so a spec can send a signal that comes after it. It must
 	// not block. vm-launch leaves it unset.
@@ -1830,6 +1866,9 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 	if s.credAck != nil {
 		filter.onCredAck(nonce, s.credAck)
 	}
+	if s.fileAck != nil {
+		filter.onFileAck(nonce, s.fileAck)
+	}
 	type ended struct{ copyErr, waitErr error }
 	done := make(chan ended, 1)
 	go func() {
@@ -1918,6 +1957,14 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 				s.logger.Println("the guest could not turn off its console's echo, so vm-launch pushes it no instance identity pairs; identity rotation is off for this guest")
 			} else if s.onConsole != nil && !signalled && !isClosed(filter.exited) {
 				s.onConsole(stdin)
+			}
+			// A guest that could not turn off its echo, and a stack guest
+			// that fell back to the busybox guest, never says that it takes
+			// file pushes.
+			if s.onFileConsole != nil && (!filter.fileOn || filter.credOff) {
+				s.logger.Println("the guest did not say that it takes pushes of mirrored files, so vm-launch pushes it no changes to them; the guest keeps the copies it booted with")
+			} else if s.onFileConsole != nil && !signalled && !isClosed(filter.exited) {
+				s.onFileConsole(stdin)
 			}
 		case <-markerSeen:
 			markerSeen = nil

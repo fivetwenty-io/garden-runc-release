@@ -84,13 +84,31 @@ const guestAppRootEtc = "/rvm/app/etc"
 // pushes (see guestCredReader), unless the console still echoes its input
 // (see guestIdentityEchoCheck).
 func guestControlReader(nonce string, pidFiles []string, identity bool) string {
-	cred, match := "", ""
+	return guestControlReaderMirroring(nonce, pidFiles, identity, nil)
+}
+
+// guestControlReaderMirroring is guestControlReader for a guest that may
+// also take pushes of mirrored files, which the reader installs when mirror
+// has files to watch (see mountMirror.guestFileReader), unless the console
+// still echoes its input.
+func guestControlReaderMirroring(nonce string, pidFiles []string, identity bool, mirror *mountMirror) string {
+	cred, cases := "", ""
 	if identity {
 		prefix := credTag(nonce)
 		cred = guestCredReader(nonce)
+		cases = `		"` + prefix + `"*) [ -n "$rvm_echo" ] || rvm_cred "${rvm_line#"` + prefix + `"}" ;;
+`
+	}
+	if mirror.watching() {
+		prefix := fileTag(nonce)
+		cred += mirror.guestFileReader(nonce)
+		cases += `		"` + prefix + `"*) [ -n "$rvm_echo" ] || rvm_file "${rvm_line#"` + prefix + `"}" ;;
+`
+	}
+	match := ""
+	if cases != "" {
 		match = `		case "$rvm_line" in
-		"` + prefix + `"*) [ -n "$rvm_echo" ] || rvm_cred "${rvm_line#"` + prefix + `"}" ;;
-		esac
+` + cases + `		esac
 `
 	}
 	return `(

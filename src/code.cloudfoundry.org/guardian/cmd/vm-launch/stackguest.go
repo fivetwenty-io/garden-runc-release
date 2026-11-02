@@ -173,7 +173,10 @@ func (s *guestStack) hasAppRoot() bool { return s != nil }
 // well as, with an identity, whether the console still echoes. The boot
 // pair, the run section's FIFO, and the log FIFOs of every process are set
 // up before the start tag too (see guestRunSetup), and so are the trusted
-// certificate files, with or without the rest (see guestSystemCertsSetup).
+// certificate files, with or without the rest (see guestSystemCertsSetup),
+// and the mirrored mounts (see mountMirror.guestSetup). A guest that watches
+// mirrored files checks its console's echo as a guest with an identity
+// does.
 // The guest frames the output of every process (see guestProcessWrapper), so
 // no process holds the console, even an app that runs alone: none can read
 // the stop request or a pushed pair, and none can write a line that
@@ -200,15 +203,15 @@ func (s *guestStack) initScriptWithVolumes(nonce string, volume bool) string {
 	certs := guestSystemCertsSetup(s.systemCerts)
 	procs := s.processes()
 	checks := guestSidecarChecks(len(s.sidecars))
-	if s.identity != nil {
+	if s.identity != nil || s.mirror.watching() {
 		checks += guestIdentityEchoCheck(nonce)
 	}
-	checks += certs + guestRunSetup(s.identity != nil, procs)
+	checks += certs + s.mirror.guestSetup(nonce) + guestRunSetup(s.identity != nil, procs)
 	timeout := guestTimeoutSeconds
 	if volume {
 		timeout = guestVolumeTimeoutSeconds
 	}
-	return stage2Script(nonce, volume, true, checks, guestRunSectionWithin(nonce, procs, s.identity != nil, exec, timeout))
+	return stage2Script(nonce, volume, true, checks, guestRunSectionMirroring(nonce, procs, s.identity != nil, s.mirror, exec, timeout))
 }
 
 // processes returns the app, from /rvm/argv and the guest environment, and

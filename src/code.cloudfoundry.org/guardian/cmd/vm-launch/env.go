@@ -48,7 +48,8 @@ const (
 // sets its own PATH. CF_INSTANCE_CERT, CF_INSTANCE_KEY, and
 // CF_SYSTEM_CERT_PATH name container files, and SERVICE_BINDING_ROOT and
 // VCAP_SERVICES_FILE_PATH name file-based service bindings, which are in the
-// container and not in the guest. VCAP_PLATFORM_OPTIONS belongs to the
+// container and not in the guest unless the guest mirrors their mount (see
+// mountMirror.keptEnv). VCAP_PLATFORM_OPTIONS belongs to the
 // launcher, which unsets it before the app starts. CF_VM_SIDECARS is
 // vm-launch's own description of the sidecars, which the guest gets as files
 // (see sidecarGuestFiles). CF_VM_SIDECAR_RELAY marks a launcher process as a
@@ -238,6 +239,15 @@ func withEnvValue(env map[string]string, name, value string) map[string]string {
 	return withValue
 }
 
+// denylistKeeping returns deny without each of names, as a copy when names
+// is not empty.
+func denylistKeeping(deny map[string]bool, names []string) map[string]bool {
+	for _, name := range names {
+		deny = denylistWithout(deny, name)
+	}
+	return deny
+}
+
 // denylistWithout returns a copy of deny without name.
 func denylistWithout(deny map[string]bool, name string) map[string]bool {
 	kept := make(map[string]bool, len(deny))
@@ -264,7 +274,14 @@ func buildStackGuestEnv(env map[string]string, guestMiB int, identity bool, logg
 // holds the trusted certificate files at certDir, which it exports as
 // CF_SYSTEM_CERT_PATH (see buildGuestEnvWithCerts).
 func buildStackGuestEnvWithCerts(env map[string]string, guestMiB int, identity bool, certDir string, logger *log.Logger) (string, error) {
-	deny := stackGuestDenylist(identity)
+	return buildStackGuestEnvKeeping(env, guestMiB, identity, certDir, nil, logger)
+}
+
+// buildStackGuestEnvKeeping is buildStackGuestEnvWithCerts for a guest that
+// also keeps the denied variables in keep, which name paths in its mirrored
+// mounts (see mountMirror.keptEnv).
+func buildStackGuestEnvKeeping(env map[string]string, guestMiB int, identity bool, certDir string, keep []string, logger *log.Logger) (string, error) {
+	deny := denylistKeeping(stackGuestDenylist(identity), keep)
 	if identity {
 		env = withEnvValue(withEnvValue(env, instanceCertEnv, guestInstanceCertPath), instanceKeyEnv, guestInstanceKeyPath)
 	}

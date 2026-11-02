@@ -100,6 +100,13 @@ func guestRunSection(nonce string, procs []guestProcess, identity bool, exec gue
 // seconds, in the text the guest's shell takes, in place of
 // guestTimeoutSeconds.
 func guestRunSectionWithin(nonce string, procs []guestProcess, identity bool, exec guestExec, timeout string) string {
+	return guestRunSectionMirroring(nonce, procs, identity, nil, exec, timeout)
+}
+
+// guestRunSectionMirroring is guestRunSectionWithin for a guest whose
+// control reader also installs the pushes of mirrored files (see
+// guestControlReaderMirroring).
+func guestRunSectionMirroring(nonce string, procs []guestProcess, identity bool, mirror *mountMirror, exec guestExec, timeout string) string {
 	var b strings.Builder
 	b.WriteString(`command exec 4<>` + guestEvents + ` || rvm_fail "opening the event FIFO ` + guestEvents + ` failed"
 `)
@@ -107,7 +114,7 @@ func guestRunSectionWithin(nonce string, procs []guestProcess, identity bool, ex
 	for i, p := range procs {
 		pidFiles[i] = p.pidPath
 	}
-	b.WriteString(guestControlReader(nonce, pidFiles, identity))
+	b.WriteString(guestControlReaderMirroring(nonce, pidFiles, identity, mirror))
 	b.WriteString(guestFrameFunc(nonce) + guestDrainFunc)
 	b.WriteString("command exec 5>&1\n")
 	for _, p := range procs {

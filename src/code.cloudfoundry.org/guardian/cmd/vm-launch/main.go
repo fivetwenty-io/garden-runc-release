@@ -7,7 +7,7 @@
 //
 // Usage:
 //
-//	vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--max-vcpus N] [--artifacts DIR] -- PATH [ARGS...]
+//	vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--max-vcpus N] [--mirror-mounts] [--artifacts DIR] -- PATH [ARGS...]
 //
 // When PATH is the CF launcher ("launcher APP-DIR START-COMMAND ..."), the
 // guest runs START-COMMAND. Otherwise it runs PATH and ARGS, shell-quoted.
@@ -543,12 +543,18 @@ const volumeSyncMountsFlag = "volume-sync-mounts"
 // ignores it.
 const qemuSandboxFlag = "qemu-sandbox"
 
+// mirrorMountsFlag names the vm-launch flag with which the operator turns on
+// mirrored mounts: a guest with an app root then gets the container's small
+// read-only bind mounts at their own paths, by rule (see mountMirror). It is
+// off by default, and Garden renders it from a job property.
+const mirrorMountsFlag = "mirror-mounts"
+
 // maxVCPUsFlag names the vm-launch flag with which the operator caps the
 // guest's vCPU count. Zero, the default, leaves the count at the CPUs the
 // container may run on (see guestVCPUCount).
 const maxVCPUsFlag = "max-vcpus"
 
-const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--qemu-sandbox=OPTIONS] [--max-vcpus N] [--image-user USER [--image-default-env NAMES]] [--artifacts DIR] -- PATH [ARGS...]\n"
+const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--qemu-sandbox=OPTIONS] [--max-vcpus N] [--mirror-mounts] [--image-user USER [--image-default-env NAMES]] [--artifacts DIR] -- PATH [ARGS...]\n"
 
 type config struct {
 	backend   backend.Kind
@@ -582,6 +588,8 @@ type config struct {
 	// maxVCPUs is the operator's cap on the guest's vCPU count, or 0 for
 	// none (see maxVCPUsFlag).
 	maxVCPUs int
+	// mirrorMounts turns on mirrored mounts (see mirrorMountsFlag).
+	mirrorMounts bool
 	// image, when set, makes this a launch of the Docker image guest (see
 	// imageguest.go).
 	image *imageConfig
@@ -1033,34 +1041,48 @@ func run(argv []string, logger *log.Logger) int {
 	// the instance identity pair, and its environment keeps CF_INSTANCE_CERT
 	// and CF_INSTANCE_KEY only when the pair was read. The busybox guest
 	// refused sidecars in toBusybox, and it gets no pair.
+	//
+	// With --mirror-mounts, a guest with an app root also gets the
+	// container's mounts by rule, and its environment and every sidecar's
+	// keep the variables that name a path in them. The busybox guest gets
+	// none.
 	var identity *instanceIdentity
+	var mirror *mountMirror
 	if stack.hasAppRoot() {
 		if identity, err = readInstanceIdentity(env[instanceCertEnv], env[instanceKeyEnv]); err != nil {
 			logger.Print(err)
 			return exitLaunchError
 		}
+		if cfg.mirrorMounts {
+			if mirror, err = readMountMirror(mountInfoPath, mirrorDedicatedPaths(env, vols), logger); err != nil {
+				logger.Print(err)
+				return exitLaunchError
+			}
+		}
 		deny := stackGuestDenylist(identity != nil)
 		if stack.image != nil {
 			deny = imageGuestDenylist(identity != nil)
 		}
-		files, err := sidecarGuestFilesOf(sidecars, deny)
+		files, err := sidecarGuestFilesOf(sidecars, denylistKeeping(deny, mirror.keptEnv(env)))
 		if err != nil {
 			logger.Print(err)
 			return exitLaunchError
 		}
-		stack.sidecars, stack.identity, stack.systemCerts = files, identity, sysCerts
+		stack.sidecars, stack.identity, stack.systemCerts, stack.mirror = files, identity, sysCerts, mirror
 		guestMode += guestExtrasLine(sidecars, identity)
 	} else if len(sidecars) > 0 {
 		logger.Print(sidecarsRefusal(len(sidecars), "the stack guest has no app root"))
 		return exitLaunchError
+	} else if cfg.mirrorMounts {
+		logger.Print("the busybox guest has no app root, so vm-launch mirrors none of the container's mounts into it")
 	}
 	if stack != nil && stack.image != nil {
-		if envFile, err = buildImageGuestEnvWithCerts(withImageDefaults(env, cfg.image.defaultEnv, imgUser), memMiB, identity != nil, sysCerts.dirOf(), logger); err != nil {
+		if envFile, err = buildImageGuestEnvKeeping(withImageDefaults(env, cfg.image.defaultEnv, imgUser), memMiB, identity != nil, sysCerts.dirOf(), mirror.keptEnv(env), logger); err != nil {
 			logger.Print(err)
 			return exitLaunchError
 		}
 	} else if stack != nil {
-		if envFile, err = buildStackGuestEnvWithCerts(env, memMiB, identity != nil, sysCerts.dirOf(), logger); err != nil {
+		if envFile, err = buildStackGuestEnvKeeping(env, memMiB, identity != nil, sysCerts.dirOf(), mirror.keptEnv(env), logger); err != nil {
 			logger.Print(err)
 			return exitLaunchError
 		}
@@ -1322,8 +1344,15 @@ func run(argv []string, logger *log.Logger) int {
 	if identity != nil {
 		stopWatch = watchIdentity(&sup, nonce, env[instanceCertEnv], env[instanceKeyEnv], identity, logger)
 	}
+	// A guest with mirrored files gets each change to them in the same way,
+	// once it has said that it takes the pushes.
+	stopMirror := func() {}
+	if mirror.watching() {
+		stopMirror = watchMirror(&sup, nonce, mirror, logger)
+	}
 	res, err := sup.run(cmd, nonce)
 	stopWatch()
+	stopMirror()
 	stopMetrics()
 	// QEMU has been reaped, or never started. Every virtiofsd has stopped,
 	// or stops now, and its last lines come before the exit line.
@@ -1524,6 +1553,7 @@ func parseArgs(argv []string) (config, error) {
 	syncMounts := fs.Bool(volumeSyncMountsFlag, true, "mount every volume image with sync and dirsync; with =false, an image whose filesystem has a journal mounts without them")
 	sandbox := fs.String(qemuSandboxFlag, qemuSandbox, "the value of QEMU's -sandbox option, which turns on its seccomp filter; empty turns the sandbox off")
 	maxVCPUs := fs.Int(maxVCPUsFlag, 0, "the most vCPUs a guest gets; 0 gives it one for each CPU the container may run on")
+	mirror := fs.Bool(mirrorMountsFlag, false, "give a guest with an app root the container's small read-only bind mounts at their own paths, by rule")
 	imageUser := fs.String(imageUserFlag, "", "run the CF launcher on the Docker image that Garden bound into the container, as this user")
 	imageDefaults := fs.String(imageDefaultEnvFlag, "", "the names among HOME, PATH, and USER that hold Garden's defaults, which the Docker image's user replaces")
 	if err := fs.Parse(argv); err != nil {
@@ -1533,7 +1563,7 @@ func parseArgs(argv []string) (config, error) {
 		return config{}, fmt.Errorf("--%s must be 0 or more, got %d", maxVCPUsFlag, *maxVCPUs)
 	}
 
-	cfg := config{backend: backend.Kind(*kind), transparent: *transparent, allowVolumeShares: *allowShares, volumeSyncMounts: *syncMounts, qemuSandbox: *sandbox, maxVCPUs: *maxVCPUs}
+	cfg := config{backend: backend.Kind(*kind), transparent: *transparent, allowVolumeShares: *allowShares, volumeSyncMounts: *syncMounts, qemuSandbox: *sandbox, maxVCPUs: *maxVCPUs, mirrorMounts: *mirror}
 	virtiofsdSet, imageSet, imageDefaultsSet := false, false, false
 	fs.Visit(func(f *flag.Flag) {
 		virtiofsdSet = virtiofsdSet || f.Name == virtiofsdFlag
