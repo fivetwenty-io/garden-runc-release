@@ -308,6 +308,23 @@ properties:
       garden.execution_backends.
     default: false
 
+  garden.vm_max_vcpus:
+    description: |
+      The most vCPUs a vm-* guest gets. The default, 0, sets no cap, and a
+      guest then gets one vCPU for each CPU its container may run on, which
+      is every core of the cell unless the container is confined to a cpuset,
+      up to 32, so that a VM app can use every core the way a runC app can.
+      The container's CPU weight still bounds the guest's total CPU time
+      whatever the count. Each vCPU adds a little guest kernel memory and
+      host thread overhead, so an operator who runs many small VM apps on a
+      cell with many cores may cap it. A vm-firecracker guest with an odd
+      count above 1 gets one vCPU less, because Firecracker takes 1 or an
+      even number. The job renders vm-max-vcpus only when the value is
+      positive, and Garden then passes --max-vcpus to vm-launch, so the
+      default changes no argument. A positive value requires a vm-* entry in
+      garden.execution_backends.
+    default: 0
+
   garden.vm_volume_sync_mounts:
     description: |
       Mount a journalled ext4 image volume of a vm-* container with sync and

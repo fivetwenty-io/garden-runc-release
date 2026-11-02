@@ -54,6 +54,7 @@ func TestMain(m *testing.M) {
 		os.Exit(shareRun(os.Args[1:]))
 	}
 	markUndumpable = func() error { return nil }
+	countContainerCPUs = func() (int, error) { return defaultGuestVCPUs, nil }
 	os.Exit(m.Run())
 }
 

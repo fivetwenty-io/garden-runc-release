@@ -314,6 +314,10 @@ end -%>
   unless vm_qemu_sandbox.is_a?(String) && !vm_qemu_sandbox.match?(/[\r\n]/)
     raise "garden.vm_qemu_sandbox must be a one-line string, got #{vm_qemu_sandbox.inspect}"
   end
+  vm_max_vcpus = p("garden.vm_max_vcpus")
+  unless vm_max_vcpus.is_a?(Integer) && vm_max_vcpus >= 0
+    raise "garden.vm_max_vcpus must be 0 or a positive whole number of vCPUs, got #{vm_max_vcpus.inspect}"
+  end
   vm_stack_tarballs = p("garden.vm_stack_tarballs")
   unless vm_stack_tarballs.is_a?(Array)
     raise "garden.vm_stack_tarballs must be a list of absolute paths, got #{vm_stack_tarballs.inspect}"
@@ -340,6 +344,9 @@ end -%>
     if vm_volume_shares
       raise "garden.vm_volume_shares requires a vm-* entry in garden.execution_backends, because only a VM container serves a share"
     end
+    if vm_max_vcpus > 0
+      raise "garden.vm_max_vcpus requires a vm-* entry in garden.execution_backends, because only a VM container has vCPUs"
+    end
     unless vm_volume_sync_mounts
       raise "garden.vm_volume_sync_mounts requires a vm-* entry in garden.execution_backends, because only a VM container mounts an image volume"
     end
@@ -365,6 +372,9 @@ end -%>
 <% end -%>
 <% if vm_qemu_sandbox != vm_qemu_sandbox_default -%>
   vm-qemu-sandbox = <%= vm_qemu_sandbox %>
+<% end -%>
+<% if vm_max_vcpus > 0 -%>
+  vm-max-vcpus = <%= vm_max_vcpus %>
 <% end -%>
 <% vm_stack_tarballs.each do |tarball| -%>
   vm-stack-tarball = <%= tarball %>

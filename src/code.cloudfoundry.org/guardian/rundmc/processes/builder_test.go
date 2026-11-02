@@ -1403,6 +1403,20 @@ var _ = Describe("the volume flags of the wrapped vm-launch", func() {
 		})
 	})
 
+	Describe("VMLaunchCPUFlags", func() {
+		DescribeTable("renders the flags for each setting",
+			func(maxVCPUs uint, expected []string) {
+				Expect(processes.VMLaunchCPUFlags(maxVCPUs)).To(Equal(expected))
+			},
+			Entry("the default of no cap passes nothing", uint(0), []string(nil)),
+			Entry("a cap passes the flag and the number", uint(4), []string{"--max-vcpus", "4"}),
+		)
+
+		It("names the flag vm-launch reads", func() {
+			Expect(processes.VMLaunchMaxVCPUsFlag).To(Equal("--max-vcpus"))
+		})
+	})
+
 	Context("when no flag is set", func() {
 		It("builds the argv it built before: the path, then vm-launch's own arguments", func() {
 			Expect(build().Args).To(Equal(append([]string{processes.VMLaunchPath}, launcherArgs...)))

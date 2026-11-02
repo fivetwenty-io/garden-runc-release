@@ -535,6 +535,55 @@ describe 'garden' do
         end
       end
 
+      context 'vm_max_vcpus' do
+        let(:execution_tail) do
+          "\n; execution backends\n  execution-backend = vm-qemu\n  vm-artifacts-dir = /var/vcap/data/vm-runtime/artifacts\n  vm-launch-bin = /var/vcap/packages/guardian/bin/vm-launch\n"
+        end
+
+        def render_with(backends, extra)
+          template.render({ 'garden' => { 'execution_backends' => backends }.merge(extra) })
+        end
+
+        it 'declares a default of 0, which is no cap, and a description' do
+          garden_spec = YAML.load_file(File.join(File.dirname(__FILE__), '../../jobs/garden/spec'))
+          property = garden_spec['properties']['garden.vm_max_vcpus']
+          expect(property['default']).to eql(0)
+          expect(property['description']).not_to be_empty
+        end
+
+        [[], ['vm-qemu'], %w[vm-qemu vm-firecracker], ['oci-gvisor']].each do |backends|
+          it "renders byte for byte what it rendered before the property existed when it is 0 (#{backends.inspect})" do
+            expect(render_with(backends, { 'vm_max_vcpus' => 0 })).to eql(render_with(backends, {}))
+          end
+        end
+
+        context 'with a cap' do
+          let(:garden_properties) { { 'execution_backends' => ['vm-qemu'], 'vm_max_vcpus' => 4 } }
+
+          it 'renders the key after the vm keys and nothing else new' do
+            expect(server['vm-max-vcpus']).to eql(4)
+            expect(raw_template).to end_with(execution_tail + "  vm-max-vcpus = 4\n")
+          end
+        end
+
+        it 'renders the key on a vm-firecracker cell too' do
+          rendered = IniParse.parse(render_with(['vm-firecracker'], { 'vm_max_vcpus' => 2 }))['server']
+          expect(rendered['vm-max-vcpus']).to eql(2)
+        end
+
+        [[], ['oci-gvisor']].each do |backends|
+          it "raises for a cap when the backends are #{backends.inspect}" do
+            expect { render_with(backends, { 'vm_max_vcpus' => 2 }) }.to raise_error(/garden.vm_max_vcpus requires a vm-\* entry/)
+          end
+        end
+
+        ['2', -1, 1.5, true, []].each do |value|
+          it "raises for #{value.inspect}, which is not a whole number of 0 or more" do
+            expect { render_with(['vm-qemu'], { 'vm_max_vcpus' => value }) }.to raise_error(/garden.vm_max_vcpus must be 0 or a positive whole number/)
+          end
+        end
+      end
+
       context 'volume properties' do
         let(:volume_keys) { %w[vm-block-volumes vm-volume-shares vm-volume-async-mounts] }
         let(:defaults) { { 'vm_block_volumes' => false, 'vm_volume_shares' => false, 'vm_volume_sync_mounts' => true } }

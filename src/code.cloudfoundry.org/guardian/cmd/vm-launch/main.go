@@ -7,7 +7,7 @@
 //
 // Usage:
 //
-//	vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--artifacts DIR] -- PATH [ARGS...]
+//	vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--max-vcpus N] [--artifacts DIR] -- PATH [ARGS...]
 //
 // When PATH is the CF launcher ("launcher APP-DIR START-COMMAND ..."), the
 // guest runs START-COMMAND. Otherwise it runs PATH and ARGS, shell-quoted.
@@ -272,12 +272,20 @@
 // guest's memory, as the unsized container mount is bounded by the
 // container's memory.
 //
-// Memory: the guest gets MEMORY_LIMIT less 192 MiB, which the container
-// keeps for the hypervisor and everything else it runs, with a floor of 128
-// MiB and a ceiling of 16 GiB. MEMORY_LIMIT must be whole megabytes, such as
-// 512m. When it is missing or malformed, or below the 320m that the floor
-// and the reserve need, the guest gets 128 MiB and vm-launch logs a line
-// that says so.
+// Memory: the guest gets MEMORY_LIMIT less what the container keeps for the
+// hypervisor and everything else it runs, which is 128 MiB on QEMU and 96 MiB
+// on Firecracker, plus 2 MiB for each GiB of the limit for the host page
+// tables, with a floor of 128 MiB and a ceiling of 16 GiB. MEMORY_LIMIT must
+// be whole megabytes, such as 512m. When it is missing or malformed, or below
+// what the floor and the reserve need, the guest gets 128 MiB and vm-launch
+// logs a line that says so.
+//
+// CPUs: the guest gets one vCPU for each CPU the container may run on, which
+// is the CPUs of its cpuset and otherwise every online CPU, less --max-vcpus
+// when the operator sets it, and at most 32. Firecracker takes 1 or an even
+// number, so an odd count above 1 loses one. The container's CPU weight still
+// bounds the guest's total CPU time. When the count cannot be read, the
+// guest gets one vCPU and vm-launch logs a line that says so.
 //
 // Guest root disk: when VCAP_APPLICATION has limits.disk, vm-launch creates
 // a sparse image for the guest root in its work directory, with mode 0600,
@@ -535,7 +543,12 @@ const volumeSyncMountsFlag = "volume-sync-mounts"
 // ignores it.
 const qemuSandboxFlag = "qemu-sandbox"
 
-const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--qemu-sandbox=OPTIONS] [--artifacts DIR] -- PATH [ARGS...]\n"
+// maxVCPUsFlag names the vm-launch flag with which the operator caps the
+// guest's vCPU count. Zero, the default, leaves the count at the CPUs the
+// container may run on (see guestVCPUCount).
+const maxVCPUsFlag = "max-vcpus"
+
+const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--qemu-sandbox=OPTIONS] [--max-vcpus N] [--artifacts DIR] -- PATH [ARGS...]\n"
 
 type config struct {
 	backend   backend.Kind
@@ -566,6 +579,9 @@ type config struct {
 	// qemuSandbox is the value of QEMU's -sandbox option, or empty for none
 	// (see qemuSandboxFlag).
 	qemuSandbox string
+	// maxVCPUs is the operator's cap on the guest's vCPU count, or 0 for
+	// none (see maxVCPUsFlag).
+	maxVCPUs int
 }
 
 // init holds the main goroutine, and with it run, to the thread-group
@@ -850,7 +866,8 @@ func run(argv []string, logger *log.Logger) int {
 		}
 	}
 	defer closeLauncher()
-	memMiB := guestMemory(lookupEnv, logger)
+	memMiB := guestMemory(cfg.backend, lookupEnv, logger)
+	vcpus := guestVCPUCount(cfg.backend, countContainerCPUs, cfg.maxVCPUs, logger)
 	// The launcher derives DATABASE_URL from the resolved VCAP_SERVICES, so
 	// the references are resolved before buildGuestEnv.
 	services, resolved, err := resolveCredhubRefs(lookupEnv, cfg.credhub, defaultCredhubClient, sigs, logger)
@@ -1141,7 +1158,7 @@ func run(argv []string, logger *log.Logger) int {
 	defer shareSrv.stop(0)
 	shareSrv.setGuestMemory(memMiB)
 	files, drivePaths, initrdPath, monitorFD, rootPath := hypervisorFilesWithStack(prepared.files(), initrd, qemuMonitor, rootImg, sd)
-	hvArgv, err := hypervisorArgvWithStack(cfg.backend, cfg.artifacts, workDir, initrdPath, memMiB, nw, drivePaths, rootPath, monitorFD, sd, shareSrv.sockets()...)
+	hvArgv, err := hypervisorArgvWithVCPUs(cfg.backend, cfg.artifacts, workDir, initrdPath, memMiB, vcpus, nw, drivePaths, rootPath, monitorFD, sd, shareSrv.sockets()...)
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError
@@ -1449,11 +1466,15 @@ func parseArgs(argv []string) (config, error) {
 	virtiofsd := fs.String(virtiofsdFlag, "", "path of the executable that runs virtiofsd, which serves shares")
 	syncMounts := fs.Bool(volumeSyncMountsFlag, true, "mount every volume image with sync and dirsync; with =false, an image whose filesystem has a journal mounts without them")
 	sandbox := fs.String(qemuSandboxFlag, qemuSandbox, "the value of QEMU's -sandbox option, which turns on its seccomp filter; empty turns the sandbox off")
+	maxVCPUs := fs.Int(maxVCPUsFlag, 0, "the most vCPUs a guest gets; 0 gives it one for each CPU the container may run on")
 	if err := fs.Parse(argv); err != nil {
 		return config{}, err
 	}
+	if *maxVCPUs < 0 {
+		return config{}, fmt.Errorf("--%s must be 0 or more, got %d", maxVCPUsFlag, *maxVCPUs)
+	}
 
-	cfg := config{backend: backend.Kind(*kind), transparent: *transparent, allowVolumeShares: *allowShares, volumeSyncMounts: *syncMounts, qemuSandbox: *sandbox}
+	cfg := config{backend: backend.Kind(*kind), transparent: *transparent, allowVolumeShares: *allowShares, volumeSyncMounts: *syncMounts, qemuSandbox: *sandbox, maxVCPUs: *maxVCPUs}
 	virtiofsdSet := false
 	fs.Visit(func(f *flag.Flag) { virtiofsdSet = virtiofsdSet || f.Name == virtiofsdFlag })
 	if virtiofsdSet {

@@ -12,7 +12,7 @@ import (
 // guestOutputLimit bounds the guest command's output that waits for stdout.
 // It is far more than a reader that keeps up ever leaves waiting, and small
 // next to the memory the container keeps for vm-launch (see
-// guestMemoryReserveMiB).
+// guestMemoryReserve).
 const guestOutputLimit = 1 << 20
 
 // outputFlushTimeout bounds how long vm-launch waits, once the hypervisor has
