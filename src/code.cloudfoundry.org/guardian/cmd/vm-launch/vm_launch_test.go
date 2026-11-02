@@ -1736,6 +1736,22 @@ var _ = Describe("run with a stack image", func() {
 		Expect(heldFilesEndingIn("rootfs.squashfs")).To(BeZero())
 	})
 
+	It("leaves the volume's directory out of the droplet image when the volume is under the droplet's home", func() {
+		withImageVolume()
+		dropletHome = dir
+		record := filepath.Join(dir, "mksquashfs-args")
+		recorder := "#!/bin/sh\nprintf '%s\\n' \"$@\" >" + shellQuote(record) + "\nprintf 'droplet' >\"$2\"\n"
+		Expect(os.WriteFile(filepath.Join(art, artMksquashfs), []byte(recorder), 0o755)).To(Succeed())
+
+		guestOf([]string{launcher, "app", "true", ""})
+		Expect(logBuf.String()).To(ContainSubstring("stack guest: "), logBuf.String())
+		raw, err := os.ReadFile(record)
+		Expect(err).NotTo(HaveOccurred())
+		args := strings.Split(strings.TrimSpace(string(raw)), "\n")
+		Expect(args).To(ContainElement("-one-file-system"))
+		Expect(args[len(args)-2:]).To(Equal([]string{"-e", "volume"}), "the build must exclude the volume's directory, relative to the home")
+	})
+
 	It("boots the stack guest on Firecracker for an app with a private disk image, with the volume's drive before the stack and the droplet", func() {
 		withImageVolume()
 		letFirecrackerSeeVMLaunch()

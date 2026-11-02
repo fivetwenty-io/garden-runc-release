@@ -73,10 +73,17 @@ func buildDropletImage(ctx context.Context, artifacts, home, workDir string, exc
 		"-mem", "64M", "-processors", "1", "-no-progress", "-quiet",
 		"-one-file-system",
 	}
+	// mksquashfs reads every argument after the first -e as an exclude, so
+	// the excludes follow one -e.
+	var excludes []string
 	for _, dir := range append([]string{workDir}, exclude...) {
 		if rel, ok := relativeToHome(home, dir); ok {
-			args = append(args, "-e", rel)
+			excludes = append(excludes, rel)
 		}
+	}
+	if len(excludes) > 0 {
+		args = append(args, "-e")
+		args = append(args, excludes...)
 	}
 
 	start := time.Now()

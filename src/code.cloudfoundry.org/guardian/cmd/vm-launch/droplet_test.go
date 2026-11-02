@@ -212,15 +212,15 @@ var _ = Describe("the arguments of the droplet build", func() {
 		return strings.Split(strings.TrimSpace(string(raw)), "\n")
 	}
 
-	// excludesOf returns the values that follow each -e in args.
+	// excludesOf returns the values that follow the -e in args, which are
+	// all of the arguments after it.
 	excludesOf := func(args []string) []string {
-		var got []string
 		for i, a := range args {
-			if a == "-e" && i+1 < len(args) {
-				got = append(got, args[i+1])
+			if a == "-e" {
+				return args[i+1:]
 			}
 		}
-		return got
+		return nil
 	}
 
 	It("never leaves the home's filesystem", func() {
@@ -240,6 +240,15 @@ var _ = Describe("the arguments of the droplet build", func() {
 		Expect(os.Mkdir(work, 0o700)).To(Succeed())
 		args := argsOf(home, work, filepath.Join(home, "persist"))
 		Expect(excludesOf(args)).To(Equal([]string{".work", "persist"}))
+	})
+
+	It("gives all of the excludes after one -e, with the work directory first", func() {
+		home := GinkgoT().TempDir()
+		work := filepath.Join(home, "tmp")
+		Expect(os.Mkdir(work, 0o700)).To(Succeed())
+		args := argsOf(home, work, filepath.Join(home, "persist"), filepath.Join(home, "deep", "er"))
+		Expect(args[len(args)-4:]).To(Equal([]string{"-e", "tmp", "persist", "deep/er"}))
+		Expect(args).To(ContainElement("-one-file-system"))
 	})
 
 	It("passes the excludes through the signal-watching build too", func() {
