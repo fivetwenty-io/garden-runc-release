@@ -205,8 +205,9 @@ func shellEscapeDQ(s string) string {
 // size and digest match, and the mode is octal. A file mount is rewritten in
 // place, which is what a running container sees of a bound file that the
 // host rewrites. It takes only the bits that the old and new modes share
-// while it is rewritten, so a reader the new mode shuts out never sees the
-// new bytes. A file in a tree is renamed over the old one from the
+// while it is rewritten, so a reader the new mode shuts out never opens it
+// to see the new bytes. A reader that already holds it open still reads
+// them. A file in a tree is renamed over the old one from the
 // scratch directory, which is on the same filesystem, so a reader in the
 // app never sees half of it. The answer is the OK line or the bad line,
 // with the end line's own sequence number. A frame that a new begin line

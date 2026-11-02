@@ -212,8 +212,22 @@ var _ = Describe("mirrored mounts", func() {
 				{rel: "sub/dir", kind: mirrorDir, perm: 0o755, place: true},
 			}), "a place takes the kind of the mount that fills it, and a missing place is added below a parent in the copy")
 			Expect(logBuf.String()).To(Equal(
-				`not mirroring the mount at "/srv/denied/deep" into the guest, because vm-launch could not read its place in the mirrored mount at "/srv"` + "\n" +
+				`not mirroring the mount at "/srv/denied/deep" into the guest, because the mount at "/srv/denied" above it does not reach the guest` + "\n" +
 					`not mirroring the mount at "/srv/unread/deep" into the guest, because vm-launch could not read its place in the mirrored mount at "/srv"` + "\n"))
+		})
+
+		It("holds back a mount below a mirrored tree that has no room left for its place", func() {
+			full := mirrorMount{path: "/srv", dir: true, entries: []mirrorEntry{{kind: mirrorDir, perm: 0o755}}}
+			for i := 1; i < mirrorTreeMaxEntries; i++ {
+				full.entries = append(full.entries, mirrorEntry{rel: fmt.Sprintf("f%d", i), kind: mirrorFile, perm: 0o644})
+			}
+			mounts := placeMirrorPoints([]mirrorMount{
+				full,
+				{path: "/srv/inner", entries: []mirrorEntry{{kind: mirrorFile, perm: 0o600, data: []byte("i")}}},
+			}, logger)
+			Expect(mounts).To(HaveLen(1))
+			Expect(mounts[0].entries).To(HaveLen(mirrorTreeMaxEntries))
+			Expect(logBuf.String()).To(Equal(fmt.Sprintf(`not mirroring the mount at "/srv/inner" into the guest, because the mirrored mount at "/srv" already holds its limit of %d entries, which leaves no room for its place`+"\n", mirrorTreeMaxEntries)))
 		})
 
 		It("refuses a mount point that is reached through a symbolic link", func() {

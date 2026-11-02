@@ -376,8 +376,8 @@ func readMountMirror(mountinfo string, dedicated []string, logger *log.Logger) (
 // the guest binds that tree read-only before it binds the mount below it and
 // can create nothing in it then. The walk leaves the place out when it could
 // not open or read the entry, so this adds it when its parent is in the copy,
-// and otherwise holds the mount back with one line. mounts are in path order,
-// so the tree comes before the mounts below it.
+// and otherwise holds the mount back with one line that says why. mounts are
+// in path order, so the tree comes before the mounts below it.
 func placeMirrorPoints(mounts []mirrorMount, logger *log.Logger) []mirrorMount {
 	kept := mounts[:0]
 	for _, mm := range mounts {
@@ -387,50 +387,72 @@ func placeMirrorPoints(mounts []mirrorMount, logger *log.Logger) []mirrorMount {
 				tree = &kept[i]
 			}
 		}
-		if tree == nil || placeMirrorPoint(tree, mm) {
+		if tree == nil {
 			kept = append(kept, mm)
 			continue
 		}
-		logger.Printf("not mirroring the mount at %s into the guest, because vm-launch could not read its place in the mirrored mount at %s", quoteForLog(mm.path), quoteForLog(tree.path))
+		if why := placeMirrorPoint(tree, mm); why != "" {
+			logger.Printf("not mirroring the mount at %s into the guest, because %s", quoteForLog(mm.path), why)
+			continue
+		}
+		kept = append(kept, mm)
 	}
 	return kept
 }
 
-// placeMirrorPoint gives inner its place in the copy of tree, and reports
-// whether it could.
-func placeMirrorPoint(tree *mirrorMount, inner mirrorMount) bool {
+// placeMirrorPoint gives inner its place in the copy of tree. It returns why
+// it could not, or "" when it did.
+func placeMirrorPoint(tree *mirrorMount, inner mirrorMount) string {
 	rel := strings.TrimPrefix(inner.path, tree.path+"/")
 	kind := mirrorFile
 	if inner.dir {
 		kind = mirrorDir
 	}
-	parent := path.Dir(rel)
-	if parent == "." {
-		parent = ""
-	}
-	parentFound := false
+	byRel := make(map[string]*mirrorEntry, len(tree.entries))
 	for j := range tree.entries {
-		e := &tree.entries[j]
-		if e.rel == rel {
-			if !e.place {
-				return false
-			}
-			e.kind = kind
-			return true
-		}
-		if e.rel == parent && e.kind == mirrorDir && !e.place {
-			parentFound = true
-		}
+		byRel[tree.entries[j].rel] = &tree.entries[j]
 	}
-	if !parentFound {
-		return false
+	if e, ok := byRel[rel]; ok {
+		if !e.place {
+			return fmt.Sprintf("vm-launch could not read its place in the mirrored mount at %s", quoteForLog(tree.path))
+		}
+		e.kind = kind
+		return ""
+	}
+	// The nearest entry above the place says why the place is missing: a
+	// directory in the copy that the walk could not read it in, or the
+	// stand-in for a mount that the guest does not get, which the walk does
+	// not enter. The tree's root, whose rel is "", is always there.
+	parent := mirrorParentRel(rel)
+	above := parent
+	e, ok := byRel[above]
+	for !ok {
+		above = mirrorParentRel(above)
+		e, ok = byRel[above]
+	}
+	switch {
+	case e.place:
+		return fmt.Sprintf("the mount at %s above it does not reach the guest", quoteForLog(tree.path+"/"+above))
+	case above != parent || e.kind != mirrorDir:
+		return fmt.Sprintf("vm-launch could not read its place in the mirrored mount at %s", quoteForLog(tree.path))
+	case len(tree.entries) >= mirrorTreeMaxEntries:
+		return fmt.Sprintf("the mirrored mount at %s already holds its limit of %d entries, which leaves no room for its place", quoteForLog(tree.path), mirrorTreeMaxEntries)
 	}
 	perm := uint32(0o644)
 	if inner.dir {
 		perm = 0o755
 	}
 	tree.entries = append(tree.entries, mirrorEntry{rel: rel, kind: kind, perm: perm, place: true})
-	return true
+	return ""
+}
+
+// mirrorParentRel returns the rel of the directory that holds the entry at
+// rel, which is "" for an entry directly below the mount's root.
+func mirrorParentRel(rel string) string {
+	if parent := path.Dir(rel); parent != "." {
+		return parent
+	}
+	return ""
 }
 
 // readMountTable returns the records of the mount table at mountinfo, one
