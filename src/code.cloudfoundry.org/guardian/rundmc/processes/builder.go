@@ -70,6 +70,17 @@ const (
 	// so VMLaunchVolumeFlags passes the flag only to turn that off.
 	VMLaunchVolumeSyncMountsFlag = "--volume-sync-mounts"
 
+	// VMLaunchQEMUSandboxFlag gives vm-launch the value of QEMU's -sandbox
+	// option, and an empty value turns the sandbox off. vm-launch defaults to
+	// VMQemuSandboxDefault, so VMLaunchQEMUSandboxFlags passes the flag only
+	// for another value.
+	VMLaunchQEMUSandboxFlag = "--qemu-sandbox"
+
+	// VMQemuSandboxDefault is the -sandbox option value that vm-launch uses
+	// when the operator sets none: QEMU's seccomp filter with the obsolete,
+	// elevateprivileges, spawn, and resourcecontrol groups denied.
+	VMQemuSandboxDefault = "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"
+
 	// portEnvPrefix starts the environment entry that names the port of a
 	// process that serves one. vm-launch forwards ports only when the entry
 	// is present, whatever its value, and exits when the value is no port.
@@ -187,6 +198,17 @@ func VMLaunchVolumeFlags(allowShares bool, virtiofsdPath string, syncMounts bool
 		flags = append(flags, VMLaunchVolumeSyncMountsFlag+"=false")
 	}
 	return flags
+}
+
+// VMLaunchQEMUSandboxFlags returns the vm-launch flag that carries the
+// operator's QEMU -sandbox value, or none for VMQemuSandboxDefault so that
+// vm-launch gets the arguments it gets today. An empty value is passed, and
+// turns the sandbox off.
+func VMLaunchQEMUSandboxFlags(sandbox string) []string {
+	if sandbox == VMQemuSandboxDefault {
+		return nil
+	}
+	return []string{VMLaunchQEMUSandboxFlag + "=" + sandbox}
 }
 
 // WithVMLaunchFlags makes BuildProcess pass flags to the vm-launch process

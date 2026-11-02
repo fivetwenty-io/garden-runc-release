@@ -529,7 +529,13 @@ const stopDeadline = 8 * time.Second
 // volume are never changed by it.
 const volumeSyncMountsFlag = "volume-sync-mounts"
 
-const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--artifacts DIR] -- PATH [ARGS...]\n"
+// qemuSandboxFlag names the vm-launch flag that carries the operator's value
+// for QEMU's -sandbox option. Its default is qemuSandbox, an empty value
+// turns the sandbox off, and Garden renders it from a job property. Firecracker
+// ignores it.
+const qemuSandboxFlag = "qemu-sandbox"
+
+const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--qemu-sandbox=OPTIONS] [--artifacts DIR] -- PATH [ARGS...]\n"
 
 type config struct {
 	backend   backend.Kind
@@ -557,6 +563,9 @@ type config struct {
 	// is false, an image with a journal mounts without them (see
 	// volumeSyncMountsFlag).
 	volumeSyncMounts bool
+	// qemuSandbox is the value of QEMU's -sandbox option, or empty for none
+	// (see qemuSandboxFlag).
+	qemuSandbox string
 }
 
 // init holds the main goroutine, and with it run, to the thread-group
@@ -1137,6 +1146,9 @@ func run(argv []string, logger *log.Logger) int {
 		logger.Print(err)
 		return exitLaunchError
 	}
+	if cfg.backend == backend.VMQemu {
+		hvArgv = withQEMUSandbox(hvArgv, cfg.qemuSandbox)
+	}
 
 	select {
 	case sig := <-sigs:
@@ -1433,11 +1445,12 @@ func parseArgs(argv []string) (config, error) {
 	allowShares := fs.Bool(allowVolumeSharesFlag, false, "allow an app to ask for a volume as a share in VM_VOLUMES, which only QEMU can serve")
 	virtiofsd := fs.String(virtiofsdFlag, "", "path of the executable that runs virtiofsd, which serves shares")
 	syncMounts := fs.Bool(volumeSyncMountsFlag, true, "mount every volume image with sync and dirsync; with =false, an image whose filesystem has a journal mounts without them")
+	sandbox := fs.String(qemuSandboxFlag, qemuSandbox, "the value of QEMU's -sandbox option, which turns on its seccomp filter; empty turns the sandbox off")
 	if err := fs.Parse(argv); err != nil {
 		return config{}, err
 	}
 
-	cfg := config{backend: backend.Kind(*kind), transparent: *transparent, allowVolumeShares: *allowShares, volumeSyncMounts: *syncMounts}
+	cfg := config{backend: backend.Kind(*kind), transparent: *transparent, allowVolumeShares: *allowShares, volumeSyncMounts: *syncMounts, qemuSandbox: *sandbox}
 	virtiofsdSet := false
 	fs.Visit(func(f *flag.Flag) { virtiofsdSet = virtiofsdSet || f.Name == virtiofsdFlag })
 	if virtiofsdSet {

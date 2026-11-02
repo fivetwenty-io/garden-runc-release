@@ -1385,6 +1385,21 @@ var _ = Describe("the volume flags of the wrapped vm-launch", func() {
 			Expect(processes.VMLaunchAllowVolumeSharesFlag).To(Equal("--allow-volume-shares"))
 			Expect(processes.VMLaunchVirtiofsdFlag).To(Equal("--virtiofsd-path"))
 			Expect(processes.VMLaunchVolumeSyncMountsFlag).To(Equal("--volume-sync-mounts"))
+			Expect(processes.VMLaunchQEMUSandboxFlag).To(Equal("--qemu-sandbox"))
+		})
+	})
+
+	Describe("VMLaunchQEMUSandboxFlags", func() {
+		It("passes nothing for the default, which vm-launch uses without a flag", func() {
+			Expect(processes.VMLaunchQEMUSandboxFlags(processes.VMQemuSandboxDefault)).To(BeEmpty())
+		})
+
+		It("passes a custom value as one argument", func() {
+			Expect(processes.VMLaunchQEMUSandboxFlags("on,spawn=deny")).To(Equal([]string{"--qemu-sandbox=on,spawn=deny"}))
+		})
+
+		It("passes an empty value, which turns the sandbox off", func() {
+			Expect(processes.VMLaunchQEMUSandboxFlags("")).To(Equal([]string{"--qemu-sandbox="}))
 		})
 	})
 

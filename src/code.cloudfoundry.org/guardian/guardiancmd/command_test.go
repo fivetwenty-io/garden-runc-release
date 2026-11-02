@@ -13,6 +13,7 @@ import (
 	"code.cloudfoundry.org/guardian/rundmc"
 	"code.cloudfoundry.org/guardian/rundmc/bundlerules"
 	"code.cloudfoundry.org/guardian/rundmc/goci"
+	"code.cloudfoundry.org/guardian/rundmc/processes"
 	"code.cloudfoundry.org/guardian/rundmc/runcontainerd"
 	"code.cloudfoundry.org/guardian/rundmc/runcontainerd/runcontainerdfakes"
 	"code.cloudfoundry.org/guardian/rundmc/rundmcfakes"
@@ -51,6 +52,7 @@ var _ = Describe("execution backend flags", func() {
 	BeforeEach(func() {
 		log = lagertest.NewTestLogger("execution-backends")
 		cmd = &CommonCommand{}
+		cmd.ExecutionBackends.VMQemuSandbox = processes.VMQemuSandboxDefault
 
 		launchBin = filepath.Join(GinkgoT().TempDir(), "vm-launch")
 		Expect(os.WriteFile(launchBin, []byte("#!/bin/sh\n"), 0o755)).To(Succeed())
@@ -535,6 +537,29 @@ var _ = Describe("execution backend flags", func() {
 			Expect(parsed.ExecutionBackends.VMVolumeAsyncMounts).To(BeFalse())
 		})
 
+		It("defaults --vm-qemu-sandbox to the seccomp sandbox and takes a custom or an empty value", func() {
+			Expect(parse().ExecutionBackends.VMQemuSandbox).To(Equal(processes.VMQemuSandboxDefault))
+			Expect(parse("--vm-qemu-sandbox=on,spawn=deny").ExecutionBackends.VMQemuSandbox).To(Equal("on,spawn=deny"))
+			Expect(parse("--vm-qemu-sandbox=").ExecutionBackends.VMQemuSandbox).To(BeEmpty())
+		})
+
+		It("reads the sandbox value from the ini file the job renders, an empty one included", func() {
+			read := func(line string) string {
+				GinkgoHelper()
+				ini := filepath.Join(GinkgoT().TempDir(), "config.ini")
+				Expect(os.WriteFile(ini, []byte("[server]\n"+line), 0o600)).To(Succeed())
+				gdn := &GdnCommand{ServerCommand: &ServerCommand{CommonCommand: &CommonCommand{}}}
+				gdn.ServerCommand.ExecutionBackends.VMQemuSandbox = processes.VMQemuSandboxDefault
+				parser := flags.NewParser(gdn, flags.IgnoreUnknown)
+				parser.NamespaceDelimiter = "-"
+				Expect(flags.NewIniParser(parser).ParseFile(ini)).To(Succeed())
+				return gdn.ServerCommand.ExecutionBackends.VMQemuSandbox
+			}
+			Expect(read("")).To(Equal(processes.VMQemuSandboxDefault))
+			Expect(read("  vm-qemu-sandbox = on,spawn=deny\n")).To(Equal("on,spawn=deny"))
+			Expect(read("  vm-qemu-sandbox = \n")).To(BeEmpty())
+		})
+
 		It("turns shares on with --vm-volume-shares", func() {
 			Expect(parse("--vm-volume-shares").ExecutionBackends.VMVolumeShares).To(BeTrue())
 		})
@@ -565,6 +590,22 @@ var _ = Describe("execution backend flags", func() {
 				backends, err := cmd.wireExecutionBackends(log)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(backends.vmLaunchFlags).To(BeEmpty())
+			})
+
+			It("passes --qemu-sandbox with a custom value", func() {
+				cmd.ExecutionBackends.VMQemuSandbox = "on,spawn=deny"
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vmLaunchFlags).To(Equal([]string{"--qemu-sandbox=on,spawn=deny"}))
+			})
+
+			It("passes --qemu-sandbox= with an empty value, which turns the sandbox off", func() {
+				cmd.ExecutionBackends.VMQemuSandbox = ""
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vmLaunchFlags).To(Equal([]string{"--qemu-sandbox="}))
 			})
 
 			It("passes the share flag and the wrapper's path inside the container when shares are on", func() {
@@ -846,6 +887,7 @@ var _ = Describe("VM stack flags", func() {
 	BeforeEach(func() {
 		log = lagertest.NewTestLogger("vm-stack")
 		cmd = &CommonCommand{}
+		cmd.ExecutionBackends.VMQemuSandbox = processes.VMQemuSandboxDefault
 
 		launchBin = filepath.Join(GinkgoT().TempDir(), "vm-launch")
 		Expect(os.WriteFile(launchBin, []byte("#!/bin/sh\n"), 0o755)).To(Succeed())

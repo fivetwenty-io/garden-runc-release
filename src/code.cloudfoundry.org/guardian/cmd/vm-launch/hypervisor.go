@@ -85,12 +85,30 @@ func guestMemory(lookupEnv func(string) (string, bool), logger *log.Logger) int 
 	return guest
 }
 
-// qemuSandbox is QEMU's -sandbox option: its own seccomp filter. It denies the
+// qemuSandbox is the default value of QEMU's -sandbox option (see
+// qemuSandboxFlag): its own seccomp filter. It denies the
 // obsolete system calls, the privilege changes (setuid and the like), spawning
 // a process (fork and exec), and changes to resource limits and priorities.
 // QEMU as vm-launch starts it needs none of them: the user-mode network runs
 // in process, and no helper script or child process is configured.
 const qemuSandbox = "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"
+
+// withQEMUSandbox returns argv with the value of its -sandbox option replaced
+// by sandbox, or without the option when sandbox is empty. It copies argv.
+func withQEMUSandbox(argv []string, sandbox string) []string {
+	out := make([]string, 0, len(argv))
+	for i := 0; i < len(argv); i++ {
+		if argv[i] != "-sandbox" || i+1 >= len(argv) {
+			out = append(out, argv[i])
+			continue
+		}
+		if sandbox != "" {
+			out = append(out, "-sandbox", sandbox)
+		}
+		i++
+	}
+	return out
+}
 
 // qemuMachine is QEMU's -M option: the microvm machine under KVM, with guest
 // RAM left out of any core dump of QEMU.
@@ -203,6 +221,10 @@ func qemuArgv(root, initrd string, memMiB int, nw *network, drives []volumeDrive
 		"-nographic",
 		"-serial", "stdio",
 		"-no-reboot",
+		// The only monitor is the QMP socket below. -nodefaults already drops
+		// the default one, and naming none keeps a stdio monitor from ever
+		// reaching the guest's console.
+		"-monitor", "none",
 		"-sandbox", qemuSandbox,
 		"-kernel", art(artBzImage),
 		"-initrd", initrd,

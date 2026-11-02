@@ -677,7 +677,7 @@ var _ = Describe("parseArgs", func() {
 		cfg, err := parseArgs([]string{"--backend", "vm-qemu", "--", "/tmp/lifecycle/launcher", "app", "echo hi && exit 3", ""})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(cfg).To(Equal(config{backend: backend.VMQemu, artifacts: defaultArtifactsDir, command: "echo hi && exit 3", credhub: credhubRetry{attempts: 3, delay: time.Second},
-			args: []string{"/tmp/lifecycle/launcher", "app", "echo hi && exit 3", ""}, volumeSyncMounts: true}))
+			args: []string{"/tmp/lifecycle/launcher", "app", "echo hi && exit 3", ""}, volumeSyncMounts: true, qemuSandbox: qemuSandbox}))
 	})
 
 	It("holds back the refusal of an empty start command, which only the stack guest can run, and still parses the CredHub flags", func() {
@@ -753,6 +753,34 @@ var _ = Describe("parseArgs", func() {
 		Expect(err).To(MatchError(ContainSubstring("invalid boolean value")))
 	})
 
+	It("defaults the QEMU sandbox to the value Garden's default names and takes a custom or an empty value", func() {
+		Expect("--" + qemuSandboxFlag).To(Equal(processes.VMLaunchQEMUSandboxFlag))
+		Expect(qemuSandbox).To(Equal(processes.VMQemuSandboxDefault))
+		Expect(usage).To(ContainSubstring("[--qemu-sandbox=OPTIONS]"))
+		for flags, want := range map[string]string{"": qemuSandbox, "--qemu-sandbox=on,spawn=deny": "on,spawn=deny", "--qemu-sandbox=": ""} {
+			argv := []string{"--backend", "vm-qemu"}
+			if flags != "" {
+				argv = append(argv, flags)
+			}
+			cfg, err := parseArgs(append(argv, "--", "true"))
+			Expect(err).NotTo(HaveOccurred(), "%q", flags)
+			Expect(cfg.qemuSandbox).To(Equal(want), "%q", flags)
+		}
+	})
+
+	It("replaces or drops the -sandbox option of the QEMU command line and leaves the rest alone", func() {
+		argv, err := hypervisorArgv(backend.VMQemu, "/opt/garden-vm/artifacts", "/unused", "/proc/self/fd/3", 128, taskNetwork(), nil, "", 0)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(optionAfter(withQEMUSandbox(argv, "on,spawn=deny"), "-sandbox", "")).To(Equal("on,spawn=deny"))
+		Expect(withQEMUSandbox(argv, qemuSandbox)).To(Equal(argv))
+
+		off := withQEMUSandbox(argv, "")
+		Expect(off).NotTo(ContainElement("-sandbox"))
+		Expect(off).NotTo(ContainElement(qemuSandbox))
+		Expect(off).To(HaveLen(len(argv) - 2))
+		Expect(argv).To(ContainElement(qemuSandbox), "the input is not changed")
+	})
+
 	It("names the flag Garden's process builder passes", func() {
 		Expect("--" + transparentProxyFlag).To(Equal(processes.VMLaunchTransparentProxyFlag))
 		Expect(usage).To(ContainSubstring("[" + processes.VMLaunchTransparentProxyFlag + "]"))
@@ -775,6 +803,7 @@ var _ = Describe("hypervisor command lines", func() {
 			art + "/qemu/qemu-system-x86_64-microvm", "-L", art + "/qemu/share",
 			"-M", "microvm,accel=kvm,dump-guest-core=off", "-cpu", "host", "-smp", "1", "-m", "128",
 			"-nodefaults", "-no-user-config", "-nographic", "-serial", "stdio", "-no-reboot",
+			"-monitor", "none",
 			"-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny",
 			"-kernel", art + "/kernel/bzImage", "-initrd", "/proc/self/fd/3",
 			"-append", "console=ttyS0 reboot=t panic=-1 rdinit=/init pci=off quiet",
