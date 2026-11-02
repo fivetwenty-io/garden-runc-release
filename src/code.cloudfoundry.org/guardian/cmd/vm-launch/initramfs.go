@@ -187,8 +187,8 @@ const guestStage2Exec = `exec /bin/sh ` + guestStage2 + ` "$@"
 // among them (see guestStackDiskFind). In place of the overlay root, it
 // builds the app root from the stack, the droplet, and the root disk, or RAM
 // without one (see guestStackSetup), and it runs stage 2 on the initramfs,
-// which stays the guest's own root. The app alone runs in the app root (see
-// guestStackRunCommand).
+// which stays the guest's own root. Only the app and its sidecars run in the
+// app root (see stackExec).
 const guestStackInit = guestInitStart + guestFailFunc + guestStackDiskFind + guestStackSetup + guestStage2Exec
 
 // guestStage2 is where the initramfs holds stage 2 of the guest's boot.
@@ -504,20 +504,15 @@ func initScript(nonce string, volume bool) string {
 	return stage2Script(nonce, volume, false, "", "")
 }
 
-// stackInitScript is the guest /rvm/init of a guest with a stack and no
-// volumes, which guestStackInit runs on the initramfs. It is initScript
-// without volumes and with three differences. It mounts no /dev/shm of its own, because the app
-// sees only the one stage 1 mounted in the app root. It checks /rvm/argv and
-// /rvm/cwd after /rvm/env (see guestStackChecks). And it runs the launcher
-// in the app root (see guestStackRunCommand) in place of /rvm/cmd.
-func stackInitScript(nonce string) string {
-	return stage2Script(nonce, false, true, "", "")
-}
-
-// stage2Script is initScript, or stackInitScript when stack is set. With a
-// run section (see guestRunSection), stage 2 adds checks to its setup steps
-// and runs the section after the start tag in place of the command, its
-// status, and the stop reader, whose part the section's control reader
+// stage2Script is initScript, or a stack guest's stage 2 when stack is set
+// (see guestStack.initScript), which differs from it in three ways. It
+// mounts no /dev/shm of its own, because the app sees only the one stage 1
+// mounted in the app root. It checks /rvm/argv and /rvm/cwd after /rvm/env
+// (see guestStackChecks). And it always has a run section (see
+// guestRunSection), which runs the launcher and the sidecars in the app root
+// in place of /rvm/cmd. With a run section, stage 2 adds checks to its setup
+// steps and runs the section after the start tag in place of the command,
+// its status, and the stop reader, whose part the section's control reader
 // takes. A stack guest with volumes mounts them as initScript does, binds
 // them into the app root, and unbinds them in its teardown (see
 // guestStackVolumeSetup, guestStackVolumeBinds, and
@@ -528,10 +523,8 @@ func stage2Script(nonce string, volume, stack bool, checks, section string) stri
 		setup += guestShmSetup
 	}
 	setup += guestNetworkSetup + guestLimitsSetup + guestEnvChecks
-	command := guestRunCommand
 	if stack {
 		setup += guestStackChecks
-		command = guestStackRunCommand
 	}
 	setup += checks
 	switch {
@@ -543,7 +536,7 @@ func stage2Script(nonce string, volume, stack bool, checks, section string) stri
 	run := guestListenWatch(nonce)
 	if section == "" {
 		setup += guestStopReader(nonce)
-		run += command + guestRunStatus + guestStopReaderStop
+		run += guestRunCommand + guestRunStatus + guestStopReaderStop
 	} else {
 		run += section
 	}
@@ -570,7 +563,9 @@ export PATH=/bin
 const guestConsoleSetup = `stty -echo </dev/console || echo "vm-launch guest setup: turning off console echo failed; a stop request will appear in the output"
 `
 
-// guestStopReader starts, in every guest, the background stop reader, which
+// guestStopReader starts, in the busybox guest, the background stop reader,
+// whose part the control reader takes in a stack guest (see
+// guestControlReader), and which
 // sends SIGTERM to the command's top process when vm-launch writes the stop
 // request (see stopTag) to the console, as runC sends SIGTERM to a
 // container's first process. It starts before the start tag, so it is in

@@ -80,16 +80,17 @@ var _ = Describe("the volumes of the stack guest", func() {
 		It("is the stack guest's own with the volume setup and the binds before the start tag, and the stack teardown after the command", func() {
 			s := &guestStack{}
 			plain := s.initScript(testNonce)
-			Expect(plain).To(Equal(stackInitScript(testNonce)))
 			Expect(plain).NotTo(ContainSubstring("/rvm/mounts"))
+			setup := guestRunSetup(false, s.processes())
+			Expect(strings.Count(plain, setup)).To(Equal(1))
 			script := s.initScriptWithVolumes(testNonce, true)
 			start := strings.Index(script, "echo "+startTag(testNonce)+"\n")
 			Expect(start).To(BeNumerically(">", 0))
-			setup := strings.Index(script, guestStackVolumeSetup+guestStackVolumeBinds)
-			Expect(setup).To(BeNumerically(">", 0))
-			Expect(setup + len(guestStackVolumeSetup+guestStackVolumeBinds)).To(BeNumerically("<=", start))
+			binds := strings.Index(script, guestStackVolumeSetup+guestStackVolumeBinds)
+			Expect(binds).To(BeNumerically(">", 0))
+			Expect(binds + len(guestStackVolumeSetup+guestStackVolumeBinds)).To(BeNumerically("<=", start))
 			Expect(script).To(Equal(strings.NewReplacer(
-				guestStopReader(testNonce), guestStackVolumeSetup+guestStackVolumeBinds+guestStopReader(testNonce),
+				setup, setup+guestStackVolumeSetup+guestStackVolumeBinds,
 				guestOOMReport(testNonce), guestOOMReport(testNonce)+guestStackVolumeTeardown,
 			).Replace(plain)))
 			Expect(script).NotTo(ContainSubstring(guestVolumeSetup))
@@ -163,7 +164,7 @@ var _ = Describe("the volumes of the stack guest", func() {
 			g.vols, g.drives.volumes = nil, nil
 			g.stack.fallback = true
 			byName := archive(g)
-			Expect(string(byName["rvm/init"].data)).To(Equal(stackInitScript(testNonce)))
+			Expect(string(byName["rvm/init"].data)).To(Equal(g.stack.initScript(testNonce)))
 			Expect(string(byName[strings.TrimPrefix(guestFallbackInit, "/")].data)).To(Equal(initScript(testNonce, false)))
 			Expect(byName).NotTo(HaveKey("rvm/mounts"))
 		})
@@ -366,8 +367,9 @@ var _ = Describe("the stack guest with a volume against a real QEMU", func() {
 	// bootStackVolume boots a real guest under TCG with the test stack, a
 	// droplet, the launcher realStackVolumeLauncher, and img as an image
 	// volume at /home/vcap/data, with a guest root image when withRoot is
-	// set, and returns the console output without carriage returns. It
-	// fails the spec unless QEMU exits 0 and the guest started the launcher.
+	// set, and returns the console output without carriage returns and
+	// with the app's lines unframed. It fails the spec unless QEMU exits 0
+	// and the guest started the launcher.
 	bootStackVolume := func(img *os.File, withRoot bool) string {
 		GinkgoHelper()
 		art := realArtifacts()
@@ -404,7 +406,7 @@ var _ = Describe("the stack guest with a volume against a real QEMU", func() {
 		code, stdout, stderr := bootRealQEMU(markedArgv(tcgArgv(qemu, hvArgv)), files)
 		Expect(code).To(Equal(0), "QEMU failed: %s\n%s", stderr, stdout)
 		Expect(stdout).To(ContainSubstring(startTag(testNonce)), stdout)
-		return strings.ReplaceAll(stdout, "\r", "")
+		return unframeApp(strings.ReplaceAll(stdout, "\r", ""), testNonce)
 	}
 
 	DescribeTable("formats a new image for vcap, lets the app write to it as uid 2000 through the bind, stops with status 0 after a clean unmount, and finds the file at the next boot",

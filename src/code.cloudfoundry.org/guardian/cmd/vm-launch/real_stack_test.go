@@ -21,7 +21,7 @@ import (
 // Run as env, it takes only -C DIR NAME=value... PROG ARGS, as uid 2000, and
 // refuses to run as root, so a working directory is never entered with root's
 // rights. Run as setpriv, it takes only the exact options stage 2
-// passes (see guestStackRunCommand), so a change to that command line fails
+// passes (see guestStackDrop), so a change to that command line fails
 // the boot instead of passing unnoticed. Setpriv refuses to run as root
 // with a loader variable in its environment, because the stack's own,
 // dynamically linked, would load what the variable names (see
@@ -299,8 +299,9 @@ func realDropletImage(art string) *os.File {
 // bootRealStackGuest boots a real guest under TCG with a stack, as vm-launch
 // boots one with QEMU: the test stack, a droplet, and the test launcher,
 // with the launcher argv argv, env as the guest environment, and a guest
-// root image when withRoot is set. It returns the console output, with carriage returns removed, and fails
-// the spec unless QEMU exits 0 and the guest started the launcher.
+// root image when withRoot is set. It returns the console output, with carriage returns removed and with
+// the app's lines unframed (see unframeApp), and fails the spec unless QEMU
+// exits 0 and the guest started the launcher.
 func bootRealStackGuest(argv []string, withRoot bool, env string) string {
 	return bootRealStackGuestWithCerts(argv, withRoot, env, nil)
 }
@@ -353,7 +354,18 @@ func bootRealStackGuestTweaked(argv []string, withRoot bool, env string, certs *
 	code, stdout, stderr := bootRealQEMU(markedArgv(tcgArgv(qemu, hvArgv)), files)
 	Expect(code).To(Equal(0), "QEMU failed: %s\n%s", stderr, stdout)
 	Expect(stdout).To(ContainSubstring(startTag(testNonce)), stdout)
-	return strings.ReplaceAll(stdout, "\r", "")
+	return unframeApp(strings.ReplaceAll(stdout, "\r", ""), testNonce)
+}
+
+// unframeApp takes the frame off each line of the app's own output in the
+// console output out of a guest with the nonce nonce, so that a spec that
+// reads the console without the supervisor sees the app's lines as the
+// supervisor passes them on. Other processes' frames stay as they are.
+func unframeApp(out, nonce string) string {
+	for _, stream := range []string{"0o ", "0e "} {
+		out = strings.ReplaceAll(out, logTag(nonce)+stream, "")
+	}
+	return out
 }
 
 var _ = Describe("the stack guest against a real QEMU", func() {
