@@ -548,6 +548,7 @@ exit 0`)
 			Expect(os.ReadFile(f.release)).To(Equal([]byte("held\n")))
 			Expect(logBuf.String()).NotTo(ContainSubstring("another instance of this process is waiting"))
 			Expect(logBuf.String()).NotTo(ContainSubstring("hands the volumes over"))
+			Expect(logBuf.String()).NotTo(ContainSubstring("released volume image"))
 			Expect(lockedElsewhere(img)).To(BeFalse())
 		})
 
