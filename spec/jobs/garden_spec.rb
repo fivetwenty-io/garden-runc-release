@@ -707,8 +707,10 @@ describe 'garden' do
       end
 
       context 'volume properties' do
-        let(:volume_keys) { %w[vm-block-volumes vm-volume-shares vm-volume-async-mounts] }
-        let(:defaults) { { 'vm_block_volumes' => false, 'vm_volume_shares' => false, 'vm_volume_sync_mounts' => true } }
+        let(:volume_keys) { %w[vm-block-volumes vm-volume-shares vm-volume-async-mounts vm-volume-handoff] }
+        let(:defaults) do
+          { 'vm_block_volumes' => false, 'vm_volume_shares' => false, 'vm_volume_sync_mounts' => true, 'vm_volume_handoff' => false }
+        end
         let(:execution_tail) do
           "\n; execution backends\n  execution-backend = vm-qemu\n  vm-artifacts-dir = /var/vcap/data/vm-runtime/artifacts\n  vm-launch-bin = /var/vcap/packages/guardian/bin/vm-launch\n"
         end
@@ -717,13 +719,14 @@ describe 'garden' do
           template.render({ 'garden' => { 'execution_backends' => backends }.merge(extra) })
         end
 
-        it 'declares the defaults: block volumes and shares off, synchronous mounts on' do
+        it 'declares the defaults: block volumes, shares, and the handoff off, synchronous mounts on' do
           garden_spec = YAML.load_file(File.join(File.dirname(__FILE__), '../../jobs/garden/spec'))
           properties = garden_spec['properties']
           expect(properties['garden.vm_block_volumes']['default']).to eql(false)
           expect(properties['garden.vm_volume_shares']['default']).to eql(false)
           expect(properties['garden.vm_volume_sync_mounts']['default']).to eql(true)
-          %w[garden.vm_block_volumes garden.vm_volume_shares garden.vm_volume_sync_mounts].each do |name|
+          expect(properties['garden.vm_volume_handoff']['default']).to eql(false)
+          %w[garden.vm_block_volumes garden.vm_volume_shares garden.vm_volume_sync_mounts garden.vm_volume_handoff].each do |name|
             expect(properties[name]['description']).not_to be_empty
           end
         end
@@ -783,6 +786,23 @@ describe 'garden' do
           end
         end
 
+        context 'with the handoff on' do
+          let(:garden_properties) { { 'execution_backends' => ['vm-qemu'], 'vm_volume_handoff' => true } }
+
+          it 'renders the flag and nothing else new' do
+            expect(server['vm-volume-handoff']).to eql(true)
+            expect(server['vm-block-volumes']).to be_nil
+            expect(server['vm-volume-shares']).to be_nil
+            expect(server['vm-volume-async-mounts']).to be_nil
+            expect(raw_template).to end_with(execution_tail + "  vm-volume-handoff = true\n")
+          end
+
+          it 'renders the flag on a vm-firecracker cell too' do
+            rendered = IniParse.parse(render_with(['vm-firecracker'], { 'vm_volume_handoff' => true }))['server']
+            expect(rendered['vm-volume-handoff']).to eql(true)
+          end
+        end
+
         context 'with synchronous mounts explicitly on' do
           let(:garden_properties) { { 'execution_backends' => ['vm-qemu'], 'vm_volume_sync_mounts' => true } }
 
@@ -791,29 +811,35 @@ describe 'garden' do
           end
         end
 
-        context 'with all three changed' do
+        context 'with all four changed' do
           let(:garden_properties) do
-            { 'execution_backends' => %w[oci-gvisor vm-qemu], 'vm_block_volumes' => true, 'vm_volume_shares' => true, 'vm_volume_sync_mounts' => false }
+            {
+              'execution_backends' => %w[oci-gvisor vm-qemu], 'vm_block_volumes' => true, 'vm_volume_shares' => true,
+              'vm_volume_sync_mounts' => false, 'vm_volume_handoff' => true
+            }
           end
 
-          it 'renders the three keys after the vm keys, in a fixed order' do
+          it 'renders the four keys after the vm keys, in a fixed order' do
             expect(raw_template).to end_with(
               "  vm-launch-bin = /var/vcap/packages/guardian/bin/vm-launch\n" \
-              "  vm-block-volumes = true\n  vm-volume-shares = true\n  vm-volume-async-mounts = true\n"
+              "  vm-block-volumes = true\n  vm-volume-shares = true\n  vm-volume-async-mounts = true\n" \
+              "  vm-volume-handoff = true\n"
             )
           end
 
-          it 'parses back into the three values' do
+          it 'parses back into the four values' do
             expect(server['vm-block-volumes']).to eql(true)
             expect(server['vm-volume-shares']).to eql(true)
             expect(server['vm-volume-async-mounts']).to eql(true)
+            expect(server['vm-volume-handoff']).to eql(true)
           end
         end
 
         {
           'vm_block_volumes' => [true, /garden.vm_block_volumes requires a vm-\* entry/],
           'vm_volume_shares' => [true, /garden.vm_volume_shares requires a vm-\* entry/],
-          'vm_volume_sync_mounts' => [false, /garden.vm_volume_sync_mounts requires a vm-\* entry/]
+          'vm_volume_sync_mounts' => [false, /garden.vm_volume_sync_mounts requires a vm-\* entry/],
+          'vm_volume_handoff' => [true, /garden.vm_volume_handoff requires a vm-\* entry/]
         }.each do |property, (value, message)|
           [[], ['oci-gvisor']].each do |backends|
             it "raises when #{property} is #{value} and the backends are #{backends.inspect}" do
@@ -826,7 +852,7 @@ describe 'garden' do
           expect { render_with([], defaults) }.not_to raise_error
         end
 
-        %w[vm_block_volumes vm_volume_shares vm_volume_sync_mounts].each do |property|
+        %w[vm_block_volumes vm_volume_shares vm_volume_sync_mounts vm_volume_handoff].each do |property|
           ['false', 'true', 'yes', 0, []].each do |value|
             it "raises for #{property} set to #{value.inspect}, which is not a boolean" do
               expect { render_with(['vm-qemu'], { property => value }) }.to raise_error(/garden.#{property} must be true or false/)

@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -435,6 +436,208 @@ stat -L -c %s /proc/self/fd/3 /proc/self/fd/6 >`+shellQuote(sizesFile)+` || exit
 		Expect(logBuf.String()).To(ContainSubstring("guest never started its command; last console output follows"))
 		Expect(logBuf.String()).To(ContainSubstring("vm-launch guest setup: mounting the volume image rvm-disk-2.img at /data failed"))
 		Expect(lockedElsewhere(img)).To(BeFalse())
+	})
+
+	Describe("the volume handoff", func() {
+		var reqPath string
+		// The fake hypervisors live at the artifact paths vm-launch runs.
+		const qemuHypervisor, firecrackerHypervisor = "qemu/ld-linux-x86-64.so.2", "firecracker/firecracker"
+
+		BeforeEach(func() {
+			requireOpenat2()
+			GinkgoT().Setenv("VCAP_APPLICATION", `{"application_id":"`+testAppID+`","process_type":"web","process_id":"`+handoffProcessID+`","name":"app"}`)
+			reqPath = filepath.Join(volDir, handoffRequestName(filepath.Base(img)))
+			saved := handoffTiming
+			DeferCleanup(func() { handoffTiming = saved })
+			handoffTiming.poll, handoffTiming.hold = 20*time.Millisecond, 0
+		})
+
+		runWith := func(kind backend.Kind, flags ...string) int {
+			argv := append([]string{"--backend", string(kind), "--artifacts", art}, flags...)
+			return run(append(argv, "--", "/tmp/lifecycle/launcher", "app", "true", ""), log.New(logBuf, "", 0))
+		}
+
+		// askForever is a replacement of the same process that asks for the
+		// image, with a rising sequence number, until the spec ends.
+		askForever := func() {
+			done := make(chan struct{})
+			stopped := make(chan struct{})
+			DeferCleanup(func() { close(done); <-stopped })
+			go func() {
+				defer GinkgoRecover()
+				defer close(stopped)
+				for seq := uint64(1); ; seq++ {
+					tmp := reqPath + handoffTempSuffix
+					line := handoffRequest{ProcessID: handoffProcessID, Token: waiterToken, Seq: seq}.line()
+					Expect(os.WriteFile(tmp, []byte(line), 0o600)).To(Succeed())
+					Expect(os.Rename(tmp, reqPath)).To(Succeed())
+					select {
+					case <-done:
+						return
+					case <-time.After(20 * time.Millisecond):
+					}
+				}
+			}()
+		}
+
+		// holderHypervisor is a fake hypervisor for a holder, written to
+		// the artifact path hypervisor. It starts the guest command and
+		// creates the file started. It reports status 0 when a stop request
+		// comes, and status 7 when no line comes for ten seconds with a
+		// waiter or for two without one. After its status it closes its own
+		// copy of the image and records whether vm-launch still holds the
+		// lock, which it must until the hypervisor has exited, and whether a
+		// waiter took the image before then.
+		type holderFiles struct{ started, release, waiterLocked string }
+		holderHypervisor := func(hypervisor string, waiter bool) holderFiles {
+			wait := "2"
+			if waiter {
+				wait = "10"
+			}
+			d := GinkgoT().TempDir()
+			f := holderFiles{started: filepath.Join(d, "started"), release: filepath.Join(d, "release"), waiterLocked: filepath.Join(d, "waiter-locked")}
+			writeFakeHypervisor(filepath.Join(art, hypervisor), fdThreeChecks(img)+`echo "RVM_START_$nonce"
+: >`+shellQuote(f.started)+`
+status=7
+while IFS= read -r -t `+wait+` line; do
+	if [ "$line" = "RVM_STOP_$nonce" ]; then
+		status=0
+		break
+	fi
+done
+echo "RVM_EXIT_$nonce=$status"
+exec 3>&-
+sleep 0.3
+exec 20<>`+shellQuote(img)+`
+if flock -n 20; then echo released; else echo held; fi >`+shellQuote(f.release)+`
+exec 20>&-
+if [ -e `+shellQuote(f.waiterLocked)+` ]; then echo "the waiter locked the image before the hypervisor exited" >>`+shellQuote(f.release)+`; fi
+exit 0`)
+			return f
+		}
+
+		// watchesAtStart waits until the holder's guest command runs and
+		// then counts the descriptors on the volume directory that vm-launch,
+		// which runs in this test process, holds. Only a handoff watch holds
+		// one. The spec counts them itself, because a confined hypervisor
+		// running as root holds no capability and so may not read the
+		// descriptors of this process.
+		watchesAtStart := func(f holderFiles) int {
+			Eventually(f.started, 20*time.Second, 10*time.Millisecond).Should(BeAnExistingFile())
+			links, err := filepath.Glob("/proc/self/fd/*")
+			Expect(err).NotTo(HaveOccurred())
+			n := 0
+			for _, l := range links {
+				if target, err := os.Readlink(l); err == nil && target == volDir {
+					n++
+				}
+			}
+			return n
+		}
+
+		It("never watches for a request without --volume-handoff, so a live one does not stop the guest", func() {
+			askForever()
+			f := holderHypervisor(qemuHypervisor, false)
+			watches := make(chan int, 1)
+			go func() {
+				defer GinkgoRecover()
+				watches <- watchesAtStart(f)
+			}()
+			Expect(runWith(backend.VMQemu)).To(Equal(7), logBuf.String())
+			Expect(watches).To(Receive(Equal(0)))
+			Expect(os.ReadFile(f.release)).To(Equal([]byte("held\n")))
+			Expect(logBuf.String()).NotTo(ContainSubstring("another instance of this process is waiting"))
+			Expect(logBuf.String()).NotTo(ContainSubstring("hands the volumes over"))
+			Expect(logBuf.String()).NotTo(ContainSubstring("released volume image"))
+			Expect(lockedElsewhere(img)).To(BeFalse())
+		})
+
+		DescribeTable("hands the image to a waiting replacement with --volume-handoff, which locks it only once the hypervisor has exited", func(kind backend.Kind, hypervisor string) {
+			f := holderHypervisor(hypervisor, true)
+			// The replacement starts its wait, with the wait vm-launch gives
+			// it, once the holder's guest command runs and the spec has
+			// counted the holder's watches.
+			watches := make(chan int, 1)
+			waited := make(chan waitedImage, 1)
+			waiterLog := &safeBuffer{}
+			go func() {
+				defer GinkgoRecover()
+				watches <- watchesAtStart(f)
+				id := handoffIdentity{ProcessID: handoffProcessID, Token: waiterToken}
+				o := imageOptions{Size: defaultImageSize, LockWait: lockWait, LockPoll: 20 * time.Millisecond, IsMountRoot: alwaysMountRoot, Handoff: &id,
+					Logf: log.New(waiterLog, "", 0).Printf}
+				w, err := openVolumeImage(&guestVolume{ContainerDir: volDir, ImageName: filepath.Base(img)}, o, nil)
+				if err == nil {
+					Expect(os.WriteFile(f.waiterLocked, nil, 0o600)).To(Succeed())
+				}
+				waited <- waitedImage{img: w, err: err, at: time.Now()}
+			}()
+			Expect(runWith(kind, "--volume-handoff")).To(Equal(0), logBuf.String())
+			returned := time.Now()
+			Expect(watches).To(Receive(Equal(1)), logBuf.String())
+			Expect(os.ReadFile(f.release)).To(Equal([]byte("held\n")))
+			Expect(logBuf.String()).To(ContainSubstring("another instance of this process is waiting for volume image " + img + ", so vm-launch asks the guest command to stop and hands the volumes over once the guest has stopped"))
+			var w waitedImage
+			Eventually(waited, 10*time.Second).Should(Receive(&w))
+			Expect(w.err).NotTo(HaveOccurred())
+			DeferCleanup(w.img.Close)
+			Expect(w.at).To(BeTemporally("<", returned.Add(5*time.Second)))
+			Expect(reqPath).NotTo(BeAnExistingFile(), "the replacement left its request behind")
+			// Each side says when the lock changed hands, and only the side
+			// that waited says it took the lock.
+			Expect(logBuf.String()).To(ContainSubstring("released volume image " + img + ", so an instance that waits for it can take it\n"))
+			Expect(logBuf.String()).NotTo(ContainSubstring("holds the lock now"))
+			Expect(waiterLog.String()).To(MatchRegexp(`volume image ` + regexp.QuoteMeta(img) + `: this instance holds the lock now, \S+ after it first asked for it\n`))
+		},
+			Entry("on QEMU", backend.VMQemu, qemuHypervisor),
+			Entry("on Firecracker", backend.VMFirecracker, firecrackerHypervisor),
+		)
+
+		// waitBehindHolder runs vm-launch while another instance holds the
+		// image, and reports whether a request file appeared during the
+		// lock wait.
+		waitBehindHolder := func(flags ...string) (asked bool) {
+			writeImage(img, defaultImageSize, nil)
+			holder, err := os.OpenFile(img, os.O_RDWR, 0)
+			Expect(err).NotTo(HaveOccurred())
+			defer holder.Close()
+			Expect(syscall.Flock(int(holder.Fd()), syscall.LOCK_EX)).To(Succeed())
+			argvFile := writeFakeHypervisor(filepath.Join(art, qemuHypervisor), "")
+			done := make(chan struct{})
+			seen := make(chan bool, 1)
+			go func() {
+				defer GinkgoRecover()
+				for {
+					if _, err := os.Lstat(reqPath); err == nil {
+						seen <- true
+						return
+					}
+					select {
+					case <-done:
+						seen <- false
+						return
+					case <-time.After(5 * time.Millisecond):
+					}
+				}
+			}()
+			code := runWith(backend.VMQemu, flags...)
+			close(done)
+			Expect(code).To(Equal(exitLaunchError))
+			Expect(argvFile).NotTo(BeAnExistingFile())
+			Expect(reqPath).NotTo(BeAnExistingFile(), "the wait left its request behind")
+			return <-seen
+		}
+
+		It("never asks the holder for the image without --volume-handoff", func() {
+			Expect(waitBehindHolder()).To(BeFalse())
+			Expect(logBuf.String()).NotTo(ContainSubstring("asking the instance that holds it"))
+			Expect(logBuf.String()).To(ContainSubstring("volume image " + img + " is in use by another instance"))
+		})
+
+		It("asks the holder for the image during the wait with --volume-handoff", func() {
+			Expect(waitBehindHolder("--volume-handoff")).To(BeTrue())
+			Expect(logBuf.String()).To(ContainSubstring("volume image " + img + " is locked; asking the instance that holds it to hand it over"))
+		})
 	})
 })
 

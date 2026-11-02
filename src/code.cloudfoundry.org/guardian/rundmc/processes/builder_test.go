@@ -1497,6 +1497,20 @@ var _ = Describe("the volume flags of the wrapped vm-launch", func() {
 		})
 	})
 
+	Describe("VMLaunchHandoffFlags", func() {
+		DescribeTable("renders the flag for each setting",
+			func(handoff bool, expected []string) {
+				Expect(processes.VMLaunchHandoffFlags(handoff)).To(Equal(expected))
+			},
+			Entry("the default of no handoff passes nothing", false, []string(nil)),
+			Entry("a handoff passes the flag", true, []string{"--volume-handoff"}),
+		)
+
+		It("names the flag vm-launch reads", func() {
+			Expect(processes.VMLaunchVolumeHandoffFlag).To(Equal("--volume-handoff"))
+		})
+	})
+
 	Context("when no flag is set", func() {
 		It("builds the argv it built before: the path, then vm-launch's own arguments", func() {
 			Expect(build().Args).To(Equal(append([]string{processes.VMLaunchPath}, launcherArgs...)))

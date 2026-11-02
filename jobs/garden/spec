@@ -386,6 +386,22 @@ properties:
       Setting true requires a vm-* entry in garden.execution_backends.
     default: false
 
+  garden.vm_volume_handoff:
+    description: |
+      Hand a private disk image volume over from a running vm-* instance to
+      a new instance of the same app process that waits for it, such as the
+      replacement Diego starts during an evacuation. The waiting instance
+      asks for the image, and the running one, once it has held the image
+      for a minute, gives its guest the usual stop and its deadline, then
+      releases the image, so the replacement need not wait out the whole
+      evacuation. The handoff never grants the image to anyone, and the
+      image's flock stays the only fence. The handoff stops the old guest
+      early, so it is off by default, and then an instance neither asks for
+      an image nor reads a request. It renders vm-volume-handoff = true in
+      config.ini, Garden then passes --volume-handoff to vm-launch, and it
+      requires a vm-* entry in garden.execution_backends.
+    default: false
+
   garden.vm_qemu_sandbox:
     description: |
       The value of QEMU's -sandbox option for a vm-qemu container, which turns

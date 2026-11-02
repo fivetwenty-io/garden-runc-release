@@ -1688,8 +1688,11 @@ type runResult struct {
 	markerFound bool
 	guestStatus int
 	// received is the first signal vm-launch received, whether it was
-	// forwarded or became a stop request, or 0.
+	// forwarded or became a stop request, or 0. A handoff counts as SIGTERM.
 	received syscall.Signal
+	// handedOff is set when the guest was stopped for a handoff request
+	// rather than for a signal.
+	handedOff bool
 	// guestOOMKills is how many processes the guest kernel killed for lack of
 	// memory, as the guest reported, or 0.
 	guestOOMKills int
@@ -1731,6 +1734,16 @@ type runResult struct {
 // the drain closes before that, on the guest's listen report. A signal that
 // the supervisor forwards runs closePorts at once, because the hypervisor
 // may end at once.
+//
+// A handoff request (see handoff.go) is a stop that comes from another
+// instance rather than from a signal. The supervisor takes one only while the
+// guest's command runs and no signal has come, writes the stop request for
+// it, and starts the deadline, so it then acts as after a first SIGTERM that
+// became a stop request. A signal that comes later changes nothing, and a
+// request that comes after a signal, or once the guest reported its status,
+// is never taken. A request is only advice, so when the stop request cannot
+// be written the supervisor logs it and goes on as if no request had come,
+// and the instance keeps its volumes until it is stopped.
 type supervisor struct {
 	stdout io.Writer
 	// stderr, when set, takes the app's stderr lines from the guest's log
@@ -1801,6 +1814,11 @@ type supervisor struct {
 	// status line, so a spec can send a signal that comes after it. It must
 	// not block. vm-launch leaves it unset.
 	reported func()
+	// handoff, when set, carries the line that says why another instance
+	// needs the guest's volumes. The supervisor takes from it only while the
+	// guest command runs and no signal has come, so a sender that offers a
+	// line with a timeout learns whether the supervisor acted on it.
+	handoff <-chan string
 	// prepare, when set, makes the supervisor start the hypervisor from an
 	// OS thread of its own, after prepare has run on it (see
 	// startConfined). vm-launch uses it to start Firecracker without any
@@ -1909,9 +1927,11 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 	running, markerSeen := filter.running, filter.exited
 	var kill <-chan time.Time
 	var killReason string
-	// signalled is set at the first signal, and asked once the stop request
-	// for it is written.
+	// signalled is set at the first signal, or at the handoff, and asked
+	// once the stop request for it is written. handoff is s.handoff only
+	// while the guest command runs and nothing has asked it to stop.
 	signalled, asked := false, false
+	var handoff <-chan string
 	closePorts := func() {
 		if s.closePorts != nil {
 			s.closePorts()
@@ -1936,6 +1956,7 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 				continue
 			}
 			signalled = true
+			handoff = nil
 			if ss, ok := sig.(syscall.Signal); ok {
 				res.received = ss
 			}
@@ -1994,8 +2015,39 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 			case !signalled && !isClosed(filter.exited):
 				s.onFileConsole(stdin)
 			}
+			if !signalled && !isClosed(filter.exited) {
+				handoff = s.handoff
+			}
+		case reason := <-handoff:
+			handoff = nil
+			// The marker may have come in the same pass, and then the guest
+			// is already on its way down.
+			if isClosed(filter.exited) {
+				continue
+			}
+			// Unlike a signal, a request that cannot reach the guest is not
+			// forwarded to the hypervisor, which would end the guest without
+			// its teardown. tryStop keeps the console when it wrote nothing,
+			// so a later signal still asks the guest to stop and the
+			// identity pushes go on. The handoff stays off from here until
+			// the instance stops, because the watcher has ended and nothing
+			// sets handoff again. That is safe, since the instance then keeps
+			// its volumes and the replacement waits as it would without the
+			// handoff.
+			if err := stdin.tryStop(stopTag(nonce)); err != nil {
+				s.logger.Printf("%s, but sending the stop request to the guest failed: %v; this instance keeps the volumes until it is stopped", reason, err)
+				continue
+			}
+			signalled, asked = true, true
+			res.received, res.handedOff = syscall.SIGTERM, true
+			s.logger.Printf("%s, so vm-launch asks the guest command to stop and hands the volumes over once the guest has stopped", reason)
+			if kill == nil {
+				kill = time.After(s.deadline)
+				killReason = fmt.Sprintf("the guest did not stop within %v of the handoff request; killing the hypervisor", s.deadline)
+			}
 		case <-markerSeen:
 			markerSeen = nil
+			handoff = nil
 			// After a stop request, the guest's status ends the drain.
 			// Without one, the ports close when the guest ends, as they do
 			// when the guest command ends of its own accord.

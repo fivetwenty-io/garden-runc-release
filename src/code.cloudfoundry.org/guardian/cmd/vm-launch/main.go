@@ -7,7 +7,7 @@
 //
 // Usage:
 //
-//	vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--max-vcpus N] [--full-memory-limit] [--mirror-mounts] [--artifacts DIR] -- PATH [ARGS...]
+//	vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--volume-handoff] [--max-vcpus N] [--full-memory-limit] [--mirror-mounts] [--artifacts DIR] -- PATH [ARGS...]
 //
 // When PATH is the CF launcher ("launcher APP-DIR START-COMMAND ..."), the
 // guest runs START-COMMAND. Otherwise it runs PATH and ARGS, shell-quoted.
@@ -114,6 +114,15 @@
 // for as long as the VM runs, waiting up to 30 seconds in all, over every
 // volume, for another instance to release it, checks after the wait that the name still refers to the
 // locked file, and passes the image to the hypervisor as file descriptor 3.
+// With --volume-handoff, which is off by default, it asks the instance that
+// holds the image on JuiceFS or NFS to hand it over while it waits, through a
+// request file .rvm-handoff-IMAGENAME beside the image. The holder, when it
+// runs with the flag too, is an instance of the same process_id, has held the
+// image for a minute, and its guest command runs, stops the guest as at a
+// SIGTERM and releases the image once the hypervisor has exited, so that an
+// evacuation's replacement need not wait for the old instance to be stopped
+// (see handoff.go). Without the flag, a launch neither writes a request nor
+// reads one.
 // With more than one volume, the volumes are taken in the byte order of
 // their paths and numbered from 0 in that order, shares included. Each image
 // or disk gets the next file descriptor and the next drive, and its drive
@@ -439,7 +448,8 @@
 //	       died from signal N, before the guest reported a status; this
 //	       includes a signal while vm-launch waits for the volume image,
 //	       resolves CredHub references, or starts virtiofsd, and a guest
-//	       command that did not stop within 8 seconds of the signal
+//	       command that did not stop within 8 seconds of the signal; a guest
+//	       stopped for a handoff counts as stopped by SIGTERM
 //
 // A guest command can exit with any of these values itself; whenever vm-launch
 // picks the status, it also writes a "vm-launch:" line to stderr.
@@ -567,7 +577,15 @@ const maxVCPUsFlag = "max-vcpus"
 // The cell is then oversubscribed by the reserve for each VM container.
 const fullMemoryLimitFlag = "full-memory-limit"
 
-const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--qemu-sandbox=OPTIONS] [--max-vcpus N] [--full-memory-limit] [--mirror-mounts] [--guest-agent] [--image-user USER [--image-default-env NAMES]] [--artifacts DIR] -- PATH [ARGS...]\n"
+// volumeHandoffFlag names the vm-launch flag with which the operator turns
+// on the volume handoff (see handoff.go). It is off by default, and Garden
+// renders it from a job property. With it, a launch that waits for an image
+// asks the holder to hand it over, and a launch that holds one stops its
+// guest early for such a request. Without it, a launch does neither, so an
+// instance keeps its image until it is stopped, as before the handoff.
+const volumeHandoffFlag = "volume-handoff"
+
+const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--volume-handoff] [--qemu-sandbox=OPTIONS] [--max-vcpus N] [--full-memory-limit] [--mirror-mounts] [--guest-agent] [--image-user USER [--image-default-env NAMES]] [--artifacts DIR] -- PATH [ARGS...]\n"
 
 type config struct {
 	backend   backend.Kind
@@ -595,6 +613,9 @@ type config struct {
 	// is false, an image with a journal mounts without them (see
 	// volumeSyncMountsFlag).
 	volumeSyncMounts bool
+	// volumeHandoff lets the launch take part in the volume handoff (see
+	// volumeHandoffFlag).
+	volumeHandoff bool
 	// qemuSandbox is the value of QEMU's -sandbox option, or empty for none
 	// (see qemuSandboxFlag).
 	qemuSandbox string
@@ -890,6 +911,9 @@ func run(argv []string, logger *log.Logger) int {
 	}
 	if err == nil {
 		err = applyVolumeSettings(lookupEnv, vols)
+	}
+	if err == nil && !cfg.volumeHandoff {
+		withoutHandoff(vols)
 	}
 	var selected []selectedVolume
 	if err == nil && len(vols) > 0 {
@@ -1472,7 +1496,18 @@ func run(argv []string, logger *log.Logger) int {
 	if mirror.watching() {
 		stopMirror = watchMirror(&sup, nonce, mirror, logger)
 	}
+	// The holder of an image under a distributed flock reads, while the
+	// guest runs, whether another instance of its process waits for the
+	// image, and the supervisor then stops the guest so that the release
+	// below hands the image over (see handoff.go). The watcher stops as soon
+	// as the supervisor returns. Without --volume-handoff no volume has a
+	// watch, so no watcher starts and the supervisor never stops the guest
+	// for a request.
+	handoffs := startHandoffWatcher(prepared.handoffWatches(), handoffTiming.poll, handoffTiming.hold)
+	defer handoffs.stop()
+	sup.handoff = handoffs.requests()
 	res, err := sup.run(cmd, nonce)
+	handoffs.stop()
 	stopWatch()
 	stopMirror()
 	stopMetrics()
@@ -1718,6 +1753,7 @@ func parseArgs(argv []string) (config, error) {
 	allowShares := fs.Bool(allowVolumeSharesFlag, false, "allow an app to ask for a volume as a share in VM_VOLUMES, which only QEMU can serve")
 	virtiofsd := fs.String(virtiofsdFlag, "", "path of the executable that runs virtiofsd, which serves shares")
 	syncMounts := fs.Bool(volumeSyncMountsFlag, true, "mount every volume image with sync and dirsync; with =false, an image whose filesystem has a journal mounts without them")
+	handoff := fs.Bool(volumeHandoffFlag, false, "ask the instance that holds a volume image for it while waiting, and hand a held image to a waiting instance of the same process")
 	sandbox := fs.String(qemuSandboxFlag, qemuSandbox, "the value of QEMU's -sandbox option, which turns on its seccomp filter; empty turns the sandbox off")
 	maxVCPUs := fs.Int(maxVCPUsFlag, 0, "the most vCPUs a guest gets; 0 gives it one for each CPU the container may run on")
 	fullMemory := fs.Bool(fullMemoryLimitFlag, false, "give the guest the whole MEMORY_LIMIT, which Garden has raised the container's limit to hold")
@@ -1732,7 +1768,7 @@ func parseArgs(argv []string) (config, error) {
 		return config{}, fmt.Errorf("--%s must be 0 or more, got %d", maxVCPUsFlag, *maxVCPUs)
 	}
 
-	cfg := config{backend: backend.Kind(*kind), transparent: *transparent, allowVolumeShares: *allowShares, volumeSyncMounts: *syncMounts, qemuSandbox: *sandbox, maxVCPUs: *maxVCPUs, fullMemoryLimit: *fullMemory, mirrorMounts: *mirror, guestAgent: *guestAgent}
+	cfg := config{backend: backend.Kind(*kind), transparent: *transparent, allowVolumeShares: *allowShares, volumeSyncMounts: *syncMounts, volumeHandoff: *handoff, qemuSandbox: *sandbox, maxVCPUs: *maxVCPUs, fullMemoryLimit: *fullMemory, mirrorMounts: *mirror, guestAgent: *guestAgent}
 	virtiofsdSet, imageSet, imageDefaultsSet := false, false, false
 	fs.Visit(func(f *flag.Flag) {
 		virtiofsdSet = virtiofsdSet || f.Name == virtiofsdFlag
@@ -2042,6 +2078,8 @@ func exitCode(r runResult) (code int, reason string) {
 	switch {
 	case r.markerFound:
 		return r.guestStatus, ""
+	case r.handedOff:
+		return 128 + int(r.received), "stopped to hand the volumes to another instance before the guest reported a status"
 	case r.received != 0:
 		return 128 + int(r.received), fmt.Sprintf("stopped by %v before the guest reported a status", r.received)
 	case r.state == nil:

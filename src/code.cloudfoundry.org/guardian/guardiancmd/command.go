@@ -222,6 +222,7 @@ type CommonCommand struct {
 		VMGuestAgent        bool          `long:"vm-guest-agent" description:"Give each vm-* container the guest agent, which runs a cf ssh session, command, and signals inside the guest as the app user. Garden passes --guest-agent to vm-launch, binds vm-launch read-only over /bin/bash in the container so that diego-sshd's shell reaches the agent, and adds /dev/vhost-vsock to a vm-qemu container when the host has it. Off by default."`
 		VMVolumeAsyncMounts bool          `long:"vm-volume-async-mounts" description:"Mount a journalled ext4 image volume of a vm-* container without sync and dirsync, which vm-launch otherwise uses. A legacy ext2 image without a journal keeps them. Garden passes --volume-sync-mounts=false to vm-launch only when this is set. Off by default."`
 		VMMirrorMounts      bool          `long:"vm-mirror-mounts" description:"Carry the bind mounts of a vm-* container, such as the file-based service bindings at /etc/cf-service-bindings, into its guest at the same paths, by rule. Garden passes --mirror-mounts to vm-launch only when this is set. Off by default."`
+		VMVolumeHandoff     bool          `long:"vm-volume-handoff" description:"Let a vm-* container that holds a private disk image stop its guest early and hand the image over when a new instance of the same app process waits for it, such as during an evacuation, and let a waiting container ask for it. The old guest gets the usual stop and its deadline. The handoff never grants the image to anyone, and the image's flock stays the only fence. Garden passes --volume-handoff to vm-launch only when this is set. Off by default."`
 		VMQemuSandbox       string        `long:"vm-qemu-sandbox" default:"on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny" description:"The value of QEMU's -sandbox option for a vm-qemu container, which turns on QEMU's own seccomp filter. An empty value turns the sandbox off. Garden passes --qemu-sandbox to vm-launch only when the value differs from the default."`
 		VMStackTarballs     []string      `long:"vm-stack-tarball" description:"Absolute path of a stack rootfs tarball to turn into a read-only squashfs image for vm-* containers, such as /var/vcap/packages/cflinuxfs4/rootfs.tar. A VM container whose rootfs is a listed tarball gets the image bound read-only at /opt/garden-vm/stack. Requires a vm-* backend. Can be specified multiple times."`
 		VMStackCacheDir     string        `long:"vm-stack-cache-dir" default:"/var/vcap/data/vm-runtime/stacks" description:"Host directory that caches the stack images, one directory for each tarball digest."`
@@ -1238,20 +1239,21 @@ func (cmd *CommonCommand) logUnusedBlockVolumes(log lager.Logger) {
 }
 
 // vmLaunchVolumeFlags returns the volume, QEMU sandbox, CPU, mount mirroring,
-// and guest agent flags for the wrapped vm-launch of a vm-* container, which
-// are empty for the defaults.
+// guest agent, and handoff flags for the wrapped vm-launch of a vm-* container,
+// which are empty for the defaults.
 func (cmd *CommonCommand) vmLaunchVolumeFlags() []string {
 	flags := processes.VMLaunchVolumeFlags(cmd.ExecutionBackends.VMVolumeShares, bundlerules.VMVirtiofsdPath, !cmd.ExecutionBackends.VMVolumeAsyncMounts)
 	flags = append(flags, processes.VMLaunchQEMUSandboxFlags(cmd.ExecutionBackends.VMQemuSandbox)...)
 	flags = append(flags, processes.VMLaunchCPUFlags(cmd.ExecutionBackends.VMMaxVCPUs)...)
 	flags = append(flags, processes.VMLaunchMirrorMountsFlags(cmd.ExecutionBackends.VMMirrorMounts)...)
-	return append(flags, processes.VMLaunchGuestAgentFlags(cmd.ExecutionBackends.VMGuestAgent)...)
+	flags = append(flags, processes.VMLaunchGuestAgentFlags(cmd.ExecutionBackends.VMGuestAgent)...)
+	return append(flags, processes.VMLaunchHandoffFlags(cmd.ExecutionBackends.VMVolumeHandoff)...)
 }
 
 // logUnusedVolumeFlags notes that --vm-volume-shares,
 // --vm-volume-async-mounts, --vm-max-vcpus, --vm-full-memory-limit,
-// --vm-mirror-mounts, or --vm-guest-agent has no effect because no vm-*
-// backend is enabled.
+// --vm-mirror-mounts, --vm-guest-agent, or --vm-volume-handoff has no effect
+// because no vm-* backend is enabled.
 func (cmd *CommonCommand) logUnusedVolumeFlags(log lager.Logger) {
 	if cmd.ExecutionBackends.VMVolumeShares {
 		log.Info("volume-shares-unused-without-a-vm-backend")
@@ -1270,6 +1272,9 @@ func (cmd *CommonCommand) logUnusedVolumeFlags(log lager.Logger) {
 	}
 	if cmd.ExecutionBackends.VMGuestAgent {
 		log.Info("guest-agent-unused-without-a-vm-backend")
+	}
+	if cmd.ExecutionBackends.VMVolumeHandoff {
+		log.Info("volume-handoff-unused-without-a-vm-backend")
 	}
 }
 

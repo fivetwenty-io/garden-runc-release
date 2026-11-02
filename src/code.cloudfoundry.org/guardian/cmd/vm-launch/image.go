@@ -173,6 +173,18 @@ type imageOptions struct {
 	// and takes nothing from the budget.
 	LockBudget *lockBudget
 
+	// Handoff, when set, is who this launch is in a handoff request (see
+	// handoff.go). While the lock wait finds the image locked, the launch
+	// writes a request beside the image that asks the holder to hand it over,
+	// and it removes the request once the wait has ended. Without it the wait
+	// asks nothing.
+	Handoff *handoffIdentity
+
+	// busy, when set, runs each time the lock wait finds the image locked,
+	// before it waits for the next try. openVolumeImage sets it to the
+	// requester's refresh when Handoff is set.
+	busy func()
+
 	// Logf, when set, takes the lines that are not errors: an image kept at a
 	// larger size than asked for, an existing image that grows, and the
 	// progress of a grow that writes zeros. Without it they are not printed.
@@ -345,10 +357,11 @@ func (e *signalledError) Error() string {
 // or removes an image that fails a check. It then calls BeforeLock, when there
 // is one, and takes an exclusive flock, retrying every LockPoll for up to
 // LockWait, or for what is left of LockBudget when that is less, and giving up
-// early when a signal arrives on sigs. Once it holds the lock, it checks that
-// the name still refers to the locked file, which an operator or a co-bound
-// app could have deleted or replaced during the wait, and checks the file
-// again.
+// early when a signal arrives on sigs. With Handoff set, it asks the holder
+// for the image while it waits (see handoff.go). Once it holds the lock, it
+// checks that the name still refers to the locked file, which an operator or
+// a co-bound app could have deleted or replaced during the wait, and checks
+// the file again.
 //
 // Still under the lock, it brings the image up to Size (growImage), writing
 // only past the image's current end, after asking the volume whether it has
@@ -436,12 +449,25 @@ func openVolumeImage(v *guestVolume, o imageOptions, sigs <-chan os.Signal) (*os
 			return nil, err
 		}
 	}
-	if err := lockImage(fd, path, o, sigs); err != nil {
+	// A launch that takes part in the handoff asks the holder for the image
+	// while the wait finds it locked, and takes its request back however the
+	// wait ends, so that no holder acts on it later. It first removes the
+	// temporary request files that killed launches left behind.
+	var asker *handoffRequester
+	if o.Handoff != nil {
+		sweepHandoffTemps(dirfd)
+		asker = newHandoffRequester(dirfd, v.ImageName, path, *o.Handoff, o.logf)
+		o.busy = asker.refresh
+	}
+	err = lockImage(fd, path, o, sigs)
+	asker.withdraw()
+	if err != nil {
 		return nil, err
 	}
 	if err := checkImageName(dirfd, fd, v.ImageName, path); err != nil {
 		return nil, err
 	}
+	asker.took()
 	size, err := checkOpenImage(fd, path, o)
 	if err != nil {
 		return nil, err
@@ -1746,8 +1772,9 @@ func checkImage(fd int, path string) (int64, error) {
 
 // lockImage takes an exclusive flock on fd. It tries again every o.LockPoll
 // until o.LockWait has passed, or the time left in o.LockBudget, whichever is
-// less, and stops early when a signal arrives. The time it spends goes
-// against the budget, whether or not it gets the lock.
+// less, and stops early when a signal arrives. Each time it finds the image
+// locked and goes on waiting, it calls o.busy, when set. The time it spends
+// goes against the budget, whether or not it gets the lock.
 func lockImage(fd int, path string, o imageOptions, sigs <-chan os.Signal) error {
 	began := time.Now()
 	wait := o.LockWait
@@ -1770,6 +1797,9 @@ func lockImage(fd int, path string, o imageOptions, sigs <-chan os.Signal) error
 		if remaining <= 0 {
 			return &volumeError{kind: errVolumeInUse,
 				msg: fmt.Sprintf("volume image %s is in use by another instance; VM backends allow one writer per image", path)}
+		}
+		if o.busy != nil {
+			o.busy()
 		}
 		wait := o.LockPoll
 		if remaining < wait {

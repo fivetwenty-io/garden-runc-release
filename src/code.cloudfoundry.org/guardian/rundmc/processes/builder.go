@@ -105,6 +105,12 @@ const (
 	// flag only when the operator turns the agent on.
 	VMLaunchGuestAgentFlag = "--guest-agent"
 
+	// VMLaunchVolumeHandoffFlag tells vm-launch to hand a private disk
+	// image over to a waiting instance of the same process, and to ask for
+	// one while it waits. vm-launch defaults to no handoff, so
+	// VMLaunchHandoffFlags passes the flag only to turn it on.
+	VMLaunchVolumeHandoffFlag = "--volume-handoff"
+
 	// portEnvPrefix starts the environment entry that names the port of a
 	// process that serves one. vm-launch forwards ports only when the entry
 	// is present, whatever its value, and exits when the value is no port.
@@ -279,6 +285,17 @@ func VMLaunchGuestAgentFlags(on bool) []string {
 		return nil
 	}
 	return []string{VMLaunchGuestAgentFlag}
+}
+
+// VMLaunchHandoffFlags returns the vm-launch flag that turns on the volume
+// handoff. It returns none for the default of no handoff, so that vm-launch
+// gets the arguments it gets today, and VMLaunchVolumeHandoffFlag when
+// handoff is true.
+func VMLaunchHandoffFlags(handoff bool) []string {
+	if !handoff {
+		return nil
+	}
+	return []string{VMLaunchVolumeHandoffFlag}
 }
 
 // WithVMLaunchFlags makes BuildProcess pass flags to the vm-launch process

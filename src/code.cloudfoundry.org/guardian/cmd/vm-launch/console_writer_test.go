@@ -107,6 +107,17 @@ func pipeHolds(r *os.File) int {
 	return n
 }
 
+// fillLines returns lines that hold twice the capacity of the pipe behind f
+// (F_GETPIPE_SZ), so that a push of them fills the pipe on any page size.
+func fillLines(f *os.File) []string {
+	raw, err := f.SyscallConn()
+	Expect(err).NotTo(HaveOccurred())
+	var size int
+	Expect(raw.Control(func(fd uintptr) { size, err = unix.FcntlInt(fd, unix.F_GETPIPE_SZ, 0) })).To(Succeed())
+	Expect(err).NotTo(HaveOccurred())
+	return pushLines(2 * size / 128)
+}
+
 var _ = Describe("the console writer", func() {
 	stopLine := stopTag(testNonce) + "\n"
 
@@ -170,10 +181,11 @@ var _ = Describe("the console writer", func() {
 
 	It("cuts short a chunk that waits on a full pipe and writes none of it", func() {
 		w, rd := consolePipe()
-		w.pace = 0
-		// The push is far bigger than the pipe, and nothing reads the pipe
-		// yet, so the push waits in a write once the pipe is full.
-		lines := pushLines(2000)
+		// The push is twice the size of the pipe, and nothing reads the
+		// pipe yet, so the push waits in a write once the pipe is full. Its
+		// chunk deadline is far off, so only the stop ends that write.
+		w.pace, w.chunkTimeout = 0, time.Minute
+		lines := fillLines(rd.r)
 		pushed := make(chan error, 1)
 		go func() { pushed <- w.push(lines) }()
 		// The pipe is full once what it holds stops growing.
@@ -216,6 +228,55 @@ var _ = Describe("the console writer", func() {
 		Expect(string(rd.bytes())).To(Equal(stopLine))
 	})
 
+	It("gives the console back when tryStop writes nothing, so a later paced push and stop still work", func() {
+		w, rd := consolePipe()
+		w.pace, w.chunkTimeout = 0, time.Minute
+		lines := fillLines(rd.r)
+		pushed := make(chan error, 1)
+		go func() { pushed <- w.push(lines) }()
+		held := 0
+		Eventually(func() bool {
+			was := held
+			held = pipeHolds(rd.r)
+			return held > 0 && held == was
+		}, 5*time.Second, 50*time.Millisecond).Should(BeTrue())
+
+		// Nothing reads the full pipe, so the stop request finds no room and
+		// runs out its deadline without writing any of itself.
+		began := time.Now()
+		Expect(w.tryStop(stopTag(testNonce))).To(MatchError(os.ErrDeadlineExceeded))
+		Expect(time.Since(began)).To(BeNumerically(">=", stopRequestTimeout-50*time.Millisecond))
+		Eventually(pushed, time.Second).Should(Receive(MatchError(errConsoleStopped)))
+		Expect(pipeHolds(rd.r)).To(Equal(held))
+
+		// The later push has three chunks with pauses between them, which
+		// it gets through only because tryStop put a fresh wake channel in
+		// place of the one the stop closed.
+		rd.start()
+		w.pace = 20 * time.Millisecond
+		later := append(pushLines(5), "RVM_CRED_"+testNonce+"=end 1")
+		Expect(consoleChunks(later, w.chunk)).To(HaveLen(3))
+		Expect(w.push(later)).To(Succeed())
+		Expect(w.stop(stopTag(testNonce))).To(Succeed())
+		Expect(w.close()).To(Succeed())
+		Eventually(rd.done, 5*time.Second).Should(BeClosed())
+		got := rd.bytes()
+		Expect(string(got[held:])).To(Equal(string(joinLines(later)) + stopLine))
+		Expect(joinLines(lines)).To(HavePrefix(string(got[:held])))
+	})
+
+	It("stops for good when tryStop writes the stop request", func() {
+		w, rd := consolePipe()
+		rd.start()
+		Expect(w.tryStop(stopTag(testNonce))).To(Succeed())
+		Expect(w.push(pushLines(1))).To(MatchError(errConsoleStopped))
+		Expect(w.tryStop(stopTag(testNonce))).To(MatchError(errConsoleStopped))
+		Expect(w.stop(stopTag(testNonce))).To(MatchError(errConsoleStopped))
+		Expect(w.close()).To(Succeed())
+		Eventually(rd.done, 5*time.Second).Should(BeClosed())
+		Expect(string(rd.bytes())).To(Equal(stopLine))
+	})
+
 	It("fails every push and the stop request once it is closed", func() {
 		w, _ := consolePipe()
 		Expect(w.close()).To(Succeed())
@@ -250,7 +311,11 @@ var _ = Describe("the console writer", func() {
 		w, rd := consolePipe()
 		Expect(rd.r.Close()).To(Succeed())
 		Expect(w.push(pushLines(1))).To(MatchError(ContainSubstring("broken pipe")))
+		// A tryStop that wrote nothing leaves the writer as it was.
+		Expect(w.tryStop(stopTag(testNonce))).To(MatchError(ContainSubstring("broken pipe")))
+		Expect(w.push(pushLines(1))).To(MatchError(ContainSubstring("broken pipe")))
 		Expect(w.stop(stopTag(testNonce))).To(MatchError(ContainSubstring("broken pipe")))
+		Expect(w.tryStop(stopTag(testNonce))).To(MatchError(errConsoleStopped))
 	})
 })
 
