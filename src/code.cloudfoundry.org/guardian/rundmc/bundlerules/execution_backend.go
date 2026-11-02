@@ -127,6 +127,11 @@ type ExecutionBackend struct {
 	// vm-qemu, /dev/vhost-vsock, on which vm-launch reserves the guest's
 	// vsock address. It is false unless the operator turns the agent on.
 	GuestAgent bool
+
+	// HostVhostVsock says that the host has /dev/vhost-vsock, without which
+	// a vm-qemu container gets no node for it, and its guest runs without the
+	// agent rather than failing to be created.
+	HostVhostVsock bool
 }
 
 // NewExecutionBackend returns the rule with the default required artifact table.
@@ -164,7 +169,7 @@ func (r ExecutionBackend) Apply(bndl goci.Bndl, spec spec.DesiredContainerSpec) 
 		if kind == backend.VMFirecracker {
 			nodes = append(nodes, tunNode)
 		}
-		if r.GuestAgent && kind == backend.VMQemu {
+		if r.GuestAgent && r.HostVhostVsock && kind == backend.VMQemu {
 			vsock := vhostVsockNode
 			vsock.gid = r.KVMGid
 			nodes = append(nodes, vsock)

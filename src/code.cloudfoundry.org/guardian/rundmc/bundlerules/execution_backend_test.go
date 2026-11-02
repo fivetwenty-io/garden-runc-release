@@ -214,6 +214,7 @@ var _ = Describe("ExecutionBackendRule", func() {
 		When("the guest agent is on", func() {
 			BeforeEach(func() {
 				rule.GuestAgent = true
+				rule.HostVhostVsock = true
 			})
 
 			It("appends /dev/vhost-vsock after /dev/kvm with the kvm gid", func() {
@@ -257,6 +258,28 @@ var _ = Describe("ExecutionBackendRule", func() {
 
 			It("does not modify the input bundle", func() {
 				Expect(inputBndl).To(Equal(pristine))
+			})
+
+			When("the host has no /dev/vhost-vsock", func() {
+				BeforeEach(func() {
+					rule.HostVhostVsock = false
+				})
+
+				It("binds vm-launch over /bin/bash but adds no /dev/vhost-vsock node or rule, so the create still succeeds", func() {
+					Expect(newBndl.Devices()).To(HaveLen(2))
+					for _, device := range newBndl.Devices() {
+						Expect(device.Path).NotTo(Equal("/dev/vhost-vsock"))
+					}
+					Expect(newBndl.Resources().Devices).To(HaveLen(2))
+					for _, rule := range newBndl.Resources().Devices {
+						if rule.Minor != nil {
+							Expect(*rule.Minor).NotTo(Equal(int64(241)))
+						}
+					}
+					mounts := newBndl.Mounts()
+					Expect(mounts).To(HaveLen(4))
+					Expect(mounts[3].Destination).To(Equal("/bin/bash"))
+				})
 			})
 		})
 
@@ -461,6 +484,7 @@ var _ = Describe("ExecutionBackendRule", func() {
 		When("the guest agent is on", func() {
 			BeforeEach(func() {
 				rule.GuestAgent = true
+				rule.HostVhostVsock = true
 			})
 
 			It("binds vm-launch read-only over /bin/bash but adds no /dev/vhost-vsock node or rule", func() {

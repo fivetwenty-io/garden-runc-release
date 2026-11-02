@@ -693,6 +693,60 @@ var _ = Describe("execution backend flags", func() {
 			})
 		})
 
+		Context("with the guest agent on", func() {
+			var originalVsock string
+
+			BeforeEach(func() {
+				cmd.ExecutionBackends.Enabled = []string{"vm-qemu"}
+				cmd.ExecutionBackends.VMLaunchBin = launchBin
+				cmd.ExecutionBackends.VMGuestAgent = true
+				originalVsock = hostVhostVsockPath
+			})
+
+			AfterEach(func() {
+				hostVhostVsockPath = originalVsock
+			})
+
+			It("gives vm-qemu containers /dev/vhost-vsock when the host has the character device", func() {
+				hostVhostVsockPath = "/dev/null"
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vhostVsock).To(BeTrue())
+				Expect(log.LogMessages()).NotTo(ContainElement(ContainSubstring("guest-agent-vhost-vsock-unavailable")))
+			})
+
+			It("gives no container /dev/vhost-vsock and says so once when the host has no such device", func() {
+				hostVhostVsockPath = filepath.Join(GinkgoT().TempDir(), "vhost-vsock")
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vhostVsock).To(BeFalse())
+				Expect(backends.vmLaunchFlags).To(ContainElement("--guest-agent"))
+				Expect(log).To(gbytes.Say("guest-agent-vhost-vsock-unavailable"))
+				Expect(log).NotTo(gbytes.Say("guest-agent-vhost-vsock-unavailable"))
+			})
+
+			It("gives no container /dev/vhost-vsock when the host's path is not a character device", func() {
+				hostVhostVsockPath = launchBin
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vhostVsock).To(BeFalse())
+				Expect(log).To(gbytes.Say(`guest-agent-vhost-vsock-unavailable.*not a character device`))
+			})
+
+			It("does not look for /dev/vhost-vsock when vm-qemu is not enabled", func() {
+				cmd.ExecutionBackends.Enabled = []string{"vm-firecracker"}
+				hostVhostVsockPath = filepath.Join(GinkgoT().TempDir(), "vhost-vsock")
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vhostVsock).To(BeFalse())
+				Expect(log.LogMessages()).NotTo(ContainElement(ContainSubstring("guest-agent-vhost-vsock-unavailable")))
+			})
+		})
+
 		It("passes nothing and says so when only oci-gvisor is enabled", func() {
 			cmd.ExecutionBackends.VMVolumeShares = true
 			cmd.ExecutionBackends.VMVolumeAsyncMounts = true

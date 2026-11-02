@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"time"
 
@@ -217,7 +218,7 @@ type CommonCommand struct {
 		VMBlockVolumes      bool          `long:"vm-block-volumes" description:"Give a vm-* container the block device named by each bind mount whose source is a read-only pdi: descriptor tmpfs, as a root:kvm 0660 node at /dev/pdi/MAJOR-MINOR with a read-write device cgroup rule. A device that is the wrong size, mounted, held, or busy on the host refuses the container. The descriptor bind mount must be read-write. Off by default."`
 		VMVolumeShares      bool          `long:"vm-volume-shares" description:"Let an app on a vm-qemu container ask for a volume as a share in VM_VOLUMES. Garden passes --allow-volume-shares and the virtiofsd wrapper's path to vm-launch. Off by default, and a share is refused on vm-firecracker whatever its value."`
 		VMMaxVCPUs          uint          `long:"vm-max-vcpus" description:"The most vCPUs a vm-* guest gets. By default, which is 0, a guest gets one vCPU for each CPU its container may run on, up to 32, so that it can use every core of the cell the way a runC app can, and its container's CPU weight still bounds its total CPU time. Garden passes --max-vcpus to vm-launch only when this is set."`
-		VMGuestAgent        bool          `long:"vm-guest-agent" description:"Give each vm-* container the guest agent, which runs a cf ssh session, command, and signals inside the guest as the app user. Garden passes --guest-agent to vm-launch, binds vm-launch read-only over /bin/bash in the container so that diego-sshd's shell reaches the agent, and adds /dev/vhost-vsock to a vm-qemu container. Off by default."`
+		VMGuestAgent        bool          `long:"vm-guest-agent" description:"Give each vm-* container the guest agent, which runs a cf ssh session, command, and signals inside the guest as the app user. Garden passes --guest-agent to vm-launch, binds vm-launch read-only over /bin/bash in the container so that diego-sshd's shell reaches the agent, and adds /dev/vhost-vsock to a vm-qemu container when the host has it. Off by default."`
 		VMVolumeAsyncMounts bool          `long:"vm-volume-async-mounts" description:"Mount a journalled ext4 image volume of a vm-* container without sync and dirsync, which vm-launch otherwise uses. A legacy ext2 image without a journal keeps them. Garden passes --volume-sync-mounts=false to vm-launch only when this is set. Off by default."`
 		VMQemuSandbox       string        `long:"vm-qemu-sandbox" default:"on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny" description:"The value of QEMU's -sandbox option for a vm-qemu container, which turns on QEMU's own seccomp filter. An empty value turns the sandbox off. Garden passes --qemu-sandbox to vm-launch only when the value differs from the default."`
 		VMStackTarballs     []string      `long:"vm-stack-tarball" description:"Absolute path of a stack rootfs tarball to turn into a read-only squashfs image for vm-* containers, such as /var/vcap/packages/cflinuxfs4/rootfs.tar. A VM container whose rootfs is a listed tarball gets the image bound read-only at /opt/garden-vm/stack. Requires a vm-* backend. Can be specified multiple times."`
@@ -692,6 +693,7 @@ func (cmd *CommonCommand) wireContainerizer(
 		executionBackendRule := bundlerules.NewExecutionBackend(cmd.ExecutionBackends.VMArtifactsDir, cmd.ExecutionBackends.VMLaunchBin, backends.kvmGid)
 		executionBackendRule.BlockVolumes = backends.blockVolumes
 		executionBackendRule.GuestAgent = cmd.ExecutionBackends.VMGuestAgent
+		executionBackendRule.HostVhostVsock = backends.vhostVsock
 		bundleRules = append(bundleRules, executionBackendRule)
 	}
 
@@ -894,6 +896,11 @@ type executionBackends struct {
 	// Docker image runs on. It is empty unless --vm-docker-rootfs is set and
 	// a vm-* backend is enabled.
 	vmDockerRootFS string
+
+	// vhostVsock says that the host has the /dev/vhost-vsock that the guest
+	// agent of a vm-qemu container needs. It is false unless the agent is on
+	// and vm-qemu is enabled.
+	vhostVsock bool
 }
 
 // releaser returns the step that releases claimed block devices, or nil.
@@ -969,6 +976,24 @@ func (b *executionBackends) tapGroup() (uint32, bool) {
 
 // lookupKVMGroup resolves the host group that owns /dev/kvm. Tests replace it.
 var lookupKVMGroup = user.LookupGroup
+
+// hostVhostVsockPath is the host's vhost-vsock device. Tests replace it.
+var hostVhostVsockPath = "/dev/vhost-vsock"
+
+// hostHasVhostVsock reports whether the host has its vhost-vsock device,
+// which is a character device, and logs once at start-up when it does not,
+// because then no vm-qemu guest on the cell gets the guest agent.
+func hostHasVhostVsock(log lager.Logger) bool {
+	info, err := os.Stat(hostVhostVsockPath)
+	if err == nil && info.Mode()&os.ModeCharDevice == 0 {
+		err = errors.New("not a character device")
+	}
+	if err != nil {
+		log.Info("guest-agent-vhost-vsock-unavailable", lager.Data{"path": hostVhostVsockPath, "error": err.Error()})
+		return false
+	}
+	return true
+}
 
 // kvmGroupName is the host group that owns /dev/kvm.
 const kvmGroupName = "kvm"
@@ -1096,9 +1121,11 @@ func (cmd *CommonCommand) wireExecutionBackends(log lager.Logger) (*executionBac
 		vmDockerRootFS = cmd.ExecutionBackends.VMDockerRootFS
 	}
 
+	vhostVsock := kvmGid != 0 && cmd.ExecutionBackends.VMGuestAgent && slices.Contains(kinds, backend.VMQemu) && hostHasVhostVsock(log)
+
 	log.Info("enabled", lager.Data{"backends": kinds, "kvm-gid": kvmGid, "block-volumes": blockVolumes != nil, "vm-launch-flags": vmLaunchFlags, "vm-stacks": vmStacks != nil, "vm-docker-images": vmDockerRootFS != ""})
 
-	return &executionBackends{registry: registry, kvmGid: kvmGid, blockVolumes: blockVolumes, vmLaunchFlags: vmLaunchFlags, vmStacks: vmStacks, vmDockerRootFS: vmDockerRootFS}, nil
+	return &executionBackends{registry: registry, kvmGid: kvmGid, blockVolumes: blockVolumes, vmLaunchFlags: vmLaunchFlags, vmStacks: vmStacks, vmDockerRootFS: vmDockerRootFS, vhostVsock: vhostVsock}, nil
 }
 
 // checkVMDockerFlags refuses Docker image flags that cannot work: a tarball

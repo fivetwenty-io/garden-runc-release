@@ -333,8 +333,9 @@ properties:
       session in the container, outside the guest. When it is true, Garden
       binds vm-launch read-only over /bin/bash in the container, so that the
       shell diego-sshd starts reaches the agent, and gives a vm-qemu
-      container /dev/vhost-vsock, which vm-launch uses to reach the agent. It
-      renders vm-guest-agent only when the value is true, and Garden then
+      container /dev/vhost-vsock, which vm-launch uses to reach the agent,
+      when the cell has it. On a cell without it, a vm-qemu guest runs without
+      the agent, and cf ssh into it says why. It renders vm-guest-agent only when the value is true, and Garden then
       passes --guest-agent to vm-launch, so the default changes no argument.
       It requires a vm-* entry in garden.execution_backends.
     default: false
