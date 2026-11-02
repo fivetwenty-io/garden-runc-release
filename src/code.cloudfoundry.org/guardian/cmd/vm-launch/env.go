@@ -168,10 +168,14 @@ func validEnvName(name string) bool {
 }
 
 // lastWinsEnv returns environ, in os.Environ form, as a map. When a name
-// appears more than once, the last value wins, as it does under runc and
-// bash: Garden lists the image's variables before the process's own, so the
-// last value is Diego's. os.Getenv keeps the first one instead, which is why
-// every reader of the environment goes through this map. An entry without
+// appears more than once, the last value wins, as it does under bash.
+// Garden lists the image's variables before the process's own, so the last
+// value is Diego's. Runc removes the duplicates before it starts the process
+// (prepareEnv in libcontainer), keeping the last value of each name, and that
+// is what makes a variable that an app sets itself lose to the executor's. A
+// process that is handed duplicates directly would see the first one through
+// os.Getenv, which is why every reader of the environment goes through this
+// map. An entry without
 // "=" names nothing a process can look up; it is left out with one line that
 // counts such entries and never repeats one.
 func lastWinsEnv(environ []string, logger *log.Logger) map[string]string {
