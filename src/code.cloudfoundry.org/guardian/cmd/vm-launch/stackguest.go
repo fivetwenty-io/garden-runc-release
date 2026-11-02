@@ -186,10 +186,16 @@ func (s *guestStack) initScript(nonce string) string {
 // volume is set. Stage 2 then mounts them as the busybox guest's does and
 // binds each into the app root, and its teardown unbinds them before it
 // unmounts them (see guestStackVolumeBinds and guestStackVolumeTeardown).
+// The Docker image guest runs its processes with its own command and exec
+// (see guestImage).
 func (s *guestStack) initScriptWithVolumes(nonce string, volume bool) string {
+	command, exec := guestStackRunCommand, guestExec(stackExec)
+	if s.image != nil {
+		command, exec = s.image.runCommand(), s.image.exec
+	}
 	certs := guestSystemCertsSetup(s.systemCerts)
 	if len(s.sidecars) == 0 && s.identity == nil {
-		return stage2Script(nonce, volume, true, certs, "")
+		return stage2ScriptRunning(nonce, volume, true, command, certs, "")
 	}
 	procs := s.processes()
 	checks := guestSidecarChecks(len(s.sidecars))
@@ -197,7 +203,7 @@ func (s *guestStack) initScriptWithVolumes(nonce string, volume bool) string {
 		checks += guestIdentityEchoCheck(nonce)
 	}
 	checks += certs + guestRunSetup(s.identity != nil, procs)
-	return stage2Script(nonce, volume, true, checks, guestRunSection(nonce, procs, s.identity != nil, stackExec))
+	return stage2ScriptRunning(nonce, volume, true, command, checks, guestRunSection(nonce, procs, s.identity != nil, exec))
 }
 
 // processes returns the app, from /rvm/argv and the guest environment, and

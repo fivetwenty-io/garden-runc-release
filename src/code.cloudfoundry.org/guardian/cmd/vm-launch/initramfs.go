@@ -523,6 +523,13 @@ func stackInitScript(nonce string) string {
 // guestStackVolumeSetup, guestStackVolumeBinds, and
 // guestStackVolumeTeardown).
 func stage2Script(nonce string, volume, stack bool, checks, section string) string {
+	return stage2ScriptRunning(nonce, volume, stack, guestStackRunCommand, checks, section)
+}
+
+// stage2ScriptRunning is stage2Script with stackCommand in place of
+// guestStackRunCommand as the command of a stack guest without a run
+// section. The Docker image guest passes its own (see guestImage.runCommand).
+func stage2ScriptRunning(nonce string, volume, stack bool, stackCommand, checks, section string) string {
 	setup := guestFailFunc + guestConsoleSetup
 	if !stack {
 		setup += guestShmSetup
@@ -531,7 +538,7 @@ func stage2Script(nonce string, volume, stack bool, checks, section string) stri
 	command := guestRunCommand
 	if stack {
 		setup += guestStackChecks
-		command = guestStackRunCommand
+		command = stackCommand
 	}
 	setup += checks
 	switch {
@@ -1665,7 +1672,8 @@ const sectorBytes = 512
 // images, as RVM_STACK_ID and RVM_DROPLET_ID after the volumes, and no size
 // for either (see guestStackDiskFunc). A guest with a stack and without
 // both identities is an error, and so is one of the identities in a guest
-// without a stack, whose stage 1 would refuse the drive.
+// without a stack, whose stage 1 would refuse the drive. The Docker image
+// guest gets its image's identity as RVM_STACK_ID and no RVM_DROPLET_ID.
 func disksFile(g guestContents) (string, error) {
 	var b strings.Builder
 	d := g.drives
@@ -1714,6 +1722,11 @@ func disksFile(g guestContents) (string, error) {
 	switch {
 	case g.stack == nil && d.stackID+d.dropletID != "":
 		return "", fmt.Errorf("drive identities %q and %q for no stack and droplet images", d.stackID, d.dropletID)
+	case g.stack != nil && g.stack.image != nil && (d.stackID == "" || d.dropletID != ""):
+		return "", fmt.Errorf("the Docker image guest needs the identity of its image and none for a droplet, and has %q and %q", d.stackID, d.dropletID)
+	case g.stack != nil && g.stack.image != nil:
+		named = append(named, namedDriveID{name: "the Docker image", id: d.stackID})
+		fmt.Fprintf(&b, "RVM_STACK_ID=%s\n", d.stackID)
 	case g.stack != nil && (d.stackID == "" || d.dropletID == ""):
 		return "", fmt.Errorf("a guest with a stack needs the identities of both the stack image and the droplet image, and has %q and %q", d.stackID, d.dropletID)
 	case g.stack != nil:
@@ -1836,6 +1849,11 @@ type guestStack struct {
 	// or the droplet image (see guestFallbackFunc).
 	fallbackEnv string
 	fallback    bool
+	// image, when set, makes this the Docker image guest, whose image takes
+	// the stack's drive and which has no droplet, no fallback, and no
+	// volumes. Its stage 1 is guestImageInit, and its processes run as the
+	// image's user (see guestImage).
+	image *guestImage
 }
 
 // guestSidecar is one sidecar's two files in the stack guest. argv is its
@@ -1876,6 +1894,8 @@ func (s *guestStack) check() error {
 		return fmt.Errorf("a guest runs at most %d sidecars, and this one has %d", maxGuestSidecars, len(s.sidecars))
 	case s.identity != nil && (len(s.identity.cert) == 0 || len(s.identity.key) == 0):
 		return errors.New("the instance identity pair for the guest lacks its certificate or its key")
+	case s.image != nil && s.fallback:
+		return errors.New("the Docker image guest has no busybox guest to fall back to, yet it was given one")
 	}
 	for i, sidecar := range s.sidecars {
 		n := i + 1
@@ -2234,6 +2254,12 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, g 
 			return err
 		}
 		stage1, stage2 = guestStackInit, g.stack.initScriptWithVolumes(g.nonce, len(g.vols) > 0)
+		if g.stack.image != nil {
+			if len(g.vols) > 0 {
+				return fmt.Errorf("the Docker image guest mounts no volumes, and it was given %d", len(g.vols))
+			}
+			stage1 = guestImageInit
+		}
 	}
 	steps := []func() error{
 		func() error { return cw.Dir("bin", 0o755) },

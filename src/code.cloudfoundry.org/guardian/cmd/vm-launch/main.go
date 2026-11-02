@@ -529,7 +529,7 @@ const stopDeadline = 8 * time.Second
 // volume are never changed by it.
 const volumeSyncMountsFlag = "volume-sync-mounts"
 
-const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--artifacts DIR] -- PATH [ARGS...]\n"
+const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--image-user USER [--image-default-env NAMES]] [--artifacts DIR] -- PATH [ARGS...]\n"
 
 type config struct {
 	backend   backend.Kind
@@ -557,6 +557,17 @@ type config struct {
 	// is false, an image with a journal mounts without them (see
 	// volumeSyncMountsFlag).
 	volumeSyncMounts bool
+	// image, when set, makes this a launch of the Docker image guest (see
+	// imageguest.go).
+	image *imageConfig
+}
+
+// imageConfig is what Garden tells vm-launch about a Docker image guest: the
+// user that Diego asked for, and the variables that the process lacked
+// before Garden gave it defaults (see withImageDefaults).
+type imageConfig struct {
+	user       string
+	defaultEnv []string
 }
 
 // init holds the main goroutine, and with it run, to the thread-group
@@ -731,7 +742,23 @@ func run(argv []string, logger *log.Logger) int {
 	// is then exactly the guest of a launch without a stack image. guestMode
 	// is the line that names the guest and why, which run logs once the
 	// hypervisor is about to start.
-	stackImg, why := stackCandidate(cfg.args)
+	//
+	// A launch with --image-user runs the Docker image guest or nothing. Its
+	// image takes the stack image's place, and every reason for the busybox
+	// guest refuses the launch instead (see toBusybox).
+	var stackImg *os.File
+	var imgUser imageUser
+	why := ""
+	switch {
+	case cfg.image != nil && !isLauncher(cfg.args):
+		why = "the process is not the CF launcher"
+	case cfg.image != nil:
+		if stackImg, imgUser, err = openGuestImage(cfg.image.user); err != nil {
+			why = strings.ReplaceAll(err.Error(), "\n", "; ")
+		}
+	default:
+		stackImg, why = stackCandidate(cfg.args)
+	}
 	defer func() { closeFile(stackImg, "the stack image", logger) }()
 	guestMode := ""
 	// toBusybox settles on the busybox guest for the reason why. A launcher
@@ -742,6 +769,10 @@ func run(argv []string, logger *log.Logger) int {
 	toBusybox := func(why string) bool {
 		closeFile(stackImg, "the stack image", logger)
 		stackImg = nil
+		if cfg.image != nil {
+			logger.Print("image guest: " + why)
+			return false
+		}
 		guestMode = "busybox guest: " + why
 		if len(sidecars) > 0 {
 			logger.Print(sidecarsRefusal(len(sidecars), why))
@@ -780,6 +811,12 @@ func run(argv []string, logger *log.Logger) int {
 	// directory exists and before CredHub is asked anything. Every volume
 	// is checked before any of them is prepared.
 	vols, err := volumesFromEnv(lookupEnv)
+	// The Docker image guest mounts no volumes yet, so a launch with any
+	// volume is refused before a provider is looked for.
+	if err == nil && cfg.image != nil && len(vols) > 0 {
+		toBusybox(fmt.Sprintf("the Docker image guest mounts no volumes, and the app has %d", len(vols)))
+		return exitLaunchError
+	}
 	if err == nil {
 		err = applyVolumeSettings(lookupEnv, vols)
 	}
@@ -834,6 +871,13 @@ func run(argv []string, logger *log.Logger) int {
 			}
 		}
 	}
+	// The Docker lifecycle's launcher enters the image's working directory
+	// itself, as the image's user, so every process starts at the top of the
+	// app root.
+	if stack != nil && cfg.image != nil {
+		stack.image = &guestImage{uid: imgUser.uid, gid: imgUser.gid}
+		stack.cwd = "/"
+	}
 	closeLauncher := func() {
 		if stack != nil {
 			closeFile(stack.launcher.file, "the launcher", logger)
@@ -852,10 +896,14 @@ func run(argv []string, logger *log.Logger) int {
 	if resolved {
 		env[vcapServicesEnv] = services
 	}
-	caBundle, err := guestCABundle(rootfsCABundles, lookupEnv, logger)
-	if err != nil {
-		logger.Print(err)
-		return exitLaunchError
+	// The Docker image guest keeps the image's own CA bundle, as a runC
+	// container of the image does, so it takes none from the container.
+	var caBundle []byte
+	if cfg.image == nil {
+		if caBundle, err = guestCABundle(rootfsCABundles, lookupEnv, logger); err != nil {
+			logger.Print(err)
+			return exitLaunchError
+		}
 	}
 	sysCerts, err := readSystemCerts(lookupEnv, logger)
 	if err != nil {
@@ -933,7 +981,13 @@ func run(argv []string, logger *log.Logger) int {
 	// not build gives the busybox guest, whose environment is built then.
 	var droplet *os.File
 	defer func() { closeFile(droplet, "the droplet image", logger) }()
-	if stack != nil {
+	if stack != nil && stack.image != nil {
+		size := int64(-1)
+		if info, err := stackImg.Stat(); err == nil {
+			size = info.Size()
+		}
+		guestMode = fmt.Sprintf("image guest: the launcher runs on the Docker image as uid %d and gid %d, with an image of %d bytes", imgUser.uid, imgUser.gid, size)
+	} else if stack != nil {
 		img, sig, err := buildDropletImageWatching(sigs, dropletBuildTimeout, cfg.artifacts, dropletHome, workDir)
 		if sig != nil {
 			logger.Printf("received %v while the droplet image was building", sig)
@@ -965,7 +1019,11 @@ func run(argv []string, logger *log.Logger) int {
 			logger.Print(err)
 			return exitLaunchError
 		}
-		files, err := sidecarGuestFilesOf(sidecars, stackGuestDenylist(identity != nil))
+		deny := stackGuestDenylist(identity != nil)
+		if stack.image != nil {
+			deny = imageGuestDenylist(identity != nil)
+		}
+		files, err := sidecarGuestFilesOf(sidecars, deny)
 		if err != nil {
 			logger.Print(err)
 			return exitLaunchError
@@ -976,7 +1034,12 @@ func run(argv []string, logger *log.Logger) int {
 		logger.Print(sidecarsRefusal(len(sidecars), "the stack guest has no app root"))
 		return exitLaunchError
 	}
-	if stack != nil {
+	if stack != nil && stack.image != nil {
+		if envFile, err = buildImageGuestEnvWithCerts(withImageDefaults(env, cfg.image.defaultEnv, imgUser), memMiB, identity != nil, sysCerts.dirOf(), logger); err != nil {
+			logger.Print(err)
+			return exitLaunchError
+		}
+	} else if stack != nil {
 		if envFile, err = buildStackGuestEnvWithCerts(env, memMiB, identity != nil, sysCerts.dirOf(), logger); err != nil {
 			logger.Print(err)
 			return exitLaunchError
@@ -1073,7 +1136,7 @@ func run(argv []string, logger *log.Logger) int {
 	// identity are refused before the hypervisor starts.
 	var sd *stackDrives
 	if stack != nil {
-		sd = &stackDrives{stack: stackImg, droplet: droplet}
+		sd = &stackDrives{stack: stackImg, droplet: droplet, image: stack.image != nil}
 	}
 	drives, err := newGuestDrivesWithStack(cfg.backend, prepared, rootImg, sd)
 	if err != nil {
@@ -1433,13 +1496,31 @@ func parseArgs(argv []string) (config, error) {
 	allowShares := fs.Bool(allowVolumeSharesFlag, false, "allow an app to ask for a volume as a share in VM_VOLUMES, which only QEMU can serve")
 	virtiofsd := fs.String(virtiofsdFlag, "", "path of the executable that runs virtiofsd, which serves shares")
 	syncMounts := fs.Bool(volumeSyncMountsFlag, true, "mount every volume image with sync and dirsync; with =false, an image whose filesystem has a journal mounts without them")
+	imageUser := fs.String(imageUserFlag, "", "run the CF launcher on the Docker image that Garden bound into the container, as this user")
+	imageDefaults := fs.String(imageDefaultEnvFlag, "", "the names among HOME, PATH, and USER that hold Garden's defaults, which the Docker image's user replaces")
 	if err := fs.Parse(argv); err != nil {
 		return config{}, err
 	}
 
 	cfg := config{backend: backend.Kind(*kind), transparent: *transparent, allowVolumeShares: *allowShares, volumeSyncMounts: *syncMounts}
-	virtiofsdSet := false
-	fs.Visit(func(f *flag.Flag) { virtiofsdSet = virtiofsdSet || f.Name == virtiofsdFlag })
+	virtiofsdSet, imageSet, imageDefaultsSet := false, false, false
+	fs.Visit(func(f *flag.Flag) {
+		virtiofsdSet = virtiofsdSet || f.Name == virtiofsdFlag
+		imageSet = imageSet || f.Name == imageUserFlag
+		imageDefaultsSet = imageDefaultsSet || f.Name == imageDefaultEnvFlag
+	})
+	switch {
+	case imageSet && *imageUser == "":
+		return config{}, fmt.Errorf("--%s must not be empty", imageUserFlag)
+	case imageSet:
+		names, err := parseImageDefaultEnv(*imageDefaults)
+		if err != nil {
+			return config{}, err
+		}
+		cfg.image = &imageConfig{user: *imageUser, defaultEnv: names}
+	case imageDefaultsSet:
+		return config{}, fmt.Errorf("--%s needs --%s", imageDefaultEnvFlag, imageUserFlag)
+	}
 	if virtiofsdSet {
 		if *virtiofsd == "" {
 			return config{}, fmt.Errorf("--%s must not be empty", virtiofsdFlag)
