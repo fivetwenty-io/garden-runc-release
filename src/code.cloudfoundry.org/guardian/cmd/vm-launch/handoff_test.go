@@ -796,6 +796,20 @@ var _ = Describe("the volume handoff between two instances", func() {
 	handoffLine := "another instance of this process is waiting for volume image " + filepath.Join("%s", handoffImageName) +
 		", so vm-launch asks the guest command to stop and hands the volumes over once the guest has stopped\n"
 
+	It("does not say that it holds the lock when the image was replaced while it waited", func() {
+		holder, err := open(identity(handoffProcessID, holderToken), time.Second)
+		Expect(err).NotTo(HaveOccurred())
+		ch := wait(identity(handoffProcessID, waiterToken), 10*time.Second)
+		waitForRequest()
+		replacement := filepath.Join(dir, "replacement")
+		writeImage(replacement, defaultImageSize, nil)
+		Expect(os.Rename(replacement, filepath.Join(dir, handoffImageName))).To(Succeed())
+		Expect(holder.Close()).To(Succeed())
+		w := take(ch)
+		Expect(errors.Is(w.err, errImageReplaced)).To(BeTrue(), "%v", w.err)
+		Expect(logBuf.String()).NotTo(ContainSubstring("holds the lock now"))
+	})
+
 	It("hands the image over when the replacement waits while the holder's command runs", func(ctx SpecContext) {
 		holder, err := open(identity(handoffProcessID, holderToken), time.Second)
 		Expect(err).NotTo(HaveOccurred())

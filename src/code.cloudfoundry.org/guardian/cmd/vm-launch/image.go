@@ -464,10 +464,10 @@ func openVolumeImage(v *guestVolume, o imageOptions, sigs <-chan os.Signal) (*os
 	if err != nil {
 		return nil, err
 	}
-	asker.took()
 	if err := checkImageName(dirfd, fd, v.ImageName, path); err != nil {
 		return nil, err
 	}
+	asker.took()
 	size, err := checkOpenImage(fd, path, o)
 	if err != nil {
 		return nil, err
