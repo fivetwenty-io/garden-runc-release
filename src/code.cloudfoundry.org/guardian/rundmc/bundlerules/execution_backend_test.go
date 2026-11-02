@@ -193,6 +193,73 @@ var _ = Describe("ExecutionBackendRule", func() {
 			}))
 		})
 
+		When("the guest agent is off", func() {
+			It("adds no /dev/vhost-vsock node or rule and no mount over /bin/bash", func() {
+				for _, device := range newBndl.Devices() {
+					Expect(device.Path).NotTo(Equal("/dev/vhost-vsock"))
+				}
+				for _, rule := range newBndl.Resources().Devices {
+					if rule.Minor != nil {
+						Expect(*rule.Minor).NotTo(Equal(int64(241)))
+					}
+				}
+				for _, mount := range newBndl.Mounts() {
+					Expect(mount.Destination).NotTo(Equal("/bin/bash"))
+				}
+				Expect(newBndl.Devices()).To(HaveLen(2))
+				Expect(newBndl.Mounts()).To(HaveLen(3))
+			})
+		})
+
+		When("the guest agent is on", func() {
+			BeforeEach(func() {
+				rule.GuestAgent = true
+			})
+
+			It("appends /dev/vhost-vsock after /dev/kvm with the kvm gid", func() {
+				Expect(newBndl.Devices()).To(HaveLen(3))
+				Expect(newBndl.Devices()[1].Path).To(Equal("/dev/kvm"))
+
+				vsock := newBndl.Devices()[2]
+				Expect(vsock.Path).To(Equal("/dev/vhost-vsock"))
+				Expect(vsock.Type).To(Equal("c"))
+				Expect(vsock.Major).To(Equal(int64(10)))
+				Expect(vsock.Minor).To(Equal(int64(241)))
+				Expect(*vsock.FileMode).To(Equal(os.FileMode(0o660)))
+				Expect(*vsock.UID).To(Equal(uint32(0)))
+				Expect(*vsock.GID).To(Equal(uint32(kvmGid)))
+			})
+
+			It("appends a cgroup allow rule for c 10:241 rwm after the kvm rule", func() {
+				rules := newBndl.Resources().Devices
+				Expect(rules).To(HaveLen(3))
+
+				major, minor := int64(10), int64(241)
+				Expect(rules[2]).To(Equal(specs.LinuxDeviceCgroup{Allow: true, Type: "c", Major: &major, Minor: &minor, Access: "rwm"}))
+			})
+
+			It("binds vm-launch read-only over /bin/bash, without noexec", func() {
+				mounts := newBndl.Mounts()
+				Expect(mounts).To(HaveLen(4))
+				Expect(mounts[3]).To(Equal(specs.Mount{
+					Destination: "/bin/bash",
+					Source:      "/var/vcap/packages/guardian/bin/vm-launch",
+					Type:        "bind",
+					Options:     []string{"bind", "ro", "nosuid", "nodev"},
+				}))
+			})
+
+			It("keeps the artifacts and vm-launch mounts", func() {
+				mounts := newBndl.Mounts()
+				Expect(mounts[1].Destination).To(Equal("/opt/garden-vm/artifacts"))
+				Expect(mounts[2].Destination).To(Equal("/opt/garden-vm/vm-launch"))
+			})
+
+			It("does not modify the input bundle", func() {
+				Expect(inputBndl).To(Equal(pristine))
+			})
+		})
+
 		It("keeps the AppArmor profile, and so does the wrapped vm-launch process", func() {
 			Expect(newBndl.Process().ApparmorProfile).To(Equal("garden-default"))
 		})
@@ -389,6 +456,34 @@ var _ = Describe("ExecutionBackendRule", func() {
 
 		It("does not modify the input bundle", func() {
 			Expect(inputBndl).To(Equal(pristine))
+		})
+
+		When("the guest agent is on", func() {
+			BeforeEach(func() {
+				rule.GuestAgent = true
+			})
+
+			It("binds vm-launch read-only over /bin/bash but adds no /dev/vhost-vsock node or rule", func() {
+				Expect(newBndl.Devices()).To(HaveLen(3))
+				for _, device := range newBndl.Devices() {
+					Expect(device.Path).NotTo(Equal("/dev/vhost-vsock"))
+				}
+				Expect(newBndl.Resources().Devices).To(HaveLen(3))
+				for _, rule := range newBndl.Resources().Devices {
+					if rule.Minor != nil {
+						Expect(*rule.Minor).NotTo(Equal(int64(241)))
+					}
+				}
+
+				mounts := newBndl.Mounts()
+				Expect(mounts).To(HaveLen(4))
+				Expect(mounts[3]).To(Equal(specs.Mount{
+					Destination: "/bin/bash",
+					Source:      "/var/vcap/packages/guardian/bin/vm-launch",
+					Type:        "bind",
+					Options:     []string{"bind", "ro", "nosuid", "nodev"},
+				}))
+			})
 		})
 
 		It("keeps the AppArmor profile", func() {

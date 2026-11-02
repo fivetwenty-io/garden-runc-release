@@ -628,6 +628,37 @@ var _ = Describe("execution backend flags", func() {
 				Expect(backends.vmLaunchFlags).To(Equal([]string{"--volume-sync-mounts=false"}))
 			})
 
+			It("passes --guest-agent alone when the guest agent is on", func() {
+				cmd.ExecutionBackends.VMGuestAgent = true
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vmLaunchFlags).To(Equal([]string{"--guest-agent"}))
+			})
+
+			It("passes no --guest-agent when the guest agent is off", func() {
+				cmd.ExecutionBackends.VMGuestAgent = false
+				cmd.ExecutionBackends.VMVolumeShares = true
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vmLaunchFlags).NotTo(ContainElement("--guest-agent"))
+			})
+
+			It("passes --guest-agent after the volume and CPU flags", func() {
+				cmd.ExecutionBackends.VMVolumeAsyncMounts = true
+				cmd.ExecutionBackends.VMMaxVCPUs = 4
+				cmd.ExecutionBackends.VMGuestAgent = true
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vmLaunchFlags).To(Equal([]string{
+					"--volume-sync-mounts=false",
+					"--max-vcpus", "4",
+					"--guest-agent",
+				}))
+			})
+
 			It("passes all three flags when both settings differ from the defaults", func() {
 				cmd.ExecutionBackends.VMVolumeShares = true
 				cmd.ExecutionBackends.VMVolumeAsyncMounts = true
@@ -650,11 +681,22 @@ var _ = Describe("execution backend flags", func() {
 				Expect(backends.vmLaunchFlags).To(BeEmpty())
 				Expect(log).To(gbytes.Say("volume-shares-unused-without-a-vm-backend"))
 			})
+
+			It("says the guest agent is unused when the vm-* backends were dropped for want of a kvm gid", func() {
+				cmd.ExecutionBackends.VMGuestAgent = true
+				lookupKVMGroup = func(name string) (*user.Group, error) { return nil, user.UnknownGroupError(name) }
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vmLaunchFlags).To(BeEmpty())
+				Expect(log).To(gbytes.Say("guest-agent-unused-without-a-vm-backend"))
+			})
 		})
 
 		It("passes nothing and says so when only oci-gvisor is enabled", func() {
 			cmd.ExecutionBackends.VMVolumeShares = true
 			cmd.ExecutionBackends.VMVolumeAsyncMounts = true
+			cmd.ExecutionBackends.VMGuestAgent = true
 			cmd.ExecutionBackends.Enabled = []string{"oci-gvisor"}
 			cmd.Containerd.Socket = "/run/containerd.sock"
 
@@ -663,6 +705,7 @@ var _ = Describe("execution backend flags", func() {
 			Expect(backends.vmLaunchFlags).To(BeEmpty())
 			Expect(log).To(gbytes.Say("volume-shares-unused-without-a-vm-backend"))
 			Expect(log).To(gbytes.Say("volume-async-mounts-unused-without-a-vm-backend"))
+			Expect(log).To(gbytes.Say("guest-agent-unused-without-a-vm-backend"))
 		})
 
 		It("passes nothing when no backend is enabled", func() {
@@ -917,6 +960,30 @@ var _ = Describe("VM stack flags", func() {
 			Expect(parsed.ExecutionBackends.VMDockerRootFS).To(BeEmpty())
 			Expect(parsed.ExecutionBackends.VMDockerImageCacheDir).To(Equal("/var/vcap/data/vm-runtime/images"))
 			Expect(parsed.ExecutionBackends.VMDockerImageCacheBytes).To(Equal(int64(10 << 30)))
+		})
+
+		It("has the guest agent off unless --vm-guest-agent is given", func() {
+			parsed := &CommonCommand{}
+			_, err := flags.NewParser(parsed, flags.IgnoreUnknown).ParseArgs([]string{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(parsed.ExecutionBackends.VMGuestAgent).To(BeFalse())
+
+			parsed = &CommonCommand{}
+			_, err = flags.NewParser(parsed, flags.IgnoreUnknown).ParseArgs([]string{"--vm-guest-agent"})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(parsed.ExecutionBackends.VMGuestAgent).To(BeTrue())
+		})
+
+		It("parses the guest agent line that the garden job renders", func() {
+			ini := filepath.Join(GinkgoT().TempDir(), "config.ini")
+			Expect(os.WriteFile(ini, []byte("[server]\n  vm-guest-agent = true\n"), 0o644)).To(Succeed())
+
+			gdn := &GdnCommand{ServerCommand: &ServerCommand{CommonCommand: &CommonCommand{}}}
+			parser := flags.NewParser(gdn, flags.IgnoreUnknown)
+			parser.NamespaceDelimiter = "-"
+			Expect(flags.NewIniParser(parser).ParseFile(ini)).To(Succeed())
+
+			Expect(gdn.ServerCommand.ExecutionBackends.VMGuestAgent).To(BeTrue())
 		})
 
 		It("accepts every Docker image flag", func() {
