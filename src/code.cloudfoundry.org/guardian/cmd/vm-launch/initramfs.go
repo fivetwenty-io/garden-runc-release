@@ -122,6 +122,7 @@ func startTag(nonce string) string  { return "RVM_START_" + nonce }
 func exitTag(nonce string) string   { return "RVM_EXIT_" + nonce + "=" }
 func listenTag(nonce string) string { return "RVM_LISTEN_" + nonce + "=" }
 func oomTag(nonce string) string    { return "RVM_OOM_" + nonce + "=" }
+func cpuTag(nonce string) string    { return "RVM_CPU_" + nonce + "=" }
 
 // stopTag is the stop request, the one line vm-launch writes to the guest's
 // serial console, which the guest's stop reader acts on (see
@@ -534,14 +535,14 @@ func stage2Script(nonce string, volume, stack bool, checks, section string) stri
 	case volume:
 		setup += guestVolumeSetup
 	}
-	run := guestListenWatch(nonce)
+	run := guestListenWatch(nonce) + guestCPUWatch(nonce)
 	if section == "" {
 		setup += guestStopReader(nonce)
 		run += guestRunCommand + guestRunStatus + guestStopReaderStop
 	} else {
 		run += section
 	}
-	run += guestListenStop + guestOOMReport(nonce)
+	run += guestListenStop + guestCPUStop + guestOOMReport(nonce)
 	switch {
 	case volume && stack && section != "":
 		run += guestStackRunVolumeTeardown
@@ -812,6 +813,44 @@ if [ -n "${RVM_PORTS:-}" ]; then
 fi
 `
 }
+
+// guestCPUInterval is how many seconds pass between the lines in which the
+// CPU watcher reports the guest's busy time. Garden takes a figure as fresh for
+// 35 seconds, which is seven of these.
+const guestCPUInterval = 5
+
+// guestCPUWatch starts, in every guest, the watcher that tells vm-launch how
+// much CPU time the guest's processes have used. It reads the first line of
+// /proc/stat, which adds up every vCPU, and writes the ticks spent in user
+// mode (user and nice) and in system mode (system, irq, and softirq) as a
+// cpuTag line, user:system, at the start and then every guestCPUInterval
+// seconds. Idle, iowait, and steal ticks are not busy time and are left out,
+// so a guest that halts its vCPUs reads as idle however the hypervisor
+// schedules them. A line whose figures are not all digits is skipped. The
+// watcher opens /dev/console for each line, as the listen watcher does, so it
+// never writes through the console that the command may have made
+// non-blocking.
+func guestCPUWatch(nonce string) string {
+	return `(
+	while :; do
+		if read -r rvm_cpu rvm_u rvm_n rvm_s rvm_i rvm_w rvm_irq rvm_sirq rvm_rest </proc/stat 2>/dev/null; then
+			case "$rvm_u$rvm_n$rvm_s$rvm_irq$rvm_sirq" in
+			'' | *[!0-9]*) ;;
+			*) echo "` + cpuTag(nonce) + `$((rvm_u + rvm_n)):$((rvm_s + rvm_irq + rvm_sirq))" >/dev/console ;;
+			esac
+		fi
+		sleep ` + strconv.Itoa(guestCPUInterval) + `
+	done
+) </dev/null &
+rvm_cpuwatch=$!
+`
+}
+
+// guestCPUStop stops the CPU watcher once the command has ended and before
+// stage 2 reports its status, so no CPU line follows the exit line.
+const guestCPUStop = `kill "$rvm_cpuwatch" 2>/dev/null
+wait "$rvm_cpuwatch" 2>/dev/null
+`
 
 // guestListenRefresh is how many looks the listen watcher makes between the
 // lines in which it reports every port, changed or not.

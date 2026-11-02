@@ -166,6 +166,10 @@ type Containerizer struct {
 	// and guestFigure remembers which containers Metrics last answered from it.
 	guestMemory vmGuestMemory
 	guestFigure sync.Map
+
+	// guestCPU holds the newest guest CPU sample of each VM container, which
+	// Metrics uses in place of the cgroup's CPU time while the sample is fresh.
+	guestCPU vmGuestCPU
 }
 
 // Option configures a Containerizer collaborator that only some deployments need.
@@ -791,6 +795,7 @@ func (c *Containerizer) Destroy(log lager.Logger, handle string) error {
 	}
 
 	c.guestMemory.Remove(handle)
+	c.guestCPU.Remove(handle)
 	c.guestFigure.Delete(handle)
 
 	// The cgroup removal fails while any process of the container is left,
@@ -934,6 +939,7 @@ func (c *Containerizer) Metrics(log lager.Logger, handle string) (gardener.Actua
 
 	if backend.IsVM(backend.FromBundle(bundle)) {
 		c.applyGuestMemory(log, handle, &actualContainerMetrics)
+		c.applyGuestCPU(handle, &actualContainerMetrics)
 	}
 
 	return actualContainerMetrics, nil
@@ -964,6 +970,25 @@ func (c *Containerizer) applyGuestMemory(log lager.Logger, handle string, metric
 	}
 
 	metrics.Memory.TotalUsageTowardLimit = used
+}
+
+// applyGuestCPU replaces the cgroup's CPU time with the guest's, the time its
+// vCPUs spent in user and in system mode, while the container has a fresh
+// sample. The cgroup of a VM container holds the hypervisor and counts the
+// guest's idle time and interrupts, so its figure says little about the app.
+// Without a fresh sample the cgroup figure stays. The entitlement is the
+// container's and does not change.
+func (c *Containerizer) applyGuestCPU(handle string, metrics *gardener.ActualContainerMetrics) {
+	sample, fresh := c.guestCPU.Fresh(handle)
+	if !fresh {
+		return
+	}
+
+	metrics.CPU = garden.ContainerCPUStat{
+		Usage:  sample.User + sample.System,
+		User:   sample.User,
+		System: sample.System,
+	}
 }
 
 func (c *Containerizer) Shutdown() error {

@@ -287,7 +287,7 @@ var _ = Describe("the stop reader", func() {
 				lastSetup = guestVolumeSetup
 			}
 			Expect(script).To(ContainSubstring(lastSetup+guestStopReader(testNonce)+"echo "+startTag(testNonce)+"\n"), "volume=%v", volume)
-			Expect(script).To(ContainSubstring(guestRunCommand+guestRunStatus+guestStopReaderStop+guestListenStop), "volume=%v", volume)
+			Expect(script).To(ContainSubstring(guestRunCommand+guestRunStatus+guestStopReaderStop+guestListenStop+guestCPUStop), "volume=%v", volume)
 			if volume {
 				Expect(strings.Index(script, guestStopReaderStop)).To(BeNumerically("<", strings.Index(script, guestVolumeTeardown)))
 			}

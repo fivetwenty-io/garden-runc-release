@@ -24,3 +24,9 @@ func NewOOMLineScanner(next io.Writer) OOMLineScanner {
 func SetGuestMemoryClock(c *Containerizer, now func() time.Time) {
 	c.guestMemory.now = now
 }
+
+// SetGuestCPUClock makes the container's guest CPU store read now in place of
+// the wall clock, so a spec can age a sample.
+func SetGuestCPUClock(c *Containerizer, now func() time.Time) {
+	c.guestCPU.now = now
+}

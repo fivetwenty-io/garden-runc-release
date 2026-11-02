@@ -89,6 +89,61 @@ func parseVMMetricsLine(line []byte) (vmMemorySample, bool) {
 	return s, true
 }
 
+// vmCPUSample is one parsed CPU line, in nanoseconds of CPU time that the
+// guest's vCPUs together have spent in user mode and in system mode since the
+// guest booted.
+type vmCPUSample struct {
+	User, System uint64
+}
+
+// vmCPUMaxNanoseconds bounds each figure of a CPU line at 31 years of CPU
+// time, so that the two together cannot overflow 64 bits.
+const vmCPUMaxNanoseconds = 1_000_000_000_000_000_000
+
+// parseVMCPULine parses one line, without its newline, in the form
+//
+//	vm-launch-metrics v1 cpu user=N system=N
+//
+// and reports false when the line is not in that form or a figure is above
+// vmCPUMaxNanoseconds.
+func parseVMCPULine(line []byte) (vmCPUSample, bool) {
+	var s vmCPUSample
+
+	rest, ok := bytes.CutPrefix(line, []byte(vmMetricsLinePrefix+"cpu "))
+	if !ok {
+		return s, false
+	}
+
+	userToken, systemToken, found := bytes.Cut(rest, []byte(" "))
+	if !found {
+		return vmCPUSample{}, false
+	}
+
+	userValue, ok := bytes.CutPrefix(userToken, []byte("user="))
+	if !ok {
+		return vmCPUSample{}, false
+	}
+
+	systemValue, ok := bytes.CutPrefix(systemToken, []byte("system="))
+	if !ok {
+		return vmCPUSample{}, false
+	}
+
+	if s.User, ok = parseDecimal(userValue); !ok {
+		return vmCPUSample{}, false
+	}
+
+	if s.System, ok = parseDecimal(systemValue); !ok {
+		return vmCPUSample{}, false
+	}
+
+	if s.User > vmCPUMaxNanoseconds || s.System > vmCPUMaxNanoseconds {
+		return vmCPUSample{}, false
+	}
+
+	return s, true
+}
+
 // parseDecimal reads an unsigned decimal number of at most 19 digits, which
 // cannot overflow, and rejects signs, spaces, and an empty string.
 func parseDecimal(b []byte) (uint64, bool) {
@@ -117,6 +172,7 @@ func parseDecimal(b []byte) (uint64, bool) {
 type vmMetricsFilter struct {
 	next     io.Writer
 	onSample func(vmMemorySample)
+	onCPU    func(vmCPUSample)
 	onBad    func(dropped int)
 
 	mu      sync.Mutex
@@ -195,10 +251,18 @@ func (f *vmMetricsFilter) step(out []byte, b byte) []byte {
 	return out
 }
 
-// complete parses the held line and drops it.
+// complete parses the held line, a memory line or a CPU line, and drops it.
 func (f *vmMetricsFilter) complete() {
+	cpu, isCPU := parseVMCPULine(f.held)
 	sample, ok := parseVMMetricsLine(f.held)
 	f.held = f.held[:0]
+
+	if isCPU {
+		if f.onCPU != nil {
+			f.onCPU(cpu)
+		}
+		return
+	}
 
 	if ok {
 		if f.onSample != nil {
@@ -242,25 +306,32 @@ func (f *vmMetricsFilter) Dropped() int {
 	return f.dropped
 }
 
-// vmGuestSample is a stored sample, with the time Garden received it and the
+// vmStoredSample is a stored sample, with the time Garden received it and the
 // process it came from.
-type vmGuestSample struct {
-	vmMemorySample
+type vmStoredSample[T any] struct {
+	sample   T
 	received time.Time
 	source   any
 }
 
-// vmGuestMemory keeps the newest guest memory sample for each container. Its
-// zero value is ready to use and reads the wall clock, and a spec sets now to
-// control time.
-type vmGuestMemory struct {
+// vmSampleStore keeps the newest guest sample of one kind for each container.
+// Its zero value is ready to use and reads the wall clock, and a spec sets now
+// to control time.
+type vmSampleStore[T any] struct {
 	now func() time.Time
 
 	mu      sync.Mutex
-	samples map[string]vmGuestSample
+	samples map[string]vmStoredSample[T]
 }
 
-func (m *vmGuestMemory) clock() time.Time {
+// vmGuestMemory holds the guest memory samples, and vmGuestCPU the guest CPU
+// samples. A container has one of each, and each goes stale on its own.
+type (
+	vmGuestMemory = vmSampleStore[vmMemorySample]
+	vmGuestCPU    = vmSampleStore[vmCPUSample]
+)
+
+func (m *vmSampleStore[T]) clock() time.Time {
 	if m.now != nil {
 		return m.now()
 	}
@@ -271,22 +342,22 @@ func (m *vmGuestMemory) clock() time.Time {
 // Record stores sample as the newest for handle. The source identifies the
 // process that wrote it, so that Forget can tell its own sample from a
 // successor's.
-func (m *vmGuestMemory) Record(handle string, source any, sample vmMemorySample) {
+func (m *vmSampleStore[T]) Record(handle string, source any, sample T) {
 	received := m.clock()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if m.samples == nil {
-		m.samples = map[string]vmGuestSample{}
+		m.samples = map[string]vmStoredSample[T]{}
 	}
 
-	m.samples[handle] = vmGuestSample{vmMemorySample: sample, received: received, source: source}
+	m.samples[handle] = vmStoredSample[T]{sample: sample, received: received, source: source}
 }
 
 // Fresh returns the container's sample when Garden received it less than
 // vmMetricsStaleAfter ago.
-func (m *vmGuestMemory) Fresh(handle string) (vmMemorySample, bool) {
+func (m *vmSampleStore[T]) Fresh(handle string) (T, bool) {
 	now := m.clock()
 
 	m.mu.Lock()
@@ -294,14 +365,15 @@ func (m *vmGuestMemory) Fresh(handle string) (vmMemorySample, bool) {
 
 	stored, ok := m.samples[handle]
 	if !ok || now.Sub(stored.received) >= vmMetricsStaleAfter {
-		return vmMemorySample{}, false
+		var none T
+		return none, false
 	}
 
-	return stored.vmMemorySample, true
+	return stored.sample, true
 }
 
 // Forget removes the container's sample if it came from source.
-func (m *vmGuestMemory) Forget(handle string, source any) {
+func (m *vmSampleStore[T]) Forget(handle string, source any) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -311,7 +383,7 @@ func (m *vmGuestMemory) Forget(handle string, source any) {
 }
 
 // Remove removes the container's sample whatever its source.
-func (m *vmGuestMemory) Remove(handle string) {
+func (m *vmSampleStore[T]) Remove(handle string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

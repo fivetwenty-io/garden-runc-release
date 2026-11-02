@@ -1249,6 +1249,11 @@ func run(argv []string, logger *log.Logger) int {
 	cmd := newHypervisorCmd(hvArgv, files)
 	sup := supervisor{stdout: os.Stdout, stderr: os.Stderr, logger: logger, signals: sigs, grace: killGrace, deadline: stopDeadline, started: closeInherited}
 	sup.logs, sup.firstExit = relayCallbacks(hub)
+	// The guest's CPU lines go to the stderr that Garden reads for the
+	// memory lines, and each is one Write, as theirs are.
+	sup.cpu = func(user, system uint64) {
+		_, _ = io.WriteString(logger.Writer(), guestCPULine(user, system))
+	}
 	if len(shares) > 0 {
 		// A virtiofsd that ends while QEMU runs kills it, which takes QEMU's
 		// process, known once it has started. QEMU's reap is reported at

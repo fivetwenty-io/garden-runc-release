@@ -937,12 +937,14 @@ type serialFilter struct {
 	exitTag    []byte
 	listenTag  []byte
 	oomTag     []byte
+	cpuTag     []byte
 	credOKTag  []byte
 	credBadTag []byte
 	credOffTag []byte
 	logTag     []byte
 	firstTag   []byte
 	listen     func(port int, up bool)
+	cpu        func(user, system uint64)
 	credAck    func(seq int, ok bool)
 	logs       func(index int, stream byte, line string)
 	firstExit  func(index, status int)
@@ -993,6 +995,13 @@ func newSerialFilter(out io.Writer, nonce string) *serialFilter {
 func (f *serialFilter) onListen(nonce string, listen func(port int, up bool)) {
 	f.listenTag = []byte(listenTag(nonce))
 	f.listen = listen
+}
+
+// onCPU makes the filter swallow the guest's CPU lines (see guestCPUWatch) and
+// pass the busy time of each, in clock ticks, to cpu.
+func (f *serialFilter) onCPU(nonce string, cpu func(user, system uint64)) {
+	f.cpuTag = []byte(cpuTag(nonce))
+	f.cpu = cpu
 }
 
 // onCredAck makes the filter pass the guest's acknowledgements of identity
@@ -1155,6 +1164,7 @@ const (
 	lineCredBad
 	lineLog
 	lineFirst
+	lineCPU
 	lineKinds
 )
 
@@ -1162,7 +1172,7 @@ const (
 // the command runs, other than the exit marker, with nil for a kind it does
 // not look for.
 func (f *serialFilter) lineTags() [lineKinds][]byte {
-	return [lineKinds][]byte{lineOOM: f.oomTag, lineListen: f.listenTag, lineCredOK: f.credOKTag, lineCredBad: f.credBadTag, lineLog: f.logTag, lineFirst: f.firstTag}
+	return [lineKinds][]byte{lineOOM: f.oomTag, lineListen: f.listenTag, lineCredOK: f.credOKTag, lineCredBad: f.credBadTag, lineLog: f.logTag, lineFirst: f.firstTag, lineCPU: f.cpuTag}
 }
 
 // indexLine returns the index in pending of the first tag of a line that the
@@ -1216,6 +1226,8 @@ func (f *serialFilter) processLine(kind, idx int, eof bool) bool {
 		return f.processCount(f.credBadTag, idx, eof, func(seq int) { f.credAck(seq, false) })
 	case lineLog:
 		return f.processFrame(idx, eof)
+	case lineCPU:
+		return f.processCPU(idx, eof)
 	default:
 		return f.processFirst(idx, eof)
 	}
@@ -1383,6 +1395,26 @@ func (f *serialFilter) processListen(idx int, eof bool) bool {
 	return true
 }
 
+// processCPU handles the CPU tag at pending[idx:] as processListen handles a
+// listen tag: a complete line leaves the output and its figures go to the
+// callback, and anything else after the tag is output.
+func (f *serialFilter) processCPU(idx int, eof bool) bool {
+	user, system, n, ok, needMore := parseCPU(f.pending[idx+len(f.cpuTag):])
+	if needMore && !eof {
+		f.emitPending(idx, false)
+		return false
+	}
+	if !ok {
+		// The tag ends in its only '=', so no tag can start inside it.
+		f.emitPending(idx+len(f.cpuTag), true)
+		return true
+	}
+	f.emitPending(idx, true)
+	f.swallow(len(f.cpuTag) + n)
+	f.cpu(user, system)
+	return true
+}
+
 // processCount handles a tag at pending[idx:] whose line carries a count, the
 // OOM line and both acknowledgements, as processListen handles a listen tag:
 // a complete line leaves the output and its count goes to take, and anything
@@ -1457,6 +1489,55 @@ func parseStatus(b []byte) (status int, ok, needMore bool) {
 		return status, true, false
 	default:
 		return 0, false, false
+	}
+}
+
+// maxTickDigits is the most digits of one figure in a CPU line. Eleven digits
+// of clock ticks at 100 a second are 31 years of CPU time, and the largest
+// figure converts to nanoseconds in 64 bits with room to add two of them.
+const maxTickDigits = 11
+
+// parseCPU parses the bytes after a CPU tag: the busy ticks in user mode, a
+// colon, the busy ticks in system mode, and LF or CRLF, each figure with 1 to
+// maxTickDigits decimal digits. n is the length of what it parsed. needMore
+// reports that b ends before that can be decided.
+func parseCPU(b []byte) (user, system uint64, n int, ok, needMore bool) {
+	user, i, ok, needMore := parseTicks(b, ':')
+	if !ok {
+		return 0, 0, 0, false, needMore
+	}
+	system, j, ok, needMore := parseTicks(b[i+1:], '\n')
+	if !ok {
+		return 0, 0, 0, false, needMore
+	}
+	return user, system, i + 1 + j + 1, true, false
+}
+
+// parseTicks parses 1 to maxTickDigits decimal digits at the start of b and
+// the byte end that follows them, which for '\n' may be CRLF instead. i is the
+// index of that byte, or of the CR before the LF.
+func parseTicks(b []byte, end byte) (ticks uint64, i int, ok, needMore bool) {
+	for i < len(b) && i <= maxTickDigits && b[i] >= '0' && b[i] <= '9' {
+		ticks = ticks*10 + uint64(b[i]-'0')
+		i++
+	}
+	switch {
+	case i > maxTickDigits:
+		return 0, 0, false, false
+	case i == len(b):
+		return 0, 0, false, true
+	case i == 0:
+		return 0, 0, false, false
+	case b[i] == end:
+		return ticks, i, true, false
+	case end != '\n' || b[i] != '\r':
+		return 0, 0, false, false
+	case i+1 == len(b):
+		return 0, 0, false, true
+	case b[i+1] == '\n':
+		return ticks, i + 1, true, false
+	default:
+		return 0, 0, false, false
 	}
 }
 
@@ -1721,6 +1802,9 @@ type supervisor struct {
 	// listen, when set, gets the guest's listen lines (see serialFilter). It
 	// must not block.
 	listen func(port int, up bool)
+	// cpu, when set, gets the guest's busy time in clock ticks, in user and in
+	// system mode (see serialFilter). It must not block.
+	cpu func(user, system uint64)
 	// credAck, when set, gets the guest's acknowledgements of identity pushes
 	// (see serialFilter). It must not block.
 	credAck func(seq int, ok bool)
@@ -1826,6 +1910,9 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 	filter.onFrames(nonce, errOut, s.logs, s.firstExit)
 	if s.listen != nil {
 		filter.onListen(nonce, s.listen)
+	}
+	if s.cpu != nil {
+		filter.onCPU(nonce, s.cpu)
 	}
 	if s.credAck != nil {
 		filter.onCredAck(nonce, s.credAck)

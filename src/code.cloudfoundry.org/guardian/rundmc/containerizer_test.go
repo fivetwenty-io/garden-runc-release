@@ -1024,6 +1024,170 @@ var _ = Describe("Rundmc", func() {
 					})
 				})
 
+				Context("when the wrapped launcher writes guest CPU lines on stderr", func() {
+					const (
+						cpuLine      = "vm-launch-metrics v1 cpu user=30000000 system=10000000\n"
+						laterCPULine = "vm-launch-metrics v1 cpu user=50000000 system=20000000\n"
+						memoryLine   = "vm-launch-metrics v1 used=300 total=1000 available=700 free=400 caches=200\n"
+					)
+
+					var (
+						inner  *gardenfakes.FakeProcess
+						stderr *bytes.Buffer
+						pio    garden.ProcessIO
+						lines  []string
+						now    time.Time
+						writer io.Writer
+					)
+
+					cgroupCPU := garden.ContainerCPUStat{Usage: 9000, User: 6000, System: 3000}
+
+					BeforeEach(func() {
+						inner = new(gardenfakes.FakeProcess)
+						stderr = new(bytes.Buffer)
+						pio = garden.ProcessIO{Stderr: stderr}
+						lines = []string{cpuLine}
+						bundle := bundleFor(map[string]string{backend.AnnotationKey: string(kind)})
+						bundle.Spec.Linux = &specs.Linux{Resources: &specs.LinuxResources{}}
+						fakeOCIRuntime.BundleInfoReturns("/bundle", bundle, nil)
+						now = time.Unix(1000, 0)
+						rundmc.SetGuestMemoryClock(containerizer, func() time.Time { return now })
+						rundmc.SetGuestCPUClock(containerizer, func() time.Time { return now })
+						fakeCPUCgrouper.ReadTotalCgroupUsageReturns(cgroupCPU, nil)
+
+						fakeOCIRuntime.ExecStub = func(_ lager.Logger, _ string, _ garden.ProcessSpec, io garden.ProcessIO) (garden.Process, error) {
+							writer = io.Stderr
+							for _, line := range lines {
+								_, _ = io.Stderr.Write([]byte(line))
+							}
+							return inner, nil
+						}
+					})
+
+					run := func() garden.Process {
+						process, err := containerizer.Run(logger, "some-handle", launcherSpec(), pio)
+						Expect(err).NotTo(HaveOccurred())
+						return process
+					}
+
+					cpu := func() garden.ContainerCPUStat {
+						metrics, err := containerizer.Metrics(logger, "some-handle")
+						Expect(err).NotTo(HaveOccurred())
+						return metrics.CPU
+					}
+
+					It("takes the lines out of the stream and passes the rest on", func() {
+						lines = []string{"before\n", cpuLine, "after"}
+
+						run()
+
+						Expect(stderr.String()).To(Equal("before\nafter"))
+					})
+
+					It("reports the guest's CPU time in place of the cgroup's", func() {
+						run()
+
+						Expect(cpu()).To(Equal(garden.ContainerCPUStat{Usage: 40000000, User: 30000000, System: 10000000}))
+					})
+
+					It("reports the newest sample", func() {
+						lines = []string{cpuLine, laterCPULine}
+
+						run()
+
+						Expect(cpu()).To(Equal(garden.ContainerCPUStat{Usage: 70000000, User: 50000000, System: 20000000}))
+					})
+
+					It("keeps the entitlement from the container's own shares and age", func() {
+						before, err := containerizer.Metrics(logger, "some-handle")
+						Expect(err).NotTo(HaveOccurred())
+
+						run()
+
+						after, err := containerizer.Metrics(logger, "some-handle")
+						Expect(err).NotTo(HaveOccurred())
+						Expect(after.CPUEntitlement).To(Equal(before.CPUEntitlement))
+					})
+
+					It("falls back to the cgroup figure when the sample is stale", func() {
+						run()
+
+						now = now.Add(34 * time.Second)
+						Expect(cpu().Usage).To(Equal(uint64(40000000)))
+
+						now = now.Add(time.Second)
+						Expect(cpu()).To(Equal(cgroupCPU))
+					})
+
+					It("returns to the guest figure when a new sample arrives", func() {
+						run()
+
+						now = now.Add(time.Minute)
+						Expect(cpu()).To(Equal(cgroupCPU))
+
+						_, _ = writer.Write([]byte(laterCPULine))
+						Expect(cpu().Usage).To(Equal(uint64(70000000)))
+					})
+
+					It("reports the cgroup figure when the launcher wrote no sample", func() {
+						lines = nil
+
+						run()
+
+						Expect(cpu()).To(Equal(cgroupCPU))
+					})
+
+					It("drops a malformed line and keeps the cgroup figure", func() {
+						lines = []string{"vm-launch-metrics v1 cpu user=1\n", "vm-launch-metrics v1 cpu user=x system=1\n"}
+
+						run()
+
+						Expect(stderr.Len()).To(Equal(0))
+						Expect(cpu()).To(Equal(cgroupCPU))
+					})
+
+					It("ages the CPU sample and the memory sample on their own", func() {
+						lines = []string{cpuLine}
+						run()
+
+						now = now.Add(30 * time.Second)
+						_, _ = writer.Write([]byte(memoryLine))
+						now = now.Add(10 * time.Second)
+
+						metrics, err := containerizer.Metrics(logger, "some-handle")
+						Expect(err).NotTo(HaveOccurred())
+						Expect(metrics.CPU).To(Equal(cgroupCPU))
+						Expect(metrics.Memory.TotalUsageTowardLimit).To(Equal(uint64(300)))
+					})
+
+					It("removes the sample when its own process ends", func() {
+						process := run()
+						Expect(cpu().Usage).To(Equal(uint64(40000000)))
+
+						_, err := process.Wait()
+						Expect(err).NotTo(HaveOccurred())
+
+						Expect(cpu()).To(Equal(cgroupCPU))
+					})
+
+					It("removes the sample when the container is destroyed", func() {
+						run()
+
+						Expect(containerizer.Destroy(logger, "some-handle")).To(Succeed())
+
+						Expect(cpu()).To(Equal(cgroupCPU))
+					})
+
+					It("never uses the sample for a bundle that is not a VM", func() {
+						run()
+						bundle := bundleFor(nil)
+						bundle.Spec.Linux = &specs.Linux{Resources: &specs.LinuxResources{}}
+						fakeOCIRuntime.BundleInfoReturns("/bundle", bundle, nil)
+
+						Expect(cpu()).To(Equal(cgroupCPU))
+					})
+				})
+
 				Context("when the launcher is a sidecar's log relay", func() {
 					const relayValue = "CF_VM_SIDECAR_RELAY=1:0123456789abcdef0123456789abcdef"
 
