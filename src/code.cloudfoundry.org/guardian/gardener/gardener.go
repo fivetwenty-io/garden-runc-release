@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -48,6 +49,17 @@ const VolumizerSession = "volumizer"
 // is not ready.
 type VMStackImager interface {
 	Image(log lager.Logger, tarball string) (dir string, ok bool)
+}
+
+// VMImager builds the guest image of a VM container that asks for a Docker
+// image. Image returns the container's image directory, which holds
+// rootfs.squashfs, passwd, and group, together with the image's environment,
+// and it keeps the image for the container until Release.
+type VMImager interface {
+	Image(log lager.Logger, handle string, image garden.ImageRef) (dir string, env []string, err error)
+	Release(log lager.Logger, handle string) error
+	// Prune releases the image of every handle that keep does not name.
+	Prune(log lager.Logger, keep []string) error
 }
 
 type SysInfoProvider interface {
@@ -195,6 +207,13 @@ type Gardener struct {
 	// VMStacks builds the stack image of a VM container. A nil value turns
 	// the builder off.
 	VMStacks VMStackImager
+
+	// VMImages builds the guest image of a VM container that asks for a
+	// Docker image, and VMDockerRootFS is the operator's stack tarball that
+	// such a container runs its hypervisor on. When either is unset, a VM
+	// backend refuses a Docker image.
+	VMImages       VMImager
+	VMDockerRootFS string
 }
 
 func New(
@@ -257,6 +276,17 @@ func (g *Gardener) vmStackDir(log lager.Logger, k backend.Kind, containerSpec ga
 	return dir
 }
 
+// dockerGuestImage returns the Docker image of a VM container whose guest
+// boots it, and reports whether the container is one. It reports false when
+// the feature is off, when the backend is not a VM backend, and when the spec
+// asks for no Docker image.
+func (g *Gardener) dockerGuestImage(k backend.Kind, containerSpec garden.ContainerSpec) (garden.ImageRef, bool) {
+	if g.VMImages == nil || g.VMDockerRootFS == "" || !backend.IsVM(k) {
+		return garden.ImageRef{}, false
+	}
+	return backend.DockerImageRef(containerSpec)
+}
+
 // Create creates a container by combining the results of networker.Network,
 // volumizer.Create and containzer.Create.
 func (g *Gardener) Create(containerSpec garden.ContainerSpec) (ctr garden.Container, err error) {
@@ -275,6 +305,13 @@ func (g *Gardener) Create(containerSpec garden.ContainerSpec) (ctr garden.Contai
 		return nil, errors.New("privileged container creation is disabled")
 	}
 
+	// The image builder pulls each Docker image under the container's handle
+	// with VMImageBuildSuffix appended, in the volumizer that holds every
+	// container's image, so a container may not take a handle of that shape.
+	if g.VMImages != nil && strings.HasSuffix(containerSpec.Handle, backend.VMImageBuildSuffix) {
+		return nil, fmt.Errorf("handles ending in %s are reserved for Docker image builds", backend.VMImageBuildSuffix)
+	}
+
 	// Resolve the backend before the cleanup defer below is armed and before
 	// any property, volume, or network state exists, so a rejection leaves
 	// nothing behind.
@@ -282,6 +319,16 @@ func (g *Gardener) Create(containerSpec garden.ContainerSpec) (ctr garden.Contai
 	if err != nil {
 		log.Error("resolve-execution-backend-failed", err)
 		return nil, err
+	}
+
+	// A VM container that asks for a Docker image boots the image in its
+	// guest and runs its hypervisor on the operator's tarball, so from here
+	// on the spec names the tarball, and the check below sees the image that
+	// the hypervisor really runs on.
+	dockerImage, dockerGuest := g.dockerGuestImage(executionBackend, containerSpec)
+	if dockerGuest {
+		containerSpec.Image = garden.ImageRef{}
+		containerSpec.RootFSPath = g.VMDockerRootFS
 	}
 
 	// A VM backend runs its hypervisor inside the image's mount namespace, so
@@ -306,8 +353,11 @@ func (g *Gardener) Create(containerSpec garden.ContainerSpec) (ctr garden.Contai
 	}
 
 	// The stack image can make the create wait, so it comes after the checks
-	// that refuse the create at once.
-	vmStackDir := g.vmStackDir(log, executionBackend, containerSpec)
+	// that refuse the create at once. A Docker image guest has no use for it.
+	var vmStackDir string
+	if !dockerGuest {
+		vmStackDir = g.vmStackDir(log, executionBackend, containerSpec)
+	}
 
 	defer func() {
 		if err != nil {
@@ -343,9 +393,33 @@ func (g *Gardener) Create(containerSpec garden.ContainerSpec) (ctr garden.Contai
 		}
 	}
 
+	// The guest image comes after the cleanup above is armed, so a create
+	// that fails later releases it.
+	var vmImageDir string
+	var vmImageEnv []string
+	if dockerGuest {
+		startedAt := time.Now()
+		vmImageDir, vmImageEnv, err = g.VMImages.Image(log.Session("vm-image"), containerSpec.Handle, dockerImage)
+		if err != nil {
+			log.Error("vm-image-failed", err)
+			return nil, err
+		}
+		log.Info("vm-image-ready", lager.Data{"dir": vmImageDir, "elapsed": time.Since(startedAt).String()})
+	}
+
 	runtimeSpec, err := g.Volumizer.Create(log, containerSpec)
 	if err != nil {
 		return nil, err
+	}
+
+	// The processes of a Docker image guest get the image's environment
+	// beneath their own, as the processes of a runC Docker container do, and
+	// not the tarball's.
+	if dockerGuest {
+		if runtimeSpec.Process == nil {
+			runtimeSpec.Process = &specs.Process{}
+		}
+		runtimeSpec.Process.Env = vmImageEnv
 	}
 
 	networkBindMounts, err := g.Networker.SetupBindMounts(log, containerSpec.Handle, containerSpec.Privileged, runtimeSpec.Root.Path)
@@ -364,6 +438,7 @@ func (g *Gardener) Create(containerSpec garden.ContainerSpec) (ctr garden.Contai
 
 		ExecutionBackend: string(executionBackend),
 		VMStackDir:       vmStackDir,
+		VMImageDir:       vmImageDir,
 	}
 
 	if err := g.Containerizer.Create(log, desiredSpec); err != nil {
@@ -445,6 +520,10 @@ func (g *Gardener) destroy(log lager.Logger, handle string) error {
 	errs = multierror.Append(errs, g.Networker.Destroy(log, handle))
 
 	errs = multierror.Append(errs, g.Volumizer.Destroy(log.Session(VolumizerSession), handle))
+
+	if g.VMImages != nil {
+		errs = multierror.Append(errs, g.VMImages.Release(log.Session("vm-image"), handle))
+	}
 
 	if err := errs.ErrorOrNil(); err != nil {
 		// keep container metadata so that destroy can be retried
@@ -645,6 +724,15 @@ func (g *Gardener) Cleanup(log lager.Logger) error {
 	handles, err := g.Containerizer.Handles()
 	if err != nil {
 		return err
+	}
+
+	// An image that a crashed create or a failed destroy left behind belongs
+	// to no container that Garden still has, and nothing else would release
+	// it. A failure here only leaves those images in the cache.
+	if g.VMImages != nil {
+		if err := g.VMImages.Prune(log.Session("vm-image"), handles); err != nil {
+			log.Error("prune-vm-images-failed", err)
+		}
 	}
 
 	failedToRestore := g.Restorer.Restore(log, handles)

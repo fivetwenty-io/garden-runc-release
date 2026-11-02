@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"code.cloudfoundry.org/garden"
@@ -31,6 +32,46 @@ type fakeVMStackImager struct {
 func (f *fakeVMStackImager) Image(_ lager.Logger, tarball string) (string, bool) {
 	f.tarballs = append(f.tarballs, tarball)
 	return f.dir, f.ok
+}
+
+// fakeVMImager records its calls under a lock, because the cleanup destroys
+// containers in parallel.
+type fakeVMImager struct {
+	mu sync.Mutex
+
+	dir        string
+	env        []string
+	err        error
+	releaseErr error
+
+	pruneErr   error
+
+	handles  []string
+	images   []garden.ImageRef
+	released []string
+	kept     [][]string
+}
+
+func (f *fakeVMImager) Image(_ lager.Logger, handle string, image garden.ImageRef) (string, []string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.handles = append(f.handles, handle)
+	f.images = append(f.images, image)
+	return f.dir, f.env, f.err
+}
+
+func (f *fakeVMImager) Release(_ lager.Logger, handle string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.released = append(f.released, handle)
+	return f.releaseErr
+}
+
+func (f *fakeVMImager) Prune(_ lager.Logger, keep []string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.kept = append(f.kept, keep)
+	return f.pruneErr
 }
 
 var _ = Describe("Gardener", func() {
@@ -432,6 +473,169 @@ var _ = Describe("Gardener", func() {
 					gdnr.VMStacks = nil
 					createWith("vm-qemu", stackURI)
 					Expect(createdSpec().VMStackDir).To(BeEmpty())
+				})
+			})
+
+			Describe("the Docker image guest", func() {
+				const dockerRootFS = "/var/vcap/packages/cflinuxfs4/rootfs.tar"
+
+				var (
+					imager *fakeVMImager
+					stacks *fakeVMStackImager
+				)
+
+				dockerSpec := func(kind string) garden.ContainerSpec {
+					return garden.ContainerSpec{
+						Handle:     "some-ctr",
+						Image:      garden.ImageRef{URI: "docker:///some/image#latest", Username: "some-user", Password: "some-secret"},
+						Env:        []string{"FROM_SPEC=1"},
+						Properties: garden.Properties{backend.AnnotationKey: kind},
+					}
+				}
+
+				BeforeEach(func() {
+					var err error
+					gdnr.Backends, err = backend.NewRegistry(backend.VMQemu, backend.VMFirecracker, backend.OCIGvisor)
+					Expect(err).NotTo(HaveOccurred())
+					imager = &fakeVMImager{dir: "/var/vcap/data/vm-runtime/images/containers/some-ctr", env: []string{"PATH=/image/bin", "IMAGE=1"}}
+					stacks = &fakeVMStackImager{dir: "/var/vcap/data/vm-runtime/stacks/abc", ok: true}
+					gdnr.VMImages = imager
+					gdnr.VMDockerRootFS = dockerRootFS
+					gdnr.VMStacks = stacks
+					volumizer.CreateReturns(specs.Spec{Root: &specs.Root{Path: "/some/rootfs"}, Process: &specs.Process{Env: []string{"TARBALL=1"}}}, nil)
+				})
+
+				DescribeTable("builds the image and runs the container on the operator's tarball",
+					func(kind string) {
+						_, err := gdnr.Create(dockerSpec(kind))
+						Expect(err).NotTo(HaveOccurred())
+
+						By("building the image with the spec's credentials")
+						Expect(imager.handles).To(Equal([]string{"some-ctr"}))
+						Expect(imager.images).To(Equal([]garden.ImageRef{{URI: "docker:///some/image#latest", Username: "some-user", Password: "some-secret"}}))
+
+						By("creating the container's volume from the tarball, with no Docker image")
+						Expect(volumizer.CreateCallCount()).To(Equal(1))
+						_, created := volumizer.CreateArgsForCall(0)
+						Expect(created.Image).To(Equal(garden.ImageRef{}))
+						Expect(created.RootFSPath).To(Equal(dockerRootFS))
+
+						By("giving the bundle the image's environment and directory and no stack image")
+						Expect(createdSpec().BaseConfig.Process.Env).To(Equal([]string{"PATH=/image/bin", "IMAGE=1"}))
+						Expect(createdSpec().Env).To(Equal([]string{"FROM_SPEC=1"}))
+						Expect(createdSpec().VMImageDir).To(Equal("/var/vcap/data/vm-runtime/images/containers/some-ctr"))
+						Expect(createdSpec().VMStackDir).To(BeEmpty())
+						Expect(stacks.tarballs).To(BeEmpty())
+						Expect(createdSpec().ExecutionBackend).To(Equal(kind))
+
+						By("networking the container with the rewritten spec")
+						_, networked, _ := networker.NetworkArgsForCall(0)
+						Expect(networked.Image).To(Equal(garden.ImageRef{}))
+						Expect(networked.RootFSPath).To(Equal(dockerRootFS))
+						Expect(logger).To(gbytes.Say("vm-image-ready"))
+					},
+					Entry("on vm-qemu", "vm-qemu"),
+					Entry("on vm-firecracker", "vm-firecracker"),
+				)
+
+				It("finds a Docker image in the rootfs path", func() {
+					containerSpec := dockerSpec("vm-qemu")
+					containerSpec.Image = garden.ImageRef{}
+					containerSpec.RootFSPath = "docker:///some/image"
+					_, err := gdnr.Create(containerSpec)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(imager.images).To(Equal([]garden.ImageRef{{URI: "docker:///some/image"}}))
+					_, created := volumizer.CreateArgsForCall(0)
+					Expect(created.RootFSPath).To(Equal(dockerRootFS))
+				})
+
+				It("gives the bundle an empty process when the tarball's spec has none", func() {
+					volumizer.CreateReturns(specs.Spec{Root: &specs.Root{Path: "/some/rootfs"}}, nil)
+					_, err := gdnr.Create(dockerSpec("vm-qemu"))
+					Expect(err).NotTo(HaveOccurred())
+					Expect(createdSpec().BaseConfig.Process.Env).To(Equal([]string{"PATH=/image/bin", "IMAGE=1"}))
+				})
+
+				It("fails the create with the builder's reason and releases the image", func() {
+					imager.err = errors.New("vm image: mksquashfs: exit status 1: no space left")
+					_, err := gdnr.Create(dockerSpec("vm-qemu"))
+					Expect(err).To(MatchError("vm image: mksquashfs: exit status 1: no space left"))
+					Expect(volumizer.CreateCallCount()).To(Equal(0))
+					Expect(containerizer.CreateCallCount()).To(Equal(0))
+					Expect(imager.released).To(Equal([]string{"some-ctr"}))
+				})
+
+				It("releases the image when a later step fails the create", func() {
+					containerizer.CreateReturns(errors.New("bundle failed"))
+					_, err := gdnr.Create(dockerSpec("vm-qemu"))
+					Expect(err).To(MatchError("bundle failed"))
+					Expect(imager.released).To(Equal([]string{"some-ctr"}))
+				})
+
+				It("refuses a handle that the image builder reserves, before it builds anything", func() {
+					containerSpec := dockerSpec("vm-qemu")
+					containerSpec.Handle = "other-ctr-vm-image"
+					_, err := gdnr.Create(containerSpec)
+					Expect(err).To(MatchError("handles ending in -vm-image are reserved for Docker image builds"))
+					Expect(imager.handles).To(BeEmpty())
+					Expect(imager.released).To(BeEmpty())
+					Expect(volumizer.CreateCallCount()).To(Equal(0))
+					Expect(networker.NetworkCallCount()).To(Equal(0))
+				})
+
+				It("refuses the reserved handle for a container of any backend", func() {
+					_, err := gdnr.Create(garden.ContainerSpec{Handle: "other-ctr-vm-image"})
+					Expect(err).To(MatchError(ContainSubstring("reserved for Docker image builds")))
+					Expect(volumizer.CreateCallCount()).To(Equal(0))
+				})
+
+				It("does not build the image when the handle is already in use", func() {
+					containerizer.HandlesReturns([]string{"some-ctr"}, nil)
+					_, err := gdnr.Create(dockerSpec("vm-qemu"))
+					Expect(err).To(MatchError("Handle 'some-ctr' already in use"))
+					Expect(imager.handles).To(BeEmpty())
+				})
+
+				DescribeTable("refuses the Docker image as before when the feature is off",
+					func(off func()) {
+						off()
+						_, err := gdnr.Create(dockerSpec("vm-qemu"))
+						Expect(err).To(MatchError(backend.ErrRootFSNotOperatorInstalled))
+						Expect(imager.handles).To(BeEmpty())
+						Expect(volumizer.CreateCallCount()).To(Equal(0))
+					},
+					Entry("with no builder", func() { gdnr.VMImages = nil }),
+					Entry("with no tarball", func() { gdnr.VMDockerRootFS = "" }),
+				)
+
+				It("refuses a spec that names a Docker image in both fields", func() {
+					containerSpec := dockerSpec("vm-qemu")
+					containerSpec.RootFSPath = "docker:///other/image"
+					_, err := gdnr.Create(containerSpec)
+					Expect(err).To(MatchError(backend.ErrRootFSNotOperatorInstalled))
+					Expect(imager.handles).To(BeEmpty())
+				})
+
+				It("leaves a Docker image alone on a backend that is not a VM backend", func() {
+					_, err := gdnr.Create(dockerSpec("oci-gvisor"))
+					Expect(err).NotTo(HaveOccurred())
+					Expect(imager.handles).To(BeEmpty())
+					_, created := volumizer.CreateArgsForCall(0)
+					Expect(created.Image.URI).To(Equal("docker:///some/image#latest"))
+					Expect(createdSpec().VMImageDir).To(BeEmpty())
+					Expect(createdSpec().BaseConfig.Process.Env).To(Equal([]string{"TARBALL=1"}))
+				})
+
+				It("leaves a stack app alone and keeps its stack image", func() {
+					_, err := gdnr.Create(garden.ContainerSpec{
+						Handle:     "some-ctr",
+						Image:      garden.ImageRef{URI: dockerRootFS},
+						Properties: garden.Properties{backend.AnnotationKey: "vm-qemu"},
+					})
+					Expect(err).NotTo(HaveOccurred())
+					Expect(imager.handles).To(BeEmpty())
+					Expect(createdSpec().VMImageDir).To(BeEmpty())
+					Expect(createdSpec().VMStackDir).To(Equal("/var/vcap/data/vm-runtime/stacks/abc"))
 				})
 			})
 
@@ -1432,6 +1636,27 @@ var _ = Describe("Gardener", func() {
 			Expect(handle).To(Equal("some-handle"))
 		})
 
+		Context("when a guest image builder is set", func() {
+			var imager *fakeVMImager
+
+			BeforeEach(func() {
+				imager = &fakeVMImager{}
+				gdnr.VMImages = imager
+			})
+
+			It("releases the container's guest image", func() {
+				Expect(gdnr.Destroy("some-handle")).To(Succeed())
+				Expect(imager.released).To(Equal([]string{"some-handle"}))
+			})
+
+			It("keeps the metadata when the release fails, so the destroy can be retried", func() {
+				imager.releaseErr = errors.New("release failed")
+				Expect(gdnr.Destroy("some-handle")).To(MatchError(ContainSubstring("release failed")))
+				Expect(containerizer.RemoveBundleCallCount()).To(Equal(0))
+				Expect(propertyManager.DestroyKeySpaceCallCount()).To(Equal(0))
+			})
+		})
+
 		Context("when containerizer fails to destroy the container", func() {
 			BeforeEach(func() {
 				containerizer.DestroyReturns(errors.New("containerized deletion failed"))
@@ -1612,6 +1837,28 @@ var _ = Describe("Gardener", func() {
 			}
 			Expect(actualHandles).To(ConsistOf(handles))
 			Expect(logger.LogMessages()).ToNot(ContainElement(ContainSubstring("failed to remove container")))
+		})
+
+		Context("when the cell boots Docker images", func() {
+			var imager *fakeVMImager
+
+			BeforeEach(func() {
+				imager = &fakeVMImager{}
+				gdnr.VMImages = imager
+			})
+
+			It("prunes the images to the containers it has and releases the ones it destroys", func() {
+				Expect(cleanupErr).NotTo(HaveOccurred())
+				Expect(imager.kept).To(Equal([][]string{{"some-handle"}}))
+				Expect(imager.released).To(ConsistOf("unrestorable-handle-1", "unrestorable-handle-2"))
+			})
+
+			It("logs a failed prune and goes on with the cleanup", func() {
+				imager.pruneErr = errors.New("vm image: reading the containers directory: permission denied")
+				Expect(gdnr.Cleanup(logger)).To(Succeed())
+				Expect(logger).To(gbytes.Say("prune-vm-images-failed"))
+				Expect(restorer.RestoreCallCount()).To(Equal(2))
+			})
 		})
 
 		Context("when pea cleanup fails", func() {

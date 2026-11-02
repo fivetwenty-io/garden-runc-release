@@ -354,13 +354,21 @@ func (c *Containerizer) Run(log lager.Logger, handle string, spec garden.Process
 		return nil, err
 	}
 
-	if c.backendDispatch && spec.Path == cfLauncherPath {
-		wrapped, isVM, err := c.wrapVMLauncher(log, handle, spec)
+	if c.backendDispatch {
+		// Every process needs the bundle, because the processes of a Docker
+		// image guest must not run as the user they ask for. A bundle that
+		// cannot be read fails the process rather than run it as asked.
+		_, bundle, err := c.runtime.BundleInfo(log, handle)
 		if err != nil {
+			log.Error("bundle-info-failed", err)
 			return nil, err
 		}
 
-		spec = wrapped
+		isVM := false
+		if spec.Path == cfLauncherPath {
+			spec, isVM = c.wrapVMLauncher(log, bundle, spec)
+		}
+		spec = asVMImageHostUser(bundle, spec)
 
 		if isVM {
 			return c.runVMLauncher(log, handle, spec, io)
@@ -368,6 +376,79 @@ func (c *Containerizer) Run(log lager.Logger, handle string, spec garden.Process
 	}
 
 	return c.runtime.Exec(log, handle, spec, io)
+}
+
+const (
+	// vmImageHostUser is the user that every process of a Docker image guest
+	// container, apart from peas, runs as on the host side. The user that
+	// Diego asks for belongs to the image, which only the guest has, and it
+	// means nothing in the stack tarball that the container runs on.
+	vmImageHostUser = "vcap"
+
+	// vmLaunchImageUserFlag and vmLaunchImageDefaultEnvFlag tell vm-launch the
+	// image user that Diego asked for, and which of vmImageDefaultEnv the
+	// process lacked before Garden gave it defaults.
+	vmLaunchImageUserFlag       = "--image-user"
+	vmLaunchImageDefaultEnvFlag = "--image-default-env"
+
+	// vmImageDefaultUser is the image user of a process that asks for none,
+	// which is Docker's default.
+	vmImageDefaultUser = "root"
+)
+
+// vmImageDefaultEnv lists the variables that Garden or runC gives a default
+// when a process lacks them, and whose value vm-launch gives the image's user
+// instead.
+var vmImageDefaultEnv = []string{"HOME", "PATH", "USER"}
+
+// isVMImageGuest reports whether a bundle is a VM container whose guest
+// boots a Docker image.
+func isVMImageGuest(bundle goci.Bndl) bool {
+	return backend.IsVM(backend.FromBundle(bundle)) && bundle.Spec.Annotations[backend.ImageAnnotationKey] == backend.DockerImage
+}
+
+// asVMImageHostUser runs a process of a Docker image guest container as
+// vmImageHostUser in that user's home directory. It returns every other
+// process as is.
+func asVMImageHostUser(bundle goci.Bndl, spec garden.ProcessSpec) garden.ProcessSpec {
+	if !isVMImageGuest(bundle) {
+		return spec
+	}
+	spec.User = vmImageHostUser
+	spec.Dir = ""
+	return spec
+}
+
+// vmImageLaunchFlags returns the vm-launch flags that carry a Docker image
+// guest's user and the defaults that the process's environment lacked, which
+// is the bundle's environment beneath the process's own.
+func vmImageLaunchFlags(bundle goci.Bndl, spec garden.ProcessSpec) []string {
+	user := spec.User
+	if user == "" {
+		user = vmImageDefaultUser
+	}
+
+	var env []string
+	if bundle.Spec.Process != nil {
+		env = append(env, bundle.Spec.Process.Env...)
+	}
+	env = append(env, spec.Env...)
+	set := make(map[string]bool, len(env))
+	for _, kv := range env {
+		name, _, _ := strings.Cut(kv, "=")
+		set[name] = true
+	}
+	var missing []string
+	for _, name := range vmImageDefaultEnv {
+		if !set[name] {
+			missing = append(missing, name)
+		}
+	}
+
+	return []string{
+		vmLaunchImageUserFlag + "=" + user,
+		vmLaunchImageDefaultEnvFlag + "=" + strings.Join(missing, ","),
+	}
 }
 
 // wrapVMLauncher rewrites the CF launcher process of a vm-* container so that
@@ -385,36 +466,38 @@ func (c *Containerizer) Run(log lager.Logger, handle string, spec garden.Process
 // relay", which streams that sidecar's output from the app's vm-launch and
 // exits with its status. It is not wrapped, so it runs without the kvm gid
 // and without CAP_NET_RAW, as diego-sshd does.
-func (c *Containerizer) wrapVMLauncher(log lager.Logger, handle string, spec garden.ProcessSpec) (garden.ProcessSpec, bool, error) {
-	_, bundle, err := c.runtime.BundleInfo(log, handle)
-	if err != nil {
-		log.Error("bundle-info-failed", err)
-		return spec, false, err
-	}
-
+//
+// In a Docker image guest container the wrapped launcher also gets the image
+// user and the missing defaults (see vmImageLaunchFlags) before vm-launch's
+// own arguments.
+func (c *Containerizer) wrapVMLauncher(log lager.Logger, bundle goci.Bndl, spec garden.ProcessSpec) (garden.ProcessSpec, bool) {
 	kind := backend.FromBundle(bundle)
 	if !backend.IsVM(kind) {
-		return spec, false, nil
+		return spec, false
 	}
 
 	if isSidecarRelay(spec.Env) {
 		log.Info("vm-sidecar-relay", lager.Data{"backend": string(kind)})
 		spec.Path = processes.VMLaunchPath
 		spec.Args = []string{"relay"}
-		return spec, false, nil
+		return spec, false
 	}
 
-	log.Info("vm-wrap-launcher", lager.Data{"backend": string(kind)})
+	imageGuest := isVMImageGuest(bundle)
+	log.Info("vm-wrap-launcher", lager.Data{"backend": string(kind), "docker-image": imageGuest})
 
-	args := make([]string, 0, len(spec.Args)+4)
+	args := make([]string, 0, len(spec.Args)+6)
 	args = append(args, "--backend", string(kind))
+	if imageGuest {
+		args = append(args, vmImageLaunchFlags(bundle, spec)...)
+	}
 	args = append(args, "--", spec.Path)
 	args = append(args, spec.Args...)
 
 	spec.Path = processes.VMLaunchPath
 	spec.Args = args
 
-	return processes.MarkVMLaunch(spec), true, nil
+	return processes.MarkVMLaunch(spec), true
 }
 
 // sidecarRelayEnv names the variable that makes a launcher a sidecar's log

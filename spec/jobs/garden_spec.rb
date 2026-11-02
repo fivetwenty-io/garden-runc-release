@@ -746,6 +746,80 @@ describe 'garden' do
           end
         end
       end
+
+      context 'Docker image properties' do
+        let(:rootfs) { '/var/vcap/packages/cflinuxfs4/rootfs.tar' }
+
+        def render_with(backends, extra)
+          template.render({ 'garden' => { 'execution_backends' => backends }.merge(extra) })
+        end
+
+        def render_server(backends, extra)
+          IniParse.parse(render_with(backends, extra))['server']
+        end
+
+        it 'declares an empty tarball, the cache directory, and a 10 GiB budget' do
+          garden_spec = YAML.load_file(File.join(File.dirname(__FILE__), '../../jobs/garden/spec'))
+          properties = garden_spec['properties']
+          expect(properties['garden.vm_docker_rootfs']['default']).to eql('')
+          expect(properties['garden.vm_docker_image_cache_dir']['default']).to eql('/var/vcap/data/vm-runtime/images')
+          expect(properties['garden.vm_docker_image_cache_bytes']['default']).to eql(10 * 1024 * 1024 * 1024)
+          %w[garden.vm_docker_rootfs garden.vm_docker_image_cache_dir garden.vm_docker_image_cache_bytes].each do |name|
+            expect(properties[name]['description']).not_to be_empty
+          end
+        end
+
+        [[], ['vm-qemu'], %w[vm-qemu vm-firecracker], %w[oci-gvisor vm-qemu]].each do |backends|
+          it "renders no Docker image line by default (#{backends.inspect})" do
+            expect(render_with(backends, {})).not_to include('vm-docker')
+          end
+        end
+
+        it 'renders the tarball and the cache settings, which parse back' do
+          server = render_server(['vm-qemu'], { 'vm_docker_rootfs' => rootfs })
+          expect(server['vm-docker-rootfs']).to eql(rootfs)
+          expect(server['vm-docker-image-cache-dir']).to eql('/var/vcap/data/vm-runtime/images')
+          expect(server['vm-docker-image-cache-bytes']).to eql(10_737_418_240)
+        end
+
+        it 'renders a cache directory and a budget that the operator sets' do
+          server = render_server(['vm-firecracker'], {
+                                   'vm_docker_rootfs' => rootfs,
+                                   'vm_docker_image_cache_dir' => '/var/vcap/data/images',
+                                   'vm_docker_image_cache_bytes' => 1_048_576
+                                 })
+          expect(server['vm-docker-image-cache-dir']).to eql('/var/vcap/data/images')
+          expect(server['vm-docker-image-cache-bytes']).to eql(1_048_576)
+        end
+
+        it 'renders no cache setting without a tarball' do
+          expect(render_with(['vm-qemu'], { 'vm_docker_image_cache_bytes' => 1_048_576 })).not_to include('vm-docker')
+        end
+
+        it 'raises for a relative tarball path' do
+          expect { render_with(['vm-qemu'], { 'vm_docker_rootfs' => 'packages/cflinuxfs4/rootfs.tar' }) }
+            .to raise_error(/garden.vm_docker_rootfs must be an absolute path or empty/)
+        end
+
+        it 'raises for a relative cache directory' do
+          expect { render_with(['vm-qemu'], { 'vm_docker_rootfs' => rootfs, 'vm_docker_image_cache_dir' => 'images' }) }
+            .to raise_error(/garden.vm_docker_image_cache_dir must be an absolute path/)
+        end
+
+        [0, -1, '1024', 1.5].each do |value|
+          it "raises for a budget of #{value.inspect}" do
+            expect { render_with(['vm-qemu'], { 'vm_docker_image_cache_bytes' => value }) }
+              .to raise_error(/garden.vm_docker_image_cache_bytes must be a positive whole number of bytes/)
+          end
+        end
+
+        [[], ['oci-gvisor']].each do |backends|
+          it "raises when the tarball is set and the backends are #{backends.inspect}" do
+            expect { render_with(backends, { 'vm_docker_rootfs' => rootfs }) }
+              .to raise_error(/garden.vm_docker_rootfs requires a vm-\* entry/)
+          end
+        end
+      end
     end
   end
 

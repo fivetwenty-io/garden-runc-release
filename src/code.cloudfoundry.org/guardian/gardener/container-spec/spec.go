@@ -59,4 +59,9 @@ type DesiredContainerSpec struct {
 	// VMStackDir is the host directory that holds the stack image of a VM
 	// container. Empty means the container gets no stack bind.
 	VMStackDir string
+
+	// VMImageDir is the host directory that holds the guest image of a VM
+	// container whose guest boots a Docker image, with rootfs.squashfs,
+	// passwd, and group inside. Empty means the guest boots the stack.
+	VMImageDir string
 }
