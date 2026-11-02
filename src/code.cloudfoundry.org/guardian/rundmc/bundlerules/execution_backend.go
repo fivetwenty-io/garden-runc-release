@@ -222,7 +222,7 @@ func (r ExecutionBackend) Apply(bndl goci.Bndl, spec spec.DesiredContainerSpec) 
 		annotations[k] = v
 	}
 	annotations[backend.AnnotationKey] = string(kind)
-	if reserveMiB >= 0 {
+	if reserveMiB > 0 {
 		annotations[backend.MemoryReserveAnnotationKey] = strconv.Itoa(reserveMiB)
 	}
 	if backend.IsVM(kind) && spec.VMImageDir != "" {

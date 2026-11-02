@@ -38,7 +38,8 @@ const DockerImage = "docker"
 // MemoryReserveAnnotationKey is the bundle annotation that marks a VM
 // container whose memory limit Garden raised by the hypervisor's reserve, so
 // that its guest has the whole limit the app asked for. Its value is the
-// reserve in MiB, which is 0 when the container had no limit to raise. The
+// reserve in MiB. A container that had no limit to raise carries no
+// annotation, so its guest keeps the size that its cgroup gives. The
 // annotation lives as long as the container's bundle, so a container keeps
 // the guest it was created for when the operator changes the option and
 // Garden restarts.

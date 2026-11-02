@@ -618,10 +618,10 @@ var _ = Describe("the memory reserve of a vm-* container", func() {
 			Expect(backend.FullMemoryLimitFromBundle(applied(backend.VMQemu))).To(BeTrue())
 		})
 
-		It("records a reserve of 0 for a container with no limit to raise", func() {
+		It("records no reserve for a container with no limit to raise", func() {
 			unlimited := int64(0)
 			limits = specs.LinuxMemory{Limit: &unlimited}
-			Expect(applied(backend.VMQemu).Spec.Annotations).To(HaveKeyWithValue(backend.MemoryReserveAnnotationKey, "0"))
+			Expect(applied(backend.VMQemu).Spec.Annotations).NotTo(HaveKey(backend.MemoryReserveAnnotationKey))
 		})
 
 		It("raises the limit and the swap when they are one pointer, as the limits rule sets them", func() {
