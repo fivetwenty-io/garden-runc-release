@@ -12,6 +12,7 @@ import (
 	spec "code.cloudfoundry.org/guardian/gardener/container-spec"
 	"code.cloudfoundry.org/guardian/rundmc/goci"
 	"code.cloudfoundry.org/guardian/rundmc/processes"
+	"code.cloudfoundry.org/guardian/rundmc/seccompvsock"
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -139,6 +140,14 @@ type ExecutionBackend struct {
 	// a vm-qemu container gets no node for it, and its guest runs without the
 	// agent rather than failing to be created.
 	HostVhostVsock bool
+
+	// DenyVsock says that the base bundles' seccomp profiles deny
+	// socket(AF_VSOCK). A vm-qemu container that gets /dev/vhost-vsock for
+	// the guest agent is then the one exception: its profile allows the
+	// call again, because its wrapped vm-launch dials the agent over vsock,
+	// and the process builder starts every other process of the container
+	// under a filter that denies it (see processes.WithVsockDenial).
+	DenyVsock bool
 }
 
 // NewExecutionBackend returns the rule with the default required artifact table.
@@ -183,6 +192,9 @@ func (r ExecutionBackend) Apply(bndl goci.Bndl, spec spec.DesiredContainerSpec) 
 			vsock := vhostVsockNode
 			vsock.gid = r.KVMGid
 			nodes = append(nodes, vsock)
+			if r.DenyVsock {
+				bndl = bndl.WithSeccomp(seccompvsock.Allow(bndl.Seccomp()))
+			}
 		}
 		// Claimed last, because it creates host nodes. Nothing below can fail,
 		// and a failure later in the create is cleaned up by the destroy that

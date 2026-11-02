@@ -482,6 +482,22 @@ var _ = Describe("Bundle", func() {
 		})
 	})
 
+	Describe("WithSeccomp", func() {
+		It("sets the seccomp profile without changing the bundle it was given", func() {
+			profile := &specs.LinuxSeccomp{DefaultAction: specs.ActAllow}
+			returnedBundle := initialBundle.WithSeccomp(profile)
+			Expect(returnedBundle.Seccomp()).To(BeIdenticalTo(profile))
+			Expect(initialBundle.Seccomp()).To(BeNil())
+
+			Expect(returnedBundle.WithSeccomp(nil).Seccomp()).To(BeNil())
+			Expect(returnedBundle.Seccomp()).To(BeIdenticalTo(profile))
+		})
+
+		It("has no profile when the bundle has no Linux section", func() {
+			Expect(goci.Bndl{}.Seccomp()).To(BeNil())
+		})
+	})
+
 	Describe("WithMaskedPaths", func() {
 		It("sets the MaskedPaths in the bundle", func() {
 			returnedBundle := initialBundle.WithMaskedPaths([]string{"path1", "path2"})

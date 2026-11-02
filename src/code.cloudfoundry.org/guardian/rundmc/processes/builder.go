@@ -11,6 +11,7 @@ import (
 	"code.cloudfoundry.org/garden"
 	"code.cloudfoundry.org/guardian/backend"
 	"code.cloudfoundry.org/guardian/rundmc/goci"
+	"code.cloudfoundry.org/guardian/rundmc/seccompvsock"
 	"code.cloudfoundry.org/guardian/rundmc/users"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
@@ -111,6 +112,19 @@ const (
 	// VMLaunchHandoffFlags passes the flag only to turn it on.
 	VMLaunchVolumeHandoffFlag = "--volume-handoff"
 
+	// VMLaunchDenyVsockCommand is the vm-launch command that BuildProcess
+	// runs a process through when its container's profile lets it create
+	// vsock sockets (see WithVsockDenial). vm-launch deny-vsock -- PATH ARG...
+	// installs a seccomp filter that denies socket(AF_VSOCK) and then execs
+	// PATH, which it looks up in the process's PATH as the runtime would.
+	VMLaunchDenyVsockCommand = "deny-vsock"
+
+	// VMLaunchDenyChildVsockFlag tells vm-launch to start each of its own
+	// children, the hypervisor, virtiofsd, and the droplet build, under a
+	// seccomp filter that denies socket(AF_VSOCK), while vm-launch keeps the
+	// call for the guest agent's relay.
+	VMLaunchDenyChildVsockFlag = "--deny-child-vsock"
+
 	// portEnvPrefix starts the environment entry that names the port of a
 	// process that serves one. vm-launch forwards ports only when the entry
 	// is present, whatever its value, and exits when the value is no port.
@@ -183,6 +197,9 @@ type ProcBuilder struct {
 	// vmLaunchFlags are the operator's volume flags, which BuildProcess
 	// passes to the wrapped vm-launch.
 	vmLaunchFlags []string
+	// denyVsock keeps vsock sockets from every process of a vm-* container
+	// but its wrapped vm-launch (see WithVsockDenial).
+	denyVsock bool
 }
 
 // Option customises a ProcBuilder.
@@ -196,6 +213,22 @@ type Option func(*ProcBuilder)
 func WithKVMGid(gid uint32) Option {
 	return func(p *ProcBuilder) {
 		p.kvmGid = gid
+	}
+}
+
+// WithVsockDenial tells BuildProcess that the operator denies
+// socket(AF_VSOCK) to container processes. Seccomp profiles deny it then, but
+// the profile belongs to the whole container, and the execution backend rule
+// lets a vm-qemu container with the guest agent create vsock sockets, so
+// that its wrapped vm-launch can reach the agent. In a vm-* container whose
+// profile does not deny the call, BuildProcess runs every other process
+// through vm-launch's VMLaunchDenyVsockCommand, which execs it under a filter
+// that denies it, and gives the wrapped vm-launch VMLaunchDenyChildVsockFlag,
+// so that the hypervisor and the rest of its children run under that filter
+// too. A container whose profile denies the call already gets neither.
+func WithVsockDenial() Option {
+	return func(p *ProcBuilder) {
+		p.denyVsock = true
 	}
 }
 
@@ -364,7 +397,9 @@ func (p *ProcBuilder) CheckUser(bndl goci.Bndl, spec garden.ProcessSpec, user *u
 // the --transparent-proxy flag before its own arguments (vm-launch keeps the
 // hypervisor from inheriting the capability). That wrapped vm-launch also
 // gets the flags set with WithVMLaunchFlags after it. The marker is removed
-// before the process is built.
+// before the process is built. With WithVsockDenial, a process other than
+// that vm-launch runs through vm-launch's deny-vsock in a vm-* container
+// whose profile lets it create vsock sockets.
 // Callers check the resolved user with CheckUser first, because a kvm primary
 // gid cannot be removed here.
 func (p *ProcBuilder) BuildProcess(bndl goci.Bndl, spec garden.ProcessSpec, user *users.ExecUser) *specs.Process {
@@ -384,8 +419,15 @@ func (p *ProcBuilder) BuildProcess(bndl goci.Bndl, spec garden.ProcessSpec, user
 		capabilities = WithoutCapability(capabilities, CapSetGID)
 	}
 
+	// Only the wrapped vm-launch of a container that the profile lets create
+	// vsock sockets keeps the call.
+	denyVsock := p.denyVsock && vm && !seccompvsock.Denies(bndl.Seccomp())
+
 	env := p.envDeterminer.EnvFor(bndl, spec, user.Uid)
 	args := []string{spec.Path}
+	if denyVsock && !wrapped {
+		args = []string{VMLaunchPath, VMLaunchDenyVsockCommand, "--", spec.Path}
+	}
 	if wrapped && kind == backend.VMFirecracker && hasPort(env) {
 		capabilities = WithCapability(capabilities, CapNetRaw)
 		args = append(args, VMLaunchTransparentProxyFlag)
@@ -393,6 +435,9 @@ func (p *ProcBuilder) BuildProcess(bndl goci.Bndl, spec garden.ProcessSpec, user
 	if wrapped {
 		args = append(args, p.vmLaunchFlags...)
 		args = append(args, VMLaunchMemoryFlags(bndl)...)
+		if denyVsock {
+			args = append(args, VMLaunchDenyChildVsockFlag)
+		}
 	}
 	args = append(args, spec.Args...)
 

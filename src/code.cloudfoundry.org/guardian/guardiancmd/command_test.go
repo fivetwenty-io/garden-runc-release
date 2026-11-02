@@ -646,6 +646,7 @@ var _ = Describe("execution backend flags", func() {
 
 			It("passes --guest-agent alone when the guest agent is on", func() {
 				cmd.ExecutionBackends.VMGuestAgent = true
+				cmd.Containers.DenyVsock = true
 
 				backends, err := cmd.wireExecutionBackends(log)
 				Expect(err).NotTo(HaveOccurred())
@@ -665,6 +666,7 @@ var _ = Describe("execution backend flags", func() {
 				cmd.ExecutionBackends.VMVolumeAsyncMounts = true
 				cmd.ExecutionBackends.VMMaxVCPUs = 4
 				cmd.ExecutionBackends.VMGuestAgent = true
+				cmd.Containers.DenyVsock = true
 
 				backends, err := cmd.wireExecutionBackends(log)
 				Expect(err).NotTo(HaveOccurred())
@@ -786,6 +788,7 @@ var _ = Describe("execution backend flags", func() {
 				cmd.ExecutionBackends.Enabled = []string{"vm-qemu"}
 				cmd.ExecutionBackends.VMLaunchBin = launchBin
 				cmd.ExecutionBackends.VMGuestAgent = true
+				cmd.Containers.DenyVsock = true
 				originalVsock, originalDevice = hostVhostVsockPath, hostVhostVsockDevice
 			})
 
@@ -831,6 +834,31 @@ var _ = Describe("execution backend flags", func() {
 				Expect(err).NotTo(HaveOccurred())
 				Expect(backends.vhostVsock).To(BeFalse())
 				Expect(log).To(gbytes.Say(`guest-agent-vhost-vsock-unavailable.*device 1:3 is not vhost-vsock, which is 10:241`))
+			})
+
+			It("turns the agent on when the vsock denial is on", func() {
+				hostVhostVsockPath = "/dev/null"
+				hostVhostVsockDevice = [2]uint32{1, 3}
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.guestAgent).To(BeTrue())
+				Expect(backends.vmLaunchFlags).To(ContainElement("--guest-agent"))
+				Expect(log.LogMessages()).NotTo(ContainElement(ContainSubstring("guest-agent-refused-without-vsock-denial")))
+			})
+
+			It("refuses the agent, says so, and gives no container /dev/vhost-vsock when the vsock denial is off", func() {
+				cmd.Containers.DenyVsock = false
+				hostVhostVsockPath = "/dev/null"
+				hostVhostVsockDevice = [2]uint32{1, 3}
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.guestAgent).To(BeFalse())
+				Expect(backends.vhostVsock).To(BeFalse())
+				Expect(backends.vmLaunchFlags).NotTo(ContainElement("--guest-agent"))
+				Expect(log).To(gbytes.Say("guest-agent-refused-without-vsock-denial"))
+				Expect(log).NotTo(gbytes.Say("guest-agent-refused-without-vsock-denial"))
 			})
 
 			It("does not look for /dev/vhost-vsock when vm-qemu is not enabled", func() {
@@ -1127,6 +1155,30 @@ var _ = Describe("VM stack flags", func() {
 			_, err = flags.NewParser(parsed, flags.IgnoreUnknown).ParseArgs([]string{"--vm-guest-agent"})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(parsed.ExecutionBackends.VMGuestAgent).To(BeTrue())
+		})
+
+		It("has the vsock denial off unless --deny-vsock is given", func() {
+			parsed := &CommonCommand{}
+			_, err := flags.NewParser(parsed, flags.IgnoreUnknown).ParseArgs([]string{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(parsed.Containers.DenyVsock).To(BeFalse())
+
+			parsed = &CommonCommand{}
+			_, err = flags.NewParser(parsed, flags.IgnoreUnknown).ParseArgs([]string{"--deny-vsock"})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(parsed.Containers.DenyVsock).To(BeTrue())
+		})
+
+		It("parses the vsock denial line that the garden job renders", func() {
+			ini := filepath.Join(GinkgoT().TempDir(), "config.ini")
+			Expect(os.WriteFile(ini, []byte("[server]\n  deny-vsock = true\n"), 0o644)).To(Succeed())
+
+			gdn := &GdnCommand{ServerCommand: &ServerCommand{CommonCommand: &CommonCommand{}}}
+			parser := flags.NewParser(gdn, flags.IgnoreUnknown)
+			parser.NamespaceDelimiter = "-"
+			Expect(flags.NewIniParser(parser).ParseFile(ini)).To(Succeed())
+
+			Expect(gdn.ServerCommand.Containers.DenyVsock).To(BeTrue())
 		})
 
 		It("parses the guest agent line that the garden job renders", func() {
