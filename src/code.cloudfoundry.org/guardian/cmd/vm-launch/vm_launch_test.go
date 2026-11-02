@@ -754,6 +754,22 @@ var _ = Describe("parseArgs", func() {
 		Expect(err).To(MatchError(ContainSubstring("invalid boolean value")))
 	})
 
+	It("keeps the volume handoff off by default and takes --volume-handoff on either backend", func() {
+		Expect("--" + volumeHandoffFlag).To(Equal(processes.VMLaunchVolumeHandoffFlag))
+		Expect(usage).To(ContainSubstring("[--volume-handoff]"))
+		for _, kind := range []backend.Kind{backend.VMQemu, backend.VMFirecracker} {
+			for flags, want := range map[string]bool{"": false, "--volume-handoff": true, "--volume-handoff=true": true, "--volume-handoff=false": false} {
+				argv := []string{"--backend", string(kind)}
+				if flags != "" {
+					argv = append(argv, flags)
+				}
+				cfg, err := parseArgs(append(argv, "--", "true"))
+				Expect(err).NotTo(HaveOccurred(), "%s %q", kind, flags)
+				Expect(cfg.volumeHandoff).To(Equal(want), "%s %q", kind, flags)
+			}
+		}
+	})
+
 	It("defaults the QEMU sandbox to the value Garden's default names and takes a custom or an empty value", func() {
 		Expect("--" + qemuSandboxFlag).To(Equal(processes.VMLaunchQEMUSandboxFlag))
 		Expect(qemuSandbox).To(Equal(processes.VMQemuSandboxDefault))

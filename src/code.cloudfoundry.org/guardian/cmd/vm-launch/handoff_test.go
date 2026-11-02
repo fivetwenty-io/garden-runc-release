@@ -266,7 +266,7 @@ var _ = Describe("handoff requests", func() {
 				var watcher *handoffWatcher
 
 				BeforeEach(func() {
-					watcher = startHandoffWatcher([]*handoffWatch{watch}, handoffSpecPoll)
+					watcher = startHandoffWatcher([]*handoffWatch{watch}, handoffSpecPoll, 0)
 					DeferCleanup(watcher.stop)
 				})
 
@@ -320,7 +320,7 @@ var _ = Describe("handoff requests", func() {
 	})
 
 	It("starts no watcher for no watches, and a nil watcher offers nothing", func() {
-		w := startHandoffWatcher(nil, handoffSpecPoll)
+		w := startHandoffWatcher(nil, handoffSpecPoll, 0)
 		Expect(w).To(BeNil())
 		Expect(w.requests()).To(BeNil())
 		w.stop()
@@ -622,7 +622,7 @@ var _ = Describe("the volume handoff between two instances", func() {
 		watch, err := openHandoffWatch(dir, mountID, handoffImageName, id)
 		Expect(err).NotTo(HaveOccurred())
 		defer watch.Close()
-		watcher := startHandoffWatcher([]*handoffWatch{watch}, handoffSpecPoll)
+		watcher := startHandoffWatcher([]*handoffWatch{watch}, handoffSpecPoll, 0)
 		holderLog := &safeBuffer{}
 		sup := supervisor{stdout: &safeBuffer{}, logger: log.New(holderLog, "", 0), signals: make(chan os.Signal, 2),
 			handoff: watcher.requests(), grace: 5 * time.Second, deadline: 5 * time.Second}
@@ -743,7 +743,7 @@ var _ = Describe("the volume handoff between two instances", func() {
 		watch, err := openHandoffWatch(dir, mountID, handoffImageName, identity(handoffProcessID, holderToken))
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(watch.Close)
-		watcher := startHandoffWatcher([]*handoffWatch{watch}, handoffSpecPoll)
+		watcher := startHandoffWatcher([]*handoffWatch{watch}, handoffSpecPoll, 0)
 		DeferCleanup(watcher.stop)
 		Consistently(watcher.requests(), 2*handoffRefresh+500*time.Millisecond).ShouldNot(Receive())
 	}, SpecTimeout(handoffSpecTimeout))
@@ -756,9 +756,28 @@ var _ = Describe("the volume handoff between two instances", func() {
 		watch, err := openHandoffWatch(dir, mountID, handoffImageName, identity(handoffProcessID, holderToken))
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(watch.Close)
-		watcher := startHandoffWatcher([]*handoffWatch{watch}, handoffSpecPoll)
+		watcher := startHandoffWatcher([]*handoffWatch{watch}, handoffSpecPoll, 0)
 		DeferCleanup(watcher.stop)
 		Consistently(watcher.requests(), 2*handoffRefresh+500*time.Millisecond).ShouldNot(Receive())
+	}, SpecTimeout(handoffSpecTimeout))
+
+	It("reads no request until the holder has held the image for the hold, and offers a live one after it", func(ctx SpecContext) {
+		holder, err := open(identity(handoffProcessID, holderToken), time.Second)
+		Expect(err).NotTo(HaveOccurred())
+		waiter := wait(identity(handoffProcessID, waiterToken), 20*time.Second)
+		waitForRequest()
+		watch, err := openHandoffWatch(dir, mountID, handoffImageName, identity(handoffProcessID, holderToken))
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(watch.Close)
+		const hold = 1500 * time.Millisecond
+		started := time.Now()
+		watcher := startHandoffWatcher([]*handoffWatch{watch}, handoffSpecPoll, hold)
+		DeferCleanup(watcher.stop)
+		Consistently(watcher.requests(), hold-300*time.Millisecond).ShouldNot(Receive(), "the watcher offered a request before the hold ended")
+		Eventually(watcher.requests(), hold+2*handoffRefresh).Should(Receive())
+		Expect(time.Since(started)).To(BeNumerically(">=", hold))
+		Expect(holder.Close()).To(Succeed())
+		Expect(take(waiter).err).NotTo(HaveOccurred())
 	}, SpecTimeout(handoffSpecTimeout))
 
 	DescribeTable("never stops a holder for a waiter it must not hand the image to, which waits out its lock wait",
@@ -769,7 +788,7 @@ var _ = Describe("the volume handoff between two instances", func() {
 			watch, err := openHandoffWatch(dir, mountID, handoffImageName, identity(handoffProcessID, holderToken))
 			Expect(err).NotTo(HaveOccurred())
 			DeferCleanup(watch.Close)
-			watcher := startHandoffWatcher([]*handoffWatch{watch}, handoffSpecPoll)
+			watcher := startHandoffWatcher([]*handoffWatch{watch}, handoffSpecPoll, 0)
 			DeferCleanup(watcher.stop)
 			waiter := wait(identity(processID, token), 2*handoffRefresh+500*time.Millisecond)
 			Consistently(watcher.requests(), 2*handoffRefresh).ShouldNot(Receive())

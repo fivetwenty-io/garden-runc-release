@@ -80,7 +80,7 @@ while :; do sleep 1; done`
 					ch <- waitedImage{img: w, err: err, at: time.Now()}
 				}()
 			}
-			watcher := startHandoffWatcher([]*handoffWatch{watch}, handoffPoll)
+			watcher := startHandoffWatcher([]*handoffWatch{watch}, handoffPoll, 0)
 			var qemuProc *os.Process
 			running := make(chan struct{})
 			sup := supervisor{

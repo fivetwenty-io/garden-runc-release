@@ -300,6 +300,7 @@ end -%>
     "garden.vm_block_volumes" => p("garden.vm_block_volumes"),
     "garden.vm_volume_shares" => p("garden.vm_volume_shares"),
     "garden.vm_volume_sync_mounts" => p("garden.vm_volume_sync_mounts"),
+    "garden.vm_volume_handoff" => p("garden.vm_volume_handoff"),
   }
   vm_volume_settings.each do |name, value|
     unless value == true || value == false
@@ -309,6 +310,7 @@ end -%>
   vm_block_volumes = vm_volume_settings["garden.vm_block_volumes"]
   vm_volume_shares = vm_volume_settings["garden.vm_volume_shares"]
   vm_volume_sync_mounts = vm_volume_settings["garden.vm_volume_sync_mounts"]
+  vm_volume_handoff = vm_volume_settings["garden.vm_volume_handoff"]
   vm_qemu_sandbox = p("garden.vm_qemu_sandbox")
   vm_qemu_sandbox_default = "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"
   unless vm_qemu_sandbox.is_a?(String) && !vm_qemu_sandbox.match?(/[\r\n]/)
@@ -365,6 +367,9 @@ end -%>
     unless vm_volume_sync_mounts
       raise "garden.vm_volume_sync_mounts requires a vm-* entry in garden.execution_backends, because only a VM container mounts an image volume"
     end
+    if vm_volume_handoff
+      raise "garden.vm_volume_handoff requires a vm-* entry in garden.execution_backends, because only a VM container holds an image volume"
+    end
   end
 -%>
 <% unless execution_backends.empty? -%>
@@ -384,6 +389,9 @@ end -%>
 <% end -%>
 <% unless vm_volume_sync_mounts -%>
   vm-volume-async-mounts = true
+<% end -%>
+<% if vm_volume_handoff -%>
+  vm-volume-handoff = true
 <% end -%>
 <% if vm_qemu_sandbox != vm_qemu_sandbox_default -%>
   vm-qemu-sandbox = <%= vm_qemu_sandbox %>

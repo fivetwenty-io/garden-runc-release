@@ -24,7 +24,9 @@ import (
 // each instance elsewhere and stops the old one only once the replacement
 // runs. The replacement of an app with a private image would wait on the old
 // instance's lock until it gave up, so the replacement asks the old instance,
-// through the volume they share, to let the image go.
+// through the volume they share, to let the image go. The operator turns the
+// handoff on with --volume-handoff, and a launch without it neither writes a
+// request nor reads one (see withoutHandoff).
 //
 // While its lock wait finds the image locked, a launch writes a request file,
 // .rvm-handoff-IMAGENAME, in the root of the volume, and rewrites it every
@@ -32,10 +34,13 @@ import (
 // launch that holds the image reads that file every handoffPoll. It honours a
 // request whose process_id is its own, whose token is not its own, and whose
 // sequence number rose between two reads, so that a request a departed
-// launch left behind never stops anyone. The supervisor then stops the guest
-// as it does at a first SIGTERM (see supervisor.handoff), and the launch's
-// normal way out releases the lock once the hypervisor has exited. The waiter
-// takes the lock through its unchanged wait and removes its request.
+// launch left behind never stops anyone. It reads nothing until it has held
+// the image for handoffMinHold, so that two instances of one index never pass
+// the image back and forth faster than that. The supervisor then stops the
+// guest as it does at a first SIGTERM (see supervisor.handoff), and the
+// launch's normal way out releases the lock once the hypervisor has exited.
+// The waiter takes the lock through its unchanged wait and removes its
+// request.
 //
 // The flock stays the only thing that grants an image. The handoff changes
 // when the holder lets go of it and never how anyone gets it, so the request
@@ -70,9 +75,22 @@ const (
 	handoffRefresh = time.Second
 	handoffPoll    = 2 * time.Second
 
+	// handoffMinHold is how long a launch keeps an image before it honours a
+	// request for it. Diego restarts only one instance of an index when it
+	// exits, and removes an evacuating, a suspect, or a stray one, so the
+	// image changes hands at most twice before Diego converges. The hold
+	// bounds the rate whatever Diego does, to one hand-back of an image a
+	// minute, and an instance being evacuated has almost always held its
+	// image longer than that.
+	handoffMinHold = time.Minute
+
 	// maxHandoffRequest is the largest request file the holder reads.
 	maxHandoffRequest = 256
 )
+
+// handoffTiming is how often the holder reads its requests and how long it
+// keeps its image before it honours one. Tests shorten both.
+var handoffTiming = struct{ poll, hold time.Duration }{poll: handoffPoll, hold: handoffMinHold}
 
 // handoffTokenPattern is the only token a request carries: the hex of
 // handoffTokenBytes bytes.
@@ -329,20 +347,29 @@ type handoffWatcher struct {
 	stopOnce sync.Once
 }
 
-// startHandoffWatcher starts reading the requests of watches every poll, or
-// returns nil when there are none. A request is live when two reads one poll
-// apart find the same token with a higher sequence number. The watcher then
-// offers its line for one poll, and when the supervisor does not take it,
-// because the guest command does not run yet, it reads again, so the
-// supervisor never acts on a request older than one poll. It stops once the
-// supervisor took a line or stop is called.
-func startHandoffWatcher(watches []*handoffWatch, poll time.Duration) *handoffWatcher {
+// startHandoffWatcher starts reading the requests of watches every poll, from
+// hold after it starts, or returns nil when there are none. A request is live
+// when two reads one poll apart find the same token with a higher sequence
+// number. The watcher then offers its line for one poll, and when the
+// supervisor does not take it, because the guest command does not run yet,
+// it reads again, so the supervisor never acts on a request older than one
+// poll. It stops once the supervisor took a line or stop is called.
+func startHandoffWatcher(watches []*handoffWatch, poll, hold time.Duration) *handoffWatcher {
 	if len(watches) == 0 {
 		return nil
 	}
 	w := &handoffWatcher{ch: make(chan string), done: make(chan struct{}), finished: make(chan struct{})}
 	go func() {
 		defer close(w.finished)
+		if hold > 0 {
+			t := time.NewTimer(hold)
+			select {
+			case <-t.C:
+			case <-w.done:
+				t.Stop()
+				return
+			}
+		}
 		last := make([]handoffRequest, len(watches))
 		seen := make([]bool, len(watches))
 		for {
@@ -412,4 +439,14 @@ func handoffIdentityFor(v selectedVolume, caps capabilities, mode attachMode, lo
 		return nil
 	}
 	return &handoffIdentity{ProcessID: v.Volume.ProcessID, Token: token}
+}
+
+// withoutHandoff takes vols out of the handoff, for a launch without
+// --volume-handoff. A volume takes part only with its process's process_id
+// (see handoffIdentityFor), so a volume without one neither asks a holder for
+// its image nor watches for requests while the guest runs.
+func withoutHandoff(vols []guestVolume) {
+	for i := range vols {
+		vols[i].ProcessID = ""
+	}
 }

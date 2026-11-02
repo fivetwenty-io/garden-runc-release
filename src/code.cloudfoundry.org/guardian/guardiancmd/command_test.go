@@ -536,6 +536,7 @@ var _ = Describe("execution backend flags", func() {
 			}
 			Expect(parsed.ExecutionBackends.VMVolumeShares).To(BeFalse())
 			Expect(parsed.ExecutionBackends.VMVolumeAsyncMounts).To(BeFalse())
+			Expect(parsed.ExecutionBackends.VMVolumeHandoff).To(BeFalse())
 		})
 
 		It("defaults --vm-qemu-sandbox to the seccomp sandbox and takes a custom or an empty value", func() {
@@ -569,9 +570,13 @@ var _ = Describe("execution backend flags", func() {
 			Expect(parse("--vm-volume-async-mounts").ExecutionBackends.VMVolumeAsyncMounts).To(BeTrue())
 		})
 
-		It("reads both settings from the ini file the job renders", func() {
+		It("turns the handoff on with --vm-volume-handoff", func() {
+			Expect(parse("--vm-volume-handoff").ExecutionBackends.VMVolumeHandoff).To(BeTrue())
+		})
+
+		It("reads the settings from the ini file the job renders", func() {
 			ini := filepath.Join(GinkgoT().TempDir(), "config.ini")
-			Expect(os.WriteFile(ini, []byte("[server]\n  vm-volume-shares = true\n  vm-volume-async-mounts = true\n"), 0o600)).To(Succeed())
+			Expect(os.WriteFile(ini, []byte("[server]\n  vm-volume-shares = true\n  vm-volume-async-mounts = true\n  vm-volume-handoff = true\n"), 0o600)).To(Succeed())
 
 			gdn := &GdnCommand{ServerCommand: &ServerCommand{CommonCommand: &CommonCommand{}}}
 			parser := flags.NewParser(gdn, flags.IgnoreUnknown)
@@ -579,6 +584,7 @@ var _ = Describe("execution backend flags", func() {
 			Expect(flags.NewIniParser(parser).ParseFile(ini)).To(Succeed())
 			Expect(gdn.ServerCommand.ExecutionBackends.VMVolumeShares).To(BeTrue())
 			Expect(gdn.ServerCommand.ExecutionBackends.VMVolumeAsyncMounts).To(BeTrue())
+			Expect(gdn.ServerCommand.ExecutionBackends.VMVolumeHandoff).To(BeTrue())
 		})
 
 		Context("with a vm-* backend", func() {
@@ -628,6 +634,23 @@ var _ = Describe("execution backend flags", func() {
 				Expect(backends.vmLaunchFlags).To(Equal([]string{"--volume-sync-mounts=false"}))
 			})
 
+			It("passes only --volume-handoff when the handoff is on", func() {
+				cmd.ExecutionBackends.VMVolumeHandoff = true
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vmLaunchFlags).To(Equal([]string{"--volume-handoff"}))
+			})
+
+			It("passes --volume-handoff after the CPU flags", func() {
+				cmd.ExecutionBackends.VMMaxVCPUs = 2
+				cmd.ExecutionBackends.VMVolumeHandoff = true
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vmLaunchFlags).To(Equal([]string{"--max-vcpus", "2", "--volume-handoff"}))
+			})
+
 			It("passes all three flags when both settings differ from the defaults", func() {
 				cmd.ExecutionBackends.VMVolumeShares = true
 				cmd.ExecutionBackends.VMVolumeAsyncMounts = true
@@ -655,6 +678,7 @@ var _ = Describe("execution backend flags", func() {
 		It("passes nothing and says so when only oci-gvisor is enabled", func() {
 			cmd.ExecutionBackends.VMVolumeShares = true
 			cmd.ExecutionBackends.VMVolumeAsyncMounts = true
+			cmd.ExecutionBackends.VMVolumeHandoff = true
 			cmd.ExecutionBackends.Enabled = []string{"oci-gvisor"}
 			cmd.Containerd.Socket = "/run/containerd.sock"
 
@@ -663,6 +687,7 @@ var _ = Describe("execution backend flags", func() {
 			Expect(backends.vmLaunchFlags).To(BeEmpty())
 			Expect(log).To(gbytes.Say("volume-shares-unused-without-a-vm-backend"))
 			Expect(log).To(gbytes.Say("volume-async-mounts-unused-without-a-vm-backend"))
+			Expect(log).To(gbytes.Say("volume-handoff-unused-without-a-vm-backend"))
 		})
 
 		It("passes nothing when no backend is enabled", func() {

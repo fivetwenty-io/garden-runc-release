@@ -76,8 +76,10 @@ type guestVolume struct {
 	// that allows one instance checks.
 	Index int
 	// ProcessID is the process_id in VCAP_APPLICATION, when it is a
-	// lowercase UUID, and empty otherwise. Only an instance of the same
-	// process is handed the image (see handoff.go).
+	// lowercase UUID and the operator turned the handoff on, and empty
+	// otherwise. Only an instance of the same process is handed the image,
+	// and a volume without one takes no part in the handoff (see
+	// handoff.go).
 	ProcessID string
 
 	// MountID is the ID of the mount that findVolumeProvider found
