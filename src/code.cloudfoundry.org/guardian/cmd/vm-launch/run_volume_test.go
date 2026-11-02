@@ -439,6 +439,8 @@ stat -L -c %s /proc/self/fd/3 /proc/self/fd/6 >`+shellQuote(sizesFile)+` || exit
 
 	Describe("the volume handoff", func() {
 		var reqPath string
+		// The fake hypervisors live at the artifact paths vm-launch runs.
+		const qemuHypervisor, firecrackerHypervisor = "qemu/ld-linux-x86-64.so.2", "firecracker/firecracker"
 
 		BeforeEach(func() {
 			requireOpenat2()
@@ -449,8 +451,8 @@ stat -L -c %s /proc/self/fd/3 /proc/self/fd/6 >`+shellQuote(sizesFile)+` || exit
 			handoffTiming.poll, handoffTiming.hold = 20*time.Millisecond, 0
 		})
 
-		runWith := func(flags ...string) int {
-			argv := append([]string{"--backend", string(backend.VMQemu), "--artifacts", art}, flags...)
+		runWith := func(kind backend.Kind, flags ...string) int {
+			argv := append([]string{"--backend", string(kind), "--artifacts", art}, flags...)
 			return run(append(argv, "--", "/tmp/lifecycle/launcher", "app", "true", ""), log.New(logBuf, "", 0))
 		}
 
@@ -477,7 +479,8 @@ stat -L -c %s /proc/self/fd/3 /proc/self/fd/6 >`+shellQuote(sizesFile)+` || exit
 			}()
 		}
 
-		// holderHypervisor is a fake QEMU for a holder. It counts the
+		// holderHypervisor is a fake hypervisor for a holder, written to
+		// the artifact path hypervisor. It counts the
 		// descriptors of vm-launch on the volume directory, which only a
 		// handoff watch holds, starts the guest command, and creates the
 		// file started. It reports status 0 when a stop request comes, and
@@ -487,14 +490,14 @@ stat -L -c %s /proc/self/fd/3 /proc/self/fd/6 >`+shellQuote(sizesFile)+` || exit
 		// vm-launch still holds the lock, which it must until the hypervisor
 		// has exited, and whether a waiter took the image before then.
 		type holderFiles struct{ watches, started, release, waiterLocked string }
-		holderHypervisor := func(waiter bool) holderFiles {
+		holderHypervisor := func(hypervisor string, waiter bool) holderFiles {
 			wait := "2"
 			if waiter {
 				wait = "10"
 			}
 			d := GinkgoT().TempDir()
 			f := holderFiles{watches: filepath.Join(d, "watches"), started: filepath.Join(d, "started"), release: filepath.Join(d, "release"), waiterLocked: filepath.Join(d, "waiter-locked")}
-			writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), fdThreeChecks(img)+`n=0
+			writeFakeHypervisor(filepath.Join(art, hypervisor), fdThreeChecks(img)+`n=0
 for l in /proc/$PPID/fd/*; do
 	[ "$(readlink "$l")" = `+shellQuote(volDir)+` ] && n=$((n + 1))
 done
@@ -521,8 +524,8 @@ exit 0`)
 
 		It("never watches for a request without --volume-handoff, so a live one does not stop the guest", func() {
 			askForever()
-			f := holderHypervisor(false)
-			Expect(runWith()).To(Equal(7), logBuf.String())
+			f := holderHypervisor(qemuHypervisor, false)
+			Expect(runWith(backend.VMQemu)).To(Equal(7), logBuf.String())
 			Expect(os.ReadFile(f.watches)).To(Equal([]byte("0\n")))
 			Expect(os.ReadFile(f.release)).To(Equal([]byte("held\n")))
 			Expect(logBuf.String()).NotTo(ContainSubstring("another instance of this process is waiting"))
@@ -530,8 +533,8 @@ exit 0`)
 			Expect(lockedElsewhere(img)).To(BeFalse())
 		})
 
-		It("hands the image to a waiting replacement with --volume-handoff, which locks it only once the hypervisor has exited", func() {
-			f := holderHypervisor(true)
+		DescribeTable("hands the image to a waiting replacement with --volume-handoff, which locks it only once the hypervisor has exited", func(kind backend.Kind, hypervisor string) {
+			f := holderHypervisor(hypervisor, true)
 			// The replacement starts its wait, with the wait vm-launch gives
 			// it, once the holder's guest command runs.
 			waited := make(chan waitedImage, 1)
@@ -546,7 +549,7 @@ exit 0`)
 				}
 				waited <- waitedImage{img: w, err: err, at: time.Now()}
 			}()
-			Expect(runWith("--volume-handoff")).To(Equal(0), logBuf.String())
+			Expect(runWith(kind, "--volume-handoff")).To(Equal(0), logBuf.String())
 			returned := time.Now()
 			Expect(os.ReadFile(f.watches)).To(Equal([]byte("1\n")))
 			Expect(os.ReadFile(f.release)).To(Equal([]byte("held\n")))
@@ -557,7 +560,10 @@ exit 0`)
 			DeferCleanup(w.img.Close)
 			Expect(w.at).To(BeTemporally("<", returned.Add(5*time.Second)))
 			Expect(reqPath).NotTo(BeAnExistingFile(), "the replacement left its request behind")
-		})
+		},
+			Entry("on QEMU", backend.VMQemu, qemuHypervisor),
+			Entry("on Firecracker", backend.VMFirecracker, firecrackerHypervisor),
+		)
 
 		// waitBehindHolder runs vm-launch while another instance holds the
 		// image, and reports whether a request file appeared during the
@@ -568,7 +574,7 @@ exit 0`)
 			Expect(err).NotTo(HaveOccurred())
 			defer holder.Close()
 			Expect(syscall.Flock(int(holder.Fd()), syscall.LOCK_EX)).To(Succeed())
-			argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+			argvFile := writeFakeHypervisor(filepath.Join(art, qemuHypervisor), "")
 			done := make(chan struct{})
 			seen := make(chan bool, 1)
 			go func() {
@@ -586,7 +592,7 @@ exit 0`)
 					}
 				}
 			}()
-			code := runWith(flags...)
+			code := runWith(backend.VMQemu, flags...)
 			close(done)
 			Expect(code).To(Equal(exitLaunchError))
 			Expect(argvFile).NotTo(BeAnExistingFile())
