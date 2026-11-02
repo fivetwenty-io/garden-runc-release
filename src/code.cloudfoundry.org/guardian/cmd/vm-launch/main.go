@@ -1375,6 +1375,11 @@ func run(argv []string, logger *log.Logger) int {
 	if reason != "" {
 		logger.Printf("%s; exiting %d", reason, code)
 	}
+	if hypervisorDied(res) {
+		if msg, ok := cgroupEventsMessage(); ok {
+			logger.Print(msg)
+		}
+	}
 	return code
 }
 

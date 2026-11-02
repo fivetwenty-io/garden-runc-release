@@ -799,6 +799,18 @@ exit 3
 			"hypervisor failed with exit status 3 before the guest reported a status; exiting " + strconv.Itoa(exitHypervisorFailed) + "\n"))
 	})
 
+	It("logs the container's cgroup events after the exit line when the hypervisor dies without a status", func() {
+		port := freePort()
+		p := strconv.Itoa(port)
+		portHypervisor(filepath.Join(art, "firecracker/firecracker"), port, "exit 3\n")
+		GinkgoT().Setenv("PORT", p)
+		Expect(os.WriteFile(filepath.Join(containerCgroupDir, "memory.events"), []byte("low 0\nhigh 0\nmax 9\noom 1\noom_kill 1\n"), 0o644)).To(Succeed())
+
+		Expect(runVM(backend.VMFirecracker)).To(Equal(exitHypervisorFailed), logBuf.String())
+		Expect(logBuf.String()).To(HaveSuffix("hypervisor failed with exit status 3 before the guest reported a status; exiting " + strconv.Itoa(exitHypervisorFailed) + "\n" +
+			"the container's cgroup after the hypervisor died: memory.events=[low 0 high 0 max 9 oom 1 oom_kill 1]\n"))
+	})
+
 	It("adds QEMU's forwarding rule when the guest listens and removes it when it stops", func() {
 		port := freePort()
 		_, qmpLog := portHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), port, qmpHandshake+`await closed
