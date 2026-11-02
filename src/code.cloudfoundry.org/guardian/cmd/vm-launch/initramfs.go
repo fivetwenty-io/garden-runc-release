@@ -521,7 +521,8 @@ func stackInitScript(nonce string) string {
 // takes. A stack guest with volumes mounts them as initScript does, binds
 // them into the app root, and unbinds them in its teardown (see
 // guestStackVolumeSetup, guestStackVolumeBinds, and
-// guestStackVolumeTeardown).
+// guestStackVolumeTeardown), which after a run section is
+// guestStackRunVolumeTeardown.
 func stage2Script(nonce string, volume, stack bool, checks, section string) string {
 	setup := guestFailFunc + guestConsoleSetup
 	if !stack {
@@ -549,6 +550,8 @@ func stage2Script(nonce string, volume, stack bool, checks, section string) stri
 	}
 	run += guestListenStop + guestOOMReport(nonce)
 	switch {
+	case volume && stack && section != "":
+		run += guestStackRunVolumeTeardown
 	case volume && stack:
 		run += guestStackVolumeTeardown
 	case volume:
@@ -1445,7 +1448,11 @@ const guestVolumeTeardown = guestVolumeTeardownStop + guestVolumeTeardownUnmount
 // clearing rvm_vbad, which guestVolumeTeardownUnmount sets for a volume that
 // does not flush or unmount, and which the stack guest's teardown also sets
 // for a bind that does not unmount (see guestStackVolumeTeardown).
-const guestVolumeTeardownStop = guestOtherProcesses + `rvm_vi=$RVM_VOLUMES
+const guestVolumeTeardownStop = guestVolumeTeardownFlush + guestVolumeTeardownTerm + guestVolumeTeardownKill
+
+// guestVolumeTeardownFlush is the part of guestVolumeTeardownStop that
+// flushes the drive volumes early.
+const guestVolumeTeardownFlush = guestOtherProcesses + `rvm_vi=$RVM_VOLUMES
 while [ "$rvm_vi" -gt 0 ]; do
 	rvm_vi=$((rvm_vi - 1))
 	eval "rvm_vkind=\${RVM_VOL${rvm_vi}_KIND:-} rvm_vpath=\$RVM_VOL${rvm_vi}_PATH"
@@ -1453,14 +1460,24 @@ while [ "$rvm_vi" -gt 0 ]; do
 	` + string(driveImage) + ` | ` + string(driveBlock) + `) sync -f "$rvm_vpath" >/dev/null 2>&1 ;;
 	esac
 done
-kill -TERM -1 2>/dev/null
+`
+
+// guestVolumeTeardownTerm is the part of guestVolumeTeardownStop that sends
+// SIGTERM to the processes the command left and waits up to
+// guestTeardownTermWait for them to end.
+const guestVolumeTeardownTerm = `kill -TERM -1 2>/dev/null
 rvm_n=0
 while [ "$rvm_n" -lt ` + guestTeardownTermPolls + ` ] && rvm_others; do
 	sleep ` + guestTeardownPollText + `
 	rvm_n=$((rvm_n + 1))
 done
 rvm_others && echo "vm-launch guest: processes the command left were still running ` + guestTeardownTermSeconds + ` seconds after SIGTERM, so the guest sends them SIGKILL before it flushes the volumes"
-kill -KILL -1 2>/dev/null
+`
+
+// guestVolumeTeardownKill is the part of guestVolumeTeardownStop that sends
+// SIGKILL to every process that is left, waits up to guestTeardownKillWait
+// for them to end, and clears rvm_vbad.
+const guestVolumeTeardownKill = `kill -KILL -1 2>/dev/null
 rvm_n=0
 while [ "$rvm_n" -lt ` + guestTeardownKillPolls + ` ] && rvm_others; do
 	sleep ` + guestTeardownPollText + `

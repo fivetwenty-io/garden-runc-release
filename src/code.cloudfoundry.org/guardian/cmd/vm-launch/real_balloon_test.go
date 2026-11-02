@@ -72,13 +72,6 @@ sleep 90
 // order the guest prints them.
 var realBalloonMarkers = []string{"balloon-idle", "balloon-filling", "balloon-filled", "balloon-freed"}
 
-// realBalloonDevicesCommand is the guest's command in the device count run.
-// It only says that it ran and then waits, so that the host can look at the
-// guest's devices while the guest runs.
-const realBalloonDevicesCommand = `echo balloon-command-ran
-sleep 120
-`
-
 // realBalloon is one real QEMU guest that a spec drives, with the QMP monitor
 // that vm-launch would hold.
 type realBalloon struct {
@@ -430,14 +423,29 @@ var _ = Describe("a real QEMU guest with the virtio balloon", func() {
 		expectMemoryReturned(run)
 	})
 
-	It("fits the balloon on the guest with the most drives, four volumes and a root beside the NIC, and every drive still answers with its own serial", func() {
+	It("fits the balloon on the guest with the most drives, a stack guest with four volumes, a root, the stack, and the droplet beside the NIC, and every drive still answers with its own serial", func() {
 		art := realArtifacts()
 		qemu := realQEMU()
 		requireMicrovm(qemu)
 
-		// A guest with a stack mounts no volumes, so the guest with the most
-		// devices is the one with the root and all four volumes.
-		g := taskGuest(realBalloonDevicesCommand)
+		// A stack guest mounts private disk images, so the guest with the
+		// most devices is a stack guest with the root, all four volumes,
+		// the stack, and the droplet. Its launcher only says that it ran and
+		// then waits, with the stack's own busybox, so that the host can
+		// look at the guest's devices while the guest runs.
+		sd := &stackDrives{stack: realStackImage(art), droplet: realDropletImage(art)}
+		launcher := "#!/bin/sh\necho balloon-command-ran\nexec /bin/busybox sleep 120\n"
+		lf, err := os.Open(writeTempFile("launcher", launcher))
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(lf.Close)
+		g := taskGuest("")
+		g.stack = &guestStack{
+			launcher: guestTool{name: "launcher", file: lf, size: int64(len(launcher))},
+			argv:     shellJoin([]string{stackLauncherPath, "/home/vcap/app", "", "{}"}),
+			cwd:      "/home/vcap",
+			hostname: "stack-guest-0",
+			hosts:    []byte("127.0.0.1 localhost\n"),
+		}
 		var vols []*os.File
 		var sizes []int64
 		for i := range maxVolumes {
@@ -446,14 +454,16 @@ var _ = Describe("a real QEMU guest with the virtio balloon", func() {
 			g.vols = append(g.vols, guestVolume{ContainerDir: "/home/vcap/data" + strconv.Itoa(i), ImageName: "volume.img"})
 		}
 		Expect(vols).To(HaveLen(4), "this spec is for the guest with the most volume drives")
-		g.drives.volumes = qemuImageDrives(sizes...)
 		withRealRoot(&g)
-		marked := withUserspaceMark(newRealInitramfs(g))
 		root := realRootImage()
+		g.drives, err = newGuestDrivesWithStack(backend.VMQemu, nil, root, sd)
+		Expect(err).NotTo(HaveOccurred())
+		g.drives.volumes = qemuImageDrives(sizes...)
+		marked := withUserspaceMark(newRealInitramfs(g))
 
 		runRealBalloonGuest(func(qmp *os.File) ([]string, []*os.File) {
-			files, drives, initrdPath, monitorFD, rootPath := hypervisorFiles(imageAttachments(vols...), marked, qmp, root)
-			argv, err := hypervisorArgvWithStack(backend.VMQemu, art, GinkgoT().TempDir(), initrdPath, realBalloonGuestMiB, g.nw, drives, rootPath, monitorFD, nil)
+			files, drives, initrdPath, monitorFD, rootPath := hypervisorFilesWithStack(imageAttachments(vols...), marked, qmp, root, sd)
+			argv, err := hypervisorArgvWithStack(backend.VMQemu, art, GinkgoT().TempDir(), initrdPath, realBalloonGuestMiB, g.nw, drives, rootPath, monitorFD, sd)
 			Expect(err).NotTo(HaveOccurred())
 			return markedArgv(tcgArgv(qemu, argv)), files
 		}, func(h *realBalloon) {
@@ -473,14 +483,14 @@ var _ = Describe("a real QEMU guest with the virtio balloon", func() {
 			for _, m := range regexp.MustCompile(`(?m)^\s+serial = "([^"]*)"\r?$`).FindAllStringSubmatch(tree, -1) {
 				serials = append(serials, m[1])
 			}
-			// Seven devices, each on a virtio-mmio transport of its own, out
+			// Nine devices, each on a virtio-mmio transport of its own, out
 			// of the 24 the microvm machine has: the NIC, the four volumes,
-			// the root, and the balloon.
+			// the root, the stack, the droplet, and the balloon.
 			Expect(devices).To(ConsistOf(slices.Concat(
 				[]string{"virtio-net-device", "virtio-balloon-device"},
-				slices.Repeat([]string{"virtio-blk-device"}, maxVolumes+1),
+				slices.Repeat([]string{"virtio-blk-device"}, maxVolumes+3),
 			)), tree)
-			Expect(serials).To(ConsistOf(qemuVolumeSerial(0), qemuVolumeSerial(1), qemuVolumeSerial(2), qemuVolumeSerial(3), qemuRootSerial), tree)
+			Expect(serials).To(ConsistOf(qemuVolumeSerial(0), qemuVolumeSerial(1), qemuVolumeSerial(2), qemuVolumeSerial(3), qemuRootSerial, qemuStackSerial, qemuDropletSerial), tree)
 
 			// The balloon works beside all of them: the guest answers a read
 			// with statistics that fit its size.
