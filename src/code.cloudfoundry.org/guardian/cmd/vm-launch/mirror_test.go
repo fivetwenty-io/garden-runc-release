@@ -137,7 +137,10 @@ var _ = Describe("mirrored mounts", func() {
 			Expect(out).To(ContainSubstring("not mirroring the mount at " + quoteForLog(dir+"/rw") + " into the guest, because it is writable"))
 			Expect(out).To(ContainSubstring("not mirroring the nfs4 mount at " + quoteForLog(dir+"/nfs") + " into the guest"))
 			Expect(out).To(ContainSubstring("not mirroring the mount at " + quoteForLog(dir+"/above") + " into the guest, because " + quoteForLog(dir+"/above/vol") + " below it reaches the guest on a path of its own"))
-			Expect(out).To(ContainSubstring("leaving 6 of the container's mounts out of the guest's mirrored mounts"))
+			Expect(out).To(ContainSubstring(`not mirroring the mount at "/" into the guest, because the guest's own root takes the place of the container's root`))
+			Expect(out).To(ContainSubstring(`not mirroring the 2 mounts at "/proc", "/sys/fs/cgroup" into the guest, because a copy of the kernel's pseudo filesystems`))
+			Expect(out).To(ContainSubstring(`not mirroring the mount at "/tmp/garden-init" into the guest, because the guest never gets a mount at, below, or above the paths of Garden and vm-launch`))
+			Expect(out).To(ContainSubstring("leaving 2 of the container's mounts out of the guest's mirrored mounts, because they reach the guest on a path of their own: /etc/hosts, " + dir + "/vol"))
 			Expect(out).To(ContainSubstring("mirroring 3 of the container's mounts into the guest, read-only"))
 			Expect(out).To(ContainSubstring("vm-launch pushes changes to 4 of their files"))
 		})
@@ -195,6 +198,32 @@ var _ = Describe("mirrored mounts", func() {
 			later := &mountMirror{mounts: []mirrorMount{{path: "/etc/x", entries: []mirrorEntry{{kind: mirrorFile, perm: 0o644, data: []byte("abc"), state: read}}}}}
 			later.number()
 			Expect(later.watched[0].state).To(Equal(read), "number takes the state of the read, and does not stat the file again")
+		})
+
+		It("names each denied mount once, by path, in a line for its reason", func() {
+			table := writeMountTable(dir,
+				mountInfoLine(1, "/etc", "ro", "ext4"),
+				mountInfoLine(2, "/usr/bin/setpriv", "ro", "ext4"),
+				mountInfoLine(3, "/lib64", "ro", "ext4"),
+				mountInfoLine(4, "/etc/cf-assets", "ro", "ext4"),
+				mountInfoLine(5, "/tmp", "rw", "tmpfs"),
+				mountInfoLine(6, "/proc/kcore", "ro", "tmpfs"),
+				mountInfoLine(7, "/proc/keys", "ro", "tmpfs"),
+				// A later line for a mount point hides the earlier one, so it is
+				// named once.
+				mountInfoLine(8, "/proc/keys", "ro", "tmpfs"),
+			)
+			m, err := readMountMirror(table, nil, logger)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(m).To(BeNil())
+			lines := strings.Split(strings.TrimSuffix(logBuf.String(), "\n"), "\n")
+			Expect(lines).To(Equal([]string{
+				`not mirroring the 3 mounts at "/etc", "/lib64", "/usr/bin/setpriv" into the guest, because the guest's root runs the programs, libraries, and loader in /bin, /sbin, /usr, the library directories, and /etc/ld.so.* in the app root before it drops to the app's user, so the guest never gets a mount at, below, or above them`,
+				`not mirroring the mount at "/etc/cf-assets" into the guest, because Diego's Envoy configuration in /etc/cf-assets holds a copy of the instance identity key, which reaches the guest on a path of its own, so the guest never gets a mount at, below, or above it`,
+				`not mirroring the 2 mounts at "/proc/kcore", "/proc/keys" into the guest, because the guest has its own /proc, /sys, and /dev, and a mount at, below, or above them would show it the host's`,
+				`not mirroring the mount at "/tmp" into the guest, because the guest never gets a mount at, below, or above the paths of Garden and vm-launch, which are /rvm, /opt/garden-vm, and /tmp/garden-*`,
+				"mirroring none of the container's mounts into the guest",
+			}))
 		})
 
 		It("fails on a mount table it cannot parse", func() {

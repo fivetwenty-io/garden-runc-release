@@ -62,22 +62,43 @@ var mirrorDeniedFSTypes = map[string]bool{
 	"securityfs": true, "sysfs": true, "tracefs": true,
 }
 
-// mirrorDeniedDirs are the paths whose mounts the guest never gets, at them,
-// below them, or above them. They are the guest's own proc, sysfs, and
-// devices, the programs, libraries, and loader that the guest's root runs in
-// the app root before it drops to the app's user (see guestStackSetpriv), the
-// paths of Garden and vm-launch, and Garden's Envoy configuration, whose
-// copy of the instance identity key reaches the guest on a path of its own.
-var mirrorDeniedDirs = []string{
-	"/proc", "/sys", "/dev",
-	"/bin", "/sbin", "/usr", "/lib", "/lib32", "/lib64", "/libx32",
-	"/rvm", "/opt/garden-vm", "/etc/cf-assets",
+// mirrorDenial is one group of paths whose mounts the guest never gets, at
+// them, below them, or above them, because a mount above a denied path would
+// cover that path in the guest. dirs are directories, and prefixes are path
+// prefixes. why is the clause of the log line that says why the guest never
+// gets them, and it reads the same for one mount and for several.
+type mirrorDenial struct {
+	dirs     []string
+	prefixes []string
+	why      string
 }
 
-// mirrorDeniedPrefixes are the path prefixes whose mounts the guest never
-// gets, which are Garden's paths in /tmp and the dynamic loader's
-// configuration and cache, and mounts above them are denied too.
-var mirrorDeniedPrefixes = []string{"/tmp/garden-", "/etc/ld.so."}
+// mirrorDenials are the paths whose mounts the guest never gets. They are the
+// guest's own proc, sysfs, and devices, the programs, libraries, and loader
+// that the guest's root runs in the app root before it drops to the app's
+// user (see guestStackSetpriv), the paths of Garden and vm-launch, and
+// Garden's Envoy configuration, whose copy of the instance identity key
+// reaches the guest on a path of its own.
+var mirrorDenials = []mirrorDenial{
+	{
+		dirs: []string{"/proc", "/sys", "/dev"},
+		why:  "the guest has its own /proc, /sys, and /dev, and a mount at, below, or above them would show it the host's",
+	},
+	{
+		dirs:     []string{"/bin", "/sbin", "/usr", "/lib", "/lib32", "/lib64", "/libx32"},
+		prefixes: []string{"/etc/ld.so."},
+		why:      "the guest's root runs the programs, libraries, and loader in /bin, /sbin, /usr, the library directories, and /etc/ld.so.* in the app root before it drops to the app's user, so the guest never gets a mount at, below, or above them",
+	},
+	{
+		dirs:     []string{"/rvm", "/opt/garden-vm"},
+		prefixes: []string{"/tmp/garden-"},
+		why:      "the guest never gets a mount at, below, or above the paths of Garden and vm-launch, which are /rvm, /opt/garden-vm, and /tmp/garden-*",
+	},
+	{
+		dirs: []string{"/etc/cf-assets"},
+		why:  "Diego's Envoy configuration in /etc/cf-assets holds a copy of the instance identity key, which reaches the guest on a path of its own, so the guest never gets a mount at, below, or above it",
+	},
+}
 
 // mirrorNetworkFSTypes are the network filesystems, which a copy at boot
 // would let go stale. A filesystem type that starts with "fuse." is one too.
@@ -189,23 +210,49 @@ func mirrorPathUsable(p string) bool {
 }
 
 // mirrorDenied reports whether the guest never gets a mount of fsType at p.
-// A mount above a denied path is denied as well, because its copy would put
-// content of the container's at that path too.
 func mirrorDenied(p, fsType string) bool {
-	if p == "/" || mirrorDeniedFSTypes[fsType] {
-		return true
+	return mirrorDenialOf(p, fsType) != ""
+}
+
+// mirrorDenialOf returns the clause that says why the guest never gets a
+// mount of fsType at p, or "" when the deny list lets it through.
+func mirrorDenialOf(p, fsType string) string {
+	if p == "/" {
+		return "the guest's own root takes the place of the container's root"
 	}
-	for _, dir := range mirrorDeniedDirs {
-		if underDir(p, dir) || underDir(dir, p) {
-			return true
+	if mirrorDeniedFSTypes[fsType] {
+		return "a copy of the kernel's pseudo filesystems would only show the guest the host's state, and the guest has its own"
+	}
+	for _, d := range mirrorDenials {
+		for _, dir := range d.dirs {
+			if underDir(p, dir) || underDir(dir, p) {
+				return d.why
+			}
+		}
+		for _, prefix := range d.prefixes {
+			if strings.HasPrefix(p, prefix) || underDir(path.Dir(prefix), p) {
+				return d.why
+			}
 		}
 	}
-	for _, prefix := range mirrorDeniedPrefixes {
-		if strings.HasPrefix(p, prefix) || underDir(path.Dir(prefix), p) {
-			return true
+	return ""
+}
+
+// logMirrorDenied logs each mount the deny list holds back, by its path,
+// once, with one line for each reason, in the order the reasons first came.
+func logMirrorDenied(denied map[string][]string, order []string, logger *log.Logger) {
+	for _, why := range order {
+		paths := denied[why]
+		quoted := make([]string, len(paths))
+		for i, p := range paths {
+			quoted[i] = quoteForLog(p)
 		}
+		what := "the mount at " + quoted[0]
+		if len(quoted) > 1 {
+			what = fmt.Sprintf("the %d mounts at %s", len(quoted), strings.Join(quoted, ", "))
+		}
+		logger.Printf("not mirroring %s into the guest, because %s", what, why)
 	}
-	return false
 }
 
 // mirrorNetworkFS reports whether fsType is a network filesystem.
@@ -229,8 +276,10 @@ func hasMountOption(opts []string, opt string) bool {
 // last line for a mount point is the one that counts, because a later mount
 // there hides an earlier one.
 //
-// A mount the guest never gets (see mirrorDenied) and a mount at or below a
-// dedicated path are counted in one line. A mount above a dedicated path, on
+// Each mount the guest never gets (see mirrorDenialOf) is named once, by
+// path, in a line for its reason, so that an operator can see why the guest
+// lacks it, and the mounts at or below a dedicated path are counted in one
+// line. A mount above a dedicated path, on
 // a path the guest cannot bind at, on a network filesystem, that is not
 // read-only, that is neither a file nor a directory, or that is over the
 // limits of a small mount, is held back with a line of its own. A mount
@@ -248,11 +297,16 @@ func readMountMirror(mountinfo string, dedicated []string, logger *log.Logger) (
 
 	m := &mountMirror{}
 	var left []string
+	denied := map[string][]string{}
+	var reasons []string
 	var total int64
 	for _, rec := range recs {
 		p := rec.MountPoint
-		if mirrorDenied(p, rec.FSType) {
-			left = append(left, p)
+		if why := mirrorDenialOf(p, rec.FSType); why != "" {
+			if denied[why] == nil {
+				reasons = append(reasons, why)
+			}
+			denied[why] = append(denied[why], p)
 			continue
 		}
 		if firstUnder(p, dedicated) {
@@ -294,8 +348,9 @@ func readMountMirror(mountinfo string, dedicated []string, logger *log.Logger) (
 		total += mm.bytes
 		m.mounts = append(m.mounts, mm)
 	}
+	logMirrorDenied(denied, reasons, logger)
 	if len(left) > 0 {
-		logger.Printf("leaving %d of the container's mounts out of the guest's mirrored mounts, because they belong to the host, Garden, or vm-launch, or reach the guest on a path of their own: %s", len(left), joinLoggedNames(left))
+		logger.Printf("leaving %d of the container's mounts out of the guest's mirrored mounts, because they reach the guest on a path of their own: %s", len(left), joinLoggedNames(left))
 	}
 	if len(m.mounts) == 0 {
 		logger.Print("mirroring none of the container's mounts into the guest")
