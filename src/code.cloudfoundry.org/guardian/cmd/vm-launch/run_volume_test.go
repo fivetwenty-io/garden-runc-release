@@ -481,29 +481,22 @@ stat -L -c %s /proc/self/fd/3 /proc/self/fd/6 >`+shellQuote(sizesFile)+` || exit
 		}
 
 		// holderHypervisor is a fake hypervisor for a holder, written to
-		// the artifact path hypervisor. It counts the
-		// descriptors of vm-launch on the volume directory, which only a
-		// handoff watch holds, starts the guest command, and creates the
-		// file started. It reports status 0 when a stop request comes, and
-		// status 7 when no line comes for ten seconds with a waiter or for
-		// two without one. After its
-		// status it closes its own copy of the image and records whether
-		// vm-launch still holds the lock, which it must until the hypervisor
-		// has exited, and whether a waiter took the image before then.
-		type holderFiles struct{ watches, started, release, waiterLocked string }
+		// the artifact path hypervisor. It starts the guest command and
+		// creates the file started. It reports status 0 when a stop request
+		// comes, and status 7 when no line comes for ten seconds with a
+		// waiter or for two without one. After its status it closes its own
+		// copy of the image and records whether vm-launch still holds the
+		// lock, which it must until the hypervisor has exited, and whether a
+		// waiter took the image before then.
+		type holderFiles struct{ started, release, waiterLocked string }
 		holderHypervisor := func(hypervisor string, waiter bool) holderFiles {
 			wait := "2"
 			if waiter {
 				wait = "10"
 			}
 			d := GinkgoT().TempDir()
-			f := holderFiles{watches: filepath.Join(d, "watches"), started: filepath.Join(d, "started"), release: filepath.Join(d, "release"), waiterLocked: filepath.Join(d, "waiter-locked")}
-			writeFakeHypervisor(filepath.Join(art, hypervisor), fdThreeChecks(img)+`n=0
-for l in /proc/$PPID/fd/*; do
-	[ "$(readlink "$l")" = `+shellQuote(volDir)+` ] && n=$((n + 1))
-done
-echo "$n" >`+shellQuote(f.watches)+`
-echo "RVM_START_$nonce"
+			f := holderFiles{started: filepath.Join(d, "started"), release: filepath.Join(d, "release"), waiterLocked: filepath.Join(d, "waiter-locked")}
+			writeFakeHypervisor(filepath.Join(art, hypervisor), fdThreeChecks(img)+`echo "RVM_START_$nonce"
 : >`+shellQuote(f.started)+`
 status=7
 while IFS= read -r -t `+wait+` line; do
@@ -523,11 +516,35 @@ exit 0`)
 			return f
 		}
 
+		// watchesAtStart waits until the holder's guest command runs and
+		// then counts the descriptors on the volume directory that vm-launch,
+		// which runs in this test process, holds. Only a handoff watch holds
+		// one. The spec counts them itself, because a confined hypervisor
+		// running as root holds no capability and so may not read the
+		// descriptors of this process.
+		watchesAtStart := func(f holderFiles) int {
+			Eventually(f.started, 20*time.Second, 10*time.Millisecond).Should(BeAnExistingFile())
+			links, err := filepath.Glob("/proc/self/fd/*")
+			Expect(err).NotTo(HaveOccurred())
+			n := 0
+			for _, l := range links {
+				if target, err := os.Readlink(l); err == nil && target == volDir {
+					n++
+				}
+			}
+			return n
+		}
+
 		It("never watches for a request without --volume-handoff, so a live one does not stop the guest", func() {
 			askForever()
 			f := holderHypervisor(qemuHypervisor, false)
+			watches := make(chan int, 1)
+			go func() {
+				defer GinkgoRecover()
+				watches <- watchesAtStart(f)
+			}()
 			Expect(runWith(backend.VMQemu)).To(Equal(7), logBuf.String())
-			Expect(os.ReadFile(f.watches)).To(Equal([]byte("0\n")))
+			Expect(watches).To(Receive(Equal(0)))
 			Expect(os.ReadFile(f.release)).To(Equal([]byte("held\n")))
 			Expect(logBuf.String()).NotTo(ContainSubstring("another instance of this process is waiting"))
 			Expect(logBuf.String()).NotTo(ContainSubstring("hands the volumes over"))
@@ -537,12 +554,14 @@ exit 0`)
 		DescribeTable("hands the image to a waiting replacement with --volume-handoff, which locks it only once the hypervisor has exited", func(kind backend.Kind, hypervisor string) {
 			f := holderHypervisor(hypervisor, true)
 			// The replacement starts its wait, with the wait vm-launch gives
-			// it, once the holder's guest command runs.
+			// it, once the holder's guest command runs and the spec has
+			// counted the holder's watches.
+			watches := make(chan int, 1)
 			waited := make(chan waitedImage, 1)
 			waiterLog := &safeBuffer{}
 			go func() {
 				defer GinkgoRecover()
-				Eventually(f.started, 20*time.Second, 10*time.Millisecond).Should(BeAnExistingFile())
+				watches <- watchesAtStart(f)
 				id := handoffIdentity{ProcessID: handoffProcessID, Token: waiterToken}
 				o := imageOptions{Size: defaultImageSize, LockWait: lockWait, LockPoll: 20 * time.Millisecond, IsMountRoot: alwaysMountRoot, Handoff: &id,
 					Logf: log.New(waiterLog, "", 0).Printf}
@@ -554,7 +573,7 @@ exit 0`)
 			}()
 			Expect(runWith(kind, "--volume-handoff")).To(Equal(0), logBuf.String())
 			returned := time.Now()
-			Expect(os.ReadFile(f.watches)).To(Equal([]byte("1\n")))
+			Expect(watches).To(Receive(Equal(1)), logBuf.String())
 			Expect(os.ReadFile(f.release)).To(Equal([]byte("held\n")))
 			Expect(logBuf.String()).To(ContainSubstring("another instance of this process is waiting for volume image " + img + ", so vm-launch asks the guest command to stop and hands the volumes over once the guest has stopped"))
 			var w waitedImage
