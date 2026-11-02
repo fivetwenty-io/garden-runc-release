@@ -95,3 +95,28 @@ var _ = Describe("the stop timing that Diego's interval gives", func() {
 		})
 	})
 })
+
+var _ = Describe("the stop timing when the app sets the variable too", func() {
+	var logBuf *bytes.Buffer
+
+	timingOf := func(environ ...string) (time.Duration, time.Duration) {
+		logger := log.New(logBuf, "", 0)
+		return stopTiming(lookupIn(lastWinsEnv(environ, logger)), logger)
+	}
+
+	BeforeEach(func() { logBuf = &bytes.Buffer{} })
+
+	It("uses the executor's value, which comes last, over one that the app set before it", func() {
+		deadline, windDown := timingOf("PATH=/bin", stopGraceEnv+"=3600", "A=b", stopGraceEnv+"=30")
+		Expect(deadline).To(Equal(28 * time.Second))
+		Expect(windDown).To(Equal(26 * time.Second))
+		Expect(logBuf.String()).To(BeEmpty())
+	})
+
+	It("lowers a value over 600 seconds to 600 and says so", func() {
+		deadline, windDown := timingOf(stopGraceEnv + "=601")
+		Expect(deadline).To(Equal(maxStopGrace - stopGraceMargin))
+		Expect(windDown).To(Equal(maxStopGrace - 2*stopGraceMargin))
+		Expect(logBuf.String()).To(ContainSubstring("over the 10m0s"))
+	})
+})
