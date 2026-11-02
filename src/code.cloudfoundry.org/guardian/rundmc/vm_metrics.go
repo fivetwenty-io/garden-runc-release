@@ -6,6 +6,8 @@ import (
 	"io"
 	"sync"
 	"time"
+
+	"code.cloudfoundry.org/garden"
 )
 
 // vmMetricsLinePrefix begins every stderr line vm-launch writes for one
@@ -89,6 +91,61 @@ func parseVMMetricsLine(line []byte) (vmMemorySample, bool) {
 	return s, true
 }
 
+// vmCPUSample is one parsed CPU line, in nanoseconds of CPU time that the
+// guest's vCPUs together have spent in user mode and in system mode since the
+// guest booted.
+type vmCPUSample struct {
+	User, System uint64
+}
+
+// vmCPUMaxNanoseconds bounds each figure of a CPU line at 31 years of CPU
+// time, so that the two together cannot overflow 64 bits.
+const vmCPUMaxNanoseconds = 1_000_000_000_000_000_000
+
+// parseVMCPULine parses one line, without its newline, in the form
+//
+//	vm-launch-metrics v1 cpu user=N system=N
+//
+// and reports false when the line is not in that form or a figure is above
+// vmCPUMaxNanoseconds.
+func parseVMCPULine(line []byte) (vmCPUSample, bool) {
+	var s vmCPUSample
+
+	rest, ok := bytes.CutPrefix(line, []byte(vmMetricsLinePrefix+"cpu "))
+	if !ok {
+		return s, false
+	}
+
+	userToken, systemToken, found := bytes.Cut(rest, []byte(" "))
+	if !found {
+		return vmCPUSample{}, false
+	}
+
+	userValue, ok := bytes.CutPrefix(userToken, []byte("user="))
+	if !ok {
+		return vmCPUSample{}, false
+	}
+
+	systemValue, ok := bytes.CutPrefix(systemToken, []byte("system="))
+	if !ok {
+		return vmCPUSample{}, false
+	}
+
+	if s.User, ok = parseDecimal(userValue); !ok {
+		return vmCPUSample{}, false
+	}
+
+	if s.System, ok = parseDecimal(systemValue); !ok {
+		return vmCPUSample{}, false
+	}
+
+	if s.User > vmCPUMaxNanoseconds || s.System > vmCPUMaxNanoseconds {
+		return vmCPUSample{}, false
+	}
+
+	return s, true
+}
+
 // parseDecimal reads an unsigned decimal number of at most 19 digits, which
 // cannot overflow, and rejects signs, spaces, and an empty string.
 func parseDecimal(b []byte) (uint64, bool) {
@@ -117,6 +174,7 @@ func parseDecimal(b []byte) (uint64, bool) {
 type vmMetricsFilter struct {
 	next     io.Writer
 	onSample func(vmMemorySample)
+	onCPU    func(vmCPUSample)
 	onBad    func(dropped int)
 
 	mu      sync.Mutex
@@ -195,10 +253,18 @@ func (f *vmMetricsFilter) step(out []byte, b byte) []byte {
 	return out
 }
 
-// complete parses the held line and drops it.
+// complete parses the held line, a memory line or a CPU line, and drops it.
 func (f *vmMetricsFilter) complete() {
+	cpu, isCPU := parseVMCPULine(f.held)
 	sample, ok := parseVMMetricsLine(f.held)
 	f.held = f.held[:0]
+
+	if isCPU {
+		if f.onCPU != nil {
+			f.onCPU(cpu)
+		}
+		return
+	}
 
 	if ok {
 		if f.onSample != nil {
@@ -242,25 +308,32 @@ func (f *vmMetricsFilter) Dropped() int {
 	return f.dropped
 }
 
-// vmGuestSample is a stored sample, with the time Garden received it and the
+// vmStoredSample is a stored sample, with the time Garden received it and the
 // process it came from.
-type vmGuestSample struct {
-	vmMemorySample
+type vmStoredSample[T any] struct {
+	sample   T
 	received time.Time
 	source   any
 }
 
-// vmGuestMemory keeps the newest guest memory sample for each container. Its
-// zero value is ready to use and reads the wall clock, and a spec sets now to
-// control time.
-type vmGuestMemory struct {
+// vmSampleStore keeps the newest guest sample of one kind for each container.
+// Its zero value is ready to use and reads the wall clock, and a spec sets now
+// to control time.
+type vmSampleStore[T any] struct {
 	now func() time.Time
 
 	mu      sync.Mutex
-	samples map[string]vmGuestSample
+	samples map[string]vmStoredSample[T]
 }
 
-func (m *vmGuestMemory) clock() time.Time {
+// vmGuestMemory holds the guest memory samples, and vmGuestCPU the guest CPU
+// samples. A container has one of each, and each goes stale on its own.
+type (
+	vmGuestMemory = vmSampleStore[vmMemorySample]
+	vmGuestCPU    = vmSampleStore[vmCPUSample]
+)
+
+func (m *vmSampleStore[T]) clock() time.Time {
 	if m.now != nil {
 		return m.now()
 	}
@@ -271,22 +344,22 @@ func (m *vmGuestMemory) clock() time.Time {
 // Record stores sample as the newest for handle. The source identifies the
 // process that wrote it, so that Forget can tell its own sample from a
 // successor's.
-func (m *vmGuestMemory) Record(handle string, source any, sample vmMemorySample) {
+func (m *vmSampleStore[T]) Record(handle string, source any, sample T) {
 	received := m.clock()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if m.samples == nil {
-		m.samples = map[string]vmGuestSample{}
+		m.samples = map[string]vmStoredSample[T]{}
 	}
 
-	m.samples[handle] = vmGuestSample{vmMemorySample: sample, received: received, source: source}
+	m.samples[handle] = vmStoredSample[T]{sample: sample, received: received, source: source}
 }
 
 // Fresh returns the container's sample when Garden received it less than
 // vmMetricsStaleAfter ago.
-func (m *vmGuestMemory) Fresh(handle string) (vmMemorySample, bool) {
+func (m *vmSampleStore[T]) Fresh(handle string) (T, bool) {
 	now := m.clock()
 
 	m.mu.Lock()
@@ -294,14 +367,15 @@ func (m *vmGuestMemory) Fresh(handle string) (vmMemorySample, bool) {
 
 	stored, ok := m.samples[handle]
 	if !ok || now.Sub(stored.received) >= vmMetricsStaleAfter {
-		return vmMemorySample{}, false
+		var none T
+		return none, false
 	}
 
-	return stored.vmMemorySample, true
+	return stored.sample, true
 }
 
 // Forget removes the container's sample if it came from source.
-func (m *vmGuestMemory) Forget(handle string, source any) {
+func (m *vmSampleStore[T]) Forget(handle string, source any) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -311,9 +385,139 @@ func (m *vmGuestMemory) Forget(handle string, source any) {
 }
 
 // Remove removes the container's sample whatever its source.
-func (m *vmGuestMemory) Remove(handle string) {
+func (m *vmSampleStore[T]) Remove(handle string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	delete(m.samples, handle)
+}
+
+// vmCPUGrace is added to the time over which a rise in the guest's CPU counter
+// is bounded, so that a reading taken soon after the last one has room for the
+// jitter of the guest's sampling.
+const vmCPUGrace = 10 * time.Second
+
+// vmCPUSource says where a vmCPUCounter's last figure came from.
+type vmCPUSource int
+
+const (
+	vmCPUFromCgroup vmCPUSource = iota
+	vmCPUFromGuest
+	vmCPUHeld
+)
+
+// vmCPUCounter is the CPU counter that Metrics reports for one VM container.
+// It starts from the cgroup, moves on to the guest's figures, and while the
+// guest's samples are stale it follows the cgroup's rise. It never decreases
+// in any of its three fields.
+//
+// The cgroup holds the guest's vCPU threads, so by the time the first sample
+// arrives its figure already includes the guest's time. The counter therefore
+// makes the guest's time the part of the cgroup figure that it replaces. Its
+// offset is the cgroup's reading minus the guest's, the time the container
+// spent on everything else, and the figure is the offset plus the guest's.
+type vmCPUCounter struct {
+	mu sync.Mutex
+
+	source   vmCPUSource
+	offset   garden.ContainerCPUStat
+	guest    vmCPUSample
+	at       time.Time
+	cgroup   garden.ContainerCPUStat
+	reported garden.ContainerCPUStat
+}
+
+// vmCPUReading is a figure that vmCPUCounter.report returns, with the source
+// of the counter before and after the reading.
+type vmCPUReading struct {
+	Stat          garden.ContainerCPUStat
+	Before, After vmCPUSource
+}
+
+// report returns the figure for a reading at now, given the cgroup's figure,
+// the container's guest sample when it is fresh, the container's age, and the
+// number of vCPUs that bound the guest's rise.
+func (v *vmCPUCounter) report(cgroup garden.ContainerCPUStat, sample vmCPUSample, fresh bool, now time.Time, age time.Duration, cores int) vmCPUReading {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	before := v.source
+	rise := vmCPUDelta(cgroup, v.cgroup)
+	v.cgroup = cgroup
+
+	if !fresh {
+		if v.source == vmCPUFromCgroup {
+			v.reported = vmCPUMax(v.reported, cgroup)
+		} else {
+			// Nothing in the guest can be trusted to say how much the app
+			// used, so the counter follows the cgroup's rise, which the guest
+			// cannot forge.
+			v.source = vmCPUHeld
+			v.reported = garden.ContainerCPUStat{
+				Usage:  v.reported.Usage + rise.Usage,
+				User:   v.reported.User + rise.User,
+				System: v.reported.System + rise.System,
+			}
+		}
+
+		return vmCPUReading{Stat: v.reported, Before: before, After: v.source}
+	}
+
+	window := age
+	if v.source != vmCPUFromCgroup {
+		window = now.Sub(v.at)
+	}
+
+	// A guest's vCPUs run at most cores times as fast as the clock, and twice
+	// that leaves room for the clocks' disagreement.
+	limit := 2 * uint64(cores) * uint64(max(window, 0)+vmCPUGrace)
+
+	v.guest = vmCPUSample{
+		User:   min(max(sample.User, v.guest.User), v.guest.User+limit),
+		System: min(max(sample.System, v.guest.System), v.guest.System+limit),
+	}
+	v.at = now
+
+	if v.source != vmCPUFromGuest {
+		// Only the first switch to the guest's figures takes the cgroup's
+		// reading as its base. The cgroup of a container that has run on the
+		// guest's figures holds the hypervisor's and the idle time as well, so
+		// a return from a stale spell carries on from the last figure, which
+		// followed the cgroup's rise only while the sample was stale.
+		base := v.reported
+		if before == vmCPUFromCgroup {
+			base = vmCPUMax(v.reported, cgroup)
+		}
+		v.offset = garden.ContainerCPUStat{
+			Usage:  vmCPUSub(base.Usage, v.guest.User+v.guest.System),
+			User:   vmCPUSub(base.User, v.guest.User),
+			System: vmCPUSub(base.System, v.guest.System),
+		}
+		v.source = vmCPUFromGuest
+	}
+
+	v.reported = vmCPUMax(v.reported, garden.ContainerCPUStat{
+		Usage:  v.offset.Usage + v.guest.User + v.guest.System,
+		User:   v.offset.User + v.guest.User,
+		System: v.offset.System + v.guest.System,
+	})
+
+	return vmCPUReading{Stat: v.reported, Before: before, After: v.source}
+}
+
+func vmCPUSub(a, b uint64) uint64 {
+	if b > a {
+		return 0
+	}
+
+	return a - b
+}
+
+// vmCPUDelta is how much each field of now is above before, or zero.
+func vmCPUDelta(now, before garden.ContainerCPUStat) garden.ContainerCPUStat {
+	return garden.ContainerCPUStat{Usage: vmCPUSub(now.Usage, before.Usage), User: vmCPUSub(now.User, before.User), System: vmCPUSub(now.System, before.System)}
+}
+
+func vmCPUMax(a, b garden.ContainerCPUStat) garden.ContainerCPUStat {
+	return garden.ContainerCPUStat{Usage: max(a.Usage, b.Usage), User: max(a.User, b.User), System: max(a.System, b.System)}
 }

@@ -38,3 +38,21 @@ func SetVMCgroup(unified bool) func() {
 	vmCgroupUnified = func() bool { return unified }
 	return func() { vmCgroupUnified = saved }
 }
+
+// SetGuestCPUClock makes the container's guest CPU store read now in place of
+// the wall clock, so a spec can age a sample.
+func SetGuestCPUClock(c *Containerizer, now func() time.Time) {
+	c.guestCPU.now = now
+}
+
+// SetGuestCPUCores makes the bound on how fast a guest's CPU counter may rise
+// use cores vCPUs in place of the host's.
+func SetGuestCPUCores(c *Containerizer, cores int) {
+	c.guestCPUCores = cores
+}
+
+// HasGuestCPUCounter says whether the container has a CPU counter.
+func HasGuestCPUCounter(c *Containerizer, handle string) bool {
+	_, ok := c.guestCPUCounters.Load(handle)
+	return ok
+}

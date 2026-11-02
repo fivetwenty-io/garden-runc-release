@@ -286,3 +286,110 @@ var _ = Describe("the guest memory store", func() {
 		store.Remove("a")
 	})
 })
+
+const cpuSampleLine = "vm-launch-metrics v1 cpu user=30000000 system=10000000"
+
+var _ = Describe("parsing a VM CPU line", func() {
+	It("reads the pinned line", func() {
+		sample, ok := parseVMCPULine([]byte(cpuSampleLine))
+
+		Expect(ok).To(BeTrue())
+		Expect(sample).To(Equal(vmCPUSample{User: 30000000, System: 10000000}))
+	})
+
+	It("accepts zero and the largest figure", func() {
+		sample, ok := parseVMCPULine([]byte("vm-launch-metrics v1 cpu user=0 system=1000000000000000000"))
+
+		Expect(ok).To(BeTrue())
+		Expect(sample).To(Equal(vmCPUSample{System: vmCPUMaxNanoseconds}))
+	})
+
+	It("is not taken for a memory line, and a memory line is not taken for it", func() {
+		_, ok := parseVMMetricsLine([]byte(cpuSampleLine))
+		Expect(ok).To(BeFalse())
+
+		_, ok = parseVMCPULine([]byte(sampleLine))
+		Expect(ok).To(BeFalse())
+	})
+
+	DescribeTable("rejects a line that is not in the form",
+		func(line string) {
+			_, ok := parseVMCPULine([]byte(line))
+			Expect(ok).To(BeFalse())
+		},
+		Entry("another prefix", "vm-launch-metrics v2 cpu user=1 system=1"),
+		Entry("no fields", "vm-launch-metrics v1 cpu "),
+		Entry("a missing field", "vm-launch-metrics v1 cpu user=1"),
+		Entry("an extra field", cpuSampleLine+" extra=1"),
+		Entry("a trailing space", cpuSampleLine+" "),
+		Entry("fields out of order", "vm-launch-metrics v1 cpu system=1 user=1"),
+		Entry("a double space", "vm-launch-metrics v1 cpu user=1  system=1"),
+		Entry("a negative number", "vm-launch-metrics v1 cpu user=-1 system=1"),
+		Entry("a signed number", "vm-launch-metrics v1 cpu user=+1 system=1"),
+		Entry("an empty number", "vm-launch-metrics v1 cpu user= system=1"),
+		Entry("a number past 19 digits", "vm-launch-metrics v1 cpu user=1 system=99999999999999999999"),
+		Entry("a figure above 31 years", "vm-launch-metrics v1 cpu user=1000000000000000001 system=1"),
+	)
+})
+
+var _ = Describe("the VM metrics filter with CPU lines", func() {
+	It("removes a CPU line next to a memory line and stores each, split at every offset", func() {
+		input := "before\n" + cpuSampleLine + "\n" + sampleLine + "\nafter\n"
+
+		for cut := 0; cut <= len(input); cut++ {
+			out := new(bytes.Buffer)
+			var cpus []vmCPUSample
+			var memories []vmMemorySample
+			filter := newVMMetricsFilter(out, func(s vmMemorySample) { memories = append(memories, s) }, nil)
+			filter.onCPU = func(s vmCPUSample) { cpus = append(cpus, s) }
+
+			_, err := filter.Write([]byte(input[:cut]))
+			Expect(err).NotTo(HaveOccurred())
+			_, err = filter.Write([]byte(input[cut:]))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(filter.Flush()).To(Succeed())
+
+			Expect(out.String()).To(Equal("before\nafter\n"), "cut at %d", cut)
+			Expect(cpus).To(Equal([]vmCPUSample{{User: 30000000, System: 10000000}}), "cut at %d", cut)
+			Expect(memories).To(HaveLen(1), "cut at %d", cut)
+		}
+	})
+
+	It("drops a CPU line without a callback and counts a malformed one", func() {
+		out := new(bytes.Buffer)
+		var bad []int
+		filter := newVMMetricsFilter(out, nil, func(n int) { bad = append(bad, n) })
+
+		_, err := filter.Write([]byte(cpuSampleLine + "\nvm-launch-metrics v1 cpu user=1\nrest\n"))
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(out.String()).To(Equal("rest\n"))
+		Expect(bad).To(Equal([]int{1}))
+	})
+})
+
+var _ = Describe("the guest CPU store", func() {
+	It("serves a sample until it is 35 seconds old, and forgets it by its source", func() {
+		clock := time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)
+		store := &vmGuestCPU{now: func() time.Time { return clock }}
+		first, second := new(int), new(int)
+
+		store.Record("a", first, vmCPUSample{User: 1, System: 2})
+		got, ok := store.Fresh("a")
+		Expect(ok).To(BeTrue())
+		Expect(got).To(Equal(vmCPUSample{User: 1, System: 2}))
+
+		store.Forget("a", second)
+		_, ok = store.Fresh("a")
+		Expect(ok).To(BeTrue())
+
+		clock = clock.Add(vmMetricsStaleAfter)
+		_, ok = store.Fresh("a")
+		Expect(ok).To(BeFalse())
+
+		store.Record("a", first, vmCPUSample{User: 3})
+		store.Forget("a", first)
+		_, ok = store.Fresh("a")
+		Expect(ok).To(BeFalse())
+	})
+})

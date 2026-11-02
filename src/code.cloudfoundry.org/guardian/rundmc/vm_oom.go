@@ -90,7 +90,7 @@ func (c *Containerizer) runVMLauncher(log lager.Logger, handle string, spec gard
 
 	// The process is the source of its samples, so it exists before the
 	// filter that records them.
-	launched := &vmLaunchProcess{log: log, handle: handle, scanner: scanner, died: died, stateDir: c.vmStateDir, events: c.events, memory: &c.guestMemory}
+	launched := &vmLaunchProcess{log: log, handle: handle, scanner: scanner, died: died, stateDir: c.vmStateDir, events: c.events, memory: &c.guestMemory, cpu: &c.guestCPU}
 	launched.filter = newVMMetricsFilter(died,
 		func(sample vmMemorySample) { c.guestMemory.Record(handle, launched, sample) },
 		func(dropped int) {
@@ -99,11 +99,13 @@ func (c *Containerizer) runVMLauncher(log lager.Logger, handle string, spec gard
 			}
 		},
 	)
+	launched.filter.onCPU = func(sample vmCPUSample) { c.guestCPU.Record(handle, launched, sample) }
 	pio.Stderr = launched.filter
 
 	process, err := c.runtime.Exec(log, handle, spec, pio)
 	if err != nil || process == nil {
 		c.guestMemory.Forget(handle, launched)
+		c.guestCPU.Forget(handle, launched)
 		return process, err
 	}
 
@@ -129,6 +131,7 @@ type vmLaunchProcess struct {
 	scanner interface{ Seen() bool }
 	events  EventStore
 	memory  *vmGuestMemory
+	cpu     *vmGuestCPU
 
 	// died sees the hypervisor-died line, and stateDir is where runc keeps
 	// the container's state.
@@ -146,6 +149,7 @@ func (p *vmLaunchProcess) Wait() (int, error) {
 		p.log.Error("flush-vm-launch-stderr-failed", flushErr)
 	}
 	p.memory.Forget(p.handle, p)
+	p.cpu.Forget(p.handle, p)
 
 	if p.scanner.Seen() {
 		p.once.Do(func() {
