@@ -1250,10 +1250,11 @@ func run(argv []string, logger *log.Logger) int {
 	sup := supervisor{stdout: os.Stdout, stderr: os.Stderr, logger: logger, signals: sigs, grace: killGrace, deadline: stopDeadline, started: closeInherited}
 	sup.logs, sup.firstExit = relayCallbacks(hub)
 	// The guest's CPU lines go to the stderr that Garden reads for the
-	// memory lines, and each is one Write, as theirs are.
-	sup.cpu = func(user, system uint64) {
-		_, _ = io.WriteString(logger.Writer(), guestCPULine(user, system))
-	}
+	// memory lines, each as one Write. A writer goroutine sends them, so a
+	// stderr that blocks cannot stall the console's copy.
+	cpuOut := newCPUReporter(logger.Writer())
+	defer cpuOut.close()
+	sup.cpu = cpuOut.report
 	if len(shares) > 0 {
 		// A virtiofsd that ends while QEMU runs kills it, which takes QEMU's
 		// process, known once it has started. QEMU's reap is reported at

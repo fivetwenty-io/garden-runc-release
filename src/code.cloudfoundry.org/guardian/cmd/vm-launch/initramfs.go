@@ -819,6 +819,10 @@ fi
 // 35 seconds, which is seven of these.
 const guestCPUInterval = 5
 
+// guestCPUTick is the FIFO the CPU watcher waits on. The watcher makes it,
+// and nothing ever writes it.
+const guestCPUTick = "/rvm/cpu-tick"
+
 // guestCPUWatch starts, in every guest, the watcher that tells vm-launch how
 // much CPU time the guest's processes have used. It reads the first line of
 // /proc/stat, which adds up every vCPU, and writes the ticks spent in user
@@ -829,9 +833,17 @@ const guestCPUInterval = 5
 // schedules them. A line whose figures are not all digits is skipped. The
 // watcher opens /dev/console for each line, as the listen watcher does, so it
 // never writes through the console that the command may have made
-// non-blocking.
+// non-blocking. Between lines it runs no process: it makes a FIFO once, at
+// its start, and waits out the interval with a read that times out on it, as
+// the listen watcher does, so a guest short of processes keeps reporting.
+// When the FIFO cannot be made or opened the watcher waits with sleep.
 func guestCPUWatch(nonce string) string {
 	return `(
+	if mkfifo -m 0600 ` + guestCPUTick + ` 2>/dev/null && command exec 4<>` + guestCPUTick + `; then
+		rvm_cpupause() { read -t ` + strconv.Itoa(guestCPUInterval) + ` -u 4 rvm_tick; }
+	else
+		rvm_cpupause() { sleep ` + strconv.Itoa(guestCPUInterval) + `; }
+	fi
 	while :; do
 		if read -r rvm_cpu rvm_u rvm_n rvm_s rvm_i rvm_w rvm_irq rvm_sirq rvm_rest </proc/stat 2>/dev/null; then
 			case "$rvm_u$rvm_n$rvm_s$rvm_irq$rvm_sirq" in
@@ -839,7 +851,7 @@ func guestCPUWatch(nonce string) string {
 			*) echo "` + cpuTag(nonce) + `$((rvm_u + rvm_n)):$((rvm_s + rvm_irq + rvm_sirq))" >/dev/console ;;
 			esac
 		fi
-		sleep ` + strconv.Itoa(guestCPUInterval) + `
+		rvm_cpupause
 	done
 ) </dev/null &
 rvm_cpuwatch=$!

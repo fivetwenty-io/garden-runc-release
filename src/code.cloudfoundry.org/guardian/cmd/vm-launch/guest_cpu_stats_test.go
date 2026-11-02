@@ -5,10 +5,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -217,7 +219,7 @@ var _ = Describe("the guest CPU watcher", func() {
 	// watchWith runs the watcher in shell against a /proc/stat that holds
 	// stat, with its loop cut to one round, and returns what it wrote on the
 	// console.
-	watchWith := func(shell guestShell, stat string) string {
+	watchWith := func(shell guestShell, stat, tick string) string {
 		dir := GinkgoT().TempDir()
 		proc := filepath.Join(dir, "stat")
 		Expect(os.WriteFile(proc, []byte(stat), 0o644)).To(Succeed())
@@ -225,10 +227,11 @@ var _ = Describe("the guest CPU watcher", func() {
 		watch := guestCPUWatch(testNonce)
 		Expect(strings.Count(watch, "/proc/stat")).To(Equal(1))
 		Expect(strings.Count(watch, ">/dev/console")).To(Equal(1))
-		Expect(strings.Count(watch, "sleep 5")).To(Equal(1))
+		Expect(strings.Count(watch, "\t\trvm_cpupause\n")).To(Equal(1))
 		watch = strings.Replace(watch, "/proc/stat", proc, 1)
 		watch = strings.Replace(watch, ">/dev/console", ">"+con, 1)
-		watch = strings.Replace(watch, "sleep 5", "exit 0", 1)
+		watch = strings.ReplaceAll(watch, guestCPUTick, tick)
+		watch = strings.Replace(watch, "\t\trvm_cpupause\n", "\t\texit 0\n", 1)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -248,7 +251,7 @@ var _ = Describe("the guest CPU watcher", func() {
 
 	DescribeTable("writes user and system ticks from the total line of /proc/stat",
 		func(shellOf func() guestShell, stat, want string) {
-			Expect(watchWith(shellOf(), stat)).To(Equal(want))
+			Expect(watchWith(shellOf(), stat, filepath.Join(GinkgoT().TempDir(), "tick"))).To(Equal(want))
 		},
 		shellEntries("two vCPUs", "cpu  1000 20 300 99000 50 6 4 7 0 0\ncpu0 500 10 150 49500 25 3 2 3 0 0\ncpu1 500 10 150 49500 25 3 2 3 0 0\nintr 1\n", cpuTag(testNonce)+"1020:310\n"),
 		shellEntries("an idle guest", "cpu  0 0 0 5000 0 0 0 0 0 0\n", cpuTag(testNonce)+"0:0\n"),
@@ -256,9 +259,26 @@ var _ = Describe("the guest CPU watcher", func() {
 		shellEntries("a line that stops before the interrupt columns", "cpu  10 0 5\n", cpuTag(testNonce)+"10:5\n"),
 	)
 
+	It("reports in a guest where the FIFO cannot be made, waiting with sleep", func() {
+		stat := "cpu  10 0 5 100 0 0 0\n"
+		missing := filepath.Join(GinkgoT().TempDir(), "no", "such", "dir", "tick")
+		for _, shell := range []guestShell{hostShell(), guestBusyboxShell()} {
+			watch := guestCPUWatch(testNonce)
+			Expect(watch).To(ContainSubstring("rvm_cpupause() { sleep 5; }"))
+			Expect(watchWith(shell, stat, missing)).To(Equal(cpuTag(testNonce) + "10:5\n"))
+		}
+	})
+
+	It("runs no process between its lines", func() {
+		watch := guestCPUWatch(testNonce)
+		loop := watch[strings.Index(watch, "while :;"):]
+		Expect(loop).NotTo(ContainSubstring("sleep"))
+		Expect(loop).To(ContainSubstring("rvm_cpupause"))
+	})
+
 	DescribeTable("writes nothing when /proc/stat does not hold numbers",
 		func(shellOf func() guestShell, stat string) {
-			Expect(watchWith(shellOf(), stat)).To(BeEmpty())
+			Expect(watchWith(shellOf(), stat, filepath.Join(GinkgoT().TempDir(), "tick"))).To(BeEmpty())
 		},
 		shellEntries("a figure that is not a number", "cpu  10 0 x 100 0 0 0\n"),
 		shellEntries("a negative figure", "cpu  -10 0 5 100 0 0 0\n"),
@@ -273,7 +293,7 @@ var _ = Describe("the guest CPU watcher", func() {
 			Expect(os.WriteFile(proc, []byte("cpu  1 0 1 1 0 0 0\n"), 0o644)).To(Succeed())
 			watch := strings.Replace(guestCPUWatch(testNonce), "/proc/stat", proc, 1)
 			watch = strings.Replace(watch, ">/dev/console", ">"+filepath.Join(dir, "console"), 1)
-			watch = strings.Replace(watch, "sleep 5", "sleep 30", 1)
+			watch = strings.ReplaceAll(watch, guestCPUTick, filepath.Join(dir, "tick"))
 
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
@@ -287,4 +307,95 @@ var _ = Describe("the guest CPU watcher", func() {
 		Entry("in /bin/sh", hostShell),
 		Entry("in the guest's busybox sh", guestBusyboxShell),
 	)
+})
+
+// gateWriter blocks every Write until release is closed, and keeps what it
+// was given.
+type gateWriter struct {
+	release chan struct{}
+	mu      sync.Mutex
+	got     []string
+}
+
+func (g *gateWriter) Write(p []byte) (int, error) {
+	<-g.release
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.got = append(g.got, string(p))
+
+	return len(p), nil
+}
+
+func (g *gateWriter) lines() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	return append([]string(nil), g.got...)
+}
+
+var _ io.Writer = (*gateWriter)(nil)
+
+var _ = Describe("the CPU reporter", func() {
+	It("writes the line", func() {
+		gate := &gateWriter{release: make(chan struct{})}
+		close(gate.release)
+		r := newCPUReporter(gate)
+		defer r.close()
+
+		r.report(7, 3)
+
+		Eventually(gate.lines).Should(Equal([]string{guestCPULine(7, 3)}))
+	})
+
+	It("does not block the caller while the writer is blocked, and delivers the newest figures afterwards", func() {
+		gate := &gateWriter{release: make(chan struct{})}
+		r := newCPUReporter(gate)
+		defer r.close()
+
+		done := make(chan struct{})
+		go func() {
+			defer GinkgoRecover()
+			defer close(done)
+			for i := uint64(1); i <= 1000; i++ {
+				r.report(i, i)
+			}
+		}()
+		Eventually(done, 5*time.Second).Should(BeClosed())
+
+		close(gate.release)
+
+		Eventually(func() string {
+			lines := gate.lines()
+			if len(lines) == 0 {
+				return ""
+			}
+
+			return lines[len(lines)-1]
+		}).Should(Equal(guestCPULine(1000, 1000)))
+		Expect(len(gate.lines())).To(BeNumerically("<=", 3))
+	})
+
+	It("keeps the console copy moving when the hypervisor's console runs through a filter that has a blocked CPU callback", func() {
+		gate := &gateWriter{release: make(chan struct{})}
+		defer close(gate.release)
+		r := newCPUReporter(gate)
+		defer r.close()
+
+		var out bytes.Buffer
+		f := newSerialFilter(&out, testNonce)
+		f.onCPU(r.report)
+		done := make(chan struct{})
+		go func() {
+			defer GinkgoRecover()
+			defer close(done)
+			_, _ = f.Write([]byte("RVM_START_" + testNonce + "\r\n"))
+			for i := 0; i < 50; i++ {
+				_, _ = f.Write([]byte(cpuTag(testNonce) + "1:1\r\nhello\r\n"))
+			}
+			f.finish()
+		}()
+
+		Eventually(done, 5*time.Second).Should(BeClosed())
+		Expect(strings.Count(out.String(), "hello")).To(Equal(50))
+	})
 })
