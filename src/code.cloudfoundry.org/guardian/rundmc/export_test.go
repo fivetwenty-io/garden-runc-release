@@ -30,11 +30,11 @@ func SetGuestMemoryClock(c *Containerizer, now func() time.Time) {
 // separately.
 const HypervisorDiedPrefix = vmHypervisorDiedPrefix
 
-// SetVMCgroup points the container cgroup reader at root and makes it read the
-// layout of cgroup v2 when unified is true and that of v1 otherwise. It
-// returns a function that puts the real values back.
-func SetVMCgroup(root string, unified bool) func() {
-	savedRoot, savedUnified := vmCgroupRoot, vmCgroupUnified
-	vmCgroupRoot, vmCgroupUnified = root, func() bool { return unified }
-	return func() { vmCgroupRoot, vmCgroupUnified = savedRoot, savedUnified }
+// SetVMCgroup makes the container cgroup reader read the layout of cgroup v2
+// when unified is true and that of v1 otherwise. It returns a function that
+// puts the real value back.
+func SetVMCgroup(unified bool) func() {
+	saved := vmCgroupUnified
+	vmCgroupUnified = func() bool { return unified }
+	return func() { vmCgroupUnified = saved }
 }

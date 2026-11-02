@@ -2,6 +2,7 @@ package rundmc_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -634,12 +635,16 @@ var _ = Describe("Rundmc", func() {
 					const diedLine = "vm-launch: the hypervisor ended without a guest status\n"
 
 					var (
-						cgroupRoot string
-						stderr     *bytes.Buffer
+						stateDir string
+						stderr   *bytes.Buffer
 					)
 
 					BeforeEach(func() {
-						cgroupRoot = GinkgoT().TempDir()
+						stateDir = GinkgoT().TempDir()
+						containerizer = newContainerizer(
+							rundmc.WithBackendDispatch(rundmc.NewExecStreamer(fakeOCIRuntime)),
+							rundmc.WithVMCgroupState(stateDir),
+						)
 						stderr = new(bytes.Buffer)
 						fakeOCIRuntime.BundleInfoReturns("/bundle", goci.Bndl{Spec: specs.Spec{
 							Version:     "test-version",
@@ -653,6 +658,15 @@ var _ = Describe("Rundmc", func() {
 							return inner, nil
 						}
 					})
+
+					// writeState saves a runc state that names the given
+					// cgroup paths, and write fills a cgroup directory.
+					writeState := func(paths map[string]string) {
+						Expect(os.MkdirAll(filepath.Join(stateDir, "some-handle"), 0o755)).To(Succeed())
+						raw, err := json.Marshal(map[string]any{"cgroup_paths": paths})
+						Expect(err).NotTo(HaveOccurred())
+						Expect(os.WriteFile(filepath.Join(stateDir, "some-handle", "state.json"), raw, 0o644)).To(Succeed())
+					}
 
 					write := func(dir string, files map[string]string) {
 						Expect(os.MkdirAll(dir, 0o755)).To(Succeed())
@@ -675,8 +689,10 @@ var _ = Describe("Rundmc", func() {
 					})
 
 					It("logs the memory files of the container's cgroup v2 directory once, and passes the stderr on", func() {
-						DeferCleanup(rundmc.SetVMCgroup(cgroupRoot, true))
-						write(filepath.Join(cgroupRoot, "garden/good/some-handle"), map[string]string{
+						DeferCleanup(rundmc.SetVMCgroup(true))
+						dir := filepath.Join(GinkgoT().TempDir(), "garden/good/some-handle")
+						writeState(map[string]string{"": dir})
+						write(dir, map[string]string{
 							"memory.events":  "low 0\nhigh 0\nmax 9\noom 1\noom_kill 1\n",
 							"memory.max":     "1207959552\n",
 							"memory.current": "1207000000\n",
@@ -696,9 +712,35 @@ var _ = Describe("Rundmc", func() {
 						Expect(logger).To(gbytes.Say(`"exit-status":137`))
 					})
 
-					It("logs the memory files of the container's memory cgroup on cgroup v1", func() {
-						DeferCleanup(rundmc.SetVMCgroup(cgroupRoot, false))
-						write(filepath.Join(cgroupRoot, "memory/garden/good/some-handle"), map[string]string{
+					It("reads the parent of the init cgroup that containerd mode runs the container in on cgroup v2", func() {
+						DeferCleanup(rundmc.SetVMCgroup(true))
+						parent := filepath.Join(GinkgoT().TempDir(), "garden/some-handle")
+						write(parent, map[string]string{"memory.events": "max 4\noom 1\noom_kill 1\n", "memory.max": "1207959552\n"})
+						write(filepath.Join(parent, "init"), map[string]string{"memory.events": "max 0\noom 0\noom_kill 0\n", "memory.max": "max\n"})
+						writeState(map[string]string{"": filepath.Join(parent, "init")})
+
+						wait()
+
+						Expect(logger).To(gbytes.Say(`"cgroup":"memory.events=\[max 4 oom 1 oom_kill 1\] memory.max=\[1207959552\]"`))
+					})
+
+					It("reads the cgroup directory that the state names after the container was punished", func() {
+						DeferCleanup(rundmc.SetVMCgroup(true))
+						root := GinkgoT().TempDir()
+						write(filepath.Join(root, "garden/good/some-handle"), map[string]string{"memory.max": "1\n"})
+						write(filepath.Join(root, "garden/bad/some-handle"), map[string]string{"memory.max": "1207959552\n"})
+						writeState(map[string]string{"": filepath.Join(root, "garden/bad/some-handle")})
+
+						wait()
+
+						Expect(logger).To(gbytes.Say(`"cgroup":"memory.max=\[1207959552\]"`))
+					})
+
+					It("logs the memory files of the container's memory cgroup on cgroup v1, wherever the controller is mounted", func() {
+						DeferCleanup(rundmc.SetVMCgroup(false))
+						dir := filepath.Join(GinkgoT().TempDir(), "cgroups-abcd/memory/garden/some-handle")
+						writeState(map[string]string{"memory": dir, "devices": "/elsewhere"})
+						write(dir, map[string]string{
 							"memory.oom_control":    "oom_kill_disable 0\nunder_oom 0\noom_kill 1\n",
 							"memory.limit_in_bytes": "1207959552\n",
 							"memory.failcnt":        "42\n",
@@ -710,15 +752,25 @@ var _ = Describe("Rundmc", func() {
 					})
 
 					It("says so when the cgroup has no memory files", func() {
-						DeferCleanup(rundmc.SetVMCgroup(cgroupRoot, true))
+						DeferCleanup(rundmc.SetVMCgroup(true))
+						dir := filepath.Join(GinkgoT().TempDir(), "garden/some-handle")
+						Expect(os.MkdirAll(dir, 0o755)).To(Succeed())
+						writeState(map[string]string{"": dir})
 
 						wait()
 
-						Expect(logger).To(gbytes.Say(`"cgroup":"no memory files under ` + filepath.Join(cgroupRoot, "garden/good/some-handle")))
+						Expect(logger).To(gbytes.Say(`"cgroup":"no memory files under ` + dir))
+					})
+
+					It("says so when the container has no runc state", func() {
+						DeferCleanup(rundmc.SetVMCgroup(true))
+
+						wait()
+
+						Expect(logger).To(gbytes.Say(`"cgroup":"the container's runc state cannot be read`))
 					})
 
 					It("logs nothing when the launcher wrote no such line", func() {
-						DeferCleanup(rundmc.SetVMCgroup(cgroupRoot, true))
 						fakeOCIRuntime.ExecStub = func(_ lager.Logger, _ string, _ garden.ProcessSpec, io garden.ProcessIO) (garden.Process, error) {
 							_, _ = io.Stderr.Write([]byte("vm-launch: some other note\n"))
 							return new(gardenfakes.FakeProcess), nil

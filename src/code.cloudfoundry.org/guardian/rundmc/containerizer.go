@@ -161,6 +161,7 @@ type Containerizer struct {
 	backendDispatch        bool
 	gvisorStreamer         Streamer
 	deviceReleaser         DeviceReleaser
+	vmStateDir             string
 
 	// guestMemory holds the newest guest memory sample of each VM container,
 	// and guestFigure remembers which containers Metrics last answered from it.
@@ -209,6 +210,15 @@ func WithBackendDispatch(gvisorStreamer Streamer) Option {
 	return func(c *Containerizer) {
 		c.backendDispatch = true
 		c.gvisorStreamer = gvisorStreamer
+	}
+}
+
+// WithVMCgroupState gives the Containerizer the directory where runc keeps a
+// container's state. It reads the container's memory cgroup from there when
+// the hypervisor of a VM container dies.
+func WithVMCgroupState(stateDir string) Option {
+	return func(c *Containerizer) {
+		c.vmStateDir = stateDir
 	}
 }
 
@@ -371,7 +381,7 @@ func (c *Containerizer) Run(log lager.Logger, handle string, spec garden.Process
 		spec = asVMImageHostUser(bundle, spec)
 
 		if isVM {
-			return c.runVMLauncher(log, handle, cgroupPathOf(bundle), spec, io)
+			return c.runVMLauncher(log, handle, spec, io)
 		}
 	}
 
@@ -470,15 +480,6 @@ func vmImageLaunchFlags(bundle goci.Bndl, spec garden.ProcessSpec) []string {
 // In a Docker image guest container the wrapped launcher also gets the image
 // user and the missing defaults (see vmImageLaunchFlags) before vm-launch's
 // own arguments.
-// cgroupPathOf returns the cgroup path the bundle gives its container, or the
-// empty string when it gives none.
-func cgroupPathOf(bundle goci.Bndl) string {
-	if bundle.Spec.Linux == nil {
-		return ""
-	}
-	return bundle.Spec.Linux.CgroupsPath
-}
-
 func (c *Containerizer) wrapVMLauncher(log lager.Logger, bundle goci.Bndl, spec garden.ProcessSpec) (garden.ProcessSpec, bool) {
 	kind := backend.FromBundle(bundle)
 	if !backend.IsVM(kind) {

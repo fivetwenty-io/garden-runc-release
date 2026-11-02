@@ -857,6 +857,7 @@ func (cmd *CommonCommand) wireContainerizer(
 	}
 
 	containerizerOpts = append(containerizerOpts, backends.containerizerOptions(ociRuntime)...)
+	containerizerOpts = append(containerizerOpts, rundmc.WithVMCgroupState(runcRoot))
 
 	containerizer := rundmc.New(depot, template, ociRuntime, streamer, processesStopper, eventStore, stateStore, peaCreator, peaUsernameResolver, cpuEntitlementPerShare, runtimeStopper, cpuCgrouper, runtimePolicy.IsAlternative(), containerizerOpts...)
 	return containerizer, peaCleaner, nil

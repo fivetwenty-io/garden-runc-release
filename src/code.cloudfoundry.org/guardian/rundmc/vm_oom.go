@@ -84,13 +84,13 @@ func (s *oomLineScanner) Seen() bool {
 // died. The filter takes vm-launch's guest memory lines out of the
 // stream and stores them for Metrics, and the scanner behind it sees the
 // remaining bytes. The returned process records a guest OOM when it ends.
-func (c *Containerizer) runVMLauncher(log lager.Logger, handle, cgroupPath string, spec garden.ProcessSpec, pio garden.ProcessIO) (garden.Process, error) {
+func (c *Containerizer) runVMLauncher(log lager.Logger, handle string, spec garden.ProcessSpec, pio garden.ProcessIO) (garden.Process, error) {
 	scanner := newOOMLineScanner(pio.Stderr)
 	died := newLineScanner(scanner, vmHypervisorDiedPrefix)
 
 	// The process is the source of its samples, so it exists before the
 	// filter that records them.
-	launched := &vmLaunchProcess{log: log, handle: handle, scanner: scanner, died: died, cgroupPath: cgroupPath, events: c.events, memory: &c.guestMemory}
+	launched := &vmLaunchProcess{log: log, handle: handle, scanner: scanner, died: died, stateDir: c.vmStateDir, events: c.events, memory: &c.guestMemory}
 	launched.filter = newVMMetricsFilter(died,
 		func(sample vmMemorySample) { c.guestMemory.Record(handle, launched, sample) },
 		func(dropped int) {
@@ -130,10 +130,10 @@ type vmLaunchProcess struct {
 	events  EventStore
 	memory  *vmGuestMemory
 
-	// died sees the hypervisor-died line, and cgroupPath is the container's
-	// cgroup path from its bundle.
-	died       interface{ Seen() bool }
-	cgroupPath string
+	// died sees the hypervisor-died line, and stateDir is where runc keeps
+	// the container's state.
+	died     interface{ Seen() bool }
+	stateDir string
 
 	once     sync.Once
 	diedOnce sync.Once
@@ -157,7 +157,7 @@ func (p *vmLaunchProcess) Wait() (int, error) {
 
 	if p.died.Seen() {
 		p.diedOnce.Do(func() {
-			p.log.Info("vm-hypervisor-died", lager.Data{"handle": p.handle, "exit-status": status, "cgroup": vmCgroupMemory(p.cgroupPath)})
+			p.log.Info("vm-hypervisor-died", lager.Data{"handle": p.handle, "exit-status": status, "cgroup": vmCgroupMemory(p.stateDir, p.handle)})
 		})
 	}
 
