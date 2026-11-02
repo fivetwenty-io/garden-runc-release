@@ -114,6 +114,12 @@
 // for as long as the VM runs, waiting up to 30 seconds in all, over every
 // volume, for another instance to release it, checks after the wait that the name still refers to the
 // locked file, and passes the image to the hypervisor as file descriptor 3.
+// While it waits on JuiceFS or NFS, it asks the instance that holds the image
+// to hand it over, through a request file .rvm-handoff-IMAGENAME beside the
+// image, and the holder, when it is an instance of the same process_id whose
+// guest command runs, stops the guest as at a SIGTERM and releases the image
+// once the hypervisor has exited, so that an evacuation's replacement need
+// not wait for the old instance to be stopped (see handoff.go).
 // With more than one volume, the volumes are taken in the byte order of
 // their paths and numbered from 0 in that order, shares included. Each image
 // or disk gets the next file descriptor and the next drive, and its drive
@@ -436,7 +442,8 @@
 //	       died from signal N, before the guest reported a status; this
 //	       includes a signal while vm-launch waits for the volume image,
 //	       resolves CredHub references, or starts virtiofsd, and a guest
-//	       command that did not stop within 8 seconds of the signal
+//	       command that did not stop within 8 seconds of the signal; a guest
+//	       stopped for a handoff counts as stopped by SIGTERM
 //
 // A guest command can exit with any of these values itself; whenever vm-launch
 // picks the status, it also writes a "vm-launch:" line to stderr.
@@ -1322,7 +1329,16 @@ func run(argv []string, logger *log.Logger) int {
 	if identity != nil {
 		stopWatch = watchIdentity(&sup, nonce, env[instanceCertEnv], env[instanceKeyEnv], identity, logger)
 	}
+	// The holder of an image under a distributed flock reads, while the
+	// guest runs, whether another instance of its process waits for the
+	// image, and the supervisor then stops the guest so that the release
+	// below hands the image over (see handoff.go). The watcher stops as soon
+	// as the supervisor returns.
+	handoffs := startHandoffWatcher(prepared.handoffWatches(), handoffPoll)
+	defer handoffs.stop()
+	sup.handoff = handoffs.requests()
 	res, err := sup.run(cmd, nonce)
+	handoffs.stop()
 	stopWatch()
 	stopMetrics()
 	// QEMU has been reaped, or never started. Every virtiofsd has stopped,
@@ -1797,6 +1813,8 @@ func exitCode(r runResult) (code int, reason string) {
 	switch {
 	case r.markerFound:
 		return r.guestStatus, ""
+	case r.handedOff:
+		return 128 + int(r.received), "stopped to hand the volumes to another instance before the guest reported a status"
 	case r.received != 0:
 		return 128 + int(r.received), fmt.Sprintf("stopped by %v before the guest reported a status", r.received)
 	case r.state == nil:

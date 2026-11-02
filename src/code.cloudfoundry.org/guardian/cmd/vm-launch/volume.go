@@ -75,6 +75,10 @@ type guestVolume struct {
 	// Index is the instance index the image name carries, which a provider
 	// that allows one instance checks.
 	Index int
+	// ProcessID is the process_id in VCAP_APPLICATION, when it is a
+	// lowercase UUID, and empty otherwise. Only an instance of the same
+	// process is handed the image (see handoff.go).
+	ProcessID string
 
 	// MountID is the ID of the mount that findVolumeProvider found
 	// ContainerDir on. When MountIDKnown is set, openVolumeImage refuses a
@@ -223,9 +227,13 @@ func volumesFromEnv(lookup func(string) (string, bool)) ([]guestVolume, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s %s is not an instance index from 0 to %d", instanceIndexEnv, quoteForLog(index), maxInstanceIndex)
 	}
+	processID := ""
+	if applicationIDPattern.MatchString(app.ProcessID) {
+		processID = app.ProcessID
+	}
 	vols := make([]guestVolume, len(mounts))
 	for i, m := range mounts {
-		vols[i] = guestVolume{ContainerDir: m.dir, ImageName: name, Index: int(n)}
+		vols[i] = guestVolume{ContainerDir: m.dir, ImageName: name, Index: int(n), ProcessID: processID}
 	}
 	return vols, nil
 }
@@ -248,11 +256,14 @@ func shareDirs(lookup func(string) (string, bool), dirs []string) map[string]boo
 	return shares
 }
 
-// vcapApplication is the part of VCAP_APPLICATION vm-launch reads. Both
-// fields are checked before they reach a file name.
+// vcapApplication is the part of VCAP_APPLICATION vm-launch reads. The
+// application id and the process type are checked before they reach a file
+// name. The process id never reaches one, and a value that is not a
+// lowercase UUID only keeps the instance out of the handoff.
 type vcapApplication struct {
 	ApplicationID string `json:"application_id"`
 	ProcessType   string `json:"process_type"`
+	ProcessID     string `json:"process_id"`
 }
 
 // applicationFromEnv decodes VCAP_APPLICATION. application_id must be a
@@ -460,6 +471,9 @@ type preparedVolume struct {
 	Bytes int64
 	// dev and ino name the disk's inode, so that no disk is attached twice.
 	dev, ino uint64
+	// watch reads the disk's handoff requests while the guest runs, for a
+	// volume that takes part in the handoff, and is nil otherwise.
+	watch *handoffWatch
 }
 
 // preparedVolumes are the private volumes of one launch, in volume order,
@@ -516,9 +530,10 @@ func (pv *preparedVolumes) prepare(v selectedVolume, signals <-chan os.Signal, b
 	}
 	// A volume with no size in VM_VOLUMES leaves Size zero, and the engine
 	// gives it its default, the same 1 GiB RequestedBytes reports.
+	handoff := handoffIdentityFor(v, caps, mode, logger)
 	att, err := v.Provider.Prepare(prepareRequest{
 		Mount: v.Mount, ImageName: v.Volume.ImageName, Index: v.Volume.Index, Mode: mode, Signals: signals,
-		Size: v.Volume.Settings.SizeBytes, Logger: logger, LockBudget: budget,
+		Size: v.Volume.Settings.SizeBytes, Logger: logger, LockBudget: budget, Handoff: handoff,
 		BeforeLock: func(img *os.File) error {
 			_, dev, ino, err := inodeOf(img, v.Volume.ContainerDir)
 			if err != nil {
@@ -564,7 +579,17 @@ func (pv *preparedVolumes) prepare(v selectedVolume, signals <-chan os.Signal, b
 	if err := pv.checkNotHeld(v.Volume.ContainerDir, dev, ino); err != nil {
 		return att, err
 	}
-	*pv = append(*pv, preparedVolume{Index: v.Index, Path: v.Volume.ContainerDir, Attachment: att, Bytes: size, dev: dev, ino: ino})
+	// The holder reads its requests from the volume root it locked the image
+	// in. A root that cannot be opened again keeps the image held until the
+	// instance is stopped, as it was before the handoff.
+	var watch *handoffWatch
+	if handoff != nil {
+		if watch, err = openHandoffWatch(v.Volume.ContainerDir, v.Mount.MountID, v.Volume.ImageName, *handoff); err != nil {
+			logger.Printf("watching for handoff requests: %v; this instance keeps the volume image until it is stopped", err)
+			watch = nil
+		}
+	}
+	*pv = append(*pv, preparedVolume{Index: v.Index, Path: v.Volume.ContainerDir, Attachment: att, Bytes: size, dev: dev, ino: ino, watch: watch})
 	return nil, nil
 }
 
@@ -634,12 +659,29 @@ func (pv preparedVolumes) files() []*attachment {
 	return atts
 }
 
+// handoffWatches returns the watches of the volumes that take part in the
+// handoff, in volume order.
+func (pv preparedVolumes) handoffWatches() []*handoffWatch {
+	var watches []*handoffWatch
+	for _, v := range pv {
+		if v.watch != nil {
+			watches = append(watches, v.watch)
+		}
+	}
+	return watches
+}
+
 // release releases every attachment, last first, and logs each release that
-// fails. vm-launch calls it once the hypervisor has exited or never started.
+// fails, and closes each handoff watch. vm-launch calls it once the
+// hypervisor has exited or never started, and with it the lock goes, which
+// is what a waiting instance takes over.
 func (pv preparedVolumes) release(logger *log.Logger) {
 	for i := len(pv) - 1; i >= 0; i-- {
 		if err := pv[i].Attachment.Release(); err != nil {
 			logger.Printf("releasing the volume disk: %v", err)
+		}
+		if err := pv[i].watch.Close(); err != nil {
+			logger.Printf("closing the volume's handoff watch: %v", err)
 		}
 	}
 }

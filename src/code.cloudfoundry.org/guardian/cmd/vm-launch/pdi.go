@@ -172,17 +172,23 @@ type prepareRequest struct {
 	// It lets vm-launch refuse a disk that an earlier volume of the launch
 	// already holds, which the provider's fence would otherwise wait for.
 	BeforeLock func(disk *os.File) error
+	// Handoff, when set, is who this launch is in a handoff request, which
+	// a file-image provider passes to the image engine so that its lock wait
+	// asks the holder for the image (see handoff.go). It is nil for a volume
+	// that takes no part in the handoff.
+	Handoff *handoffIdentity
 }
 
 // fileImageOptions returns base with what req sets for a file image: the
 // size floor when req asks for one, the lock budget, the check before the
-// lock, and the logger for the engine's lines.
+// lock, the handoff identity, and the logger for the engine's lines.
 func (req prepareRequest) fileImageOptions(base imageOptions) imageOptions {
 	o := base
 	if req.Size != 0 {
 		o.Size = req.Size
 	}
 	o.BeforeLock = req.BeforeLock
+	o.Handoff = req.Handoff
 	o.LockBudget = req.LockBudget
 	if req.Logger != nil {
 		o.Logf = req.Logger.Printf
