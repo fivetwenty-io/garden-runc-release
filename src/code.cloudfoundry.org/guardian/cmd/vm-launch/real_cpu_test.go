@@ -43,7 +43,7 @@ var _ = Describe("a real QEMU guest's CPU watcher", func() {
 	It("reports the ticks of a busy guest and almost none for an idle one", func() {
 		out := bootRealGuest(taskGuest(realCPUScript))
 
-		lines := regexp.MustCompile(regexp.QuoteMeta(cpuTag(testNonce)) + `([0-9]+):([0-9]+)\r?\n`).FindAllStringSubmatch(out, -1)
+		lines := regexp.MustCompile(regexp.QuoteMeta(cpuTag(testNonce))+`([0-9]+):([0-9]+)\r?\n`).FindAllStringSubmatch(out, -1)
 		Expect(len(lines)).To(BeNumerically(">=", 3), "the guest wrote %d CPU lines in a run of %d seconds\n%s", len(lines), realCPUBusySeconds+realCPUIdleSeconds, out)
 
 		busy := make([]uint64, len(lines))

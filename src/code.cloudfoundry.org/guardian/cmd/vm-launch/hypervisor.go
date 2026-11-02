@@ -985,6 +985,7 @@ func newSerialFilter(out io.Writer, nonce string) *serialFilter {
 		startTag:  []byte(startTag(nonce)),
 		exitTag:   []byte(exitTag(nonce)),
 		oomTag:    []byte(oomTag(nonce)),
+		cpuTag:    []byte(cpuTag(nonce)),
 		startSeen: make(chan struct{}),
 		running:   make(chan struct{}),
 		exited:    make(chan struct{}),
@@ -997,10 +998,10 @@ func (f *serialFilter) onListen(nonce string, listen func(port int, up bool)) {
 	f.listen = listen
 }
 
-// onCPU makes the filter swallow the guest's CPU lines (see guestCPUWatch) and
-// pass the busy time of each, in clock ticks, to cpu.
-func (f *serialFilter) onCPU(nonce string, cpu func(user, system uint64)) {
-	f.cpuTag = []byte(cpuTag(nonce))
+// onCPU makes the filter pass the busy time in clock ticks of each of the
+// guest's CPU lines (see guestCPUWatch) to cpu. The filter swallows those
+// lines with or without it, so they never reach the command's output.
+func (f *serialFilter) onCPU(cpu func(user, system uint64)) {
 	f.cpu = cpu
 }
 
@@ -1411,7 +1412,9 @@ func (f *serialFilter) processCPU(idx int, eof bool) bool {
 	}
 	f.emitPending(idx, true)
 	f.swallow(len(f.cpuTag) + n)
-	f.cpu(user, system)
+	if f.cpu != nil {
+		f.cpu(user, system)
+	}
 	return true
 }
 
@@ -1911,9 +1914,7 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 	if s.listen != nil {
 		filter.onListen(nonce, s.listen)
 	}
-	if s.cpu != nil {
-		filter.onCPU(nonce, s.cpu)
-	}
+	filter.onCPU(s.cpu)
 	if s.credAck != nil {
 		filter.onCredAck(nonce, s.credAck)
 	}

@@ -92,7 +92,7 @@ var _ = Describe("the serial filter with CPU lines", func() {
 		var out bytes.Buffer
 		var got []reading
 		f := newSerialFilter(&out, testNonce)
-		f.onCPU(testNonce, func(user, system uint64) { got = append(got, reading{user, system}) })
+		f.onCPU(func(user, system uint64) { got = append(got, reading{user, system}) })
 		for _, c := range chunks {
 			_, _ = f.Write([]byte(c))
 		}
@@ -163,15 +163,15 @@ var _ = Describe("the serial filter with CPU lines", func() {
 		Expect(got).To(BeEmpty())
 	})
 
-	It("leaves the tag alone as output when the filter has no CPU callback", func() {
+	It("swallows the line when the filter has no CPU callback", func() {
 		var out bytes.Buffer
 		f := newSerialFilter(&out, testNonce)
-		for _, c := range []string{start, line, marker} {
+		for _, c := range []string{start, "a\r\n", line, "b\r\n", marker} {
 			_, _ = f.Write([]byte(c))
 		}
 		f.finish()
 
-		Expect(out.String()).To(Equal(strings.TrimSuffix(line, "\r\n") + "\n"))
+		Expect(out.String()).To(Equal("a\nb\n"))
 	})
 
 	It("takes a CPU line next to a listen line and an OOM line", func() {
@@ -179,7 +179,7 @@ var _ = Describe("the serial filter with CPU lines", func() {
 		var got []reading
 		var ups []bool
 		f := newSerialFilter(&out, testNonce)
-		f.onCPU(testNonce, func(user, system uint64) { got = append(got, reading{user, system}) })
+		f.onCPU(func(user, system uint64) { got = append(got, reading{user, system}) })
 		f.onListen(testNonce, func(port int, up bool) { ups = append(ups, up) })
 		for _, c := range []string{start, line, listenTag(testNonce) + "8080:1\r\n", oomTagLine("2") + "\r\n", line, marker} {
 			_, _ = f.Write([]byte(c))
