@@ -318,9 +318,11 @@ func (a *guestAgent) serve(l agentListener) error {
 	}
 }
 
-// handle serves one connection: the hello, the request, and then the
-// session or the forward. A connection that finds every hello slot taken is
-// closed at once, before the agent reads a byte from it.
+// handle serves one connection: the hello, the request, the go, and then
+// the session or the forward. A connection that finds every hello slot
+// taken is closed at once, before the agent reads a byte from it, and one
+// whose hello does not hold the boot's key is closed without an answer.
+// Every other refusal is an answer, which the relay never tries again.
 func (a *guestAgent) handle(c agentConn) {
 	defer c.Close()
 	select {
@@ -330,31 +332,70 @@ func (a *guestAgent) handle(c agentConn) {
 	}
 	req, err := a.handshake(c)
 	<-a.pending
-	if err != nil {
+	fw := &agentFrameWriter{w: c}
+	refuse := func(format string, args ...any) {
+		_ = fw.writeJSON(agentFrameReady, agentReady{Error: fmt.Sprintf(format, args...)})
+	}
+	var bad agentRequestError
+	switch {
+	case errors.As(err, &bad):
+		refuse("%v", bad)
+		return
+	case err != nil:
 		return
 	}
-	fw := &agentFrameWriter{w: c}
 	select {
 	case a.sessions <- struct{}{}:
 		defer func() { <-a.sessions }()
 	default:
-		_ = fw.writeJSON(agentFrameReady, agentReady{Error: fmt.Sprintf("the guest already runs %d sessions, which is as many as it allows", guestAgentMaxSessions)})
+		refuse("the guest already runs %d sessions, which is as many as it allows", guestAgentMaxSessions)
 		return
 	}
-	switch req.Kind {
-	case agentKindSession:
-		a.session(c, fw, req)
-	case agentKindForward:
-		a.forward(c, fw, req)
-	default:
-		_ = fw.writeJSON(agentFrameReady, agentReady{Error: fmt.Sprintf("the guest agent has no request of kind %q", req.Kind)})
+	if req.Kind != agentKindSession && req.Kind != agentKindForward {
+		refuse("the guest agent has no request of kind %q", req.Kind)
+		return
 	}
+	if !a.awaitGo(c, fw) {
+		return
+	}
+	if req.Kind == agentKindSession {
+		a.session(c, fw, req)
+	} else {
+		a.forward(c, fw, req)
+	}
+}
+
+// awaitGo tells the relay that the agent has accepted the request, and
+// waits up to agentHelloTimeout for the relay's go. The relay never tries a
+// request again once it has sent the go, and the agent starts nothing
+// before it reads it, so a retry can never start a session or a forward a
+// second time.
+func (a *guestAgent) awaitGo(c agentConn, fw *agentFrameWriter) bool {
+	if fw.write(agentFrameAccepted, nil) != nil {
+		return false
+	}
+	if c.SetReadDeadline(time.Now().Add(agentHelloTimeout)) != nil {
+		return false
+	}
+	if _, err := readAgentFrameOf(c, agentFrameGo); err != nil {
+		return false
+	}
+	return c.SetReadDeadline(time.Time{}) == nil
+}
+
+// agentRequestError is a request that the agent could not read from a
+// connection whose hello held the boot's key, which the agent answers.
+type agentRequestError struct{ err error }
+
+func (e agentRequestError) Error() string {
+	return "the guest agent could not read the request: " + e.err.Error()
 }
 
 // handshake reads the hello and the request within agentHelloTimeout. The
 // hello must be the first frame and hold the boot's key, and nothing else
 // on the connection is read until it does, so a peer without the key can
-// make the agent read at most agentMaxHello bytes.
+// make the agent read at most agentMaxHello bytes. Once the key matches, a
+// request the agent cannot read is an agentRequestError.
 func (a *guestAgent) handshake(c agentConn) (agentRequest, error) {
 	var req agentRequest
 	if err := c.SetReadDeadline(time.Now().Add(agentHelloTimeout)); err != nil {
@@ -369,10 +410,10 @@ func (a *guestAgent) handshake(c agentConn) (agentRequest, error) {
 	}
 	payload, err := readAgentFrameOf(c, agentFrameRequest)
 	if err != nil {
-		return req, err
+		return req, agentRequestError{err}
 	}
 	if err := json.Unmarshal(payload, &req); err != nil {
-		return req, err
+		return req, agentRequestError{err}
 	}
 	return req, c.SetReadDeadline(time.Time{})
 }
@@ -503,9 +544,10 @@ func (a *guestAgent) session(c agentConn, fw *agentFrameWriter, req agentRequest
 		return
 	}
 	pid := cmd.Process.Pid
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
 	if err := fw.writeJSON(agentFrameReady, agentReady{}); err != nil {
-		hangUp(pid)
-		_ = cmd.Wait()
+		endSession(pid, waited)
 		return
 	}
 
@@ -531,22 +573,12 @@ func (a *guestAgent) session(c agentConn, fw *agentFrameWriter, req agentRequest
 		defer close(dropped)
 		a.sessionInput(c, cmd.Process, input, req.TTY, resize)
 	}()
-	waited := make(chan error, 1)
-	go func() { waited <- cmd.Wait() }()
 
 	select {
 	case <-waited:
 	case <-dropped:
-		// The client is gone, as when a terminal hangs up, so the session's
-		// process group gets SIGHUP and then, if it is still there,
-		// SIGKILL.
-		hangUp(pid)
-		select {
-		case <-waited:
-		case <-time.After(guestAgentHangupGrace):
-			_ = syscall.Kill(-pid, syscall.SIGKILL)
-			<-waited
-		}
+		// The client is gone, as when a terminal hangs up.
+		endSession(pid, waited)
 	}
 	deadline := time.Now().Add(guestAgentOutputGrace)
 	for _, o := range outputs {
@@ -628,6 +660,19 @@ func (a *guestAgent) sessionInput(c io.Reader, proc *os.Process, input *os.File,
 
 // hangUp sends SIGHUP to the process group that pid leads.
 func hangUp(pid int) { _ = syscall.Kill(-pid, syscall.SIGHUP) }
+
+// endSession hangs up the process group that pid leads and, if its process
+// has not ended within guestAgentHangupGrace, kills the group. waited
+// receives once the process has ended.
+func endSession(pid int, waited <-chan error) {
+	hangUp(pid)
+	select {
+	case <-waited:
+	case <-time.After(guestAgentHangupGrace):
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+		<-waited
+	}
+}
 
 // exitOf is how the process of state ended.
 func exitOf(state *os.ProcessState) agentExit {

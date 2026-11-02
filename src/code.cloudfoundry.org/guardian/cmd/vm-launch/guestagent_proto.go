@@ -66,6 +66,8 @@ const (
 	agentFrameExit      byte = 0x8a // agent to client: an agentExit
 	agentFrameData      byte = 0x8b // both ways in a forward: bytes
 	agentFrameDataEnd   byte = 0x8c // both ways in a forward: the end of the bytes
+	agentFrameAccepted  byte = 0x8d // agent to relay: the request is accepted
+	agentFrameGo        byte = 0x8e // relay to agent: start what was accepted
 	agentFrameHeaderLen      = 5
 )
 
@@ -120,7 +122,7 @@ func agentFrameLimit(typ byte) int {
 		return 1
 	case agentFrameResize:
 		return 4
-	case agentFrameStdinEnd, agentFrameDataEnd:
+	case agentFrameStdinEnd, agentFrameDataEnd, agentFrameAccepted, agentFrameGo:
 		return 0
 	default:
 		return -1

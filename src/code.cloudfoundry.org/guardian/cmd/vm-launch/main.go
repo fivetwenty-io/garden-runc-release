@@ -911,11 +911,6 @@ func run(argv []string, logger *log.Logger) int {
 		stack.image = &guestImage{uid: imgUser.uid, gid: imgUser.gid}
 		stack.cwd = "/"
 	}
-	// A cf ssh session that the guest agent runs finds the lifecycle's shell
-	// in the guest, as one in a runC container does.
-	if stack != nil && cfg.guestAgent {
-		stack.shell = openLifecycleShell(cfg.args[0], logger)
-	}
 	closeLauncher := func() {
 		if stack != nil {
 			closeFile(stack.launcher.file, "the launcher", logger)
@@ -1026,6 +1021,12 @@ func run(argv []string, logger *log.Logger) int {
 			return exitLaunchError
 		}
 		defer agent.close()
+	}
+	// A cf ssh session that the guest agent runs finds the lifecycle's shell
+	// in the guest, as one in a runC container does. A guest without the
+	// agent has no use for it.
+	if stack != nil && agent.inGuest() {
+		stack.shell = openLifecycleShell(cfg.args[0], logger)
 	}
 
 	// The droplet image is built before the guest root is sized, so the

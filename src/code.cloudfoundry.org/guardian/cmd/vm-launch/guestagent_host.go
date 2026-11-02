@@ -147,11 +147,14 @@ func newHostAgent(kind backend.Kind, workDir, socket string, logger *log.Logger)
 	return a, nil
 }
 
+// inGuest reports whether this launch's guest gets the agent.
+func (a *hostAgent) inGuest() bool { return a != nil && a.bin != nil }
+
 // guestFiles returns what the initramfs needs for the agent of the guest
 // that stack describes, a nil stack being the busybox guest, or nil when
 // this launch's guest has no agent.
 func (a *hostAgent) guestFiles(stack *guestStack) (*guestAgentFiles, error) {
-	if a == nil || a.bin == nil {
+	if !a.inGuest() {
 		return nil, nil
 	}
 	info, err := a.bin.Stat()
@@ -180,7 +183,7 @@ func (a *hostAgent) guestFiles(stack *guestStack) (*guestAgentFiles, error) {
 // moves. On Firecracker it adds the vsock section to the configuration file
 // in workDir. A launch without the agent is unchanged.
 func (a *hostAgent) hypervisor(kind backend.Kind, workDir string, files []*os.File, argv []string) ([]*os.File, []string, error) {
-	if a == nil || a.bin == nil {
+	if !a.inGuest() {
 		return files, argv, nil
 	}
 	switch kind {
@@ -539,7 +542,20 @@ func (r *agentRelay) handle(c *net.UnixConn) {
 	if err := c.SetReadDeadline(time.Time{}); err != nil {
 		return
 	}
-	agent, ready, err := r.open(request)
+	// The shim sends nothing more until it has the relay's answer, so a
+	// read that ends while the relay waits for the agent means the client
+	// is gone. The relay then stops trying and closes its connection to the
+	// agent, so the agent starts nothing it has not been told to, and ends
+	// what it has. A byte that does arrive is the client's own, and it is
+	// passed on.
+	gone, early, stopWatch := watchClient(c)
+	agent, ready, err := r.open(request, gone)
+	if !stopWatch() {
+		if agent != nil {
+			r.untrack(agent)
+		}
+		return
+	}
 	if err != nil {
 		answer("%v", err)
 		return
@@ -552,8 +568,9 @@ func (r *agentRelay) handle(c *net.UnixConn) {
 	if _, err := io.WriteString(c, "ok\n"); err != nil {
 		return
 	}
+	from := io.MultiReader(bytes.NewReader(early()), c)
 	if forward != nil {
-		r.forward(c, agent)
+		r.forward(c, from, agent)
 		return
 	}
 	// The client reads the agent's answer after the relay's, and then the
@@ -565,7 +582,7 @@ func (r *agentRelay) handle(c *net.UnixConn) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _ = io.Copy(agent, c)
+		_, _ = io.Copy(agent, from)
 		agent.Close()
 	}()
 	_, _ = io.Copy(c, agent)
@@ -589,20 +606,58 @@ func (r *agentRelay) checkPeer(c *net.UnixConn) error {
 	return nil
 }
 
+// watchClient reads one byte from c in the background while the relay
+// waits for the agent. gone closes when that read ends, because the client
+// closed its side or its connection failed. stop ends the watch and reports
+// whether the client is still there, and early then returns the byte the
+// client sent, if it sent one.
+func watchClient(c *net.UnixConn) (gone <-chan struct{}, early func() []byte, stop func() bool) {
+	ended := make(chan struct{})
+	watched := make(chan struct{})
+	var got []byte
+	go func() {
+		defer close(watched)
+		var b [1]byte
+		n, err := c.Read(b[:])
+		if n > 0 {
+			got = b[:n]
+			return
+		}
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			close(ended)
+		}
+	}()
+	stop = func() bool {
+		_ = c.SetReadDeadline(time.Unix(1, 0))
+		<-watched
+		select {
+		case <-ended:
+			return false
+		default:
+		}
+		return c.SetReadDeadline(time.Time{}) == nil
+	}
+	return ended, func() []byte { return got }, stop
+}
+
 // errAgentRelayClosed ends a client's wait for the agent when the relay
 // closes.
 var errAgentRelayClosed = errors.New("the guest agent relay closed")
 
+// errAgentClientGone ends the wait for the agent when the client leaves.
+var errAgentClientGone = errors.New("the client left before the guest agent answered")
+
 // open connects to the agent, sends the hello and request, and returns the
 // connection, which close can end, and the agent's answer. A dial that
-// fails, or an agent that ends the connection before it answers, as one
-// with all its handshakes pending does, is tried again until r.wait has
-// passed or the relay closes.
-func (r *agentRelay) open(request []byte) (agentConn, agentReady, error) {
+// fails, or an agent that sends nothing before it ends the connection or
+// before its read deadline passes, as one with all its handshakes pending
+// does, is tried again until r.wait has passed, the relay closes, or gone
+// closes.
+func (r *agentRelay) open(request []byte, gone <-chan struct{}) (agentConn, agentReady, error) {
 	deadline := time.Now().Add(r.wait)
 	for {
-		agent, ready, err := r.try(request)
-		if err == nil || errors.Is(err, errAgentRelayClosed) || errors.Is(err, errAgentAnswer) {
+		agent, ready, again, err := r.try(request, deadline, gone)
+		if err == nil || !again {
 			return agent, ready, err
 		}
 		if time.Now().After(deadline) {
@@ -613,68 +668,119 @@ func (r *agentRelay) open(request []byte) (agentConn, agentReady, error) {
 		case <-r.done:
 			retry.Stop()
 			return nil, agentReady{}, errAgentRelayClosed
+		case <-gone:
+			retry.Stop()
+			return nil, agentReady{}, errAgentClientGone
 		case <-retry.C:
 		}
 	}
 }
 
-// errAgentAnswer marks an answer from the agent that trying again would not
-// change.
-var errAgentAnswer = errors.New("the guest agent's answer")
+// agentTryRead bounds each read of one try, which covers a forward's
+// connect in the guest.
+const agentTryRead = agentHelloTimeout + guestAgentDialTimeout
 
-// try makes one connection to the agent for open.
-func (r *agentRelay) try(request []byte) (agentConn, agentReady, error) {
+// try makes one connection to the agent for open, and reports with its
+// error whether open may try again. The agent accepts the request first,
+// and the relay then sends the go, after which the agent starts the session
+// or the forward and answers. open may try again only while the agent has
+// sent nothing, which is always before the go, so a request the agent
+// started is never started a second time. Each read ends at the sooner of
+// agentTryRead from its start and deadline, and a connection still open
+// when gone closes is closed.
+func (r *agentRelay) try(request []byte, deadline time.Time, gone <-chan struct{}) (agentConn, agentReady, bool, error) {
 	var ready agentReady
 	agent, err := r.dial()
 	if err != nil {
-		return nil, ready, err
+		return nil, ready, true, err
 	}
 	if !r.track(agent) {
 		agent.Close()
-		return nil, ready, errAgentRelayClosed
+		return nil, ready, false, errAgentRelayClosed
 	}
-	fail := func(err error) (agentConn, agentReady, error) {
+	tried := make(chan struct{})
+	defer close(tried)
+	go func() {
+		select {
+		case <-gone:
+			agent.Close()
+		case <-tried:
+		}
+	}()
+	fail := func(again bool, err error) (agentConn, agentReady, bool, error) {
 		r.untrack(agent)
-		return nil, ready, err
+		return nil, ready, again, err
 	}
+	readBy := func() error { return agent.SetReadDeadline(minTime(time.Now().Add(agentTryRead), deadline)) }
 	fw := &agentFrameWriter{w: agent}
 	if err := fw.write(agentFrameHello, r.key); err != nil {
-		return fail(err)
+		return fail(true, err)
 	}
 	if err := fw.write(agentFrameRequest, request); err != nil {
-		return fail(err)
+		return fail(true, err)
 	}
-	if err := agent.SetReadDeadline(time.Now().Add(agentHelloTimeout + guestAgentDialTimeout)); err != nil {
-		return fail(err)
+	if err := readBy(); err != nil {
+		return fail(true, err)
 	}
-	var header [agentFrameHeaderLen]byte
-	if _, err := io.ReadFull(agent, header[:]); err != nil {
-		return fail(fmt.Errorf("the agent ended the connection before it answered: %w", err))
-	}
-	payload, err := readAgentFrameOf(io.MultiReader(bytes.NewReader(header[:]), agent), agentFrameReady)
+	counted := &countingReader{r: agent}
+	typ, payload, err := readAgentFrame(counted)
 	if err != nil {
-		return fail(fmt.Errorf("%w: %v", errAgentAnswer, err))
+		return fail(counted.n == 0, fmt.Errorf("reading the guest agent's answer: %w", err))
+	}
+	if typ == agentFrameAccepted {
+		if err := fw.write(agentFrameGo, nil); err != nil {
+			return fail(false, fmt.Errorf("telling the guest agent to start: %w", err))
+		}
+		if err := readBy(); err != nil {
+			return fail(false, err)
+		}
+		if typ, payload, err = readAgentFrame(agent); err != nil {
+			return fail(false, fmt.Errorf("the guest agent accepted the request and did not answer: %w", err))
+		}
+	}
+	if typ != agentFrameReady {
+		return fail(false, fmt.Errorf("the guest agent answered with a frame of type 0x%02x", typ))
 	}
 	if err := json.Unmarshal(payload, &ready); err != nil {
-		return fail(fmt.Errorf("%w could not be decoded: %v", errAgentAnswer, err))
+		return fail(false, fmt.Errorf("the guest agent's answer could not be decoded: %w", err))
 	}
 	if err := agent.SetReadDeadline(time.Time{}); err != nil {
-		return fail(err)
+		return fail(false, err)
 	}
-	return agent, ready, nil
+	return agent, ready, false, nil
 }
 
-// forward turns the client's raw bytes into data frames for the agent, which
-// has opened the forward, and the agent's data frames back into raw bytes,
-// passing on the end of each direction.
-func (r *agentRelay) forward(c *net.UnixConn, agent agentConn) {
+// minTime is the sooner of a and b.
+func minTime(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
+}
+
+// countingReader counts the bytes read through it.
+type countingReader struct {
+	r io.Reader
+	n int
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += n
+	return n, err
+}
+
+// forward turns the client's raw bytes, which it reads from from, into data
+// frames for the agent, which has opened the forward, and the agent's data
+// frames back into raw bytes on c, passing on the end of each direction.
+func (r *agentRelay) forward(c *net.UnixConn, from io.Reader, agent agentConn) {
 	fw := &agentFrameWriter{w: agent}
 	toGuest := make(chan struct{})
 	go func() {
 		defer close(toGuest)
 		buf := make([]byte, agentMaxData)
 		for {
-			n, err := c.Read(buf)
+			n, err := from.Read(buf)
 			if n > 0 && fw.writeData(agentFrameData, buf[:n]) != nil {
 				agent.Close()
 				return
