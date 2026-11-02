@@ -65,10 +65,15 @@ const (
 	// agentDialTimeout bounds one connect to the agent.
 	agentDialTimeout = 2 * time.Second
 
-	// agentRelayWait is how long the relay keeps trying to reach the agent
-	// for one client, which covers a guest that is still booting when the
-	// first cf ssh arrives.
-	agentRelayWait = 30 * time.Second
+	// agentBootWait is how long the relay keeps trying to reach the agent
+	// for one client and still lets it start the request, which covers a
+	// guest that is still booting when the first cf ssh arrives.
+	agentBootWait = 30 * time.Second
+
+	// agentRelayWait is how long the relay waits for the agent for one
+	// client in all, which leaves a request the agent accepts at the end
+	// of agentBootWait a whole agentTryRead to start.
+	agentRelayWait = agentBootWait + agentTryRead
 
 	// agentDialRetry is how long the relay waits between two tries.
 	agentDialRetry = 250 * time.Millisecond
@@ -680,14 +685,20 @@ func (r *agentRelay) open(request []byte, gone <-chan struct{}) (agentConn, agen
 // connect in the guest.
 const agentTryRead = agentHelloTimeout + guestAgentDialTimeout
 
+// errAgentTooLate is an accepted request that the relay does not tell the
+// agent to start, because less than agentTryRead of its wait is left.
+var errAgentTooLate = errors.New("the guest agent answered too late")
+
 // try makes one connection to the agent for open, and reports with its
 // error whether open may try again. The agent accepts the request first,
 // and the relay then sends the go, after which the agent starts the session
 // or the forward and answers. open may try again only while the agent has
 // sent nothing, which is always before the go, so a request the agent
 // started is never started a second time. Each read ends at the sooner of
-// agentTryRead from its start and deadline, and a connection still open
-// when gone closes is closed.
+// agentTryRead from its start and deadline. The relay sends the go only
+// while a whole agentTryRead is left before deadline, so the answer to the
+// go always has its full time, and a request accepted later starts
+// nothing. A connection still open when gone closes is closed.
 func (r *agentRelay) try(request []byte, deadline time.Time, gone <-chan struct{}) (agentConn, agentReady, bool, error) {
 	var ready agentReady
 	agent, err := r.dial()
@@ -728,6 +739,9 @@ func (r *agentRelay) try(request []byte, deadline time.Time, gone <-chan struct{
 		return fail(counted.n == 0, fmt.Errorf("reading the guest agent's answer: %w", err))
 	}
 	if typ == agentFrameAccepted {
+		if left := time.Until(deadline); left < agentTryRead {
+			return fail(false, fmt.Errorf("%w: it accepted the request with %v of the relay's %v wait left, and starting a request may take %v", errAgentTooLate, left.Round(time.Millisecond), r.wait, agentTryRead))
+		}
 		if err := fw.write(agentFrameGo, nil); err != nil {
 			return fail(false, fmt.Errorf("telling the guest agent to start: %w", err))
 		}

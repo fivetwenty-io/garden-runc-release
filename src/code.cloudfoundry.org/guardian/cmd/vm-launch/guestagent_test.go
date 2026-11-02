@@ -155,6 +155,29 @@ func (s *agentTestSession) awaitExit() agentExit {
 	return exit
 }
 
+// readyFailConn is the agent's end of a connection whose write of the Ready
+// frame fails once the session's process has written its pid to pidfile, as
+// when the relay goes away just after the session starts. failed receives
+// the time of the failure.
+type readyFailConn struct {
+	*net.UnixConn
+	pidfile string
+	failed  chan<- time.Time
+}
+
+func (c *readyFailConn) Write(p []byte) (int, error) {
+	if len(p) == 0 || p[0] != agentFrameReady {
+		return c.UnixConn.Write(p)
+	}
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if b, err := os.ReadFile(c.pidfile); err == nil && bytes.HasSuffix(b, []byte("\n")) {
+			break
+		}
+	}
+	c.failed <- time.Now()
+	return 0, errors.New("the relay went away")
+}
+
 // upperServer listens on a local TCP port, and for each connection reads
 // until the client ends its direction, then answers with what it read in
 // upper case and " bye", and closes. It returns the port.
@@ -333,6 +356,19 @@ var _ = Describe("the guest agent", func() {
 			Expect(a.sessions).To(BeEmpty())
 		})
 
+		It("gives up on a request it accepted, and starts nothing, when the go has not come within agentHelloTimeout", func() {
+			marker := filepath.Join(GinkgoT().TempDir(), "ran")
+			conn, done := serveAgent(a)
+			fw := &agentFrameWriter{w: conn}
+			Expect(fw.write(agentFrameHello, []byte(testAgentKey))).To(Succeed())
+			Expect(fw.writeJSON(agentFrameRequest, agentRequest{Kind: agentKindSession, Args: []string{"-c", "echo ran >> " + shellQuote(marker)}})).To(Succeed())
+			Expect(readAgentFrameOf(conn, agentFrameAccepted)).To(BeEmpty())
+			Consistently(done, agentHelloTimeout-time.Second).ShouldNot(BeClosed())
+			Eventually(done, 5*time.Second).Should(BeClosed())
+			Expect(marker).NotTo(BeAnExistingFile())
+			Expect(a.sessions).To(BeEmpty())
+		})
+
 		It("closes a connection at once when as many connections as it allows already wait for their hello", func() {
 			for range guestAgentMaxPending {
 				a.pending <- struct{}{}
@@ -431,6 +467,33 @@ var _ = Describe("the guest agent", func() {
 			Expect(s.conn.Close()).To(Succeed())
 			Consistently(done, guestAgentHangupGrace-500*time.Millisecond).ShouldNot(BeClosed())
 			Eventually(done, 5*time.Second).Should(BeClosed())
+		})
+
+		It("ends the session it started when it cannot write its answer, and kills one that ignores the hangup", func() {
+			pidfile := filepath.Join(a.cwd, "pid")
+			agentSide, client := agentSocketPair()
+			DeferCleanup(func() { _ = client.Close() })
+			failed := make(chan time.Time, 1)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				a.handle(&readyFailConn{UnixConn: agentSide, pidfile: pidfile, failed: failed})
+			}()
+			fw := &agentFrameWriter{w: client}
+			Expect(fw.write(agentFrameHello, []byte(testAgentKey))).To(Succeed())
+			Expect(fw.writeJSON(agentFrameRequest, agentRequest{Kind: agentKindSession, Args: []string{"-c", "trap '' HUP; echo $$ > " + shellQuote(pidfile) + "; exec sleep 30"}})).To(Succeed())
+			Expect(readAgentFrameOf(client, agentFrameAccepted)).To(BeEmpty())
+			Expect(fw.write(agentFrameGo, nil)).To(Succeed())
+			var at time.Time
+			Eventually(failed, 10*time.Second).Should(Receive(&at))
+			Eventually(done, 10*time.Second).Should(BeClosed())
+			Expect(time.Since(at)).To(BeNumerically(">=", guestAgentHangupGrace))
+			b, err := os.ReadFile(pidfile)
+			Expect(err).NotTo(HaveOccurred())
+			pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(syscall.Kill(pid, 0)).To(MatchError(syscall.ESRCH))
+			Expect(a.sessions).To(BeEmpty())
 		})
 
 		It("refuses a session when the root has no shell, and does not follow a link in the root out of it", func() {
@@ -539,7 +602,7 @@ var _ = Describe("the guest agent relay", func() {
 	}
 
 	startRelay := func(key string, dial func() (agentConn, error), off string) *agentRelay {
-		r, err := newAgentRelay(path, []byte(key), dial, off, 5*time.Second, logger)
+		r, err := newAgentRelay(path, []byte(key), dial, off, agentRelayWait, logger)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(r.close)
 		return r
@@ -756,28 +819,101 @@ var _ = Describe("the guest agent relay", func() {
 		Consistently(ran(marker), 500*time.Millisecond).Should(Equal("ran\n"))
 	})
 
-	It("never tries again once it has told the agent to start, so a stalled answer runs the session once", func() {
+	It("passes on the bytes a forward's client sends while the relay waits for the agent, ahead of what follows", func() {
+		var tries atomic.Int32
+		dial := dialAgent(a)
+		startRelay(testAgentKey, func() (agentConn, error) {
+			// The watch on the client has the first byte by the time the
+			// agent answers.
+			if tries.Add(1) < 3 {
+				return nil, errors.New("the guest is still booting")
+			}
+			return dial()
+		}, "")
+		c, err := net.Dial("unix", path)
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = c.Close() })
+		_, err = io.WriteString(c, "forward 127.0.0.1 "+strconv.Itoa(upperServer())+"\nearly ")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(c.SetReadDeadline(time.Now().Add(10 * time.Second))).To(Succeed())
+		answer, err := readLine(c, agentMaxLine)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(answer).To(Equal("ok"))
+		Expect(tries.Load()).To(BeNumerically("==", 3))
+		_, err = io.WriteString(c, "data")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(c.(*net.UnixConn).CloseWrite()).To(Succeed())
+		got, err := io.ReadAll(c)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(got)).To(Equal("EARLY DATA bye"))
+	})
+
+	It("never tries again once it has told the agent to start, so an agent that ends the connection then runs the session once", func() {
 		marker := filepath.Join(GinkgoT().TempDir(), "ran")
 		var tries atomic.Int32
-		stall := proxyAgent(a, func(relay, agent *net.UnixConn, typ byte, payload []byte) {
+		dropReady := proxyAgent(a, func(relay, agent *net.UnixConn, typ byte, payload []byte) {
 			defer GinkgoRecover()
 			Expect(typ).To(Equal(agentFrameAccepted))
 			Expect((&agentFrameWriter{w: relay}).write(typ, payload)).To(Succeed())
-			// The agent's answer and everything after it never reach the
-			// relay, as when the guest stalls.
-			_, _ = io.Copy(io.Discard, agent)
+			// The agent answers only once the relay's go has reached it,
+			// and the connection to the relay ends before the answer does.
+			typ, _, err := readAgentFrame(agent)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(typ).To(Equal(agentFrameReady))
 			relay.Close()
+			_, _ = io.Copy(io.Discard, agent)
 		})
-		r, err := newAgentRelay(path, []byte(testAgentKey), func() (agentConn, error) {
+		startRelay(testAgentKey, func() (agentConn, error) {
 			tries.Add(1)
-			return stall()
-		}, "", time.Second, logger)
-		Expect(err).NotTo(HaveOccurred())
-		DeferCleanup(r.close)
+			return dropReady()
+		}, "")
 		_, answer := askSession("-c", "echo ran >> "+shellQuote(marker))
 		Expect(answer).To(HavePrefix("error: the guest agent accepted the request and did not answer: "))
 		Eventually(ran(marker), 10*time.Second).Should(Equal("ran\n"))
 		Consistently(func() any { return []any{tries.Load(), ran(marker)()} }, time.Second).Should(Equal([]any{int32(1), "ran\n"}))
+	})
+
+	It("tells an agent that accepts with less than a try's read of the wait left nothing more, and the client that it answered too late", func() {
+		marker := filepath.Join(GinkgoT().TempDir(), "ran")
+		var tries atomic.Int32
+		sent := make(chan byte, 8)
+		// The proxy passes each frame of the relay's on to the agent and
+		// notes its type, and passes the agent's bytes back unchanged.
+		r, err := newAgentRelay(path, []byte(testAgentKey), func() (agentConn, error) {
+			tries.Add(1)
+			agentSide, agentPeer := agentSocketPair()
+			go a.handle(agentSide)
+			relaySide, relayPeer := agentSocketPair()
+			go func() {
+				defer agentPeer.Close()
+				fw := &agentFrameWriter{w: agentPeer}
+				for {
+					typ, payload, err := readAgentFrame(relayPeer)
+					if err != nil {
+						return
+					}
+					sent <- typ
+					if fw.write(typ, payload) != nil {
+						return
+					}
+				}
+			}()
+			go func() {
+				_, _ = io.Copy(relayPeer, agentPeer)
+				relayPeer.Close()
+			}()
+			return relaySide, nil
+		}, "", agentTryRead-time.Second, logger)
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(r.close)
+		_, answer := askSession("-c", "echo ran >> "+shellQuote(marker))
+		Expect(answer).To(HavePrefix("error: the guest agent answered too late: "))
+		Expect(tries.Load()).To(BeNumerically("==", 1))
+		Expect(sent).To(Receive(Equal(agentFrameHello)))
+		Expect(sent).To(Receive(Equal(agentFrameRequest)))
+		Consistently(sent, time.Second).ShouldNot(Receive())
+		Expect(marker).NotTo(BeAnExistingFile())
+		Eventually(a.sessions).Should(BeEmpty())
 	})
 
 	It("stops waiting for the agent, and ends its connection to the agent, when the client leaves", func() {
@@ -927,7 +1063,7 @@ var _ = Describe("the guest agent relay", func() {
 	})
 
 	It("ends its clients' connections when it closes", func() {
-		r, err := newAgentRelay(path, []byte(testAgentKey), dialAgent(a), "", time.Second, logger)
+		r, err := newAgentRelay(path, []byte(testAgentKey), dialAgent(a), "", agentRelayWait, logger)
 		Expect(err).NotTo(HaveOccurred())
 		c, answer := ask("forward 127.0.0.1 " + strconv.Itoa(upperServer()))
 		Expect(answer).To(Equal("ok"))
