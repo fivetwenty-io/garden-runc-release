@@ -585,9 +585,9 @@ describe 'garden' do
       end
 
       context 'vm_guest_agent' do
-        let(:execution_tail) do
-          "\n; execution backends\n  execution-backend = vm-qemu\n  vm-artifacts-dir = /var/vcap/data/vm-runtime/artifacts\n  vm-launch-bin = /var/vcap/packages/guardian/bin/vm-launch\n"
-        end
+        execution_tail_before = "\n; execution backends\n  execution-backend = vm-qemu\n  vm-artifacts-dir = /var/vcap/data/vm-runtime/artifacts\n  vm-launch-bin = /var/vcap/packages/guardian/bin/vm-launch\n"
+
+        let(:execution_tail) { execution_tail_before }
 
         def render_with(backends, extra)
           template.render({ 'garden' => { 'execution_backends' => backends }.merge(extra) })
@@ -600,9 +600,24 @@ describe 'garden' do
           expect(property['description']).not_to be_empty
         end
 
-        [[], ['vm-qemu'], %w[vm-qemu vm-firecracker], ['oci-gvisor']].each do |backends|
-          it "renders byte for byte what it rendered before the property existed when it is false (#{backends.inspect})" do
-            expect(render_with(backends, { 'vm_guest_agent' => false })).to eql(render_with(backends, {}))
+        # The execution backends section as the template rendered it before
+        # the property existed, which ends the file.
+        {
+          [] => nil,
+          ['vm-qemu'] => execution_tail_before,
+          %w[vm-qemu vm-firecracker] => "\n; execution backends\n  execution-backend = vm-qemu\n  execution-backend = vm-firecracker\n  vm-artifacts-dir = /var/vcap/data/vm-runtime/artifacts\n  vm-launch-bin = /var/vcap/packages/guardian/bin/vm-launch\n",
+          ['oci-gvisor'] => "\n; execution backends\n  execution-backend = oci-gvisor\n",
+        }.each do |backends, tail|
+          it "renders the execution backends as it did before the property existed when it is false (#{backends.inspect})" do
+            [{ 'vm_guest_agent' => false }, {}].each do |extra|
+              rendered = render_with(backends, extra)
+              if tail.nil?
+                expect(rendered).not_to include('; execution backends')
+                expect(rendered).not_to include('vm-')
+              else
+                expect(rendered).to end_with(tail)
+              end
+            end
           end
         end
 
