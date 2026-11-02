@@ -102,7 +102,7 @@ var _ = Describe("IPv6 for the guest", func() {
 			n := taskNetwork()
 			n.enableIPv6(backend.VMQemu)
 			script := withGuestIPv6(initScript(testNonce, false), n)
-			Expect(script).To(ContainSubstring(guestNetworkSetup + guestNetworkSetup6 + ". /rvm/limits"))
+			Expect(script).To(ContainSubstring(guestNetworkSetup + guestNetworkSetup6 + guestHostnameSetup + ". /rvm/limits"))
 			Expect(strings.Index(script, guestNetworkSetup6)).To(BeNumerically("<", strings.Index(script, "echo RVM_START_"+testNonce)))
 		})
 
