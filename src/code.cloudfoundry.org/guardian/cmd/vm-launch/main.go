@@ -824,6 +824,13 @@ func run(argv []string, logger *log.Logger) int {
 		logger.Print(err)
 		return exitLaunchError
 	}
+	if interfaceHasIPv6(containerNIC) {
+		nw.enableIPv6(cfg.backend)
+		logger.Printf("the container has an IPv6 address; the ports also accept connections over IPv6")
+		if nw.address6 != "" {
+			logger.Printf("the guest gets the IPv6 address %s", nw.address6)
+		}
+	}
 	// The proxy serves ports only, so only then does it need the
 	// capability. The hypervisor is confined whatever the flag says (see
 	// sup.prepare below).
@@ -953,6 +960,13 @@ func run(argv []string, logger *log.Logger) int {
 	}
 	for i, port := range nw.ports {
 		reservation, err := reservePort(port)
+		if err == nil && nw.listen6 {
+			// The IPv6 port is best effort, as its listener is: the port
+			// works over IPv4 without it.
+			if err6 := reservation.reserveIPv6(port); err6 != nil {
+				logger.Printf("reserving port %d over IPv6: %v", port, err6)
+			}
+		}
 		if err != nil {
 			logger.Print(err)
 			if errors.Is(err, syscall.EADDRINUSE) {
@@ -1284,6 +1298,8 @@ func run(argv []string, logger *log.Logger) int {
 	}
 	sup.closePorts = stopMetrics
 	var gates *portGates
+	// ipv6Proxies are the proxies that hold IPv6 listeners.
+	var ipv6Proxies []*tcpProxy
 	if len(nw.ports) > 0 {
 		// One proxy or one monitor serves every port's opener.
 		var open func(port int) portOpener
@@ -1294,11 +1310,38 @@ func run(argv []string, logger *log.Logger) int {
 			}
 			proxy := newProxy(upstreamDialPolicy, logger, opts...)
 			defer proxy.Close()
+			if nw.listen6 {
+				ipv6Proxies = append(ipv6Proxies, proxy)
+			}
 			open = func(port int) portOpener {
-				return proxyPort{proxy: proxy, addr: nw.listenAddr(port), upstream: nw.upstream(port)}
+				v4 := proxyPort{proxy: proxy, addr: nw.listenAddr(port), upstream: nw.upstream(port)}
+				if !nw.listen6 {
+					return v4
+				}
+				// A plain listener on 0.0.0.0 takes IPv6 connections too,
+				// so with an IPv6 listener beside it this one takes IPv4 only.
+				v4.network = "tcp4"
+				v6 := proxyPort{proxy: proxy, addr: nw.listenAddr6(port), upstream: nw.upstream6(port)}
+				return &dualPort{v4: v4, v6: v6, port: port, logger: logger}
 			}
 		} else {
-			open = func(port int) portOpener { return qmpPort{monitor: qmp, port: port} }
+			// QEMU's forwarding rules take IPv4 host addresses only, so the
+			// IPv6 listeners are the port proxy's, which hands each
+			// connection to the IPv4 rule of the same port.
+			var proxy6 *tcpProxy
+			if nw.listen6 {
+				proxy6 = newProxy(upstreamDialPolicy, logger)
+				defer proxy6.Close()
+				ipv6Proxies = append(ipv6Proxies, proxy6)
+			}
+			open = func(port int) portOpener {
+				v4 := qmpPort{monitor: qmp, port: port}
+				if proxy6 == nil {
+					return v4
+				}
+				v6 := proxyPort{proxy: proxy6, addr: nw.listenAddr6(port), upstream: nw.upstream6(port)}
+				return &dualPort{v4: v4, v6: v6, port: port, logger: logger}
+			}
 		}
 		// The explicit gates.end after sup.run is the one that ends the
 		// gates, as it must come before the exit line. A panic out of
@@ -1331,6 +1374,11 @@ func run(argv []string, logger *log.Logger) int {
 	if gates != nil {
 		// The gates' last lines about the ports come before the exit line.
 		gates.end()
+	}
+	// Whatever the gates left open over IPv6 stops accepting now that the
+	// guest is gone, rather than when this function returns.
+	for _, p := range ipv6Proxies {
+		p.StopAccepting()
 	}
 	// The hub's queued lines reach a relay, or else vm-launch's own output,
 	// before the exit line, and a sidecar that exited first holds the stop

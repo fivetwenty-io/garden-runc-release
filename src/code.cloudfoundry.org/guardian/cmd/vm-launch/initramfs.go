@@ -655,6 +655,41 @@ ip addr add "$RVM_ADDRESS" dev eth0 || rvm_fail "adding $RVM_ADDRESS to eth0 fai
 ip route add default via "$RVM_GATEWAY" dev eth0 || rvm_fail "adding the default route via $RVM_GATEWAY failed"
 `
 
+// guestNetworkSetup6 gives the guest eth0 its IPv6 address and default route
+// from RVM_ADDRESS6 and RVM_GATEWAY6 in /rvm/net, after guestNetworkSetup
+// has brought eth0 up. Stage 2 turns off duplicate address detection first,
+// because the address is static and the only neighbor is the hypervisor, so
+// the address is usable at once rather than a second later, and it stops
+// accepting router advertisements, so that the static address and route are
+// the only IPv6 configuration the guest has. A guest kernel
+// without IPv6, or a failure to configure it, only warns, because the guest's
+// IPv4 network works without it. A network without an IPv6 address does not
+// get this section (see withGuestIPv6).
+const guestNetworkSetup6 = `if [ -n "${RVM_ADDRESS6:-}" ]; then
+	if [ -d /proc/sys/net/ipv6/conf/eth0 ]; then
+		echo 0 >/proc/sys/net/ipv6/conf/eth0/accept_dad 2>/dev/null
+		echo 0 >/proc/sys/net/ipv6/conf/eth0/accept_ra 2>/dev/null
+		if ! ip -6 addr add "$RVM_ADDRESS6" dev eth0; then
+			echo "vm-launch guest setup: adding $RVM_ADDRESS6 to eth0 failed; the guest keeps IPv4 only"
+		elif ! ip -6 route add default via "$RVM_GATEWAY6" dev eth0; then
+			echo "vm-launch guest setup: adding the IPv6 default route via $RVM_GATEWAY6 failed; the guest has no IPv6 route out"
+		fi
+	else
+		echo "vm-launch guest setup: the guest kernel has no IPv6; the guest keeps IPv4 only"
+	fi
+fi
+`
+
+// withGuestIPv6 returns stage2, a guest stage 2 script, with the IPv6 setup
+// after its network setup when nw has an IPv6 address, and stage2 itself
+// otherwise.
+func withGuestIPv6(stage2 string, nw *network) string {
+	if nw == nil || nw.address6 == "" {
+		return stage2
+	}
+	return strings.Replace(stage2, guestNetworkSetup, guestNetworkSetup+guestNetworkSetup6, 1)
+}
+
 // guestLimitsSetup prepares the command's open-files limit from
 // /rvm/limits. A guest kernel caps every process at fs.nr_open, which is
 // 1048576 by default, so stage 2 raises it to the hard limit when that is
@@ -2261,6 +2296,7 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, g 
 			stage1 = guestImageInit
 		}
 	}
+	stage2 = withGuestIPv6(stage2, g.nw)
 	steps := []func() error{
 		func() error { return cw.Dir("bin", 0o755) },
 		func() error { return cw.Dir("dev", 0o755) },
@@ -2301,7 +2337,7 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, g 
 	}
 	if g.stack != nil {
 		steps = append(steps, g.stack.archiveSteps(cw, file)...)
-		steps = append(steps, g.stack.fallbackSteps(cw, file, g.nonce, len(g.vols) > 0)...)
+		steps = append(steps, g.stack.fallbackSteps(cw, file, g.nonce, len(g.vols) > 0, g.nw)...)
 	} else {
 		steps = append(steps, g.systemCerts.busyboxSteps(cw)...)
 	}
