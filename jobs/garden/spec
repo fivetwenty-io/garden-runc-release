@@ -247,6 +247,19 @@ properties:
     description: "Set NoNewPrivileges on unprivileged container processes. Prevents privilege escalation via setuid binaries and file capabilities."
     default: false
 
+  garden.deny_vsock:
+    description: |
+      Deny socket(AF_VSOCK) to every process in every container on the cell,
+      through each container's seccomp profile, with one exception. In a
+      vm-qemu container with the guest agent, the vm-launch process that
+      relays cf ssh sessions to the agent keeps the call, and every other
+      process there, the hypervisor and the app's own processes among them,
+      runs under a filter that denies it. Off by default, and then the
+      profiles are the ones Garden rendered before the property existed.
+      garden.vm_guest_agent requires it, because without it any process in
+      a container on the cell can reach a guest agent over vsock.
+    default: false
+
   garden.device_cgroup_rules:
     description: Device cgroup rules that will be applied to privileged containers. By default loop devices are allowed for privileged containers.
     default: ["b 7:* rwm", "c 10:237 rwm"]
@@ -357,7 +370,8 @@ properties:
       the agent, and cf ssh into it says why. It renders vm-guest-agent only
       when the value is true, and Garden then passes --guest-agent to
       vm-launch, so the default changes no argument.
-      It requires a vm-* entry in garden.execution_backends.
+      It requires a vm-* entry in garden.execution_backends, and
+      garden.deny_vsock.
     default: false
 
   garden.vm_volume_sync_mounts:

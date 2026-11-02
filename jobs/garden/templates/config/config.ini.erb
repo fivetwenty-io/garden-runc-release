@@ -75,6 +75,15 @@ parse_ip(p('garden.network_pool'), 'garden.network_pool')
 <% if p("garden.no_new_privileges") -%>
   no-new-privileges = true
 <% end -%>
+<%
+  deny_vsock = p("garden.deny_vsock")
+  unless deny_vsock == true || deny_vsock == false
+    raise "garden.deny_vsock must be true or false, got #{deny_vsock.inspect}"
+  end
+-%>
+<% if deny_vsock -%>
+  deny-vsock = true
+<% end -%>
 
 ; binaries
   iptables-bin = <%= p("garden.iptables_bin_dir") %>/iptables
@@ -389,6 +398,9 @@ end -%>
     if vm_volume_handoff
       raise "garden.vm_volume_handoff requires a vm-* entry in garden.execution_backends, because only a VM container holds an image volume"
     end
+  end
+  if vm_guest_agent && !p("garden.deny_vsock")
+    raise "garden.vm_guest_agent requires garden.deny_vsock, because without it any process in a container on the cell can reach a guest agent over vsock"
   end
 -%>
 <% unless execution_backends.empty? -%>
