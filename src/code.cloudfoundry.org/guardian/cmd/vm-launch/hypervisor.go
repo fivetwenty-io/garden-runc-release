@@ -1954,7 +1954,11 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 			// forwarded to the hypervisor, which would end the guest without
 			// its teardown. tryStop keeps the console when it wrote nothing,
 			// so a later signal still asks the guest to stop and the
-			// identity pushes go on.
+			// identity pushes go on. The handoff stays off from here until
+			// the instance stops, because the watcher has ended and nothing
+			// sets handoff again. That is safe, since the instance then keeps
+			// its volumes and the replacement waits as it would without the
+			// handoff.
 			if err := stdin.tryStop(stopTag(nonce)); err != nil {
 				s.logger.Printf("%s, but sending the stop request to the guest failed: %v; this instance keeps the volumes until it is stopped", reason, err)
 				continue

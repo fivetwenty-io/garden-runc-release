@@ -413,7 +413,8 @@ type handoffWatcher struct {
 // number. The watcher then offers its line for one poll, and when the
 // supervisor does not take it, because the guest command does not run yet,
 // it reads again, so the supervisor never acts on a request older than one
-// poll. It stops once the supervisor took a line or stop is called.
+// poll. It stops once the supervisor took a line or stop is called, and it
+// never offers a second line.
 func startHandoffWatcher(watches []*handoffWatch, poll, hold time.Duration) *handoffWatcher {
 	if len(watches) == 0 {
 		return nil
@@ -453,6 +454,10 @@ func startHandoffWatcher(watches []*handoffWatch, poll, hold time.Duration) *han
 			}
 			select {
 			case w.ch <- reason:
+				// The watcher offers one line in its life. When the stop
+				// request then fails, the instance keeps its volumes until
+				// it stops, which is safe, and the replacement waits as it
+				// would without the handoff.
 				t.Stop()
 				return
 			case <-t.C:
