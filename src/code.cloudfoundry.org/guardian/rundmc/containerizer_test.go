@@ -1201,11 +1201,127 @@ var _ = Describe("Rundmc", func() {
 				Expect(fakeOCIRuntime.ExecCallCount()).To(Equal(0))
 			})
 
-			It("does not need the bundle for other processes", func() {
+			It("fails other processes too, rather than run them as the user they ask for", func() {
 				_, err := containerizer.Run(logger, "some-handle", garden.ProcessSpec{Path: "hello"}, garden.ProcessIO{})
-				Expect(err).NotTo(HaveOccurred())
-				Expect(fakeOCIRuntime.BundleInfoCallCount()).To(Equal(0))
+				Expect(err).To(MatchError("no-bundle"))
+				Expect(fakeOCIRuntime.ExecCallCount()).To(Equal(0))
 			})
+		})
+
+		for _, kind := range []backend.Kind{backend.VMQemu, backend.VMFirecracker} {
+			kind := kind
+
+			Context(fmt.Sprintf("with a %s bundle whose guest boots a Docker image", kind), func() {
+				imageBundle := func(env ...string) goci.Bndl {
+					bundle := bundleFor(map[string]string{backend.AnnotationKey: string(kind), backend.ImageAnnotationKey: backend.DockerImage})
+					if env != nil {
+						bundle.Spec.Process = &specs.Process{Env: env}
+					}
+					return bundle
+				}
+
+				wrappedArgs := func(imageFlags ...string) []string {
+					args := append([]string{"--backend", string(kind)}, imageFlags...)
+					return append(args, "--", launcher, "app", "echo hi", "")
+				}
+
+				It("passes the image user and the defaults the process lacks, and runs vm-launch as vcap in vcap's home", func() {
+					fakeOCIRuntime.BundleInfoReturns("/bundle", imageBundle("PATH=/image/bin", "IMAGE=1"), nil)
+					spec := launcherSpec()
+					spec.User = "app"
+					spec.Dir = "/srv"
+
+					_, err := containerizer.Run(logger, "some-handle", spec, garden.ProcessIO{})
+					Expect(err).NotTo(HaveOccurred())
+
+					_, _, actual, _ := fakeOCIRuntime.ExecArgsForCall(0)
+					Expect(actual.Path).To(Equal(bundlerules.VMLaunchMountPath))
+					Expect(actual.Args).To(Equal(wrappedArgs("--image-user=app", "--image-default-env=HOME,USER")))
+					Expect(actual.Env).To(Equal([]string{"A=b", marker}))
+					Expect(actual.User).To(Equal("vcap"))
+					Expect(actual.Dir).To(BeEmpty())
+				})
+
+				It("passes root for a launcher that asks for no user, and every default when the environment has none", func() {
+					fakeOCIRuntime.BundleInfoReturns("/bundle", imageBundle(), nil)
+					spec := launcherSpec()
+					spec.User = ""
+					spec.Env = nil
+
+					_, err := containerizer.Run(logger, "some-handle", spec, garden.ProcessIO{})
+					Expect(err).NotTo(HaveOccurred())
+
+					_, _, actual, _ := fakeOCIRuntime.ExecArgsForCall(0)
+					Expect(actual.Args).To(Equal(wrappedArgs("--image-user=root", "--image-default-env=HOME,PATH,USER")))
+					Expect(actual.User).To(Equal("vcap"))
+				})
+
+				It("passes an empty list when the process sets all three, and keeps a user that looks like a flag in one argument", func() {
+					fakeOCIRuntime.BundleInfoReturns("/bundle", imageBundle("HOME=/home/app"), nil)
+					spec := launcherSpec()
+					spec.User = "-1:-1"
+					spec.Env = []string{"PATH=/bin", "USER=me", "A=b"}
+
+					_, err := containerizer.Run(logger, "some-handle", spec, garden.ProcessIO{})
+					Expect(err).NotTo(HaveOccurred())
+
+					_, _, actual, _ := fakeOCIRuntime.ExecArgsForCall(0)
+					Expect(actual.Args).To(Equal(wrappedArgs("--image-user=-1:-1", "--image-default-env=")))
+				})
+
+				It("runs every other process as vcap in vcap's home, unwrapped", func() {
+					fakeOCIRuntime.BundleInfoReturns("/bundle", imageBundle("PATH=/image/bin"), nil)
+					for _, path := range []string{"/tmp/lifecycle/diego-sshd", "/bin/sh"} {
+						_, err := containerizer.Run(logger, "some-handle", garden.ProcessSpec{Path: path, Args: []string{"x"}, User: "root", Dir: "/app"}, garden.ProcessIO{})
+						Expect(err).NotTo(HaveOccurred())
+					}
+
+					Expect(fakeOCIRuntime.ExecCallCount()).To(Equal(2))
+					for i := 0; i < 2; i++ {
+						_, _, actual, _ := fakeOCIRuntime.ExecArgsForCall(i)
+						Expect(actual.Args).To(Equal([]string{"x"}))
+						Expect(actual.User).To(Equal("vcap"))
+						Expect(actual.Dir).To(BeEmpty())
+					}
+				})
+
+				It("runs a sidecar's log relay as vcap", func() {
+					fakeOCIRuntime.BundleInfoReturns("/bundle", imageBundle(), nil)
+					spec := garden.ProcessSpec{Path: launcher, Env: []string{"CF_VM_SIDECAR_RELAY=1:0123456789abcdef0123456789abcdef"}, User: "root", Dir: "/app"}
+
+					_, err := containerizer.Run(logger, "some-handle", spec, garden.ProcessIO{})
+					Expect(err).NotTo(HaveOccurred())
+
+					_, _, actual, _ := fakeOCIRuntime.ExecArgsForCall(0)
+					Expect(actual.Path).To(Equal(bundlerules.VMLaunchMountPath))
+					Expect(actual.Args).To(Equal([]string{"relay"}))
+					Expect(actual.User).To(Equal("vcap"))
+					Expect(actual.Dir).To(BeEmpty())
+				})
+
+				It("leaves a pea's user alone", func() {
+					fakeOCIRuntime.BundleInfoReturns("/bundle", imageBundle(), nil)
+					spec := garden.ProcessSpec{Path: "/etc/cf-assets/healthcheck/healthcheck", User: "0:0", Image: garden.ImageRef{URI: "some-uri"}}
+
+					_, err := containerizer.Run(logger, "some-handle", spec, garden.ProcessIO{})
+					Expect(err).NotTo(HaveOccurred())
+
+					_, peaSpec, _, _ := fakePeaCreator.CreatePeaArgsForCall(0)
+					Expect(peaSpec.User).To(Equal("0:0"))
+				})
+			})
+		}
+
+		It("leaves the processes of a non-VM bundle with the image annotation alone", func() {
+			fakeOCIRuntime.BundleInfoReturns("/bundle", bundleFor(map[string]string{backend.AnnotationKey: string(backend.OCIRunc), backend.ImageAnnotationKey: backend.DockerImage}), nil)
+
+			_, err := containerizer.Run(logger, "some-handle", launcherSpec(), garden.ProcessIO{})
+			Expect(err).NotTo(HaveOccurred())
+
+			_, _, actual, _ := fakeOCIRuntime.ExecArgsForCall(0)
+			Expect(actual.Path).To(Equal(launcher))
+			Expect(actual.User).To(Equal("vcap"))
+			Expect(actual.Dir).To(Equal("/home/vcap"))
 		})
 	})
 
@@ -1369,11 +1485,13 @@ var _ = Describe("Rundmc", func() {
 				Expect(fakePeaUsernameResolver.ResolveUserCallCount()).To(Equal(0))
 			})
 
-			It("runs a non-pea process without consulting the bundle", func() {
-				_, err := containerizer.Run(logger, "some-handle", garden.ProcessSpec{Path: "hello"}, garden.ProcessIO{})
+			It("runs a non-pea process as it asks", func() {
+				_, err := containerizer.Run(logger, "some-handle", garden.ProcessSpec{Path: "hello", User: "root", Dir: "/app"}, garden.ProcessIO{})
 				Expect(err).NotTo(HaveOccurred())
-				Expect(fakeOCIRuntime.BundleInfoCallCount()).To(Equal(0))
 				Expect(fakeOCIRuntime.ExecCallCount()).To(Equal(1))
+				_, _, execSpec, _ := fakeOCIRuntime.ExecArgsForCall(0)
+				Expect(execSpec.User).To(Equal("root"))
+				Expect(execSpec.Dir).To(Equal("/app"))
 			})
 
 			Describe("Stop", func() {

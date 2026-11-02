@@ -314,3 +314,33 @@ var _ = Describe("StackTarball", func() {
 		Entry("an empty spec", garden.ContainerSpec{}, ""),
 	)
 })
+
+var _ = Describe("DockerImageRef", func() {
+	DescribeTable("the Docker image a spec asks for",
+		func(spec garden.ContainerSpec, expected garden.ImageRef, ok bool) {
+			ref, found := backend.DockerImageRef(spec)
+			Expect(found).To(Equal(ok))
+			Expect(ref).To(Equal(expected))
+		},
+		Entry("a docker URI in Image.URI, with its credentials",
+			garden.ContainerSpec{Image: garden.ImageRef{URI: "docker:///cloudfoundry/test#latest", Username: "u", Password: "p"}},
+			garden.ImageRef{URI: "docker:///cloudfoundry/test#latest", Username: "u", Password: "p"}, true),
+		Entry("a docker URI with a registry host",
+			garden.ContainerSpec{Image: garden.ImageRef{URI: "docker://registry.example.com/team/app#v2"}},
+			garden.ImageRef{URI: "docker://registry.example.com/team/app#v2"}, true),
+		Entry("a docker URI in RootFSPath alone",
+			garden.ContainerSpec{RootFSPath: "docker:///cloudfoundry/test"},
+			garden.ImageRef{URI: "docker:///cloudfoundry/test"}, true),
+		Entry("a docker URI in both fields, which the volumizer refuses",
+			garden.ContainerSpec{Image: garden.ImageRef{URI: "docker:///a"}, RootFSPath: "docker:///b"},
+			garden.ImageRef{}, false),
+		Entry("a docker URI beside a plain path",
+			garden.ContainerSpec{Image: garden.ImageRef{URI: "docker:///a"}, RootFSPath: "/var/vcap/packages/cflinuxfs4/rootfs.tar"},
+			garden.ImageRef{}, false),
+		Entry("a plain path", garden.ContainerSpec{Image: garden.ImageRef{URI: "/var/vcap/packages/cflinuxfs4/rootfs.tar"}}, garden.ImageRef{}, false),
+		Entry("a preloaded layer URI", garden.ContainerSpec{Image: garden.ImageRef{URI: "preloaded+layer:/r.tar?layer_path=%2Fhome%2Fvcap"}}, garden.ImageRef{}, false),
+		Entry("an OCI URI", garden.ContainerSpec{Image: garden.ImageRef{URI: "oci:///var/vcap/data/image"}}, garden.ImageRef{}, false),
+		Entry("an unparseable URI", garden.ContainerSpec{Image: garden.ImageRef{URI: "docker://%zz"}}, garden.ImageRef{}, false),
+		Entry("an empty spec", garden.ContainerSpec{}, garden.ImageRef{}, false),
+	)
+})

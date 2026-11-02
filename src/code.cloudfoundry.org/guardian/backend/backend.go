@@ -28,6 +28,23 @@ const (
 // container.
 const AnnotationKey = "garden.execution-backend"
 
+// ImageAnnotationKey is the bundle annotation that marks a VM container whose
+// guest boots a Docker image instead of the stack. Its value is DockerImage.
+const ImageAnnotationKey = "garden.vm-image"
+
+// DockerImage is the value of ImageAnnotationKey for a Docker image guest.
+const DockerImage = "docker"
+
+// dockerScheme is the URI scheme Diego gives a Docker image.
+const dockerScheme = "docker"
+
+// VMImageBuildSuffix ends the handle under which Garden pulls the Docker image
+// of a VM container to build its guest image. The rest of the build handle is
+// the container's own handle. The build image shares the volumizer's handles
+// with every container, so a cell that boots Docker images refuses a
+// container handle with this ending.
+const VMImageBuildSuffix = "-vm-image"
+
 var (
 	// ErrUnknownBackend is returned when the requested value names no backend.
 	ErrUnknownBackend = errors.New("unknown execution backend")
@@ -218,6 +235,24 @@ func StackTarball(spec garden.ContainerSpec) string {
 		}
 	}
 	return ""
+}
+
+// DockerImageRef returns the Docker image that a container spec asks for,
+// with the spec's registry credentials, and reports whether it asks for one.
+// The spec must name the image in exactly one of Image.URI and RootFSPath,
+// because the volumizer refuses a spec that names both.
+func DockerImageRef(spec garden.ContainerSpec) (garden.ImageRef, bool) {
+	image := spec.Image.URI
+	if image == "" {
+		image = spec.RootFSPath
+	} else if spec.RootFSPath != "" {
+		return garden.ImageRef{}, false
+	}
+	u, err := url.Parse(image)
+	if err != nil || u.Scheme != dockerScheme {
+		return garden.ImageRef{}, false
+	}
+	return garden.ImageRef{URI: image, Username: spec.Image.Username, Password: spec.Image.Password}, true
 }
 
 func checkOperatorImage(k Kind, image string) error {

@@ -337,6 +337,21 @@ end -%>
   if !vm_backend_enabled && vm_qemu_sandbox != vm_qemu_sandbox_default
     raise "garden.vm_qemu_sandbox requires a vm-* entry in garden.execution_backends, because only a VM container runs QEMU"
   end
+  vm_docker_rootfs = p("garden.vm_docker_rootfs")
+  unless vm_docker_rootfs.is_a?(String) && (vm_docker_rootfs.empty? || vm_docker_rootfs.start_with?("/"))
+    raise "garden.vm_docker_rootfs must be an absolute path or empty, got #{vm_docker_rootfs.inspect}"
+  end
+  vm_docker_image_cache_dir = p("garden.vm_docker_image_cache_dir")
+  unless vm_docker_image_cache_dir.is_a?(String) && vm_docker_image_cache_dir.start_with?("/")
+    raise "garden.vm_docker_image_cache_dir must be an absolute path, got #{vm_docker_image_cache_dir.inspect}"
+  end
+  vm_docker_image_cache_bytes = p("garden.vm_docker_image_cache_bytes")
+  unless vm_docker_image_cache_bytes.is_a?(Integer) && vm_docker_image_cache_bytes > 0
+    raise "garden.vm_docker_image_cache_bytes must be a positive whole number of bytes, got #{vm_docker_image_cache_bytes.inspect}"
+  end
+  if !vm_backend_enabled && !vm_docker_rootfs.empty?
+    raise "garden.vm_docker_rootfs requires a vm-* entry in garden.execution_backends, because only a VM container boots a Docker image in its guest"
+  end
   if !vm_backend_enabled
     if vm_block_volumes
       raise "garden.vm_block_volumes requires a vm-* entry in garden.execution_backends, because only a VM container gets a block device"
@@ -381,6 +396,11 @@ end -%>
 <% end -%>
 <% unless vm_stack_tarballs.empty? -%>
   vm-stack-wait = <%= vm_stack_wait_seconds %>s
+<% end -%>
+<% unless vm_docker_rootfs.empty? -%>
+  vm-docker-rootfs = <%= vm_docker_rootfs %>
+  vm-docker-image-cache-dir = <%= vm_docker_image_cache_dir %>
+  vm-docker-image-cache-bytes = <%= vm_docker_image_cache_bytes %>
 <% end -%>
 <% end -%>
 <% end -%>

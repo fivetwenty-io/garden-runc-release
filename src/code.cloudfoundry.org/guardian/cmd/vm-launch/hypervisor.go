@@ -561,7 +561,9 @@ func stackDriveFDs(nVols int, hasMonitor, hasRoot bool) (stack, droplet int) {
 // stack and droplet images in sd, which come after the root image as the last
 // two files, so no other file's descriptor moves. A nil sd gives exactly what
 // hypervisorFiles gives. Both files of an sd are required (see
-// newGuestDrivesWithStack); a missing one is passed on as a nil file.
+// newGuestDrivesWithStack); a missing one is passed on as a nil file. The
+// Docker image guest's sd gives one file, the Docker image, in the stack's
+// place.
 func hypervisorFilesWithStack(vols []*attachment, initrd, monitor, root *os.File, sd *stackDrives) (files []*os.File, drives []volumeDrive, initrdPath string, monitorFD int, rootPath string) {
 	for _, att := range vols {
 		if att == nil || att.File == nil {
@@ -586,7 +588,10 @@ func hypervisorFilesWithStack(vols []*attachment, initrd, monitor, root *os.File
 		files = append(files, root)
 		rootPath = procSelfFD(firstExtraFD + len(files) - 1)
 	}
-	if sd != nil {
+	switch {
+	case sd != nil && sd.image:
+		files = append(files, sd.stack)
+	case sd != nil:
 		files = append(files, sd.stack, sd.droplet)
 	}
 	return files, drives, initrdPath, monitorFD, rootPath
@@ -688,8 +693,10 @@ func newFirecrackerConfig(root, initrd string, memMiB int, nw *network, drives [
 
 // newFirecrackerConfigWithStack is newFirecrackerConfig for a guest that also
 // has the stack and droplet images, as read-only drives on the descriptors
-// stack and droplet, after the root image and in that order. A nil sd gives
-// exactly the configuration newFirecrackerConfig gives.
+// stack and droplet, after the root image and in that order. A droplet
+// descriptor of 0 is the Docker image guest's, which has its image on stack
+// and no droplet drive. A nil sd gives exactly the configuration
+// newFirecrackerConfig gives.
 func newFirecrackerConfigWithStack(root, initrd string, memMiB int, nw *network, drives []volumeDrive, rootPath string, sd *stackFDs) firecrackerConfig {
 	return newFirecrackerConfigWithVCPUs(root, initrd, memMiB, defaultGuestVCPUs, nw, drives, rootPath, sd)
 }
@@ -729,10 +736,14 @@ func newFirecrackerConfigWithVCPUs(root, initrd string, memMiB, vcpus int, nw *n
 		})
 	}
 	if sd != nil {
-		for _, d := range []struct {
+		images := []struct {
 			id string
 			fd int
-		}{{stackDriveID, sd.stack}, {dropletDriveID, sd.droplet}} {
+		}{{stackDriveID, sd.stack}, {dropletDriveID, sd.droplet}}
+		if sd.droplet == 0 {
+			images = images[:1]
+		}
+		for _, d := range images {
 			cfg.Drives = append(cfg.Drives, firecrackerDrive{
 				DriveID:      d.id,
 				PathOnHost:   procSelfFD(d.fd),
@@ -749,7 +760,8 @@ func newFirecrackerConfigWithVCPUs(root, initrd string, memMiB, vcpus int, nw *n
 }
 
 // stackFDs are the file descriptors the hypervisor gets the stack and droplet
-// images on.
+// images on. The Docker image guest has its image on stack and no droplet,
+// which is 0.
 type stackFDs struct {
 	stack, droplet int
 }
@@ -782,9 +794,11 @@ func hypervisorArgv(kind backend.Kind, root, workDir, initrd string, memMiB int,
 // stack and droplet images in sd, which hypervisorFilesWithStack passes as
 // the two files after the root image. The hypervisor attaches both as
 // read-only virtio-blk drives after the root image, the stack first, so no
-// other drive moves. Only whether sd is nil matters here, because the
-// descriptors follow from the drives, the monitor, and the root image (see
-// stackDriveFDs). A nil sd gives exactly the command line or configuration
+// other drive moves. Only whether sd is nil, and whether it is the Docker
+// image guest's, matter here, because the descriptors follow from the
+// drives, the monitor, and the root image (see stackDriveFDs). The Docker
+// image guest's image gets the stack's drive and serial, and it has no
+// droplet drive. A nil sd gives exactly the command line or configuration
 // hypervisorArgv gives.
 func hypervisorArgvWithStack(kind backend.Kind, root, workDir, initrd string, memMiB int, nw *network, drives []volumeDrive, rootPath string, monitorFD int, sd *stackDrives, shares ...shareSocket) ([]string, error) {
 	return hypervisorArgvWithVCPUs(kind, root, workDir, initrd, memMiB, defaultGuestVCPUs, nw, drives, rootPath, monitorFD, sd, shares...)
@@ -798,6 +812,9 @@ func hypervisorArgvWithVCPUs(kind backend.Kind, root, workDir, initrd string, me
 	if sd != nil {
 		stack, droplet := stackDriveFDs(len(drives), monitorFD > 0, rootPath != "")
 		fds = &stackFDs{stack: stack, droplet: droplet}
+		if sd.image {
+			fds.droplet = 0
+		}
 	}
 	if len(drives) > maxVolumes {
 		return nil, fmt.Errorf("%d volume drives, over the %d a guest can have", len(drives), maxVolumes)
@@ -828,7 +845,9 @@ func hypervisorArgvWithVCPUs(kind backend.Kind, root, workDir, initrd string, me
 		}
 		if fds != nil {
 			argv = append(argv, qemuReadOnlyDrive(stackDriveID, qemuStackSerial, fds.stack)...)
-			argv = append(argv, qemuReadOnlyDrive(dropletDriveID, qemuDropletSerial, fds.droplet)...)
+			if fds.droplet != 0 {
+				argv = append(argv, qemuReadOnlyDrive(dropletDriveID, qemuDropletSerial, fds.droplet)...)
+			}
 		}
 		return append(argv, qemuBalloonArgs()...), nil
 	case backend.VMFirecracker:

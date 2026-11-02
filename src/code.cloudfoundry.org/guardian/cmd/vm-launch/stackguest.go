@@ -190,7 +190,13 @@ func (s *guestStack) initScript(nonce string) string {
 // guest that runs a run section with volumes winds down within
 // guestVolumeWindDown, so that the volume teardown after the section fits
 // before the host's stop deadline.
+// The Docker image guest runs its processes with its own exec (see
+// guestImage.exec).
 func (s *guestStack) initScriptWithVolumes(nonce string, volume bool) string {
+	exec := guestExec(stackExec)
+	if s.image != nil {
+		exec = s.image.exec
+	}
 	certs := guestSystemCertsSetup(s.systemCerts)
 	procs := s.processes()
 	checks := guestSidecarChecks(len(s.sidecars))
@@ -202,7 +208,7 @@ func (s *guestStack) initScriptWithVolumes(nonce string, volume bool) string {
 	if volume {
 		timeout = guestVolumeTimeoutSeconds
 	}
-	return stage2Script(nonce, volume, true, checks, guestRunSectionWithin(nonce, procs, s.identity != nil, stackExec, timeout))
+	return stage2Script(nonce, volume, true, checks, guestRunSectionWithin(nonce, procs, s.identity != nil, exec, timeout))
 }
 
 // processes returns the app, from /rvm/argv and the guest environment, and
