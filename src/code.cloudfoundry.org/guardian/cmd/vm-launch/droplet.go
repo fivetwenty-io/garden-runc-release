@@ -57,10 +57,13 @@ type dropletImage struct {
 // the mksquashfs in the artifacts directory, as an lz4 image in which every
 // file belongs to the droplet owner. It opens the result read-only and
 // unlinks it, so nothing is left in workDir. When workDir is inside home, the
-// image leaves workDir out. A failure carries the last lines of the tool's
-// output. Cancelling ctx kills the tool, and the error then wraps the
-// context's error.
-func buildDropletImage(ctx context.Context, artifacts, home, workDir string) (*dropletImage, error) {
+// image leaves workDir out. The build never crosses into another filesystem,
+// so a volume mounted under home, which may be a FUSE mount whose files block
+// a reader, shows in the image as an empty directory at most, and it also
+// leaves out each of the directories in exclude that is under home. A failure
+// carries the last lines of the tool's output. Cancelling ctx kills the tool,
+// and the error then wraps the context's error.
+func buildDropletImage(ctx context.Context, artifacts, home, workDir string, exclude ...string) (*dropletImage, error) {
 	tool := filepath.Join(artifacts, artMksquashfs)
 	image := filepath.Join(workDir, "droplet.sqfs")
 	args := []string{
@@ -68,9 +71,12 @@ func buildDropletImage(ctx context.Context, artifacts, home, workDir string) (*d
 		"-noappend", "-comp", "lz4", "-b", "128K",
 		"-force-uid", fmt.Sprint(dropletOwner), "-force-gid", fmt.Sprint(dropletOwner),
 		"-mem", "64M", "-processors", "1", "-no-progress", "-quiet",
+		"-one-file-system",
 	}
-	if rel, err := filepath.Rel(home, workDir); err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		args = append(args, "-e", rel)
+	for _, dir := range append([]string{workDir}, exclude...) {
+		if rel, ok := relativeToHome(home, dir); ok {
+			args = append(args, "-e", rel)
+		}
 	}
 
 	start := time.Now()
@@ -112,7 +118,7 @@ func buildDropletImage(ctx context.Context, artifacts, home, workDir string) (*d
 // returned as the second result, and the build is then cancelled, so the
 // caller must not start the guest. An error that is not from a signal says
 // whether the build ran past timeout.
-func buildDropletImageWatching(sigs <-chan os.Signal, timeout time.Duration, artifacts, home, workDir string) (*dropletImage, os.Signal, error) {
+func buildDropletImageWatching(sigs <-chan os.Signal, timeout time.Duration, artifacts, home, workDir string, exclude ...string) (*dropletImage, os.Signal, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	caught := make(chan os.Signal, 1)
@@ -127,7 +133,7 @@ func buildDropletImageWatching(sigs <-chan os.Signal, timeout time.Duration, art
 		case <-stop:
 		}
 	}()
-	img, err := buildDropletImage(ctx, artifacts, home, workDir)
+	img, err := buildDropletImage(ctx, artifacts, home, workDir, exclude...)
 	close(stop)
 	<-ended
 	select {
@@ -142,6 +148,16 @@ func buildDropletImageWatching(sigs <-chan os.Signal, timeout time.Duration, art
 		err = fmt.Errorf("the build ran past its limit of %s: %w", timeout, err)
 	}
 	return img, nil, err
+}
+
+// relativeToHome returns dir relative to home, and true, when dir is strictly
+// inside home. A path that is home itself, or outside it, gives false.
+func relativeToHome(home, dir string) (string, bool) {
+	rel, err := filepath.Rel(home, dir)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return rel, true
 }
 
 // lastLines returns a newline and the last n non-empty lines of s, or an

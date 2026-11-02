@@ -417,6 +417,15 @@ type selectedVolume struct {
 	Mount    mountRecord
 }
 
+// containerDirs returns the container directory of each of vols.
+func containerDirs(vols []guestVolume) []string {
+	dirs := make([]string, 0, len(vols))
+	for _, v := range vols {
+		dirs = append(dirs, v.ContainerDir)
+	}
+	return dirs
+}
+
 // findVolumeProviders runs findVolumeProvider for each of vols, in order,
 // and stops at the first refusal. It also refuses two volumes whose mounts
 // show the same directory of one filesystem, the same device numbers and the

@@ -934,7 +934,7 @@ func run(argv []string, logger *log.Logger) int {
 	var droplet *os.File
 	defer func() { closeFile(droplet, "the droplet image", logger) }()
 	if stack != nil {
-		img, sig, err := buildDropletImageWatching(sigs, dropletBuildTimeout, cfg.artifacts, dropletHome, workDir)
+		img, sig, err := buildDropletImageWatching(sigs, dropletBuildTimeout, cfg.artifacts, dropletHome, workDir, containerDirs(vols)...)
 		if sig != nil {
 			logger.Printf("received %v while the droplet image was building", sig)
 			return 128 + signalNumber(sig)

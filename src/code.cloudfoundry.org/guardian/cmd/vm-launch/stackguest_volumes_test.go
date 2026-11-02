@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"os"
@@ -591,6 +592,7 @@ const realStackVolumeLauncher = `#!/bin/sh
 echo "vol-id=$(id -u)"
 echo "vol-mount=$(/bin/busybox grep ' /home/vcap/data ' /proc/self/mounts)"
 echo "vol-root=$(stat -c %u:%g /home/vcap/data)"
+echo "vol-listing=[$(ls /home/vcap/data | tr '\n' ' ')]"
 if [ -e /home/vcap/data/proof ]; then
 	echo "vol-found=$(cat /home/vcap/data/proof)"
 fi
@@ -598,6 +600,12 @@ echo "written-by-$(id -u)" >/home/vcap/data/proof && echo "vol-wrote=$(stat -c %
 `
 
 var _ = Describe("the stack guest with a volume against a real QEMU", func() {
+	// droplet is the droplet image for a spec that boots once with its own, or
+	// nil for the plain one that each boot builds.
+	var droplet *os.File
+
+	BeforeEach(func() { droplet = nil })
+
 	// bootStackVolume boots a real guest under TCG with the test stack, a
 	// droplet, the launcher realStackVolumeLauncher, and img as an image
 	// volume at /home/vcap/data, with a guest root image when withRoot is
@@ -608,7 +616,11 @@ var _ = Describe("the stack guest with a volume against a real QEMU", func() {
 		art := realArtifacts()
 		qemu := realQEMU()
 		requireMicrovm(qemu)
-		sd := &stackDrives{stack: realStackImage(art), droplet: realDropletImage(art)}
+		drop := droplet
+		if drop == nil {
+			drop = realDropletImage(art)
+		}
+		sd := &stackDrives{stack: realStackImage(art), droplet: drop}
 		lf, err := os.Open(writeTempFile("launcher", realStackVolumeLauncher))
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(lf.Close)
@@ -690,4 +702,39 @@ var _ = Describe("the stack guest with a volume against a real QEMU", func() {
 		Expect(out).To(ContainSubstring(exitTag(testNonce)+"0"), out)
 		Expect(rootOwner(img)).To(Equal("2000:2000"))
 	})
+
+	// A volume under /home/vcap on the cell can be a mount whose files block
+	// a reader, so the droplet build must neither enter it nor depend on
+	// its directory. A tmpfs at the volume's path under the droplet's home
+	// stands in for it, with a file that must not reach the guest.
+	DescribeTable("mounts a volume where the droplet's home has another filesystem, which the droplet build leaves out",
+		func(excluded bool) {
+			art := realArtifacts()
+			home := filepath.Join(GinkgoT().TempDir(), "home")
+			Expect(os.MkdirAll(filepath.Join(home, "app"), 0o755)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(home, "app/from-the-droplet"), []byte("droplet-file\n"), 0o644)).To(Succeed())
+			Expect(os.Mkdir(filepath.Join(home, "data"), 0o755)).To(Succeed())
+			mountTmpfs(filepath.Join(home, "data"))
+			Expect(os.WriteFile(filepath.Join(home, "data", "from-the-host-mount"), []byte("host\n"), 0o644)).To(Succeed())
+			var exclude []string
+			if excluded {
+				exclude = containerDirs([]guestVolume{{ContainerDir: filepath.Join(home, "data")}})
+			}
+			img, err := buildDropletImage(context.Background(), art, home, GinkgoT().TempDir(), exclude...)
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(img.file.Close)
+			droplet = img.file
+
+			out := bootStackVolume(openSizedFile(defaultImageSize), false)
+			Expect(out).NotTo(ContainSubstring("vm-launch guest"), out)
+			Expect(out).To(MatchRegexp(`(?m)^vol-mount=\S+ /home/vcap/data ext4 `), out)
+			Expect(out).To(MatchRegexp(`(?m)^vol-root=2000:2000$`), out)
+			Expect(out).To(MatchRegexp(`(?m)^vol-listing=\[lost\+found \]$`), out)
+			Expect(out).NotTo(ContainSubstring("from-the-host-mount"), out)
+			Expect(out).To(MatchRegexp(`(?m)^vol-wrote=2000:2000$`), out)
+			Expect(out).To(ContainSubstring(exitTag(testNonce)+"0"), out)
+		},
+		Entry("with the volume path left out of the image, so the guest makes the mount point", true),
+		Entry("with the mount point kept as an empty directory", false),
+	)
 })
