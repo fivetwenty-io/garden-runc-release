@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os/exec"
 	"sync"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"code.cloudfoundry.org/guardian/gardener"
 	spec "code.cloudfoundry.org/guardian/gardener/container-spec"
 	fakes "code.cloudfoundry.org/guardian/gardener/gardenerfakes"
+	"code.cloudfoundry.org/guardian/imageplugin"
 	"code.cloudfoundry.org/lager/v3"
 	"code.cloudfoundry.org/lager/v3/lagertest"
 	. "github.com/onsi/ginkgo/v2"
@@ -34,6 +36,22 @@ func (f *fakeVMStackImager) Image(_ lager.Logger, tarball string) (string, bool)
 	return f.dir, f.ok
 }
 
+// argsRecordingCreator builds the image plugin's create command for every
+// volume it is asked for and keeps it, so a spec can read the quota flags
+// that the plugin would have received.
+type argsRecordingCreator struct {
+	commands []*exec.Cmd
+}
+
+func (c *argsRecordingCreator) Create(log lager.Logger, handle string, spec gardener.RootfsSpec) (specs.Spec, error) {
+	cmd, err := (&imageplugin.DefaultCommandCreator{BinPath: "image-plugin"}).CreateCommand(log, handle, spec)
+	if err != nil {
+		return specs.Spec{}, err
+	}
+	c.commands = append(c.commands, cmd)
+	return specs.Spec{Root: &specs.Root{Path: "/some/rootfs"}}, nil
+}
+
 // fakeVMImager records its calls under a lock, because the cleanup destroys
 // containers in parallel.
 type fakeVMImager struct {
@@ -44,7 +62,7 @@ type fakeVMImager struct {
 	err        error
 	releaseErr error
 
-	pruneErr   error
+	pruneErr error
 
 	handles  []string
 	images   []garden.ImageRef
@@ -538,6 +556,28 @@ var _ = Describe("Gardener", func() {
 					Entry("on vm-firecracker", "vm-firecracker"),
 				)
 
+				It("excludes the operator's tarball from the disk quota, whatever scope the spec asked for", func() {
+					containerSpec := dockerSpec("vm-qemu")
+					containerSpec.Limits.Disk = garden.DiskLimits{ByteHard: 1 << 30, Scope: garden.DiskLimitScopeTotal}
+					_, err := gdnr.Create(containerSpec)
+					Expect(err).NotTo(HaveOccurred())
+					_, created := volumizer.CreateArgsForCall(0)
+					Expect(created.Limits.Disk.Scope).To(Equal(garden.DiskLimitScopeExclusive))
+					Expect(created.Limits.Disk.ByteHard).To(Equal(uint64(1 << 30)))
+				})
+
+				It("hands the image plugin a quota that leaves out the tarball, as for a stack container", func() {
+					creator := &argsRecordingCreator{}
+					gdnr.Volumizer = gardener.NewVolumeProvider(creator, volumizer, nil, 0, 0)
+					containerSpec := dockerSpec("vm-qemu")
+					containerSpec.Limits.Disk = garden.DiskLimits{ByteHard: 1 << 30, Scope: garden.DiskLimitScopeTotal}
+					_, err := gdnr.Create(containerSpec)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(creator.commands).To(HaveLen(1))
+					Expect(creator.commands[0].Args).To(ContainElements("--disk-limit-size-bytes", "1073741824", "--exclude-image-from-quota"))
+					Expect(creator.commands[0].Args).To(ContainElement(ContainSubstring(dockerRootFS)))
+				})
+
 				It("finds a Docker image in the rootfs path", func() {
 					containerSpec := dockerSpec("vm-qemu")
 					containerSpec.Image = garden.ImageRef{}
@@ -594,6 +634,18 @@ var _ = Describe("Gardener", func() {
 					_, err := gdnr.Create(dockerSpec("vm-qemu"))
 					Expect(err).To(MatchError("Handle 'some-ctr' already in use"))
 					Expect(imager.handles).To(BeEmpty())
+				})
+
+				It("leaves the quota scope of a VM container that has no Docker image alone", func() {
+					_, err := gdnr.Create(garden.ContainerSpec{
+						Handle:     "some-ctr",
+						RootFSPath: dockerRootFS,
+						Limits:     garden.Limits{Disk: garden.DiskLimits{ByteHard: 1 << 30}},
+						Properties: garden.Properties{backend.AnnotationKey: "vm-qemu"},
+					})
+					Expect(err).NotTo(HaveOccurred())
+					_, created := volumizer.CreateArgsForCall(0)
+					Expect(created.Limits.Disk.Scope).To(Equal(garden.DiskLimitScopeTotal))
 				})
 
 				DescribeTable("refuses the Docker image as before when the feature is off",

@@ -329,6 +329,14 @@ func (g *Gardener) Create(containerSpec garden.ContainerSpec) (ctr garden.Contai
 	if dockerGuest {
 		containerSpec.Image = garden.ImageRef{}
 		containerSpec.RootFSPath = g.VMDockerRootFS
+
+		// The tarball is the hypervisor's root, not the app's image, and it is
+		// far larger than a small Docker image, so a total-scope limit would
+		// charge it to the app's quota and refuse the volume. The exclusive
+		// scope counts only what the container writes on top of it. The guest
+		// root disk is sized from the same limit, so the app's own use stays
+		// bounded by it.
+		containerSpec.Limits.Disk.Scope = garden.DiskLimitScopeExclusive
 	}
 
 	// A VM backend runs its hypervisor inside the image's mount namespace, so
