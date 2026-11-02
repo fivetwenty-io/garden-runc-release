@@ -51,7 +51,9 @@ const (
 // "busybox guest: <reason>" on the console, which is the mode line of a
 // launch that settled on the busybox guest, unmounts what stage 1 mounted of
 // the images, and replaces the guest's stage 2 and environment with the
-// busybox guest's. A guest with a root disk then enters the overlay root on
+// busybox guest's, and installs the container's hosts file and hostname as the
+// busybox guest's /etc/hosts and /etc/hostname, which its stage 2 sets the
+// hostname from. A guest with a root disk then enters the overlay root on
 // the formatted disk as guestRootSetup does, and a guest without one runs
 // stage 2 on the initramfs. Either way the busybox guest's stage 2 gets the
 // volumes' devices, as it does from guestRootInit, and mounts the volumes
@@ -63,6 +65,7 @@ const guestFallbackFunc = `rvm_fallback() {
 	echo "busybox guest: $rvm_why" >/dev/console 2>/dev/null || echo "busybox guest: $rvm_why"
 	umount /rvm/droplet /rvm/stack 2>/dev/null
 	cp ` + guestFallbackInit + ` ` + guestStage2 + ` && cp ` + guestFallbackEnv + ` /rvm/env && . ` + guestFallbackPrep + ` || rvm_fail "installing the busybox guest's files failed"
+	cat ` + guestHosts + ` >/etc/hosts && cat ` + guestHostname + ` >/etc/hostname || rvm_fail "installing the container's /etc/hosts and /etc/hostname in the busybox guest failed"
 	if [ -n "$rvm_root" ]; then
 		mkdir -p /rvm/root && mount -t overlay -o lowerdir=/,upperdir=/rvm/disk/upper,workdir=/rvm/disk/work overlay /rvm/root || rvm_fail "mounting the overlay root of the busybox guest failed"
 		[ -x /rvm/root/bin/sh ] && [ -r /rvm/root` + guestStage2 + ` ] || rvm_fail "the overlay root of the busybox guest has no /bin/sh or ` + guestStage2 + `"
