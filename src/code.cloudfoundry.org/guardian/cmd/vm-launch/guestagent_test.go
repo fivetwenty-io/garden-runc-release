@@ -1014,6 +1014,62 @@ var _ = Describe("the guest agent's initramfs", func() {
 		Expect(string(byName[strings.TrimPrefix(guestFallbackInit, "/")].data)).To(Equal(fallback))
 	})
 
+	It("puts the lifecycle's shell beside the launcher in a stack guest that has it, and nothing there in one that does not", func() {
+		launcher, err := os.Open(writeTempFile("launcher", "#!/bin/sh\n"))
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = launcher.Close() })
+		shell, err := os.Open(writeTempFile("shell", "the lifecycle shell"))
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = shell.Close() })
+		guest := func(withShell bool) guestContents {
+			g := taskGuest("")
+			g.drives.stackID, g.drives.dropletID = qemuStackSerial, qemuDropletSerial
+			g.stack = &guestStack{
+				launcher: guestTool{name: "launcher", file: launcher, size: int64(len("#!/bin/sh\n"))},
+				argv:     shellJoin([]string{stackLauncherPath, "/home/vcap/app", "", ""}),
+				cwd:      "/home/vcap/app",
+				hostname: "stack-guest-0",
+				hosts:    []byte("127.0.0.1 localhost\n"),
+			}
+			if withShell {
+				g.stack.shell = guestTool{name: lifecycleShellName, file: shell, size: int64(len("the lifecycle shell"))}
+			}
+			g.agent = agentFiles(agentModeStack)
+			return g
+		}
+
+		names, byName := archive(guest(true))
+		Expect(names).To(ContainElement("rvm/lifecycle/shell"))
+		Expect(byName["rvm/lifecycle/shell"].mode).To(Equal(uint32(0o100755)))
+		Expect(string(byName["rvm/lifecycle/shell"].data)).To(Equal("the lifecycle shell"))
+		Expect(byName["rvm/lifecycle/launcher"].mode).To(Equal(uint32(0o100755)))
+
+		names, _ = archive(guest(false))
+		Expect(names).To(ContainElement("rvm/lifecycle/launcher"))
+		Expect(names).NotTo(ContainElement("rvm/lifecycle/shell"))
+	})
+
+	It("opens the lifecycle's shell beside the launcher, and goes without it, saying why only when it is there but unusable", func() {
+		dir := GinkgoT().TempDir()
+		launcher := filepath.Join(dir, "launcher")
+		Expect(os.WriteFile(launcher, []byte("#!/bin/sh\n"), 0o755)).To(Succeed())
+		logs := new(lockedBuffer)
+		logger := log.New(logs, "", 0)
+
+		Expect(openLifecycleShell(launcher, logger).file).To(BeNil())
+		Expect(logs.String()).To(BeEmpty())
+
+		Expect(os.WriteFile(filepath.Join(dir, lifecycleShellName), []byte("#!/bin/sh\n"), 0o644)).To(Succeed())
+		Expect(openLifecycleShell(launcher, logger).file).To(BeNil())
+		Expect(logs.String()).To(Equal("the guest has no lifecycle shell: guest tool shell at " + filepath.Join(dir, lifecycleShellName) + " is not executable\n"))
+
+		Expect(os.Chmod(filepath.Join(dir, lifecycleShellName), 0o755)).To(Succeed())
+		shell := openLifecycleShell(launcher, logger)
+		Expect(shell.file).NotTo(BeNil())
+		DeferCleanup(func() { _ = shell.file.Close() })
+		Expect(shell.size).To(Equal(int64(len("#!/bin/sh\n"))))
+	})
+
 	It("leaves a guest without the agent as it was", func() {
 		names, byName := archive(taskGuest("true"))
 		for _, name := range names {

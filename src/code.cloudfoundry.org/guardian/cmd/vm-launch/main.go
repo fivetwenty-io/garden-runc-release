@@ -911,10 +911,17 @@ func run(argv []string, logger *log.Logger) int {
 		stack.image = &guestImage{uid: imgUser.uid, gid: imgUser.gid}
 		stack.cwd = "/"
 	}
+	// A cf ssh session that the guest agent runs finds the lifecycle's shell
+	// in the guest, as one in a runC container does.
+	if stack != nil && cfg.guestAgent {
+		stack.shell = openLifecycleShell(cfg.args[0], logger)
+	}
 	closeLauncher := func() {
 		if stack != nil {
 			closeFile(stack.launcher.file, "the launcher", logger)
 			stack.launcher.file = nil
+			closeFile(stack.shell.file, "the lifecycle shell", logger)
+			stack.shell.file = nil
 		}
 	}
 	defer closeLauncher()
@@ -1779,6 +1786,32 @@ func newGuestStack(args []string) (*guestStack, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// openLifecycleShell opens the lifecycle's shell, which sits beside the
+// launcher, and checks it as a guest tool is. The shell is optional, since
+// the Docker lifecycle has none, so a launch whose shell is absent runs
+// without it, and so does one whose shell is unusable, which is logged.
+func openLifecycleShell(launcher string, logger *log.Logger) guestTool {
+	dir, err := filepath.Abs(filepath.Dir(launcher))
+	if err != nil {
+		logger.Printf("the guest has no lifecycle shell: resolving the launcher's directory: %v", err)
+		return guestTool{}
+	}
+	if _, err := os.Lstat(filepath.Join(dir, lifecycleShellName)); errors.Is(err, os.ErrNotExist) {
+		return guestTool{}
+	}
+	realDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		logger.Printf("the guest has no lifecycle shell: resolving the launcher's directory %s: %v", dir, err)
+		return guestTool{}
+	}
+	shell, err := openGuestTool(dir, realDir, lifecycleShellName)
+	if err != nil {
+		logger.Printf("the guest has no lifecycle shell: %s", strings.TrimSuffix(err.Error(), noGuestToolsHint))
+		return guestTool{}
+	}
+	return shell
 }
 
 // workDirStatfs is the statfs that sizes the guest root image from the

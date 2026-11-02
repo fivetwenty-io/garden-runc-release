@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log"
@@ -22,6 +23,37 @@ import (
 // realAgentAppPort is the port the agent guest's app listens on, which the
 // guest's network does not declare, so only the agent's forward reaches it.
 const realAgentAppPort = "9999"
+
+// realLifecycleShell stands in for the lifecycle's shell in the agent
+// guest. Like the real one, it enters the app directory, sources the
+// buildpack's profile scripts and then the app's, and runs the command it
+// is given, though with the stack's sh, because the test stack has no bash.
+const realLifecycleShell = `#!/bin/sh
+cd "${1:-$HOME/app}" || exit 1
+for f in ../profile.d/* .profile.d/*; do
+  if [ -f "$f" ]; then . "$f"; fi
+done
+exec sh -c "${2:-sh}"
+`
+
+// realAgentDroplet builds the agent guest's droplet image: the app's file
+// that the stack guest specs read, a buildpack profile script, and one of
+// the app's own.
+func realAgentDroplet(art string) *os.File {
+	home := filepath.Join(GinkgoT().TempDir(), "home")
+	for name, content := range map[string]string{
+		"app/from-the-droplet":   "droplet-file\n",
+		"profile.d/buildpack.sh": "export FROM_BUILDPACK_PROFILE=buildpack-profile\n",
+		"app/.profile.d/app.sh":  "export FROM_APP_PROFILE=app-profile\n",
+	} {
+		Expect(os.MkdirAll(filepath.Dir(filepath.Join(home, name)), 0o755)).To(Succeed())
+		Expect(os.WriteFile(filepath.Join(home, name), []byte(content), 0o644)).To(Succeed())
+	}
+	droplet, err := buildDropletImage(context.Background(), art, home, GinkgoT().TempDir())
+	Expect(err).NotTo(HaveOccurred())
+	DeferCleanup(droplet.file.Close)
+	return droplet.file
+}
 
 // realAgentApp is the launcher of the agent guest, a static program that
 // listens on realAgentAppPort on the guest's loopback. For each connection
@@ -92,6 +124,7 @@ type realAgentRun struct {
 	out        string
 	log        string
 	identity   realAgentShimRun
+	profile    realAgentShimRun
 	piped      realAgentShimRun
 	terminal   realAgentShimRun
 	forward    string
@@ -185,7 +218,10 @@ func superviseRealAgent() realAgentRun {
 	}
 	guestAgentBinary = buildRealAgentBinary()
 	DeferCleanup(func() { guestAgentBinary = "/proc/self/exe" })
-	sd := &stackDrives{stack: realStackImage(art), droplet: realDropletImage(art)}
+	sd := &stackDrives{stack: realStackImage(art), droplet: realAgentDroplet(art)}
+	shell, err := os.Open(writeTempFile("shell", realLifecycleShell))
+	Expect(err).NotTo(HaveOccurred())
+	DeferCleanup(shell.Close)
 
 	app := buildStaticGuestProgram("agentapp", realAgentApp)
 	appInfo, err := os.Stat(app)
@@ -213,6 +249,7 @@ func superviseRealAgent() realAgentRun {
 			cwd:      "/home/vcap",
 			hostname: "stack-guest-0",
 			hosts:    []byte("127.0.0.1 localhost\n"),
+			shell:    guestTool{name: lifecycleShellName, file: shell, size: int64(len(realLifecycleShell))},
 		}
 		g.drives, err = newGuestDrivesWithStack(backend.VMQemu, nil, nil, sd)
 		Expect(err).NotTo(HaveOccurred())
@@ -280,6 +317,7 @@ func superviseRealAgent() realAgentRun {
 			}
 			defer empty.Close()
 			run.identity = runRealAgentShim(socket, empty, []string{"-c", `id -u; id -g; cat /home/vcap/app/from-the-droplet; pwd; echo "$FROM_SHIM"`}, []string{"FROM_SHIM=from the shim", "PATH=/usr/bin:/bin"})
+			run.profile = runRealAgentShim(socket, empty, []string{"-c", `/tmp/lifecycle/shell /home/vcap/app 'echo "$FROM_BUILDPACK_PROFILE $FROM_APP_PROFILE"; pwd'`}, []string{"HOME=/home/vcap", "PATH=/usr/bin:/bin"})
 			piped, err := os.Open(writeTempFile("piped", "piped in\n"))
 			if err != nil {
 				run.piped.err = err
@@ -327,7 +365,7 @@ func superviseRealAgent() realAgentRun {
 }
 
 var _ = Describe("the guest agent against a real QEMU", func() {
-	It("runs cf ssh sessions through the guest agent in the stack guest as the app's user, forwards a port the guest does not declare, and refuses a wrong key", func() {
+	It("runs cf ssh sessions through the guest agent in the stack guest as the app's user, with the lifecycle's shell, forwards a port the guest does not declare, and refuses a wrong key", func() {
 		r := superviseRealAgent()
 		all := "out: " + r.out + "\nlog: " + r.log
 
@@ -339,6 +377,12 @@ var _ = Describe("the guest agent against a real QEMU", func() {
 		Expect(r.identity.err).NotTo(HaveOccurred(), all)
 		Expect(r.identity.exit).To(Equal(agentExit{Code: 0}), "%+v\n%s", r.identity, all)
 		Expect(r.identity.stdout).To(Equal("2000\n2000\ndroplet-file\n/home/vcap\nfrom the shim\n"), "%+v\n%s", r.identity, all)
+
+		// The lifecycle's shell is where Diego puts it, and it gives the
+		// command the buildpack's profile and the app's.
+		Expect(r.profile.err).NotTo(HaveOccurred(), all)
+		Expect(r.profile.exit).To(Equal(agentExit{Code: 0}), "%+v\n%s", r.profile, all)
+		Expect(r.profile.stdout).To(Equal("buildpack-profile app-profile\n/home/vcap/app\n"), "%+v\n%s", r.profile, all)
 
 		// Input reaches the process and its exit code comes back.
 		Expect(r.piped.err).NotTo(HaveOccurred(), all)

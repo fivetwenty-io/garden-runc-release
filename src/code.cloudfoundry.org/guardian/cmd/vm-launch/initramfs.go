@@ -1841,7 +1841,10 @@ type guestContents struct {
 // and the sidecars through the run section (see guestStack.initScript).
 // Without either, the archive is the stack guest's as it was before them.
 type guestStack struct {
-	launcher            guestTool
+	launcher guestTool
+	// shell is the lifecycle's shell, which the guest has beside the
+	// launcher, or a tool with no file for a guest without it.
+	shell               guestTool
 	argv, cwd, hostname string
 	hosts               []byte
 	// sidecars are the app's sidecars, which run beside the app in the app
@@ -1920,8 +1923,9 @@ func (s *guestStack) check() error {
 }
 
 // archiveSteps returns the archive steps that add the lifecycle directory,
-// the launcher, and the stack guest's command and host files, and then the
-// sidecars' files and the identity pair when the guest has them.
+// the launcher, the lifecycle's shell when the guest has it, and the stack
+// guest's command and host files, and then the sidecars' files and the
+// identity pair when the guest has them.
 func (s *guestStack) archiveSteps(cw *cpioWriter, file func(name string, perm uint32, content string) func() error) []func() error {
 	lifecycle := strings.TrimPrefix(guestLifecycle, "/")
 	steps := []func() error{
@@ -1929,11 +1933,18 @@ func (s *guestStack) archiveSteps(cw *cpioWriter, file func(name string, perm ui
 		func() error {
 			return cw.File(lifecycle+"/launcher", 0o755, s.launcher.size, io.NewSectionReader(s.launcher.file, 0, s.launcher.size))
 		},
+	}
+	if s.shell.file != nil {
+		steps = append(steps, func() error {
+			return cw.File(lifecycle+"/"+lifecycleShellName, 0o755, s.shell.size, io.NewSectionReader(s.shell.file, 0, s.shell.size))
+		})
+	}
+	steps = append(steps,
 		file(strings.TrimPrefix(guestArgv, "/"), 0o644, s.argv),
 		file(strings.TrimPrefix(guestCwd, "/"), 0o644, s.cwd),
 		file(strings.TrimPrefix(guestHosts, "/"), 0o644, string(s.hosts)),
 		file(strings.TrimPrefix(guestHostname, "/"), 0o644, s.hostname+"\n"),
-	}
+	)
 	steps = append(steps, s.guestSidecarSteps(cw, file)...)
 	steps = append(steps, s.guestIdentitySteps(cw, file)...)
 	return append(steps, s.systemCerts.stackSteps(cw)...)
