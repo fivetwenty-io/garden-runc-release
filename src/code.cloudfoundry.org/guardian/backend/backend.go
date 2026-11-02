@@ -35,6 +35,22 @@ const ImageAnnotationKey = "garden.vm-image"
 // DockerImage is the value of ImageAnnotationKey for a Docker image guest.
 const DockerImage = "docker"
 
+// MemoryReserveAnnotationKey is the bundle annotation that marks a VM
+// container whose memory limit Garden raised by the hypervisor's reserve, so
+// that its guest has the whole limit the app asked for. Its value is the
+// reserve in MiB, which is 0 when the container had no limit to raise. The
+// annotation lives as long as the container's bundle, so a container keeps
+// the guest it was created for when the operator changes the option and
+// Garden restarts.
+const MemoryReserveAnnotationKey = "garden.vm-memory-reserve-mib"
+
+// FullMemoryLimitFromBundle reports whether the bundle records that its
+// container's guest has the whole memory limit.
+func FullMemoryLimitFromBundle(bndl goci.Bndl) bool {
+	_, ok := bndl.Spec.Annotations[MemoryReserveAnnotationKey]
+	return ok
+}
+
 // dockerScheme is the URI scheme Diego gives a Docker image.
 const dockerScheme = "docker"
 

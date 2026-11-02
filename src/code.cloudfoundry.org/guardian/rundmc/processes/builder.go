@@ -91,7 +91,7 @@ const (
 	// whole MEMORY_LIMIT, because Garden has raised the container's own
 	// memory limit by the hypervisor's reserve. vm-launch defaults to the
 	// limit less the reserve, so VMLaunchMemoryFlags passes the flag only
-	// when the operator turned the option on.
+	// for a container whose bundle records the raise.
 	VMLaunchFullMemoryLimitFlag = "--full-memory-limit"
 
 	// portEnvPrefix starts the environment entry that names the port of a
@@ -237,10 +237,14 @@ func VMLaunchCPUFlags(maxVCPUs uint) []string {
 }
 
 // VMLaunchMemoryFlags returns the vm-launch flag that gives the guest the
-// whole MEMORY_LIMIT, or none for the default of false, so that vm-launch gets
-// the arguments it gets today.
-func VMLaunchMemoryFlags(fullMemoryLimit bool) []string {
-	if !fullMemoryLimit {
+// whole MEMORY_LIMIT when the container's bundle records that Garden raised
+// the container's memory limit by the reserve (see
+// backend.MemoryReserveAnnotationKey), or none otherwise, so that vm-launch
+// gets the arguments it gets today. It reads the bundle and not Garden's
+// configuration, so a container keeps the guest it was created for after the
+// operator changes the option.
+func VMLaunchMemoryFlags(bndl goci.Bndl) []string {
+	if !backend.FullMemoryLimitFromBundle(bndl) {
 		return nil
 	}
 	return []string{VMLaunchFullMemoryLimitFlag}
@@ -339,6 +343,7 @@ func (p *ProcBuilder) BuildProcess(bndl goci.Bndl, spec garden.ProcessSpec, user
 	}
 	if wrapped {
 		args = append(args, p.vmLaunchFlags...)
+		args = append(args, VMLaunchMemoryFlags(bndl)...)
 	}
 	args = append(args, spec.Args...)
 

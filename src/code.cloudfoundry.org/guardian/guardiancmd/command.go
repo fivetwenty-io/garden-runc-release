@@ -691,7 +691,7 @@ func (cmd *CommonCommand) wireContainerizer(
 	if backends.dispatch() {
 		executionBackendRule := bundlerules.NewExecutionBackend(cmd.ExecutionBackends.VMArtifactsDir, cmd.ExecutionBackends.VMLaunchBin, backends.kvmGid)
 		executionBackendRule.BlockVolumes = backends.blockVolumes
-		executionBackendRule.FullMemoryLimit = cmd.ExecutionBackends.VMFullMemoryLimit
+		executionBackendRule.FullMemoryLimit = backends.fullMemoryLimit
 		bundleRules = append(bundleRules, executionBackendRule)
 	}
 
@@ -880,6 +880,11 @@ type executionBackends struct {
 	// vm-* container gets. They are empty unless a vm-* backend is enabled and
 	// the operator turned on shares or turned on asynchronous image mounts.
 	vmLaunchFlags []string
+
+	// fullMemoryLimit makes the execution backend rule raise the memory limit
+	// of every vm-* container by the hypervisor's reserve. It is false unless
+	// --vm-full-memory-limit is set and a vm-* backend is enabled.
+	fullMemoryLimit bool
 
 	// blockReleaser releases the devices that an earlier run with block
 	// volumes on left claimed, when blockVolumes is nil. It is nil when no
@@ -1098,7 +1103,7 @@ func (cmd *CommonCommand) wireExecutionBackends(log lager.Logger) (*executionBac
 
 	log.Info("enabled", lager.Data{"backends": kinds, "kvm-gid": kvmGid, "block-volumes": blockVolumes != nil, "vm-launch-flags": vmLaunchFlags, "vm-stacks": vmStacks != nil, "vm-docker-images": vmDockerRootFS != ""})
 
-	return &executionBackends{registry: registry, kvmGid: kvmGid, blockVolumes: blockVolumes, vmLaunchFlags: vmLaunchFlags, vmStacks: vmStacks, vmDockerRootFS: vmDockerRootFS}, nil
+	return &executionBackends{registry: registry, kvmGid: kvmGid, blockVolumes: blockVolumes, vmLaunchFlags: vmLaunchFlags, fullMemoryLimit: kvmGid != 0 && cmd.ExecutionBackends.VMFullMemoryLimit, vmStacks: vmStacks, vmDockerRootFS: vmDockerRootFS}, nil
 }
 
 // checkVMDockerFlags refuses Docker image flags that cannot work: a tarball
@@ -1200,8 +1205,7 @@ func (cmd *CommonCommand) logUnusedBlockVolumes(log lager.Logger) {
 func (cmd *CommonCommand) vmLaunchVolumeFlags() []string {
 	flags := processes.VMLaunchVolumeFlags(cmd.ExecutionBackends.VMVolumeShares, bundlerules.VMVirtiofsdPath, !cmd.ExecutionBackends.VMVolumeAsyncMounts)
 	flags = append(flags, processes.VMLaunchQEMUSandboxFlags(cmd.ExecutionBackends.VMQemuSandbox)...)
-	flags = append(flags, processes.VMLaunchCPUFlags(cmd.ExecutionBackends.VMMaxVCPUs)...)
-	return append(flags, processes.VMLaunchMemoryFlags(cmd.ExecutionBackends.VMFullMemoryLimit)...)
+	return append(flags, processes.VMLaunchCPUFlags(cmd.ExecutionBackends.VMMaxVCPUs)...)
 }
 
 // logUnusedVolumeFlags notes that --vm-volume-shares,

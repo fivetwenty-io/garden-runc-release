@@ -1338,6 +1338,7 @@ var _ = Describe("the volume flags of the wrapped vm-launch", func() {
 		marked        bool
 		builderOpts   []processes.Option
 		builtEnv      []string
+		reserve       string
 	)
 
 	launcherArgs := []string{"--backend", "vm-qemu", "--", "/tmp/lifecycle/launcher", "app", "true", ""}
@@ -1345,6 +1346,7 @@ var _ = Describe("the volume flags of the wrapped vm-launch", func() {
 	BeforeEach(func() {
 		envDeterminer = new(fakes.FakeEnvDeterminer)
 		builtEnv = []string{"A=b"}
+		reserve = ""
 		bndl = goci.Bundle().WithCapabilities("CAP_CHOWN", "CAP_KILL")
 		kind = backend.VMQemu
 		marked = true
@@ -1357,6 +1359,9 @@ var _ = Describe("the volume flags of the wrapped vm-launch", func() {
 		GinkgoHelper()
 		envDeterminer.EnvForReturns(builtEnv)
 		bndl.Spec.Annotations = map[string]string{backend.AnnotationKey: string(kind)}
+		if reserve != "" {
+			bndl.Spec.Annotations[backend.MemoryReserveAnnotationKey] = reserve
+		}
 		spec := processSpec
 		if marked {
 			spec = processes.MarkVMLaunch(spec)
@@ -1418,16 +1423,49 @@ var _ = Describe("the volume flags of the wrapped vm-launch", func() {
 	})
 
 	Describe("VMLaunchMemoryFlags", func() {
-		DescribeTable("renders the flags for each setting",
-			func(full bool, expected []string) {
-				Expect(processes.VMLaunchMemoryFlags(full)).To(Equal(expected))
-			},
-			Entry("the default passes nothing", false, []string(nil)),
-			Entry("the full limit passes the flag", true, []string{"--full-memory-limit"}),
-		)
+		bundleWith := func(annotations map[string]string) goci.Bndl {
+			b := goci.Bundle()
+			b.Spec.Annotations = annotations
+			return b
+		}
+
+		It("passes nothing for a bundle that records no reserve", func() {
+			Expect(processes.VMLaunchMemoryFlags(bundleWith(nil))).To(BeNil())
+			Expect(processes.VMLaunchMemoryFlags(bundleWith(map[string]string{backend.AnnotationKey: "vm-qemu"}))).To(BeNil())
+		})
+
+		It("passes the flag for a bundle that records one, even a reserve of 0", func() {
+			for _, value := range []string{"130", "0"} {
+				annotations := map[string]string{backend.MemoryReserveAnnotationKey: value}
+				Expect(processes.VMLaunchMemoryFlags(bundleWith(annotations))).To(Equal([]string{"--full-memory-limit"}))
+			}
+		})
 
 		It("names the flag vm-launch reads", func() {
 			Expect(processes.VMLaunchFullMemoryLimitFlag).To(Equal("--full-memory-limit"))
+		})
+	})
+
+	Context("with a container whose bundle records a memory reserve", func() {
+		BeforeEach(func() {
+			reserve = "130"
+			builderOpts = append(builderOpts, processes.WithVMLaunchFlags(processes.VMLaunchVolumeFlags(false, virtiofsdPath, false)...))
+		})
+
+		It("puts the flag after the operator's flags and before vm-launch's own arguments", func() {
+			Expect(build().Args).To(Equal(append(
+				[]string{processes.VMLaunchPath, "--volume-sync-mounts=false", "--full-memory-limit"},
+				launcherArgs...)))
+		})
+
+		It("adds nothing to a vm-launch run without the containerizer's marker", func() {
+			marked = false
+			Expect(build().Args).To(Equal(append([]string{processes.VMLaunchPath}, launcherArgs...)))
+		})
+
+		It("adds nothing to a process other than vm-launch", func() {
+			processSpec = garden.ProcessSpec{Path: "/bin/ls", Args: []string{"-l"}}
+			Expect(build().Args).To(Equal([]string{"/bin/ls", "-l"}))
 		})
 	})
 

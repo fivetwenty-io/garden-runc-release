@@ -137,6 +137,9 @@ func (r ExecutionBackend) Apply(bndl goci.Bndl, spec spec.DesiredContainerSpec) 
 		return goci.Bndl{}, fmt.Errorf("%w: %q", backend.ErrUnknownBackend, spec.ExecutionBackend)
 	}
 
+	// reserveMiB is the reserve that a VM container's memory limit was raised
+	// by, or -1 when the guest does not have the whole limit.
+	reserveMiB := -1
 	if backend.IsVM(kind) {
 		if bndl.Spec.Process == nil {
 			return goci.Bndl{}, fmt.Errorf("%w: %s needs a bundle process to confine", backend.ErrBackendUnavailable, kind)
@@ -165,7 +168,7 @@ func (r ExecutionBackend) Apply(bndl goci.Bndl, spec spec.DesiredContainerSpec) 
 		}
 		bndl = withDeviceNodes(bndl, nodes...)
 		if r.FullMemoryLimit {
-			bndl = withMemoryReserve(bndl, kind)
+			bndl, reserveMiB = withMemoryReserve(bndl, kind)
 		}
 		mounts := []specs.Mount{
 			{
@@ -219,6 +222,9 @@ func (r ExecutionBackend) Apply(bndl goci.Bndl, spec spec.DesiredContainerSpec) 
 		annotations[k] = v
 	}
 	annotations[backend.AnnotationKey] = string(kind)
+	if reserveMiB >= 0 {
+		annotations[backend.MemoryReserveAnnotationKey] = strconv.Itoa(reserveMiB)
+	}
 	if backend.IsVM(kind) && spec.VMImageDir != "" {
 		annotations[backend.ImageAnnotationKey] = backend.DockerImage
 	}
@@ -318,29 +324,28 @@ func withDeviceNodes(bndl goci.Bndl, nodes ...deviceNode) goci.Bndl {
 
 // withMemoryReserve adds the hypervisor's reserve for kind to the bundle's
 // memory limit, and to its memory and swap limit when it has one, so that the
-// two stay as far apart as they were. A bundle with no limit, or a limit that
-// is zero or the largest the kernel takes, is unlimited and stays as it is.
-func withMemoryReserve(bndl goci.Bndl, kind backend.Kind) goci.Bndl {
+// two stay as far apart as they were. It returns the reserve in MiB. A bundle
+// with no limit, or a limit that is zero or so large that the reserve would
+// overflow it, is unlimited and stays as it is, with a reserve of 0.
+func withMemoryReserve(bndl goci.Bndl, kind backend.Kind) (goci.Bndl, int) {
 	resources := bndl.Resources()
 	if resources == nil || resources.Memory == nil || resources.Memory.Limit == nil {
-		return bndl
+		return bndl, 0
 	}
 	memory := *resources.Memory
 	limit := *memory.Limit
-	if limit <= 0 || limit >= math.MaxInt64-reserveHeadroomBytes {
-		return bndl
+	reserveMiB := backend.MemoryReserveMiB(kind, int(limit>>20))
+	reserve := int64(reserveMiB) << 20
+	if limit <= 0 || reserve > math.MaxInt64-limit {
+		return bndl, 0
 	}
-	reserve := int64(backend.MemoryReserveMiB(kind, int(limit>>20))) << 20
 	raised := limit + reserve
 	memory.Limit = &raised
-	if memory.Swap != nil && *memory.Swap > 0 && *memory.Swap < math.MaxInt64-reserveHeadroomBytes {
+	// The limit and the swap limit may be one pointer, as the limits rule sets
+	// them, so the raised swap is a new value and never a write through it.
+	if memory.Swap != nil && *memory.Swap > 0 && reserve <= math.MaxInt64-*memory.Swap {
 		swap := *memory.Swap + reserve
 		memory.Swap = &swap
 	}
-	return bndl.WithMemoryLimit(memory)
+	return bndl.WithMemoryLimit(memory), reserveMiB
 }
-
-// reserveHeadroomBytes keeps withMemoryReserve from overflowing: a limit
-// within this many bytes of the largest int64 is treated as no limit. It is
-// far above any reserve.
-const reserveHeadroomBytes = 1 << 40

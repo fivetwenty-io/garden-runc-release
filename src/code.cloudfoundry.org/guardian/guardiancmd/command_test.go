@@ -646,6 +646,29 @@ var _ = Describe("execution backend flags", func() {
 				}))
 			})
 
+			It("passes no vm-launch flag for the full memory limit, which the container's bundle carries, and turns the rule's raise on", func() {
+				Expect(cmd.ExecutionBackends.VMFullMemoryLimit).To(BeFalse())
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.fullMemoryLimit).To(BeFalse())
+
+				cmd.ExecutionBackends.VMFullMemoryLimit = true
+				backends, err = cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.fullMemoryLimit).To(BeTrue())
+				Expect(backends.vmLaunchFlags).To(BeEmpty())
+			})
+
+			It("leaves the full memory limit off when the vm-* backends were dropped for want of a kvm gid", func() {
+				cmd.ExecutionBackends.VMFullMemoryLimit = true
+				lookupKVMGroup = func(name string) (*user.Group, error) { return nil, user.UnknownGroupError(name) }
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.fullMemoryLimit).To(BeFalse())
+				Expect(log).To(gbytes.Say("full-memory-limit-unused-without-a-vm-backend"))
+			})
+
 			It("passes nothing when the vm-* backends were dropped for want of a kvm gid", func() {
 				cmd.ExecutionBackends.VMVolumeShares = true
 				lookupKVMGroup = func(name string) (*user.Group, error) { return nil, user.UnknownGroupError(name) }

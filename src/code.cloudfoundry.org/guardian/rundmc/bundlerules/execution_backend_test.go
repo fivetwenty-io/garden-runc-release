@@ -539,14 +539,18 @@ var _ = Describe("the memory reserve of a vm-* container", func() {
 		limits       specs.LinuxMemory
 	)
 
-	apply := func(kind backend.Kind) specs.LinuxMemory {
+	applied := func(kind backend.Kind) goci.Bndl {
 		bndl := goci.Bundle().
 			WithMounts(specs.Mount{Destination: "/proc", Source: "proc", Type: "proc"}).
 			WithCapabilities("CAP_CHOWN").
 			WithMemoryLimit(limits)
 		newBndl, err := rule.Apply(bndl, spec.DesiredContainerSpec{ExecutionBackend: string(kind)})
 		Expect(err).NotTo(HaveOccurred())
-		return *newBndl.Resources().Memory
+		return newBndl
+	}
+
+	apply := func(kind backend.Kind) specs.LinuxMemory {
+		return *applied(kind).Resources().Memory
 	}
 
 	BeforeEach(func() {
@@ -568,6 +572,7 @@ var _ = Describe("the memory reserve of a vm-* container", func() {
 			memory := apply(kind)
 			Expect(*memory.Limit).To(Equal(1024 * mib))
 			Expect(*memory.Swap).To(Equal(1024 * mib))
+			Expect(applied(kind).Spec.Annotations).NotTo(HaveKey(backend.MemoryReserveAnnotationKey))
 		}
 	})
 
@@ -605,6 +610,46 @@ var _ = Describe("the memory reserve of a vm-* container", func() {
 				limits = specs.LinuxMemory{Limit: &unlimited}
 				Expect(*apply(backend.VMQemu).Limit).To(Equal(unlimited))
 			}
+		})
+
+		It("records the reserve in the bundle, so that the container keeps its guest across a restart", func() {
+			Expect(applied(backend.VMQemu).Spec.Annotations).To(HaveKeyWithValue(backend.MemoryReserveAnnotationKey, "130"))
+			Expect(applied(backend.VMFirecracker).Spec.Annotations).To(HaveKeyWithValue(backend.MemoryReserveAnnotationKey, "98"))
+			Expect(backend.FullMemoryLimitFromBundle(applied(backend.VMQemu))).To(BeTrue())
+		})
+
+		It("records a reserve of 0 for a container with no limit to raise", func() {
+			unlimited := int64(0)
+			limits = specs.LinuxMemory{Limit: &unlimited}
+			Expect(applied(backend.VMQemu).Spec.Annotations).To(HaveKeyWithValue(backend.MemoryReserveAnnotationKey, "0"))
+		})
+
+		It("raises the limit and the swap when they are one pointer, as the limits rule sets them", func() {
+			shared := 1024 * mib
+			limits = specs.LinuxMemory{Limit: &shared, Swap: &shared}
+			memory := apply(backend.VMQemu)
+			Expect(*memory.Limit).To(Equal(1024*mib + 130*mib))
+			Expect(*memory.Swap).To(Equal(1024*mib + 130*mib))
+			Expect(shared).To(Equal(1024 * mib))
+		})
+
+		It("leaves a limit alone when the reserve would overflow it, and a swap likewise", func() {
+			nearMax := int64(math.MaxInt64) - 10*mib
+			small := 1024 * mib
+			limits = specs.LinuxMemory{Limit: &nearMax}
+			Expect(*apply(backend.VMQemu).Limit).To(Equal(nearMax))
+			limits = specs.LinuxMemory{Limit: &small, Swap: &nearMax}
+			memory := apply(backend.VMQemu)
+			Expect(*memory.Limit).To(Equal(1024*mib + 130*mib))
+			Expect(*memory.Swap).To(Equal(nearMax))
+		})
+
+		It("leaves a gVisor bundle exactly as it is without the option", func() {
+			withOption := applied(backend.OCIGvisor)
+			rule.FullMemoryLimit = false
+			Expect(applied(backend.OCIGvisor)).To(Equal(withOption))
+			Expect(*withOption.Resources().Memory.Limit).To(Equal(1024 * mib))
+			Expect(withOption.Spec.Annotations).NotTo(HaveKey(backend.MemoryReserveAnnotationKey))
 		})
 
 		It("leaves a bundle with no memory limit as it is", func() {
