@@ -20,6 +20,7 @@ var _ = Describe("the vsock denial of the processes in a vm-* container", func()
 		kind          backend.Kind
 		processSpec   garden.ProcessSpec
 		marked        bool
+		denial        string
 		builderOpts   []processes.Option
 	)
 
@@ -36,18 +37,23 @@ var _ = Describe("the vsock denial of the processes in a vm-* container", func()
 		envDeterminer = new(fakes.FakeEnvDeterminer)
 		envDeterminer.EnvForReturns([]string{"PATH=/usr/bin:/bin"})
 		// The container that the execution backend rule lets create vsock
-		// sockets: a vm-qemu container with the guest agent.
+		// sockets, a vm-qemu container with the guest agent, which it
+		// annotates.
 		profile = allowList()
 		kind = backend.VMQemu
 		marked = false
+		denial = seccompvsock.AnnotationWrapper
 		processSpec = garden.ProcessSpec{Path: "/tmp/lifecycle/diego-sshd", Args: []string{"--address=0.0.0.0:2222"}}
-		builderOpts = []processes.Option{processes.WithKVMGid(108), processes.WithVsockDenial()}
+		builderOpts = []processes.Option{processes.WithKVMGid(108)}
 	})
 
 	build := func() *specs.Process {
 		GinkgoHelper()
 		bndl := goci.Bundle().WithCapabilities("CAP_CHOWN").WithSeccomp(profile)
 		bndl.Spec.Annotations = map[string]string{backend.AnnotationKey: string(kind)}
+		if denial != "" {
+			bndl.Spec.Annotations[seccompvsock.AnnotationKey] = denial
+		}
 		spec := processSpec
 		if marked {
 			spec = processes.MarkVMLaunch(spec)
@@ -58,9 +64,11 @@ var _ = Describe("the vsock denial of the processes in a vm-* container", func()
 	It("names the command and the flag vm-launch reads", func() {
 		Expect(processes.VMLaunchDenyVsockCommand).To(Equal("deny-vsock"))
 		Expect(processes.VMLaunchDenyChildVsockFlag).To(Equal("--deny-child-vsock"))
+		Expect(seccompvsock.AnnotationKey).To(Equal("garden.vsock-denial"))
+		Expect(seccompvsock.AnnotationWrapper).To(Equal("wrapper"))
 	})
 
-	Context("in a container whose profile lets it create vsock sockets", func() {
+	Context("in a container annotated as one whose profile lets it create vsock sockets", func() {
 		It("runs every process but the wrapped vm-launch through vm-launch's deny-vsock, which execs it under a filter", func() {
 			Expect(build().Args).To(Equal([]string{processes.VMLaunchPath, "deny-vsock", "--", "/tmp/lifecycle/diego-sshd", "--address=0.0.0.0:2222"}))
 		})
@@ -95,9 +103,10 @@ var _ = Describe("the vsock denial of the processes in a vm-* container", func()
 		})
 	})
 
-	Context("in a container whose profile denies vsock already", func() {
+	Context("in a container annotated as one whose profile denies vsock", func() {
 		BeforeEach(func() {
 			profile = seccompvsock.Deny(allowList())
+			denial = seccompvsock.AnnotationProfile
 		})
 
 		It("runs a process as it is", func() {
@@ -118,9 +127,14 @@ var _ = Describe("the vsock denial of the processes in a vm-* container", func()
 		Expect(build().Args).To(Equal([]string{"/tmp/lifecycle/diego-sshd", "--address=0.0.0.0:2222"}))
 	})
 
-	Context("without the option, as when the denial is off", func() {
+	It("goes by the annotation and not by the profile, so that a container keeps what it was created with", func() {
+		profile = seccompvsock.Deny(allowList())
+		Expect(build().Args).To(Equal([]string{processes.VMLaunchPath, "deny-vsock", "--", "/tmp/lifecycle/diego-sshd", "--address=0.0.0.0:2222"}))
+	})
+
+	Context("in a container without the annotation, as one created while the denial was off", func() {
 		BeforeEach(func() {
-			builderOpts = []processes.Option{processes.WithKVMGid(108)}
+			denial = ""
 		})
 
 		It("builds the argv it built before for every process", func() {

@@ -10,7 +10,7 @@ import (
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
-var _ = Describe("containerSeccomp", func() {
+var _ = Describe("Garden's seccomp profiles", func() {
 	// unprivilegedGolden is the profile that buildSeccomp made before the
 	// vsock denial existed, as JSON, on a kernel new enough to allow
 	// ptrace.
@@ -25,35 +25,32 @@ var _ = Describe("containerSeccomp", func() {
 		return string(b) + "\n"
 	}
 
-	It("leaves every profile as it was, byte for byte, when the denial is off", func() {
-		unprivileged, privileged, err := containerSeccomp(false)
+	It("builds the unprivileged profile as it was, byte for byte, which denies nothing", func() {
+		unprivileged, err := buildSeccomp()
 		Expect(err).NotTo(HaveOccurred())
 
 		Expect(marshal(unprivileged)).To(Equal(unprivilegedGolden()))
-		Expect(privileged).To(BeNil())
 		Expect(seccompvsock.Denies(unprivileged)).To(BeFalse())
 	})
 
-	It("denies socket(2) for AF_VSOCK to unprivileged and privileged containers when the denial is on", func() {
-		unprivileged, privileged, err := containerSeccomp(true)
+	It("denies vsock in the unprivileged profile by changing nothing but the socket(2) rule and the architectures", func() {
+		unprivileged, err := buildSeccomp()
 		Expect(err).NotTo(HaveOccurred())
+		denied := seccompvsock.Deny(unprivileged)
+		Expect(seccompvsock.Denies(denied)).To(BeTrue())
+		Expect(denied.Architectures).To(Equal([]specs.Arch{specs.ArchX86_64}))
 
-		Expect(seccompvsock.Denies(unprivileged)).To(BeTrue())
-		Expect(seccompvsock.Denies(privileged)).To(BeTrue())
-		Expect(privileged).To(Equal(seccompvsock.Deny(nil)))
-	})
-
-	It("changes nothing in the unprivileged profile but the socket(2) rule", func() {
-		unprivileged, _, err := containerSeccomp(true)
-		Expect(err).NotTo(HaveOccurred())
-
-		Expect(marshal(seccompvsock.Allow(unprivileged))).To(Equal(unprivilegedGolden()))
+		allowed := seccompvsock.Allow(denied)
+		Expect(seccompvsock.Denies(allowed)).To(BeFalse())
+		allowed.Architectures = unprivileged.Architectures
+		Expect(marshal(allowed)).To(Equal(unprivilegedGolden()))
 		var socketRules int
-		for _, rule := range unprivileged.Syscalls {
+		for _, rule := range denied.Syscalls {
 			if len(rule.Names) == 1 && rule.Names[0] == "socket" {
 				socketRules++
 				Expect(rule.Args).To(HaveLen(1))
 			}
+			Expect(rule.Names).NotTo(ContainElement(HavePrefix("io_uring")))
 		}
 		Expect(socketRules).To(Equal(32))
 	})

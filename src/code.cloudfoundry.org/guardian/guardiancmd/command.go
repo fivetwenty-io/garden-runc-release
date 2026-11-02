@@ -43,7 +43,6 @@ import (
 	containerdprivchecker "code.cloudfoundry.org/guardian/rundmc/runcontainerd/privchecker"
 	"code.cloudfoundry.org/guardian/rundmc/runrunc"
 	"code.cloudfoundry.org/guardian/rundmc/runrunc/pid"
-	"code.cloudfoundry.org/guardian/rundmc/seccompvsock"
 	"code.cloudfoundry.org/guardian/rundmc/stopper"
 	"code.cloudfoundry.org/guardian/rundmc/users"
 	"code.cloudfoundry.org/guardian/sysinfo"
@@ -130,7 +129,7 @@ type CommonCommand struct {
 		DestroyContainersOnStartup bool          `long:"destroy-containers-on-startup" description:"Clean up all the existing containers on startup."`
 		ApparmorProfile            string        `long:"apparmor" description:"Apparmor profile to use for unprivileged container processes"`
 		NoNewPrivileges            bool          `long:"no-new-privileges" description:"Set NoNewPrivileges on unprivileged container processes"`
-		DenyVsock                  bool          `long:"deny-vsock" description:"Deny socket(AF_VSOCK) to every container process through the seccomp profile, privileged containers included, which then get a profile that denies only that call. The one exception is the wrapped vm-launch of a vm-qemu container with the guest agent, which relays cf ssh sessions to its guest over vsock, and Garden starts every other process of that container, and every child of that vm-launch, under a filter that denies the call. --vm-guest-agent needs it, and is refused without it. Off by default, which leaves every profile as it was."`
+		DenyVsock                  bool          `long:"deny-vsock" description:"Deny vsock sockets to every container process through the seccomp profile, privileged containers included, which then get a profile that denies only what this takes. The profile makes socket(AF_VSOCK) and the io_uring calls fail, and it leaves out 32-bit x86 and x32, so 32-bit programs cannot run in containers while this is on. The one exception is the wrapped vm-launch of a vm-qemu container with the guest agent, which relays cf ssh sessions to its guest over vsock. Garden starts every other process of that container, its init process included, and every child of that vm-launch, under a filter that denies the same calls. A command that is missing from that container then fails with exit status 127 once its process has started, where it used to fail to start, and a bare command name that only a relative PATH entry finds is refused, as runc refuses it. --vm-guest-agent needs this flag, and Garden refuses it without it. Garden also gives no container the guest agent while a container created without the denial still runs, and it keeps the denial for the rest of its run when it starts without this flag and finds a container that serves the guest agent. gVisor containers ignore the profile, so Garden counts them as open and gives no container the guest agent while one runs. Off by default, which leaves every profile as it was."`
 	} `group:"Container Lifecycle"`
 
 	Bin struct {
@@ -625,7 +624,7 @@ func (cmd *CommonCommand) wireContainerizer(
 		WithMounts(unprivilegedMounts...).
 		WithMaskedPaths(defaultMaskedPaths())
 
-	seccomp, privilegedSeccomp, err := containerSeccomp(cmd.Containers.DenyVsock)
+	seccomp, err := buildSeccomp()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -648,9 +647,6 @@ func (cmd *CommonCommand) wireContainerizer(
 			[]specs.LinuxDeviceCgroup{{Allow: false, Access: "rwm"}},
 			cmd.applyDeviceCgroupRules(allowedDevices)...,
 		))
-	if privilegedSeccomp != nil {
-		privilegedBundle = privilegedBundle.WithSeccomp(privilegedSeccomp)
-	}
 
 	log.Debug("base-bundles", lager.Data{
 		"privileged":   privilegedBundle,
@@ -694,6 +690,11 @@ func (cmd *CommonCommand) wireContainerizer(
 
 	bundleRules = append(bundleRules, cmd.wireKernelParams()...)
 
+	// Before the execution backend rule, which gives vsock back to a vm-qemu
+	// container that serves the guest agent.
+	vsockGate := newVsockGate(log, cmd.Containers.DenyVsock, cmd.runscCell())
+	bundleRules = append(bundleRules, bundlerules.VsockDenial{Deny: vsockGate.Deny})
+
 	// Registered last so that no earlier rule can undo its device and mount
 	// additions, and only when a backend other than oci-runc is enabled so
 	// that a cell without backend flags builds the same bundles as before.
@@ -703,7 +704,7 @@ func (cmd *CommonCommand) wireContainerizer(
 		executionBackendRule.FullMemoryLimit = backends.fullMemoryLimit
 		executionBackendRule.GuestAgent = backends.guestAgent
 		executionBackendRule.HostVhostVsock = backends.vhostVsock
-		executionBackendRule.DenyVsock = cmd.Containers.DenyVsock
+		executionBackendRule.VsockException = vsockGate.Exception
 		bundleRules = append(bundleRules, executionBackendRule)
 	}
 
@@ -722,9 +723,6 @@ func (cmd *CommonCommand) wireContainerizer(
 	}
 	if cmd.runscCell() {
 		processBuilderOpts = append(processBuilderOpts, processes.WithConfinedRootDir())
-	}
-	if cmd.Containers.DenyVsock {
-		processBuilderOpts = append(processBuilderOpts, processes.WithVsockDenial())
 	}
 	processBuilder := processes.NewBuilder(wireEnvFunc(), nonRootMaxCaps, processBuilderOpts...)
 
@@ -870,6 +868,8 @@ func (cmd *CommonCommand) wireContainerizer(
 	} else {
 		streamer = rundmc.NewNstarStreamer(ociRuntime, nstar)
 	}
+
+	vsockGate.watch(ociRuntime)
 
 	containerizerOpts = append(containerizerOpts, backends.containerizerOptions(ociRuntime)...)
 	containerizerOpts = append(containerizerOpts, rundmc.WithVMCgroupState(runcRoot))
@@ -1268,21 +1268,6 @@ func (cmd *CommonCommand) guestAgentAllowed(log lager.Logger) bool {
 		return false
 	}
 	return true
-}
-
-// containerSeccomp returns the seccomp profiles of unprivileged and of
-// privileged containers. Without denyVsock they are Garden's allow-list
-// profile and none, as they always were. With it, both deny socket(2) for
-// AF_VSOCK (see seccompvsock.Deny).
-func containerSeccomp(denyVsock bool) (unprivileged, privileged *specs.LinuxSeccomp, err error) {
-	unprivileged, err = buildSeccomp()
-	if err != nil {
-		return nil, nil, err
-	}
-	if !denyVsock {
-		return unprivileged, nil, nil
-	}
-	return seccompvsock.Deny(unprivileged), seccompvsock.Deny(nil), nil
 }
 
 // vmLaunchVolumeFlags returns the volume, QEMU sandbox, CPU, mount mirroring,

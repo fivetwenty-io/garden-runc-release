@@ -521,6 +521,14 @@ var _ = Describe("PeaCreator", func() {
 					Expect(runningBundleProcess().NoNewPrivileges).To(BeTrue())
 				})
 
+				// The execution backend rule gives vsock back only to a
+				// bundle whose spec names vm-qemu, so a pea of a sandbox
+				// that serves the guest agent stays denied.
+				It("generates the pea's bundle from a spec that names no execution backend", func() {
+					Expect(bundleGenerator.GenerateCallCount()).To(Equal(1))
+					Expect(bundleGenerator.GenerateArgsForCall(0).ExecutionBackend).To(BeEmpty())
+				})
+
 				It("does not change the process the builder returned", func() {
 					Expect(builtProcess.NoNewPrivileges).To(BeFalse())
 					Expect(builtProcess.Capabilities.Bounding).To(Equal(allCaps))

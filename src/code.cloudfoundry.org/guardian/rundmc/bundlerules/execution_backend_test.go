@@ -275,19 +275,31 @@ var _ = Describe("ExecutionBackendRule", func() {
 				Expect(inputBndl).To(Equal(pristine))
 			})
 
-			When("vsock is denied", func() {
+			When("VsockDenial denied the container vsock", func() {
 				var denied *specs.LinuxSeccomp
 
 				BeforeEach(func() {
-					rule.DenyVsock = true
 					denied = seccompvsock.Deny(allowListSeccomp())
 					inputBndl = inputBndl.WithSeccomp(denied)
+					inputBndl.Spec.Process.Args = []string{"/tmp/garden-init"}
+					inputBndl.Spec.Annotations[seccompvsock.AnnotationKey] = seccompvsock.AnnotationProfile
 					pristine = pristine.WithSeccomp(seccompvsock.Deny(allowListSeccomp()))
+					pristine.Spec.Process.Args = []string{"/tmp/garden-init"}
+					pristine.Spec.Annotations[seccompvsock.AnnotationKey] = seccompvsock.AnnotationProfile
 				})
 
 				It("lets the container create vsock sockets, so that the wrapped vm-launch can reach the agent", func() {
 					Expect(seccompvsock.Denies(newBndl.Seccomp())).To(BeFalse())
 					Expect(newBndl.Seccomp()).To(Equal(seccompvsock.Allow(denied)))
+				})
+
+				It("records that the container's other processes run under vm-launch's vsock filter", func() {
+					Expect(newBndl.Spec.Annotations).To(HaveKeyWithValue(seccompvsock.AnnotationKey, seccompvsock.AnnotationWrapper))
+					Expect(newBndl.Spec.Annotations).To(HaveKeyWithValue("existing", "annotation"))
+				})
+
+				It("starts the init process under vm-launch's vsock filter", func() {
+					Expect(newBndl.Process().Args).To(Equal([]string{"/opt/garden-vm/vm-launch", "deny-vsock", "--", "/tmp/garden-init"}))
 				})
 
 				It("does not modify the input bundle or its profile", func() {
@@ -300,10 +312,21 @@ var _ = Describe("ExecutionBackendRule", func() {
 						inputBndl = inputBndl.WithSeccomp(seccompvsock.Deny(nil))
 					})
 
-					It("gives the container no profile, as it would have without the denial", func() {
-						Expect(newBndl.Seccomp()).To(BeNil())
+					It("gives the container a profile that still refuses the io_uring calls and leaves out 32-bit programs", func() {
+						Expect(newBndl.Seccomp()).To(Equal(seccompvsock.Allow(seccompvsock.Deny(nil))))
+						Expect(newBndl.Seccomp().Architectures).To(Equal([]specs.Arch{specs.ArchX86_64}))
 					})
 				})
+
+				itKeepsTheDenial := func() {
+					GinkgoHelper()
+					Expect(newBndl.Seccomp()).To(Equal(denied))
+					Expect(newBndl.Spec.Annotations).To(HaveKeyWithValue(seccompvsock.AnnotationKey, seccompvsock.AnnotationProfile))
+					Expect(newBndl.Process().Args).To(Equal([]string{"/tmp/garden-init"}))
+					for _, device := range newBndl.Devices() {
+						Expect(device.Path).NotTo(Equal("/dev/vhost-vsock"))
+					}
+				}
 
 				When("the host has no /dev/vhost-vsock", func() {
 					BeforeEach(func() {
@@ -311,7 +334,35 @@ var _ = Describe("ExecutionBackendRule", func() {
 					})
 
 					It("keeps the denial, because no process of the container can reach an agent", func() {
-						Expect(newBndl.Seccomp()).To(Equal(denied))
+						itKeepsTheDenial()
+					})
+				})
+
+				When("gdn makes no exception now, because a container that can create vsock sockets still runs", func() {
+					var asked int
+
+					BeforeEach(func() {
+						asked = 0
+						rule.VsockException = func() bool {
+							asked++
+							return false
+						}
+					})
+
+					It("keeps the denial and adds no /dev/vhost-vsock", func() {
+						itKeepsTheDenial()
+						Expect(asked).To(Equal(1))
+					})
+				})
+
+				When("gdn makes the exception", func() {
+					BeforeEach(func() {
+						rule.VsockException = func() bool { return true }
+					})
+
+					It("gives the container vsock and /dev/vhost-vsock", func() {
+						Expect(newBndl.Spec.Annotations).To(HaveKeyWithValue(seccompvsock.AnnotationKey, seccompvsock.AnnotationWrapper))
+						Expect(newBndl.Devices()[2].Path).To(Equal("/dev/vhost-vsock"))
 					})
 				})
 			})
@@ -550,12 +601,17 @@ var _ = Describe("ExecutionBackendRule", func() {
 				rule.HostVhostVsock = true
 			})
 
-			It("keeps the vsock denial, because only a vm-qemu guest's agent is reached over vsock", func() {
+			It("keeps the vsock denial and never asks for the exception, because only a vm-qemu guest's agent is reached over vsock", func() {
 				denied := seccompvsock.Deny(allowListSeccomp())
-				rule.DenyVsock = true
+				rule.VsockException = func() bool {
+					Fail("asked for the vsock exception")
+					return true
+				}
+				inputBndl.Spec.Annotations[seccompvsock.AnnotationKey] = seccompvsock.AnnotationProfile
 				newBndl, applyErr = rule.Apply(inputBndl.WithSeccomp(denied), desiredSpec)
 				Expect(applyErr).NotTo(HaveOccurred())
 				Expect(newBndl.Seccomp()).To(Equal(denied))
+				Expect(newBndl.Spec.Annotations).To(HaveKeyWithValue(seccompvsock.AnnotationKey, seccompvsock.AnnotationProfile))
 			})
 
 			It("binds vm-launch read-only over /bin/bash but adds no /dev/vhost-vsock node or rule", func() {
