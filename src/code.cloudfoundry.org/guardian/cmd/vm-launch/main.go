@@ -725,8 +725,8 @@ func run(argv []string, logger *log.Logger) int {
 		return exitLaunchError
 	}
 	// The guest runs the app on its stack only when the process is the CF
-	// launcher, Garden bound a usable stack image, the app has no volume,
-	// and the droplet image builds. Each condition is settled as soon as
+	// launcher, Garden bound a usable stack image, every volume the app has
+	// is a private disk image, and the droplet image builds. Each condition is settled as soon as
 	// run can tell, and the first that fails gives the busybox guest, which
 	// is then exactly the guest of a launch without a stack image. guestMode
 	// is the line that names the guest and why, which run logs once the
@@ -814,12 +814,10 @@ func run(argv []string, logger *log.Logger) int {
 		return exitLaunchError
 	}
 	defer tools.Close()
-	if stackImg != nil && len(vols) > 0 && !stackModeAllowsVolumes {
-		has := "a volume"
-		if len(vols) > 1 {
-			has = fmt.Sprintf("%d volumes", len(vols))
-		}
-		if !toBusybox("the app has " + has + ", which the stack guest does not mount yet") {
+	// The stack guest mounts private disk images only, so a share or a BOSH
+	// disk keeps the busybox guest, with the first such volume named.
+	if stackImg != nil && len(selected) > 0 {
+		if ok, why := stackModeAllowsVolumes(selected); !ok && !toBusybox(why) {
 			return exitLaunchError
 		}
 	}
@@ -1627,7 +1625,7 @@ func newGuestStack(args []string) (*guestStack, error) {
 		return nil, errors.New(strings.TrimSuffix(err.Error(), noGuestToolsHint))
 	}
 	s := &guestStack{launcher: launcher, argv: argv, cwd: cwd, hostname: hostname, hosts: hosts}
-	if err := s.check(0); err != nil {
+	if err := s.check(); err != nil {
 		launcher.file.Close()
 		return nil, err
 	}

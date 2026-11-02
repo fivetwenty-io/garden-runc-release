@@ -494,10 +494,13 @@ var _ = Describe("the initramfs of a guest with a stack", func() {
 			change(&g)
 			Expect(write(g)).To(MatchError(want))
 		},
-		Entry("a volume", func(g *guestContents) {
-			g.vols = []guestVolume{{ContainerDir: "/home/vcap/data", ImageName: "rvm-disk-0.img"}}
-			g.drives.volumes = qemuImageDrives(defaultImageSize)
-		}, "a guest with a stack mounts no volumes, and this one has 1"),
+		Entry("a share", func(g *guestContents) {
+			g.vols = []guestVolume{{ContainerDir: "/home/vcap/data", Settings: volumeSettings{Mode: volumeShare}}}
+		}, `a guest with a stack mounts only private disk images, and volume 0 at "/home/vcap/data" is a share`),
+		Entry("a block volume after an image", func(g *guestContents) {
+			g.vols = []guestVolume{{ContainerDir: "/home/vcap/data", ImageName: "rvm-disk-0.img"}, {ContainerDir: "/home/vcap/disk"}}
+			g.drives.volumes = append(qemuImageDrives(defaultImageSize), guestDrive{id: qemuVolumeSerial(1), kind: driveBlock, bytes: defaultImageSize})
+		}, `a guest with a stack mounts only private disk images, and volume 1 at "/home/vcap/disk" is on a block drive`),
 		Entry("no launcher", func(g *guestContents) { g.stack.launcher = guestTool{} },
 			"a guest with a stack needs the launcher, and it has none"),
 		Entry("an empty launcher", func(g *guestContents) { g.stack.launcher.size = 0 },

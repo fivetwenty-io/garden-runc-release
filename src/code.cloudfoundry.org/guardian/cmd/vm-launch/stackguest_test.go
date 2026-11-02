@@ -352,8 +352,4 @@ var _ = Describe("stage 1 of the stack guest", func() {
 	It("formats the root disk with the very lines the rvm.6 guest uses", func() {
 		Expect(guestRootSetup).To(ContainSubstring(guestRootFormat))
 	})
-
-	It("keeps volume apps on the busybox guest", func() {
-		Expect(stackModeAllowsVolumes).To(BeFalse())
-	})
 })

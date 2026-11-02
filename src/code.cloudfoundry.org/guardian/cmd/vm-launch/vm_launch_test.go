@@ -1563,7 +1563,10 @@ var _ = Describe("run with a stack image", func() {
 		Expect(heldFilesEndingIn("/launcher")).To(BeZero())
 	})
 
-	It("keeps today's guest for an app with a volume", func() {
+	// withImageVolume gives the app one JuiceFS volume, a private disk
+	// image, at a directory of dir, and returns the directory.
+	withImageVolume := func() string {
+		GinkgoHelper()
 		volDir := filepath.Join(dir, "volume")
 		infoDir := filepath.Join(dir, "info")
 		Expect(os.Mkdir(volDir, 0o755)).To(Succeed())
@@ -1576,17 +1579,61 @@ var _ = Describe("run with a stack image", func() {
 		GinkgoT().Setenv("CF_INSTANCE_INDEX", "2")
 		GinkgoT().Setenv("VCAP_APPLICATION", vcapApp)
 		GinkgoT().Setenv("VCAP_SERVICES", vcapWith(map[string][]string{"juicefs": {mountJSON(volDir, "rw")}}))
-		img := filepath.Join(volDir, "rvm-disk-"+testAppID+"-web-2.img")
+		return volDir
+	}
 
+	It("boots the stack guest for an app with a private disk image, which stage 2 mounts, binds into the app root, and formats for vcap", func() {
+		volDir := withImageVolume()
 		initrd, argv := guestOf([]string{launcher, "app", "true", ""})
-		Expect(logBuf.String()).To(ContainSubstring("busybox guest: the app has a volume, which the stack guest does not mount yet\n"))
-		Expect(argv).NotTo(ContainSubstring("rvm-stack"))
+		Expect(logBuf.String()).To(ContainSubstring("stack guest: "))
+		Expect(logBuf.String()).NotTo(ContainSubstring("busybox guest:"))
+		Expect(argv).To(ContainSubstring("serial=" + qemuStackSerial))
+		Expect(argv).To(ContainSubstring("serial=" + qemuVolumeSerial(0)))
+		_, byName := archiveEntries(initrd)
+		Expect(string(byName["init"].data)).To(Equal(guestStackInit))
+		stage2 := string(byName["rvm/init"].data)
+		Expect(stage2).To(ContainSubstring(guestStackVolumeSetup + guestStackVolumeBinds))
+		Expect(stage2).To(ContainSubstring(guestStackVolumeTeardown))
+		Expect(string(byName["rvm/mounts"].data)).To(ContainSubstring("RVM_VOL0_KIND=image\nRVM_VOL0_PATH=" + shellQuote(volDir) + "\n"))
+		Expect(string(byName["rvm/disks"].data)).To(ContainSubstring("RVM_VOL0_KIND=image\nRVM_VOL0_ID=" + qemuVolumeSerial(0) + "\n"))
+		// The busybox guest that stage 1 falls back to mounts the volume
+		// too, and formats it for root, as it always has.
+		fallback := string(byName[strings.TrimPrefix(guestFallbackInit, "/")].data)
+		Expect(fallback).To(Equal(initScript(testNonce, true)))
 		Expect(heldFilesEndingIn("rootfs.squashfs")).To(BeZero())
-		// Each launch starts from no image, so both create it alike.
-		Expect(os.Remove(img)).To(Succeed())
-		wantInitrd, wantArgv := todaysGuestOf([]string{launcher, "app", "true", ""})
-		Expect(initrd).To(Equal(wantInitrd))
-		Expect(argv).To(Equal(wantArgv))
+	})
+
+	It("boots the stack guest on Firecracker for an app with a private disk image, with the volume's drive before the stack and the droplet", func() {
+		withImageVolume()
+		letFirecrackerSeeVMLaunch()
+		fcCopy := filepath.Join(art, "fc-copy.json")
+		initrdCopy := filepath.Join(art, "initrd-copy")
+		writeFakeHypervisor(filepath.Join(art, "firecracker/firecracker"),
+			`p=; for a in "$@"; do [ "$p" = --config-file ] && cp "$a" `+shellQuote(fcCopy)+`; p=$a; done
+cp "$initrd" `+shellQuote(initrdCopy)+` || exit 1
+`)
+		Expect(runWith(backend.VMFirecracker, []string{launcher, "app", "true", ""})).To(Equal(0), logBuf.String())
+		Expect(logBuf.String()).To(ContainSubstring("stack guest: "))
+		Expect(logBuf.String()).NotTo(ContainSubstring("busybox guest:"))
+
+		raw, err := os.ReadFile(fcCopy)
+		Expect(err).NotTo(HaveOccurred())
+		var cfg struct {
+			Drives []firecrackerDrive `json:"drives"`
+		}
+		Expect(json.Unmarshal(raw, &cfg)).To(Succeed())
+		var ids []string
+		for _, d := range cfg.Drives {
+			ids = append(ids, d.DriveID)
+		}
+		Expect(ids).To(Equal([]string{volumeDriveID(0), stackDriveID, dropletDriveID}))
+		Expect(cfg.Drives[0].IsReadOnly).To(BeFalse())
+
+		initrd, err := os.ReadFile(initrdCopy)
+		Expect(err).NotTo(HaveOccurred())
+		_, byName := archiveEntries(initrd)
+		Expect(string(byName["init"].data)).To(Equal(guestStackInit))
+		Expect(string(byName["rvm/init"].data)).To(ContainSubstring(guestStackVolumeBinds))
 	})
 
 	It("refuses an empty start command after the line that says why when the guest is the busybox guest", func() {
