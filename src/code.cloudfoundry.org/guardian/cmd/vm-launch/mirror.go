@@ -69,14 +69,15 @@ var mirrorDeniedFSTypes = map[string]bool{
 // gets them, and it reads the same for one mount and for several.
 type mirrorDenial struct {
 	dirs     []string
+	files    []string
 	prefixes []string
 	why      string
 }
 
 // mirrorDenials are the paths whose mounts the guest never gets. They are the
-// guest's own proc, sysfs, and devices, the programs, libraries, and loader
-// that the guest's root runs in the app root before it drops to the app's
-// user (see guestStackSetpriv), the paths of Garden and vm-launch, and
+// guest's own proc, sysfs, and devices, the programs, libraries, loader, and
+// user databases that the guest's root reads in the app root before it drops
+// to the app's user (see guestStackSetpriv), the paths of Garden and vm-launch, and
 // Garden's Envoy configuration, whose copy of the instance identity key
 // reaches the guest on a path of its own.
 var mirrorDenials = []mirrorDenial{
@@ -85,9 +86,12 @@ var mirrorDenials = []mirrorDenial{
 		why:  "the guest has its own /proc, /sys, and /dev, and a mount at, below, or above them would show it the host's",
 	},
 	{
-		dirs:     []string{"/bin", "/sbin", "/usr", "/lib", "/lib32", "/lib64", "/libx32"},
+		dirs: []string{"/bin", "/sbin", "/usr", "/lib", "/lib32", "/lib64", "/libx32"},
+		// setpriv looks up the app user's groups as root, so the C library
+		// reads these files with root's rights.
+		files:    []string{"/etc/passwd", "/etc/group", "/etc/nsswitch.conf"},
 		prefixes: []string{"/etc/ld.so."},
-		why:      "the guest's root runs the programs, libraries, and loader in /bin, /sbin, /usr, the library directories, and /etc/ld.so.* in the app root before it drops to the app's user, so the guest never gets a mount at, below, or above them",
+		why:      "the guest's root runs the programs, libraries, and loader in /bin, /sbin, /usr, the library directories, and /etc/ld.so.*, and reads /etc/passwd, /etc/group, and /etc/nsswitch.conf, in the app root before it drops to the app's user, so the guest never gets a mount at, below, or above them",
 	},
 	{
 		dirs:     []string{"/rvm", "/opt/garden-vm"},
@@ -229,6 +233,11 @@ func mirrorDenialOf(p, fsType string) string {
 				return d.why
 			}
 		}
+		for _, file := range d.files {
+			if p == file || underDir(file, p) {
+				return d.why
+			}
+		}
 		for _, prefix := range d.prefixes {
 			if strings.HasPrefix(p, prefix) || underDir(path.Dir(prefix), p) {
 				return d.why
@@ -348,6 +357,7 @@ func readMountMirror(mountinfo string, dedicated []string, logger *log.Logger) (
 		total += mm.bytes
 		m.mounts = append(m.mounts, mm)
 	}
+	m.mounts = placeMirrorPoints(m.mounts, logger)
 	logMirrorDenied(denied, reasons, logger)
 	if len(left) > 0 {
 		logger.Printf("leaving %d of the container's mounts out of the guest's mirrored mounts, because they reach the guest on a path of their own: %s", len(left), joinLoggedNames(left))
@@ -359,6 +369,68 @@ func readMountMirror(mountinfo string, dedicated []string, logger *log.Logger) (
 	m.number()
 	logger.Print(m.summary())
 	return m, nil
+}
+
+// placeMirrorPoints makes sure that each mirrored mount below another
+// mirrored tree has its place in that tree's copy, of its own kind, because
+// the guest binds that tree read-only before it binds the mount below it and
+// can create nothing in it then. The walk leaves the place out when it could
+// not open or read the entry, so this adds it when its parent is in the copy,
+// and otherwise holds the mount back with one line. mounts are in path order,
+// so the tree comes before the mounts below it.
+func placeMirrorPoints(mounts []mirrorMount, logger *log.Logger) []mirrorMount {
+	kept := mounts[:0]
+	for _, mm := range mounts {
+		var tree *mirrorMount
+		for i := range kept {
+			if kept[i].dir && kept[i].path != mm.path && underDir(mm.path, kept[i].path) {
+				tree = &kept[i]
+			}
+		}
+		if tree == nil || placeMirrorPoint(tree, mm) {
+			kept = append(kept, mm)
+			continue
+		}
+		logger.Printf("not mirroring the mount at %s into the guest, because vm-launch could not read its place in the mirrored mount at %s", quoteForLog(mm.path), quoteForLog(tree.path))
+	}
+	return kept
+}
+
+// placeMirrorPoint gives inner its place in the copy of tree, and reports
+// whether it could.
+func placeMirrorPoint(tree *mirrorMount, inner mirrorMount) bool {
+	rel := strings.TrimPrefix(inner.path, tree.path+"/")
+	kind := mirrorFile
+	if inner.dir {
+		kind = mirrorDir
+	}
+	parent := path.Dir(rel)
+	if parent == "." {
+		parent = ""
+	}
+	parentFound := false
+	for j := range tree.entries {
+		e := &tree.entries[j]
+		if e.rel == rel {
+			if !e.place {
+				return false
+			}
+			e.kind = kind
+			return true
+		}
+		if e.rel == parent && e.kind == mirrorDir && !e.place {
+			parentFound = true
+		}
+	}
+	if !parentFound {
+		return false
+	}
+	perm := uint32(0o644)
+	if inner.dir {
+		perm = 0o755
+	}
+	tree.entries = append(tree.entries, mirrorEntry{rel: rel, kind: kind, perm: perm, place: true})
+	return true
 }
 
 // readMountTable returns the records of the mount table at mountinfo, one
@@ -530,11 +602,26 @@ func (w *mirrorWalk) add(e mirrorEntry) error {
 }
 
 // dir reads the directory open as dir, at rel below the mount's root, in
-// name order.
+// name order. It reads the names in batches and stops with errMirrorTooLarge
+// once the directory holds more names than a whole tree may, so a huge
+// directory never sits in memory.
 func (w *mirrorWalk) dir(dir *os.File, rel string) error {
-	names, err := dir.Readdirnames(-1)
-	if err != nil {
-		return fmt.Errorf("reading the directory %s in it: %w", quoteForLog(path.Join(".", rel)), err)
+	var names []string
+	for {
+		batch, err := dir.Readdirnames(mirrorTreeMaxEntries + 1)
+		names = append(names, batch...)
+		if len(names) > mirrorTreeMaxEntries {
+			return errMirrorTooLarge
+		}
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("reading the directory %s in it: %w", quoteForLog(path.Join(".", rel)), err)
+		}
+		if len(batch) == 0 {
+			break
+		}
 	}
 	sort.Strings(names)
 	dirFD := int(dir.Fd())
@@ -647,7 +734,7 @@ func readlinkAt(dirFD int, name string) (string, error) {
 func (m *mountMirror) number() {
 	for i := range m.mounts {
 		mm := &m.mounts[i]
-		stage := guestMirrorStage + "/" + fmt.Sprint(i+1)
+		stage := mirrorStage(i)
 		for j := range mm.entries {
 			e := &mm.entries[j]
 			if e.kind != mirrorFile || len(e.data) > mirrorWatchMaxBytes || len(m.watched) == mirrorWatchMaxFiles {

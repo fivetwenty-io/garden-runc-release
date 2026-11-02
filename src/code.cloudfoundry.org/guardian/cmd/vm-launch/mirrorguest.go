@@ -89,7 +89,7 @@ func (c *cpioWriter) ownedFile(name string, perm, uid, gid uint32, data []byte) 
 	return c.pad(int64(len(data)))
 }
 
-// stage returns the initramfs path of mount i, counted from 0.
+// mirrorStage returns the initramfs path of mount i, counted from 0.
 func mirrorStage(i int) string { return guestMirrorStage + "/" + strconv.Itoa(i+1) }
 
 // stackSteps are the initramfs entries of the mirrored mounts: each mount's
@@ -204,7 +204,9 @@ func shellEscapeDQ(s string) string {
 // file numbers match the begin line, the line count matches, the decoded
 // size and digest match, and the mode is octal. A file mount is rewritten in
 // place, which is what a running container sees of a bound file that the
-// host rewrites, and a file in a tree is renamed over the old one from the
+// host rewrites. It takes only the bits that the old and new modes share
+// while it is rewritten, so a reader the new mode shuts out never sees the
+// new bytes. A file in a tree is renamed over the old one from the
 // scratch directory, which is on the same filesystem, so a reader in the
 // app never sees half of it. The answer is the OK line or the bad line,
 // with the end line's own sequence number. A frame that a new begin line
@@ -235,7 +237,11 @@ func (m *mountMirror) guestFileReader(nonce string) string {
 		rvm_got=$(stat -c %s ` + next + `/file) && [ "$rvm_got" = "$rvm_fsize" ] || return 1
 		rvm_got=$(sha256sum <` + next + `/file) && [ "${rvm_got%% *}" = "$rvm_fsum" ] || return 1
 		if [ -n "$rvm_fi" ]; then
-			cat ` + next + `/file >"$rvm_ft" && chmod "$rvm_fmode" "$rvm_ft"
+			rvm_got=$(stat -c %a "$rvm_ft") || return 1
+			case "$rvm_got" in
+			'' | *[!0-7]*) return 1 ;;
+			esac
+			chmod "$(printf '%o' $((0$rvm_got & 0$rvm_fmode)))" "$rvm_ft" && cat ` + next + `/file >"$rvm_ft" && chmod "$rvm_fmode" "$rvm_ft"
 		else
 			chown "$rvm_fo" ` + next + `/file && chmod "$rvm_fmode" ` + next + `/file && mv -f ` + next + `/file "$rvm_ft"
 		fi

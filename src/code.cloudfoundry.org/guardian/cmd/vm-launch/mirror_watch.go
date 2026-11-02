@@ -152,8 +152,8 @@ func (w *mirrorWatcher) applyAck() {
 }
 
 // mirrorPermUnknown is the perm of a watched file whose content in the guest
-// vm-launch no longer knows, because it gave up on a push of it that the
-// guest may have installed. No file's permission bits equal it, so the next
+// vm-launch no longer knows, because it gave up on a push of it, or replaced
+// one, that the guest may have installed. No file's permission bits equal it, so the next
 // change to the file is pushed whatever its content.
 const mirrorPermUnknown = ^uint32(0)
 
@@ -168,8 +168,11 @@ func (w *mirrorWatcher) tick() {
 	}
 	if p := w.pending; p != nil {
 		if want, ok := w.want[p.file.number]; ok && (!bytes.Equal(want.data, p.data) || want.perm != p.perm) {
-			// A newer change replaces the push in flight.
+			// A newer change replaces the push in flight. The guest may still
+			// install the push it replaces, so vm-launch no longer knows what
+			// the guest holds, and the next change is pushed whatever it is.
 			w.pending = nil
+			p.file.perm = mirrorPermUnknown
 		} else if p.failed || w.now().Sub(p.sentAt) >= w.ackTimeout {
 			if p.attempts > credMaxResends {
 				w.pending = nil

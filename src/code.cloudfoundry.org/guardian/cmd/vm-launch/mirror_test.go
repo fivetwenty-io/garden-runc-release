@@ -156,6 +156,66 @@ var _ = Describe("mirrored mounts", func() {
 			Expect(logBuf.String()).To(ContainSubstring("mirroring none of the container's mounts into the guest"))
 		})
 
+		It("holds back a directory with more names than a mirrored tree holds, even when none of them would be mirrored", func() {
+			// FIFOs are left out of the copy, so only the count of names in
+			// the directory can hold this mount back.
+			Expect(os.MkdirAll(filepath.Join(dir, "crowded"), 0o755)).To(Succeed())
+			for i := 0; i <= mirrorTreeMaxEntries; i++ {
+				Expect(unix.Mkfifo(filepath.Join(dir, "crowded", fmt.Sprintf("p%d", i)), 0o600)).To(Succeed())
+			}
+			table := writeMountTable(dir, mountInfoLine(5, dir+"/crowded", "ro", "ext4"))
+			m, err := readMountMirror(table, nil, logger)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(m).To(BeNil())
+			Expect(logBuf.String()).To(ContainSubstring("not mirroring the mount at " + quoteForLog(dir+"/crowded") + " into the guest, because it is over"))
+		})
+
+		It("mirrors a directory of special files below the limit, leaving the special files out", func() {
+			Expect(os.MkdirAll(filepath.Join(dir, "pipes"), 0o755)).To(Succeed())
+			for i := 0; i < mirrorTreeMaxEntries; i++ {
+				Expect(unix.Mkfifo(filepath.Join(dir, "pipes", fmt.Sprintf("p%d", i)), 0o600)).To(Succeed())
+			}
+			table := writeMountTable(dir, mountInfoLine(5, dir+"/pipes", "ro", "ext4"))
+			m, err := readMountMirror(table, nil, logger)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(m.mounts).To(HaveLen(1))
+			Expect(m.mounts[0].entries).To(HaveLen(1), "only the mount's root is copied")
+		})
+
+		It("gives each mount below a mirrored tree its place there, of its kind, even when the walk could not read it", func() {
+			tree := mirrorMount{path: "/srv", dir: true, entries: []mirrorEntry{
+				{kind: mirrorDir, perm: 0o755},
+				{rel: "sub", kind: mirrorDir, perm: 0o755},
+				{rel: "read", kind: mirrorDir, perm: 0o700, place: true},
+				{rel: "denied", kind: mirrorDir, perm: 0o755, place: true},
+			}}
+			mounts := placeMirrorPoints([]mirrorMount{
+				tree,
+				{path: "/srv/denied/deep", dir: true, entries: []mirrorEntry{{kind: mirrorDir, perm: 0o755}}},
+				{path: "/srv/file", entries: []mirrorEntry{{kind: mirrorFile, perm: 0o600, data: []byte("f")}}},
+				{path: "/srv/read", entries: []mirrorEntry{{kind: mirrorFile, perm: 0o600, data: []byte("r")}}},
+				{path: "/srv/sub/dir", dir: true, entries: []mirrorEntry{{kind: mirrorDir, perm: 0o755}}},
+				{path: "/srv/unread/deep", entries: []mirrorEntry{{kind: mirrorFile, perm: 0o600, data: []byte("u")}}},
+			}, logger)
+
+			var paths []string
+			for _, mm := range mounts {
+				paths = append(paths, mm.path)
+			}
+			Expect(paths).To(Equal([]string{"/srv", "/srv/file", "/srv/read", "/srv/sub/dir"}))
+			Expect(mounts[0].entries).To(Equal([]mirrorEntry{
+				{kind: mirrorDir, perm: 0o755},
+				{rel: "sub", kind: mirrorDir, perm: 0o755},
+				{rel: "read", kind: mirrorFile, perm: 0o700, place: true},
+				{rel: "denied", kind: mirrorDir, perm: 0o755, place: true},
+				{rel: "file", kind: mirrorFile, perm: 0o644, place: true},
+				{rel: "sub/dir", kind: mirrorDir, perm: 0o755, place: true},
+			}), "a place takes the kind of the mount that fills it, and a missing place is added below a parent in the copy")
+			Expect(logBuf.String()).To(Equal(
+				`not mirroring the mount at "/srv/denied/deep" into the guest, because vm-launch could not read its place in the mirrored mount at "/srv"` + "\n" +
+					`not mirroring the mount at "/srv/unread/deep" into the guest, because vm-launch could not read its place in the mirrored mount at "/srv"` + "\n"))
+		})
+
 		It("refuses a mount point that is reached through a symbolic link", func() {
 			write("real/a", "a", 0o644)
 			Expect(os.Symlink(filepath.Join(dir, "real"), filepath.Join(dir, "link"))).To(Succeed())
@@ -218,7 +278,7 @@ var _ = Describe("mirrored mounts", func() {
 			Expect(m).To(BeNil())
 			lines := strings.Split(strings.TrimSuffix(logBuf.String(), "\n"), "\n")
 			Expect(lines).To(Equal([]string{
-				`not mirroring the 3 mounts at "/etc", "/lib64", "/usr/bin/setpriv" into the guest, because the guest's root runs the programs, libraries, and loader in /bin, /sbin, /usr, the library directories, and /etc/ld.so.* in the app root before it drops to the app's user, so the guest never gets a mount at, below, or above them`,
+				`not mirroring the 3 mounts at "/etc", "/lib64", "/usr/bin/setpriv" into the guest, because the guest's root runs the programs, libraries, and loader in /bin, /sbin, /usr, the library directories, and /etc/ld.so.*, and reads /etc/passwd, /etc/group, and /etc/nsswitch.conf, in the app root before it drops to the app's user, so the guest never gets a mount at, below, or above them`,
 				`not mirroring the mount at "/etc/cf-assets" into the guest, because Diego's Envoy configuration in /etc/cf-assets holds a copy of the instance identity key, which reaches the guest on a path of its own, so the guest never gets a mount at, below, or above it`,
 				`not mirroring the 2 mounts at "/proc/kcore", "/proc/keys" into the guest, because the guest has its own /proc, /sys, and /dev, and a mount at, below, or above them would show it the host's`,
 				`not mirroring the mount at "/tmp" into the guest, because the guest never gets a mount at, below, or above the paths of Garden and vm-launch, which are /rvm, /opt/garden-vm, and /tmp/garden-*`,
@@ -280,6 +340,9 @@ var _ = Describe("mirrored mounts", func() {
 		Entry("the loader's preload list", "/etc/ld.so.preload"),
 		Entry("the loader's cache", "/etc/ld.so.cache"),
 		Entry("a file the loader's configuration includes", "/etc/ld.so.conf.d/x.conf"),
+		Entry("the user database that setpriv reads as root", "/etc/passwd"),
+		Entry("the group database that setpriv reads as root", "/etc/group"),
+		Entry("the name service switch that setpriv reads as root", "/etc/nsswitch.conf"),
 		Entry("Diego's assets", "/etc/cf-assets/envoy_config/envoy.yaml"),
 		Entry("/etc, which holds the loader's files", "/etc"),
 		Entry("/tmp, which holds Garden's files", "/tmp"),
@@ -295,6 +358,9 @@ var _ = Describe("mirrored mounts", func() {
 		Entry("a directory that only starts like /lib", "/library"),
 		Entry("a directory in /tmp that is not Garden's", "/tmp/app-data"),
 		Entry("a directory in /opt that is not vm-launch's", "/opt/app"),
+		Entry("a file that only starts like the user database", "/etc/passwd-"),
+		Entry("a directory that only starts like the group database", "/etc/group.d"),
+		Entry("a file that only starts like the name service switch", "/etc/nsswitch.conf.bak"),
 	)
 
 	Describe("the guest's side", func() {
@@ -490,6 +556,7 @@ var _ = Describe("mirrored mounts", func() {
 			}}
 			reader := strings.NewReplacer(guestMirrorNext, next, " >/dev/console", "").Replace(m.guestFileReader(testNonce))
 			script := "rvm_echo=\n" + reader
+			script += `cat() { stat -c %a "$rvm_ft" >>` + shellQuote(filepath.Join(dir, "modes")) + `; command cat "$@"; }` + "\n"
 			tag := fileTag(testNonce)
 			for _, l := range lines {
 				script += "rvm_file " + shellQuote(strings.TrimPrefix(l, tag)) + "\n"
@@ -519,6 +586,19 @@ var _ = Describe("mirrored mounts", func() {
 			entries, err := os.ReadDir(next)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(entries).To(BeEmpty())
+		})
+
+		It("rewrites a file mount with only the bits its old and new modes share, then gives it the new mode", func() {
+			// The shell function stands in for cat and records the file's
+			// mode while the new bytes go in.
+			modes := filepath.Join(dir, "modes")
+			out := feed(mirrorFrames(testNonce, 1, 1, []byte("narrower\n"), 0o620)...)
+			Expect(out).To(Equal(fileOKTag(testNonce) + "1\n"))
+			Expect(os.ReadFile(modes)).To(Equal([]byte("600\n")), "0644 and 0620 share 0600")
+			after, err := os.Stat(filepath.Join(stage, "file"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(after.Mode().Perm()).To(Equal(os.FileMode(0o620)))
+			Expect(os.ReadFile(filepath.Join(stage, "file"))).To(Equal([]byte("narrower\n")))
 		})
 
 		It("refuses a push whose digest, count, or file number is wrong, and keeps the old file", func() {
@@ -653,6 +733,23 @@ var _ = Describe("mirrored mounts", func() {
 			w.tick()
 			Expect(pushes).To(HaveLen(2))
 			Expect(files[0].data).To(Equal([]byte("one")))
+		})
+
+		It("pushes a file back to its old content after a push of it that a newer change replaced", func() {
+			rewrite("one", "ONE", 0o644)
+			rewrite("two", "TWO", 0o644)
+			w.tick()
+			rewrite("one", "ONE again", 0o644)
+			w.tick()
+			Expect(pushes).To(Equal([]pushed{{1, 1, "ONE", 0o644}, {2, 2, "TWO", 0o644}}))
+			// The guest installs the replaced push, and its answer does not
+			// count, so vm-launch cannot tell whether the guest holds ONE.
+			w.acked(1, true)
+			w.tick()
+			w.acked(2, true)
+			rewrite("one", "one", 0o644)
+			w.tick()
+			Expect(pushes).To(Equal([]pushed{{1, 1, "ONE", 0o644}, {2, 2, "TWO", 0o644}, {3, 1, "one", 0o644}}))
 		})
 
 		It("pushes the next change after it gave up, even one back to the content it pushed before", func() {
