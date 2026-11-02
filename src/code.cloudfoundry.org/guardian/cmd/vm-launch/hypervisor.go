@@ -1697,7 +1697,9 @@ type runResult struct {
 // it, and starts the deadline, so it then acts as after a first SIGTERM that
 // became a stop request. A signal that comes later changes nothing, and a
 // request that comes after a signal, or once the guest reported its status,
-// is never taken.
+// is never taken. A request is only advice, so when the stop request cannot
+// be written the supervisor logs it and goes on as if no request had come,
+// and the instance keeps its volumes until it is stopped.
 type supervisor struct {
 	stdout io.Writer
 	// stderr, when set, takes the app's stderr lines from the guest's log
@@ -1948,16 +1950,16 @@ func (s supervisor) run(cmd *exec.Cmd, nonce string) (runResult, error) {
 			if isClosed(filter.exited) {
 				continue
 			}
-			signalled = true
+			// Unlike a signal, a request that cannot reach the guest is not
+			// forwarded to the hypervisor, which would end the guest without
+			// its teardown.
+			if err := stdin.stop(stopTag(nonce)); err != nil {
+				s.logger.Printf("%s, but sending the stop request to the guest failed: %v; this instance keeps the volumes until it is stopped", reason, err)
+				continue
+			}
+			signalled, asked = true, true
 			res.received, res.handedOff = syscall.SIGTERM, true
 			s.logger.Printf("%s, so vm-launch asks the guest command to stop and hands the volumes over once the guest has stopped", reason)
-			if err := stdin.stop(stopTag(nonce)); err != nil {
-				s.logger.Printf("sending the stop request to the guest failed: %v; forwarding %v to the hypervisor", err, syscall.SIGTERM)
-				closePorts()
-				forward(syscall.SIGTERM)
-			} else {
-				asked = true
-			}
 			if kill == nil {
 				kill = time.After(s.deadline)
 				killReason = fmt.Sprintf("the guest did not stop within %v of the handoff request; killing the hypervisor", s.deadline)

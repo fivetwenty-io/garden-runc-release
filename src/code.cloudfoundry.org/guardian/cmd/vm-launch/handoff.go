@@ -86,7 +86,18 @@ const (
 
 	// maxHandoffRequest is the largest request file the holder reads.
 	maxHandoffRequest = 256
+
+	// handoffTempAge is how old a request's temporary file must be before
+	// sweepHandoffTemps removes it. A writer renames its file within a
+	// moment of creating it, so a file this old belongs to a launch that was
+	// killed in between, even with a server clock some minutes off.
+	handoffTempAge = 10 * time.Minute
 )
+
+// handoffTempPattern matches the name of a request's temporary file, which
+// writeHandoffRequest makes from handoffPrefix, 8 random bytes in hex, and
+// handoffTempSuffix.
+var handoffTempPattern = regexp.MustCompile(`^` + regexp.QuoteMeta(handoffPrefix) + `[0-9a-f]{16}` + regexp.QuoteMeta(handoffTempSuffix) + `$`)
 
 // handoffTiming is how often the holder reads its requests and how long it
 // keeps its image before it honours one. Tests shorten both.
@@ -166,7 +177,8 @@ func parseHandoffRequest(b []byte) (handoffRequest, bool) {
 // and renames it over name, so a reader sees the old request or the new one
 // and never part of one. The temporary file is removed when any step fails.
 // A launch killed between the create and the rename leaves a temporary file
-// of under 256 bytes, which nothing reads.
+// of under 256 bytes, which nothing reads and sweepHandoffTemps removes once
+// it is handoffTempAge old.
 func writeHandoffRequest(dirfd int, name string, r handoffRequest) error {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -198,6 +210,42 @@ func writeHandoffRequest(dirfd int, name string, r handoffRequest) error {
 		return fmt.Errorf("renaming %s to %s: %w", temp, name, err)
 	}
 	return nil
+}
+
+// sweepHandoffTemps removes the temporary request files beneath the volume
+// root dirfd that are at least handoffTempAge old. A launch that takes part
+// in the handoff runs it each time it opens its image, as a holder or as a
+// waiter, so that the files of launches killed mid-write do not pile up. It
+// touches only a name that matches handoffTempPattern and that is a regular
+// file owned by vm-launch's effective uid. An mtime in the future, from a
+// server clock that runs ahead, counts as recent. The sweep is best effort:
+// a name it cannot read or remove stays, and the next launch tries again.
+func sweepHandoffTemps(dirfd int) {
+	dfd, err := openat2Retry(dirfd, ".", &unix.OpenHow{
+		Flags: unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC, Resolve: imageOpenResolve,
+	})
+	if err != nil {
+		return
+	}
+	dir := os.NewFile(uintptr(dfd), "volume root")
+	names, err := dir.Readdirnames(-1)
+	dir.Close()
+	if err != nil {
+		return
+	}
+	for _, name := range names {
+		if !handoffTempPattern.MatchString(name) {
+			continue
+		}
+		st, err := statxTemp(dirfd, name)
+		if err != nil || st.Mode&unix.S_IFMT != unix.S_IFREG || int64(st.Uid) != int64(os.Geteuid()) {
+			continue
+		}
+		if time.Since(time.Unix(st.Mtime.Sec, int64(st.Mtime.Nsec))) < handoffTempAge {
+			continue
+		}
+		_ = unix.Unlinkat(dirfd, name, 0)
+	}
 }
 
 // readHandoffRequest returns the request file name beneath dirfd and whether

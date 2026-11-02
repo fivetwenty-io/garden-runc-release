@@ -451,9 +451,11 @@ func openVolumeImage(v *guestVolume, o imageOptions, sigs <-chan os.Signal) (*os
 	}
 	// A launch that takes part in the handoff asks the holder for the image
 	// while the wait finds it locked, and takes its request back however the
-	// wait ends, so that no holder acts on it later.
+	// wait ends, so that no holder acts on it later. It first removes the
+	// temporary request files that killed launches left behind.
 	var asker *handoffRequester
 	if o.Handoff != nil {
+		sweepHandoffTemps(dirfd)
 		asker = newHandoffRequester(dirfd, v.ImageName, path, *o.Handoff, o.logf)
 		o.busy = asker.refresh
 	}

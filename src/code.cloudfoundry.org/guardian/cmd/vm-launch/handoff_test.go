@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -106,6 +107,55 @@ var _ = Describe("handoff requests", func() {
 		It("names the request after the image, apart from the image's temp files", func() {
 			Expect(name).To(Equal(".rvm-handoff-rvm-disk-0.img"))
 			Expect(tempNamePattern.MatchString(name)).To(BeFalse())
+		})
+
+		Describe("the sweep of temporary request files", func() {
+			// put writes name beneath dir with an mtime age ago.
+			put := func(name string, age time.Duration) string {
+				path := filepath.Join(dir, name)
+				Expect(os.WriteFile(path, []byte("rvm-handoff 1\n"), 0o600)).To(Succeed())
+				when := time.Now().Add(-age)
+				Expect(os.Chtimes(path, when, when)).To(Succeed())
+				return path
+			}
+			const stale = ".rvm-handoff-0123456789abcdef.tmp"
+
+			It("removes a temporary file that is old enough and leaves everything else", func() {
+				old := put(stale, handoffTempAge+time.Minute)
+				recent := put(".rvm-handoff-fedcba9876543210.tmp", handoffTempAge-time.Minute)
+				future := put(".rvm-handoff-00000000ffffffff.tmp", -time.Hour)
+				request := put(name, time.Hour)
+				imageTemp := put(".rvm-disk-0123456789abcdef.tmp", time.Hour)
+				odd := put(".rvm-handoff-0123.tmp", time.Hour)
+				Expect(os.Mkdir(filepath.Join(dir, ".rvm-handoff-aaaaaaaaaaaaaaaa.tmp"), 0o700)).To(Succeed())
+				sweepHandoffTemps(dirfd)
+				Expect(old).NotTo(BeAnExistingFile())
+				for _, kept := range []string{recent, future, request, imageTemp, odd, filepath.Join(dir, ".rvm-handoff-aaaaaaaaaaaaaaaa.tmp")} {
+					Expect(kept).To(BeAnExistingFile())
+				}
+			})
+
+			It("matches only the names writeHandoffRequest gives its temporary files", func() {
+				Expect(handoffTempPattern.MatchString(stale)).To(BeTrue())
+				Expect(handoffTempPattern.MatchString(name)).To(BeFalse())
+				Expect(handoffTempPattern.MatchString(".rvm-disk-0123456789abcdef.tmp")).To(BeFalse())
+				Expect(handoffTempPattern.MatchString(".rvm-handoff-0123456789ABCDEF.tmp")).To(BeFalse())
+			})
+
+			It("runs when a launch that takes part in the handoff opens its image, and not otherwise", func() {
+				old := put(stale, handoffTempAge+time.Minute)
+				o := imageOptions{Size: defaultImageSize, LockWait: time.Second, LockPoll: 20 * time.Millisecond, IsMountRoot: alwaysMountRoot}
+				img, err := openVolumeImage(&guestVolume{ContainerDir: dir, ImageName: handoffImageName}, o, nil)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(img.Close()).To(Succeed())
+				Expect(old).To(BeAnExistingFile())
+				id := handoffIdentity{ProcessID: handoffProcessID, Token: holderToken}
+				o.Handoff = &id
+				img, err = openVolumeImage(&guestVolume{ContainerDir: dir, ImageName: handoffImageName}, o, nil)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(img.Close()).To(Succeed())
+				Expect(old).NotTo(BeAnExistingFile())
+			})
 		})
 
 		It("writes the request by rename, with mode 0600, and leaves no temp file", func() {
@@ -527,6 +577,26 @@ var _ = Describe("the supervisor's handoff", func() {
 		Expect(codeOf(res)).To(Equal(0))
 		Expect(os.ReadFile(stdin)).To(Equal([]byte(stopLine)))
 		Expect(logBuf.String()).To(Equal(handoffLine + "received terminated again; the guest is already stopping\n"))
+	}, SpecTimeout(handoffSpecTimeout))
+
+	It("keeps the guest running and forwards nothing when the stop request cannot be written", func(ctx SpecContext) {
+		took := make(chan bool, 1)
+		sup.stdout = writerFunc(func(p []byte) (int, error) {
+			if strings.Contains(string(p), "ready") {
+				go func() { took <- offer(5 * time.Second) }()
+			}
+			return out.Write(p)
+		})
+		// The fake hypervisor closes its stdin, the one read end of the pipe,
+		// and its command ends of its own accord a second later.
+		res, err := sup.run(exec.Command("/bin/sh", "-c", `trap 'echo forwarded >>'`+stdin+`'; exit 99' TERM INT; exec 0<&-; `+startLine+`echo ready; sleep 1; `+exitLine("5")), testNonce)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(took).To(Receive(BeTrue()))
+		Expect(codeOf(res)).To(Equal(5), logBuf.String())
+		Expect(res.handedOff).To(BeFalse())
+		Expect(res.received).To(BeZero())
+		Expect(stdin).NotTo(BeAnExistingFile(), "a signal reached the hypervisor")
+		Expect(logBuf.String()).To(MatchRegexp(`^` + regexp.QuoteMeta(reason) + `, but sending the stop request to the guest failed: write \S+: broken pipe; this instance keeps the volumes until it is stopped\n$`))
 	}, SpecTimeout(handoffSpecTimeout))
 
 	It("kills the hypervisor at the deadline when the guest command does not stop, and exits as after SIGTERM", func(ctx SpecContext) {
