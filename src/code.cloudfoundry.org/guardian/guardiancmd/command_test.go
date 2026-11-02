@@ -10,9 +10,11 @@ import (
 	"time"
 
 	"code.cloudfoundry.org/guardian/backend"
+	"code.cloudfoundry.org/guardian/gardener/gardenerfakes"
 	"code.cloudfoundry.org/guardian/rundmc"
 	"code.cloudfoundry.org/guardian/rundmc/bundlerules"
 	"code.cloudfoundry.org/guardian/rundmc/goci"
+	"code.cloudfoundry.org/guardian/rundmc/processes"
 	"code.cloudfoundry.org/guardian/rundmc/runcontainerd"
 	"code.cloudfoundry.org/guardian/rundmc/runcontainerd/runcontainerdfakes"
 	"code.cloudfoundry.org/guardian/rundmc/rundmcfakes"
@@ -51,6 +53,7 @@ var _ = Describe("execution backend flags", func() {
 	BeforeEach(func() {
 		log = lagertest.NewTestLogger("execution-backends")
 		cmd = &CommonCommand{}
+		cmd.ExecutionBackends.VMQemuSandbox = processes.VMQemuSandboxDefault
 
 		launchBin = filepath.Join(GinkgoT().TempDir(), "vm-launch")
 		Expect(os.WriteFile(launchBin, []byte("#!/bin/sh\n"), 0o755)).To(Succeed())
@@ -535,6 +538,29 @@ var _ = Describe("execution backend flags", func() {
 			Expect(parsed.ExecutionBackends.VMVolumeAsyncMounts).To(BeFalse())
 		})
 
+		It("defaults --vm-qemu-sandbox to the seccomp sandbox and takes a custom or an empty value", func() {
+			Expect(parse().ExecutionBackends.VMQemuSandbox).To(Equal(processes.VMQemuSandboxDefault))
+			Expect(parse("--vm-qemu-sandbox=on,spawn=deny").ExecutionBackends.VMQemuSandbox).To(Equal("on,spawn=deny"))
+			Expect(parse("--vm-qemu-sandbox=").ExecutionBackends.VMQemuSandbox).To(BeEmpty())
+		})
+
+		It("reads the sandbox value from the ini file the job renders, an empty one included", func() {
+			read := func(line string) string {
+				GinkgoHelper()
+				ini := filepath.Join(GinkgoT().TempDir(), "config.ini")
+				Expect(os.WriteFile(ini, []byte("[server]\n"+line), 0o600)).To(Succeed())
+				gdn := &GdnCommand{ServerCommand: &ServerCommand{CommonCommand: &CommonCommand{}}}
+				gdn.ServerCommand.ExecutionBackends.VMQemuSandbox = processes.VMQemuSandboxDefault
+				parser := flags.NewParser(gdn, flags.IgnoreUnknown)
+				parser.NamespaceDelimiter = "-"
+				Expect(flags.NewIniParser(parser).ParseFile(ini)).To(Succeed())
+				return gdn.ServerCommand.ExecutionBackends.VMQemuSandbox
+			}
+			Expect(read("")).To(Equal(processes.VMQemuSandboxDefault))
+			Expect(read("  vm-qemu-sandbox = on,spawn=deny\n")).To(Equal("on,spawn=deny"))
+			Expect(read("  vm-qemu-sandbox = \n")).To(BeEmpty())
+		})
+
 		It("turns shares on with --vm-volume-shares", func() {
 			Expect(parse("--vm-volume-shares").ExecutionBackends.VMVolumeShares).To(BeTrue())
 		})
@@ -565,6 +591,22 @@ var _ = Describe("execution backend flags", func() {
 				backends, err := cmd.wireExecutionBackends(log)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(backends.vmLaunchFlags).To(BeEmpty())
+			})
+
+			It("passes --qemu-sandbox with a custom value", func() {
+				cmd.ExecutionBackends.VMQemuSandbox = "on,spawn=deny"
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vmLaunchFlags).To(Equal([]string{"--qemu-sandbox=on,spawn=deny"}))
+			})
+
+			It("passes --qemu-sandbox= with an empty value, which turns the sandbox off", func() {
+				cmd.ExecutionBackends.VMQemuSandbox = ""
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vmLaunchFlags).To(Equal([]string{"--qemu-sandbox="}))
 			})
 
 			It("passes the share flag and the wrapper's path inside the container when shares are on", func() {
@@ -846,6 +888,7 @@ var _ = Describe("VM stack flags", func() {
 	BeforeEach(func() {
 		log = lagertest.NewTestLogger("vm-stack")
 		cmd = &CommonCommand{}
+		cmd.ExecutionBackends.VMQemuSandbox = processes.VMQemuSandboxDefault
 
 		launchBin = filepath.Join(GinkgoT().TempDir(), "vm-launch")
 		Expect(os.WriteFile(launchBin, []byte("#!/bin/sh\n"), 0o755)).To(Succeed())
@@ -871,6 +914,23 @@ var _ = Describe("VM stack flags", func() {
 			Expect(parsed.ExecutionBackends.VMStackTarballs).To(BeEmpty())
 			Expect(parsed.ExecutionBackends.VMStackCacheDir).To(Equal("/var/vcap/data/vm-runtime/stacks"))
 			Expect(parsed.ExecutionBackends.VMStackWait).To(Equal(20 * time.Second))
+			Expect(parsed.ExecutionBackends.VMDockerRootFS).To(BeEmpty())
+			Expect(parsed.ExecutionBackends.VMDockerImageCacheDir).To(Equal("/var/vcap/data/vm-runtime/images"))
+			Expect(parsed.ExecutionBackends.VMDockerImageCacheBytes).To(Equal(int64(10 << 30)))
+		})
+
+		It("accepts every Docker image flag", func() {
+			parsed := &CommonCommand{}
+			_, err := flags.NewParser(parsed, flags.IgnoreUnknown).ParseArgs([]string{
+				"--vm-docker-rootfs", "/var/vcap/packages/cflinuxfs4/rootfs.tar",
+				"--vm-docker-image-cache-dir", "/images",
+				"--vm-docker-image-cache-bytes", "1048576",
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(parsed.ExecutionBackends.VMDockerRootFS).To(Equal("/var/vcap/packages/cflinuxfs4/rootfs.tar"))
+			Expect(parsed.ExecutionBackends.VMDockerImageCacheDir).To(Equal("/images"))
+			Expect(parsed.ExecutionBackends.VMDockerImageCacheBytes).To(Equal(int64(1048576)))
 		})
 
 		It("accepts every stack flag, with --vm-stack-tarball repeatable", func() {
@@ -954,6 +1014,84 @@ var _ = Describe("VM stack flags", func() {
 
 			_, err := cmd.wireExecutionBackends(log)
 			Expect(err).To(MatchError(ContainSubstring("--vm-stack-tarball must be an absolute path")))
+		})
+
+		Describe("the Docker image guest", func() {
+			BeforeEach(func() {
+				cmd.ExecutionBackends.VMDockerRootFS = "/var/vcap/packages/cflinuxfs4/rootfs.tar"
+				cmd.ExecutionBackends.VMDockerImageCacheDir = filepath.Join(GinkgoT().TempDir(), "images")
+				cmd.ExecutionBackends.VMDockerImageCacheBytes = 10 << 30
+				cmd.ExecutionBackends.VMArtifactsDir = "/var/vcap/data/vm-runtime/artifacts"
+			})
+
+			It("records the tarball with vm-qemu and builds the image builder over the volumizer", func() {
+				cmd.ExecutionBackends.Enabled = []string{"vm-qemu"}
+				cmd.ExecutionBackends.VMLaunchBin = launchBin
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vmDockerRootFS).To(Equal("/var/vcap/packages/cflinuxfs4/rootfs.tar"))
+
+				images, err := cmd.wireVMImages(log, backends, new(gardenerfakes.FakeVolumizer))
+				Expect(err).NotTo(HaveOccurred())
+				Expect(images).NotTo(BeNil())
+				Expect(filepath.Join(cmd.ExecutionBackends.VMDockerImageCacheDir, "containers")).To(BeADirectory())
+
+				gdnr := cmd.createGardener(&commandWiring{Logger: log, Backends: backends.registry, VMImages: images, VMDockerRootFS: backends.vmDockerRootFS})
+				Expect(gdnr.VMImages).NotTo(BeNil())
+				Expect(gdnr.VMDockerRootFS).To(Equal("/var/vcap/packages/cflinuxfs4/rootfs.tar"))
+			})
+
+			It("leaves the feature off when the flag is empty", func() {
+				cmd.ExecutionBackends.VMDockerRootFS = ""
+				cmd.ExecutionBackends.Enabled = []string{"vm-qemu"}
+				cmd.ExecutionBackends.VMLaunchBin = launchBin
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				images, err := cmd.wireVMImages(log, backends, new(gardenerfakes.FakeVolumizer))
+				Expect(err).NotTo(HaveOccurred())
+				Expect(images).To(BeNil())
+
+				gdnr := cmd.createGardener(&commandWiring{Logger: log, Backends: backends.registry})
+				Expect(gdnr.VMImages).To(BeNil())
+				Expect(gdnr.VMDockerRootFS).To(BeEmpty())
+			})
+
+			It("fails for the tarball flag with no vm-* backend", func() {
+				cmd.ExecutionBackends.Enabled = []string{"oci-gvisor"}
+				cmd.Containerd.Socket = "/run/containerd.sock"
+
+				_, err := cmd.wireExecutionBackends(log)
+				Expect(err).To(MatchError(ContainSubstring("--vm-docker-rootfs requires a vm-* --execution-backend")))
+			})
+
+			It("fails for a relative tarball path", func() {
+				cmd.ExecutionBackends.Enabled = []string{"vm-qemu"}
+				cmd.ExecutionBackends.VMLaunchBin = launchBin
+				cmd.ExecutionBackends.VMDockerRootFS = "rootfs.tar"
+
+				_, err := cmd.wireExecutionBackends(log)
+				Expect(err).To(MatchError(ContainSubstring("--vm-docker-rootfs must be an absolute path")))
+			})
+
+			It("fails for a relative cache directory", func() {
+				cmd.ExecutionBackends.Enabled = []string{"vm-qemu"}
+				cmd.ExecutionBackends.VMLaunchBin = launchBin
+				cmd.ExecutionBackends.VMDockerImageCacheDir = "images"
+
+				_, err := cmd.wireExecutionBackends(log)
+				Expect(err).To(MatchError(ContainSubstring("--vm-docker-image-cache-dir must be an absolute path")))
+			})
+
+			It("fails for a cache budget that holds nothing", func() {
+				cmd.ExecutionBackends.Enabled = []string{"vm-qemu"}
+				cmd.ExecutionBackends.VMLaunchBin = launchBin
+				cmd.ExecutionBackends.VMDockerImageCacheBytes = 0
+
+				_, err := cmd.wireExecutionBackends(log)
+				Expect(err).To(MatchError(ContainSubstring("--vm-docker-image-cache-bytes must be positive")))
+			})
 		})
 
 		It("fails for a negative wait", func() {

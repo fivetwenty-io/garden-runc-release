@@ -427,7 +427,7 @@ var _ = Describe("the initramfs of a guest with a stack", func() {
 		Expect(string(byName["rvm/disks"].data)).To(Equal("RVM_VOLUMES=0\nRVM_STACK_ID=rvm-stack\nRVM_DROPLET_ID=rvm-droplet\n"))
 		Expect(string(byName["init"].data)).To(Equal(guestStackInit))
 		Expect(byName["init"].mode).To(Equal(uint32(0o100755)))
-		Expect(string(byName["rvm/init"].data)).To(Equal(stackInitScript(testNonce)))
+		Expect(string(byName["rvm/init"].data)).To(Equal(g.stack.initScript(testNonce)))
 		Expect(byName["rvm/init"].mode).To(Equal(uint32(0o100755)))
 	})
 
@@ -488,19 +488,27 @@ var _ = Describe("the initramfs of a guest with a stack", func() {
 		Expect(write(g)).To(MatchError("the launcher's argv is 131072 bytes quoted, over the 131071 bytes a guest takes"))
 	})
 
+	DescribeTable("builds a stack guest with a share or a block volume, which it mounts as it does a private disk image",
+		func(change func(*guestContents)) {
+			g := stackGuest()
+			change(&g)
+			Expect(write(g)).To(Succeed())
+		},
+		Entry("a share", func(g *guestContents) {
+			g.vols = []guestVolume{{ContainerDir: "/home/vcap/data", Settings: volumeSettings{Mode: volumeShare}}}
+		}),
+		Entry("a block volume after an image", func(g *guestContents) {
+			g.vols = []guestVolume{{ContainerDir: "/home/vcap/data", ImageName: "rvm-disk-0.img"}, {ContainerDir: "/home/vcap/disk"}}
+			g.drives.volumes = append(qemuImageDrives(defaultImageSize), guestDrive{id: qemuVolumeSerial(1), kind: driveBlock, bytes: defaultImageSize})
+		}),
+	)
+
 	DescribeTable("refuses a stack the guest could not run, so no initramfs is built",
 		func(change func(*guestContents), want string) {
 			g := stackGuest()
 			change(&g)
 			Expect(write(g)).To(MatchError(want))
 		},
-		Entry("a share", func(g *guestContents) {
-			g.vols = []guestVolume{{ContainerDir: "/home/vcap/data", Settings: volumeSettings{Mode: volumeShare}}}
-		}, `a guest with a stack mounts only private disk images, and volume 0 at "/home/vcap/data" is a share`),
-		Entry("a block volume after an image", func(g *guestContents) {
-			g.vols = []guestVolume{{ContainerDir: "/home/vcap/data", ImageName: "rvm-disk-0.img"}, {ContainerDir: "/home/vcap/disk"}}
-			g.drives.volumes = append(qemuImageDrives(defaultImageSize), guestDrive{id: qemuVolumeSerial(1), kind: driveBlock, bytes: defaultImageSize})
-		}, `a guest with a stack mounts only private disk images, and volume 1 at "/home/vcap/disk" is on a block drive`),
 		Entry("no launcher", func(g *guestContents) { g.stack.launcher = guestTool{} },
 			"a guest with a stack needs the launcher, and it has none"),
 		Entry("an empty launcher", func(g *guestContents) { g.stack.launcher.size = 0 },
@@ -527,7 +535,7 @@ var _ = Describe("the initramfs of a guest with a stack", func() {
 		Expect(guestStackInit).NotTo(ContainSubstring(guestRootSetup))
 		Expect(guestRootInit).To(Equal(guestInitStart + guestFailFunc + guestDiskFind + guestRootSetup + guestStage2Exec))
 		Expect(guestStackDiskFind).To(Equal(guestStackDiskFunc + guestDiskRead + guestStackDiskRead + guestDiskWait + "rvm_stack=$rvm_dev_stack\nrvm_droplet=$rvm_dev_droplet\n"))
-		for name, script := range map[string]string{"stage 1": guestStackInit, "stage 2": stackInitScript(testNonce)} {
+		for name, script := range map[string]string{"stage 1": guestStackInit, "stage 2": stackGuest().stack.initScript(testNonce)} {
 			out, err := exec.Command("/bin/sh", "-n", "-c", script).CombinedOutput()
 			Expect(err).NotTo(HaveOccurred(), "%s: %s", name, out)
 		}
@@ -540,16 +548,24 @@ var _ = Describe("the initramfs of a guest with a stack", func() {
 		Expect(guestStackDiskSizeCheck).To(Equal(strings.Replace(guestDiskSizeCheck, `[ "$rvm_s" = "$rvm_w" ]`, `[ -z "$rvm_w" ] || [ "$rvm_s" = "$rvm_w" ]`, 1)))
 	})
 
-	It("runs the launcher in stage 2 after the argv and working directory checks, and mounts no /dev/shm of its own", func() {
-		script := stackInitScript(testNonce)
-		Expect(script).To(Equal(strings.NewReplacer(guestShmSetup, "", guestEnvChecks, guestEnvChecks+guestStackChecks, guestRunCommand, guestStackRunCommand).Replace(initScript(testNonce, false))))
+	// stackBase is the busybox guest's stage 2 as a stack guest's starts
+	// from: without a /dev/shm of its own, and with the argv and working
+	// directory checks after the environment checks.
+	stackBase := func() string {
+		return strings.NewReplacer(guestShmSetup, "", guestEnvChecks, guestEnvChecks+guestStackChecks).Replace(initScript(testNonce, false))
+	}
+
+	It("runs the launcher in stage 2 after the argv and working directory checks, through the run section, and mounts no /dev/shm of its own", func() {
+		g := stackGuest()
+		script := g.stack.initScript(testNonce)
 		Expect(script).NotTo(ContainSubstring(guestShmSetup))
 		Expect(script).NotTo(ContainSubstring(guestRunCommand))
+		Expect(script).NotTo(ContainSubstring(guestStopReader(testNonce)))
 		Expect(script).NotTo(ContainSubstring("/rvm/cmd"))
 		start := strings.Index(script, "\necho "+startTag(testNonce)+"\n")
 		Expect(strings.Index(script, guestEnvChecks+guestStackChecks)).To(BeNumerically(">", 0))
 		Expect(strings.Index(script, guestStackChecks)).To(BeNumerically("<", start))
-		Expect(strings.Index(script, guestStackRunCommand)).To(BeNumerically(">", start))
+		Expect(strings.Index(script, guestRunSection(testNonce, g.stack.processes(), false, stackExec))).To(BeNumerically(">", start))
 	})
 
 	// withSidecars gives g two sidecars, the second with an environment of
@@ -607,9 +623,14 @@ var _ = Describe("the initramfs of a guest with a stack", func() {
 		Expect(names).NotTo(ContainElement("rvm/sidecar"))
 	})
 
-	It("keeps the stack guest's stage 2 for a guest with neither sidecars nor an identity, with an empty list as with none", func() {
+	It("runs an app with neither sidecars nor an identity alone through the run section, so it never holds the console, with an empty list as with none", func() {
 		g := stackGuest()
-		Expect(g.stack.initScript(testNonce)).To(Equal(stackInitScript(testNonce)))
+		procs := g.stack.processes()
+		Expect(procs).To(HaveLen(1))
+		Expect(g.stack.initScript(testNonce)).To(Equal(stage2Script(testNonce, false, true, guestRunSetup(false, procs), guestRunSection(testNonce, procs, false, stackExec))))
+		wrapper := guestProcessWrapper(procs[0], stackExec)
+		Expect(wrapper).To(ContainSubstring("command exec >" + guestLogFIFO(0, "out") + " 2>" + guestLogFIFO(0, "err") + " 3>&- 4>&- "))
+		Expect(wrapper).To(ContainSubstring("command exec >&5 5>&- </dev/null "))
 		_, plain := archive(g)
 		g.stack.sidecars = []guestSidecar{}
 		_, empty := archive(g)
@@ -632,14 +653,14 @@ var _ = Describe("the initramfs of a guest with a stack", func() {
 			}
 			checks += guestRunSetup(identity, g.stack.processes())
 			section := guestRunSection(testNonce, g.stack.processes(), identity, stackExec)
-			plain := stackInitScript(testNonce)
-			Expect(strings.Count(plain, guestStopReader(testNonce))).To(Equal(1))
-			Expect(strings.Count(plain, guestStackRunCommand+guestRunStatus+guestStopReaderStop)).To(Equal(1))
+			base := stackBase()
+			Expect(strings.Count(base, guestStopReader(testNonce))).To(Equal(1))
+			Expect(strings.Count(base, guestRunCommand+guestRunStatus+guestStopReaderStop)).To(Equal(1))
 			Expect(script).To(Equal(strings.NewReplacer(
 				guestStackChecks, guestStackChecks+checks,
 				guestStopReader(testNonce), "",
-				guestStackRunCommand+guestRunStatus+guestStopReaderStop, section,
-			).Replace(plain)))
+				guestRunCommand+guestRunStatus+guestStopReaderStop, section,
+			).Replace(base)))
 			Expect(strings.Contains(script, guestIdentitySetup)).To(Equal(identity))
 			Expect(strings.Contains(script, credTag(testNonce))).To(Equal(identity))
 			Expect(strings.Contains(script, credOffTag(testNonce))).To(Equal(identity))
@@ -649,6 +670,7 @@ var _ = Describe("the initramfs of a guest with a stack", func() {
 			out, err := exec.Command("/bin/sh", "-n", "-c", script).CombinedOutput()
 			Expect(err).NotTo(HaveOccurred(), string(out))
 		},
+		Entry("alone", false, false),
 		Entry("with sidecars", true, false),
 		Entry("with an identity", false, true),
 		Entry("with both", true, true),
@@ -664,11 +686,11 @@ var _ = Describe("the initramfs of a guest with a stack", func() {
 		}))
 	})
 
-	It("runs a process as the stack guest runs the app alone, through chroot, the stack's env, and setpriv to uid 2000", func() {
+	It("runs each process through chroot, the stack's env, and setpriv to uid 2000", func() {
 		g := stackGuest()
-		app := g.stack.processes()[0]
-		line := strings.Replace(stackExec(app), "-C "+shellQuote(app.dir)+" ", `-C "$(`+guestRootCat+` `+guestCwd+`)" `, 1)
-		Expect(guestStackRunCommand).To(Equal(guestRunPrefix + strings.TrimPrefix(line, ". /rvm/env && ") + " ) </dev/null\n"))
+		Expect(stackExec(g.stack.processes()[0])).To(Equal(
+			`. /rvm/env && eval "set -- $(/bin/busybox cat /rvm/argv)" && ` + guestLoaderHold +
+				`exec /bin/busybox chroot /rvm/app /usr/bin/setpriv --reuid=2000 --regid=2000 --init-groups --no-new-privs -- /usr/bin/env -C '/home/vcap/app' "$@"`))
 		Expect(stackExec(guestProcess{argvPath: "/rvm/sidecar/1/argv", envPaths: []string{"/rvm/env", "/rvm/sidecar/1/env"}, dir: "/home/vcap/it's"})).To(Equal(
 			`. /rvm/env && . /rvm/sidecar/1/env && eval "set -- $(/bin/busybox cat /rvm/sidecar/1/argv)" && ` + guestLoaderHold +
 				`exec /bin/busybox chroot /rvm/app /usr/bin/setpriv --reuid=2000 --regid=2000 --init-groups --no-new-privs -- /usr/bin/env -C '/home/vcap/it'\''s' "$@"`))

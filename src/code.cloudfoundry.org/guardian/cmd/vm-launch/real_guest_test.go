@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"code.cloudfoundry.org/guardian/backend"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -482,6 +483,45 @@ ls -ld /etc/ssl/certs/ca-certificates.crt`)
 		Expect(out).To(ContainSubstring("certs=2 file=" + guestCABundlePath))
 		Expect(out).To(ContainSubstring(hex.EncodeToString(sum[:]) + "  " + guestCABundlePath))
 		Expect(out).To(MatchRegexp(`-rw-r--r-- +1 0 +0 .*` + guestCABundlePath))
+		Expect(out).To(ContainSubstring(exitTag(testNonce) + "0"))
+	})
+
+	It("boots with the vCPUs and the memory that vm-launch derives, and the command sees both", func() {
+		logger := log.New(GinkgoWriter, "", 0)
+		memMiB := guestMemory(backend.VMQemu, envMap(map[string]string{"MEMORY_LIMIT": "384m"}), logger)
+		vcpus := guestVCPUCount(backend.VMQemu, func() (int, error) { return 2, nil }, 0, logger)
+		Expect(memMiB).To(Equal(256))
+		Expect(vcpus).To(Equal(2))
+		envFile, err := buildGuestEnv(map[string]string{memoryLimitEnv: "384m"}, memMiB, logger)
+		Expect(err).NotTo(HaveOccurred())
+
+		g := taskGuest(`echo "nproc=$(nproc) cpuinfo=$(grep -c '^processor' /proc/cpuinfo) online=$(cat /sys/devices/system/cpu/online)"
+echo "memtotal_kib=$(sed -n 's/^MemTotal: *\([0-9]*\) kB$/\1/p' /proc/meminfo)"
+echo "memory_limit=$MEMORY_LIMIT"`)
+		g.env = envFile
+		withRealRoot(&g)
+		out := bootRealGuestEdited(g, nil, realRootImage(), func(argv []string, files []*os.File) ([]string, []*os.File) {
+			Expect(optionAfter(argv, "-smp", "")).To(Equal("1"))
+			edited := append([]string(nil), argv...)
+			for i, a := range edited {
+				switch a {
+				case "-smp":
+					edited[i+1] = strconv.Itoa(vcpus)
+				case "-m":
+					edited[i+1] = strconv.Itoa(memMiB)
+				}
+			}
+			return edited, files
+		})
+		Expect(out).To(ContainSubstring(startTag(testNonce)), out)
+		Expect(out).To(MatchRegexp(`(?m)^nproc=2 cpuinfo=2 online=0-1\r?$`))
+		Expect(out).To(ContainSubstring("memory_limit=256m"))
+		m := regexp.MustCompile(`(?m)^memtotal_kib=(\d+)\r?$`).FindStringSubmatch(out)
+		Expect(m).NotTo(BeNil(), out)
+		kib, err := strconv.Atoi(m[1])
+		Expect(err).NotTo(HaveOccurred())
+		Expect(kib).To(BeNumerically("<=", memMiB*1024), out)
+		Expect(kib).To(BeNumerically(">", (memMiB-64)*1024), out)
 		Expect(out).To(ContainSubstring(exitTag(testNonce) + "0"))
 	})
 

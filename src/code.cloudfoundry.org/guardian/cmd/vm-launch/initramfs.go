@@ -187,8 +187,8 @@ const guestStage2Exec = `exec /bin/sh ` + guestStage2 + ` "$@"
 // among them (see guestStackDiskFind). In place of the overlay root, it
 // builds the app root from the stack, the droplet, and the root disk, or RAM
 // without one (see guestStackSetup), and it runs stage 2 on the initramfs,
-// which stays the guest's own root. The app alone runs in the app root (see
-// guestStackRunCommand).
+// which stays the guest's own root. Only the app and its sidecars run in the
+// app root (see stackExec).
 const guestStackInit = guestInitStart + guestFailFunc + guestStackDiskFind + guestStackSetup + guestStage2Exec
 
 // guestStage2 is where the initramfs holds stage 2 of the guest's boot.
@@ -504,20 +504,15 @@ func initScript(nonce string, volume bool) string {
 	return stage2Script(nonce, volume, false, "", "")
 }
 
-// stackInitScript is the guest /rvm/init of a guest with a stack and no
-// volumes, which guestStackInit runs on the initramfs. It is initScript
-// without volumes and with three differences. It mounts no /dev/shm of its own, because the app
-// sees only the one stage 1 mounted in the app root. It checks /rvm/argv and
-// /rvm/cwd after /rvm/env (see guestStackChecks). And it runs the launcher
-// in the app root (see guestStackRunCommand) in place of /rvm/cmd.
-func stackInitScript(nonce string) string {
-	return stage2Script(nonce, false, true, "", "")
-}
-
-// stage2Script is initScript, or stackInitScript when stack is set. With a
-// run section (see guestRunSection), stage 2 adds checks to its setup steps
-// and runs the section after the start tag in place of the command, its
-// status, and the stop reader, whose part the section's control reader
+// stage2Script is initScript, or a stack guest's stage 2 when stack is set
+// (see guestStack.initScript), which differs from it in three ways. It
+// mounts no /dev/shm of its own, because the app sees only the one stage 1
+// mounted in the app root. It checks /rvm/argv and /rvm/cwd after /rvm/env
+// (see guestStackChecks). And it always has a run section (see
+// guestRunSection), which runs the launcher and the sidecars in the app root
+// in place of /rvm/cmd. With a run section, stage 2 adds checks to its setup
+// steps and runs the section after the start tag in place of the command,
+// its status, and the stop reader, whose part the section's control reader
 // takes. A stack guest with volumes mounts them as initScript does, binds
 // them into the app root, and unbinds them in its teardown (see
 // guestStackVolumeSetup, guestStackVolumeBinds, and
@@ -529,10 +524,8 @@ func stage2Script(nonce string, volume, stack bool, checks, section string) stri
 		setup += guestShmSetup
 	}
 	setup += guestNetworkSetup + guestLimitsSetup + guestEnvChecks
-	command := guestRunCommand
 	if stack {
 		setup += guestStackChecks
-		command = guestStackRunCommand
 	}
 	setup += checks
 	switch {
@@ -544,7 +537,7 @@ func stage2Script(nonce string, volume, stack bool, checks, section string) stri
 	run := guestListenWatch(nonce)
 	if section == "" {
 		setup += guestStopReader(nonce)
-		run += command + guestRunStatus + guestStopReaderStop
+		run += guestRunCommand + guestRunStatus + guestStopReaderStop
 	} else {
 		run += section
 	}
@@ -573,7 +566,9 @@ export PATH=/bin
 const guestConsoleSetup = `stty -echo </dev/console || echo "vm-launch guest setup: turning off console echo failed; a stop request will appear in the output"
 `
 
-// guestStopReader starts, in every guest, the background stop reader, which
+// guestStopReader starts, in the busybox guest, the background stop reader,
+// whose part the control reader takes in a stack guest (see
+// guestControlReader), and which
 // sends SIGTERM to the command's top process when vm-launch writes the stop
 // request (see stopTag) to the console, as runC sends SIGTERM to a
 // container's first process. It starts before the start tag, so it is in
@@ -1682,7 +1677,8 @@ const sectorBytes = 512
 // images, as RVM_STACK_ID and RVM_DROPLET_ID after the volumes, and no size
 // for either (see guestStackDiskFunc). A guest with a stack and without
 // both identities is an error, and so is one of the identities in a guest
-// without a stack, whose stage 1 would refuse the drive.
+// without a stack, whose stage 1 would refuse the drive. The Docker image
+// guest gets its image's identity as RVM_STACK_ID and no RVM_DROPLET_ID.
 func disksFile(g guestContents) (string, error) {
 	var b strings.Builder
 	d := g.drives
@@ -1731,6 +1727,11 @@ func disksFile(g guestContents) (string, error) {
 	switch {
 	case g.stack == nil && d.stackID+d.dropletID != "":
 		return "", fmt.Errorf("drive identities %q and %q for no stack and droplet images", d.stackID, d.dropletID)
+	case g.stack != nil && g.stack.image != nil && (d.stackID == "" || d.dropletID != ""):
+		return "", fmt.Errorf("the Docker image guest needs the identity of its image and none for a droplet, and has %q and %q", d.stackID, d.dropletID)
+	case g.stack != nil && g.stack.image != nil:
+		named = append(named, namedDriveID{name: "the Docker image", id: d.stackID})
+		fmt.Fprintf(&b, "RVM_STACK_ID=%s\n", d.stackID)
 	case g.stack != nil && (d.stackID == "" || d.dropletID == ""):
 		return "", fmt.Errorf("a guest with a stack needs the identities of both the stack image and the droplet image, and has %q and %q", d.stackID, d.dropletID)
 	case g.stack != nil:
@@ -1853,6 +1854,11 @@ type guestStack struct {
 	// or the droplet image (see guestFallbackFunc).
 	fallbackEnv string
 	fallback    bool
+	// image, when set, makes this the Docker image guest, whose image takes
+	// the stack's drive and which has no droplet, no fallback, and no
+	// volumes. Its stage 1 is guestImageInit, and its processes run as the
+	// image's user (see guestImage).
+	image *guestImage
 }
 
 // guestSidecar is one sidecar's two files in the stack guest. argv is its
@@ -1875,8 +1881,7 @@ const maxGuestHostnameBytes = 64
 // the 2 MiB that the launcher's execve can carry with the default stack
 // limit. The argv must not be empty, the working directory must be an
 // absolute path that the guest's $(cat) reads back unchanged, and the
-// hostname must be one hostname -F sets as it is. Which volumes the stack
-// guest mounts is checkStackVolumes's to decide.
+// hostname must be one hostname -F sets as it is.
 func (s *guestStack) check() error {
 	switch {
 	case s.launcher.file == nil || s.launcher.size <= 0:
@@ -1893,6 +1898,8 @@ func (s *guestStack) check() error {
 		return fmt.Errorf("a guest runs at most %d sidecars, and this one has %d", maxGuestSidecars, len(s.sidecars))
 	case s.identity != nil && (len(s.identity.cert) == 0 || len(s.identity.key) == 0):
 		return errors.New("the instance identity pair for the guest lacks its certificate or its key")
+	case s.image != nil && s.fallback:
+		return errors.New("the Docker image guest has no busybox guest to fall back to, yet it was given one")
 	}
 	for i, sidecar := range s.sidecars {
 		n := i + 1
@@ -2202,8 +2209,7 @@ func addSeals(f *os.File, seals int) error {
 // guestStack.initScriptWithVolumes).
 // A hard open-files limit of 0 is an error, because it is a limit no caller
 // can have meant: vm-launch itself could not run under it. So are drives
-// that disksFile rejects, a stack that guestStack.check rejects, and a stack
-// guest with volumes that checkStackVolumes rejects.
+// that disksFile rejects and a stack that guestStack.check rejects.
 func writeInitramfs(dst *os.File, busyboxPath string, g guestContents) error {
 	if g.nw == nil {
 		return errors.New("writing the initramfs: no guest network")
@@ -2247,10 +2253,13 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, g 
 		if err := g.stack.check(); err != nil {
 			return err
 		}
-		if err := checkStackVolumes(g); err != nil {
-			return err
-		}
 		stage1, stage2 = guestStackInit, g.stack.initScriptWithVolumes(g.nonce, len(g.vols) > 0)
+		if g.stack.image != nil {
+			if len(g.vols) > 0 {
+				return fmt.Errorf("the Docker image guest mounts no volumes, and it was given %d", len(g.vols))
+			}
+			stage1 = guestImageInit
+		}
 	}
 	steps := []func() error{
 		func() error { return cw.Dir("bin", 0o755) },

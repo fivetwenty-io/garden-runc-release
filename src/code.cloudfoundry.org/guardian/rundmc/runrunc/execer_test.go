@@ -348,11 +348,11 @@ var _ = Describe("Execer", func() {
 					spec = processes.MarkVMLaunch(spec)
 				})
 
-				It("runs it with the kvm gid and the unconfined AppArmor profile", func() {
+				It("runs it with the kvm gid and the container's AppArmor profile", func() {
 					Expect(execErr).NotTo(HaveOccurred())
 					proc := builtProcess()
 					Expect(proc.User.AdditionalGids).To(ContainElement(uint32(kvmGid)))
-					Expect(proc.ApparmorProfile).To(Equal("unconfined"))
+					Expect(proc.ApparmorProfile).To(Equal("garden-default"))
 				})
 			})
 		})

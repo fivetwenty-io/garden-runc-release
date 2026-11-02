@@ -193,7 +193,7 @@ var _ = Describe("ExecutionBackendRule", func() {
 			}))
 		})
 
-		It("keeps the AppArmor profile, which only the wrapped vm-launch process gives up", func() {
+		It("keeps the AppArmor profile, and so does the wrapped vm-launch process", func() {
 			Expect(newBndl.Process().ApparmorProfile).To(Equal("garden-default"))
 		})
 
@@ -276,6 +276,64 @@ var _ = Describe("ExecutionBackendRule", func() {
 				Options:     []string{"bind", "ro", "nosuid", "nodev", "noexec"},
 			}))
 			Expect(bundlerules.VMStackMountPath).To(Equal("/opt/garden-vm/stack"))
+		})
+	})
+
+	When("the backend is vm-qemu with a Docker image directory", func() {
+		BeforeEach(func() {
+			desiredSpec.ExecutionBackend = string(backend.VMQemu)
+			desiredSpec.VMImageDir = "/var/vcap/data/vm-runtime/images/containers/some-handle"
+			touch("kernel/bzImage")
+			touch("qemu/qemu-system-x86_64-microvm")
+			touch("qemu/ld-linux-x86-64.so.2")
+			touch("busybox")
+		})
+
+		It("binds the three image files read-only after the artifacts and vm-launch binds, and marks the bundle", func() {
+			Expect(applyErr).NotTo(HaveOccurred())
+			mounts := newBndl.Mounts()
+			Expect(mounts).To(HaveLen(6))
+			Expect(mounts[1].Destination).To(Equal("/opt/garden-vm/artifacts"))
+			Expect(mounts[2].Destination).To(Equal("/opt/garden-vm/vm-launch"))
+			for i, name := range []string{"rootfs.squashfs", "passwd", "group"} {
+				Expect(mounts[3+i]).To(Equal(specs.Mount{
+					Destination: "/opt/garden-vm/image/" + name,
+					Source:      "/var/vcap/data/vm-runtime/images/containers/some-handle/" + name,
+					Type:        "bind",
+					Options:     []string{"bind", "ro", "nosuid", "nodev", "noexec"},
+				}))
+			}
+			Expect(bundlerules.VMImageMountPath).To(Equal("/opt/garden-vm/image"))
+			Expect(newBndl.Spec.Annotations).To(HaveKeyWithValue("garden.vm-image", "docker"))
+			Expect(backend.FromBundle(newBndl)).To(Equal(backend.VMQemu))
+		})
+	})
+
+	When("the backend is vm-qemu with no Docker image directory", func() {
+		BeforeEach(func() {
+			desiredSpec.ExecutionBackend = string(backend.VMQemu)
+			touch("kernel/bzImage")
+			touch("qemu/qemu-system-x86_64-microvm")
+			touch("qemu/ld-linux-x86-64.so.2")
+			touch("busybox")
+		})
+
+		It("does not mark the bundle", func() {
+			Expect(applyErr).NotTo(HaveOccurred())
+			Expect(newBndl.Spec.Annotations).NotTo(HaveKey("garden.vm-image"))
+		})
+	})
+
+	When("the backend is oci-gvisor with a Docker image directory", func() {
+		BeforeEach(func() {
+			desiredSpec.ExecutionBackend = string(backend.OCIGvisor)
+			desiredSpec.VMImageDir = "/var/vcap/data/vm-runtime/images/containers/some-handle"
+		})
+
+		It("adds no mount and does not mark the bundle", func() {
+			Expect(applyErr).NotTo(HaveOccurred())
+			Expect(newBndl.Mounts()).To(Equal(inputBndl.Mounts()))
+			Expect(newBndl.Spec.Annotations).NotTo(HaveKey("garden.vm-image"))
 		})
 	})
 

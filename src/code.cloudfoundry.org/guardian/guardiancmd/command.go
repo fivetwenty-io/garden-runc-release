@@ -45,6 +45,7 @@ import (
 	"code.cloudfoundry.org/guardian/rundmc/stopper"
 	"code.cloudfoundry.org/guardian/rundmc/users"
 	"code.cloudfoundry.org/guardian/sysinfo"
+	"code.cloudfoundry.org/guardian/vmimage"
 	"code.cloudfoundry.org/guardian/vmstack"
 	"code.cloudfoundry.org/lager/v3"
 	"code.cloudfoundry.org/localip"
@@ -215,10 +216,16 @@ type CommonCommand struct {
 		VMKVMGid            uint32        `long:"vm-kvm-gid" description:"Host gid that owns /dev/kvm, added to the vm-launch process. Resolved from the host kvm group when not set."`
 		VMBlockVolumes      bool          `long:"vm-block-volumes" description:"Give a vm-* container the block device named by each bind mount whose source is a read-only pdi: descriptor tmpfs, as a root:kvm 0660 node at /dev/pdi/MAJOR-MINOR with a read-write device cgroup rule. A device that is the wrong size, mounted, held, or busy on the host refuses the container. The descriptor bind mount must be read-write. Off by default."`
 		VMVolumeShares      bool          `long:"vm-volume-shares" description:"Let an app on a vm-qemu container ask for a volume as a share in VM_VOLUMES. Garden passes --allow-volume-shares and the virtiofsd wrapper's path to vm-launch. Off by default, and a share is refused on vm-firecracker whatever its value."`
+		VMMaxVCPUs          uint          `long:"vm-max-vcpus" description:"The most vCPUs a vm-* guest gets. By default, which is 0, a guest gets one vCPU for each CPU its container may run on, up to 32, so that it can use every core of the cell the way a runC app can, and its container's CPU weight still bounds its total CPU time. Garden passes --max-vcpus to vm-launch only when this is set."`
 		VMVolumeAsyncMounts bool          `long:"vm-volume-async-mounts" description:"Mount a journalled ext4 image volume of a vm-* container without sync and dirsync, which vm-launch otherwise uses. A legacy ext2 image without a journal keeps them. Garden passes --volume-sync-mounts=false to vm-launch only when this is set. Off by default."`
+		VMQemuSandbox       string        `long:"vm-qemu-sandbox" default:"on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny" description:"The value of QEMU's -sandbox option for a vm-qemu container, which turns on QEMU's own seccomp filter. An empty value turns the sandbox off. Garden passes --qemu-sandbox to vm-launch only when the value differs from the default."`
 		VMStackTarballs     []string      `long:"vm-stack-tarball" description:"Absolute path of a stack rootfs tarball to turn into a read-only squashfs image for vm-* containers, such as /var/vcap/packages/cflinuxfs4/rootfs.tar. A VM container whose rootfs is a listed tarball gets the image bound read-only at /opt/garden-vm/stack. Requires a vm-* backend. Can be specified multiple times."`
 		VMStackCacheDir     string        `long:"vm-stack-cache-dir" default:"/var/vcap/data/vm-runtime/stacks" description:"Host directory that caches the stack images, one directory for each tarball digest."`
 		VMStackWait         time.Duration `long:"vm-stack-wait" default:"20s" description:"How long a VM container create waits for a stack image that is still being built. When it is not ready in that time the container is created without it."`
+
+		VMDockerRootFS          string `long:"vm-docker-rootfs" description:"Absolute path of the stack rootfs tarball that a vm-* container runs its hypervisor on when it asks for a Docker image, such as /var/vcap/packages/cflinuxfs4/rootfs.tar. Setting it lets a vm-* container boot a Docker image in its guest, which Garden turns into a squashfs and binds read-only at /opt/garden-vm/image. Requires a vm-* backend. Empty by default, which refuses a Docker image on a vm-* backend."`
+		VMDockerImageCacheDir   string `long:"vm-docker-image-cache-dir" default:"/var/vcap/data/vm-runtime/images" description:"Host directory that caches the guest images of Docker images, one directory for each set of image layers."`
+		VMDockerImageCacheBytes int64  `long:"vm-docker-image-cache-bytes" default:"10737418240" description:"How many bytes the guest images of Docker images may take in the cache. Garden evicts the least recently used images that no container holds, and refuses an image bigger than the whole cache."`
 	} `group:"Execution Backends"`
 
 	CPUThrottling struct {
@@ -251,6 +258,8 @@ type commandWiring struct {
 	ContainerNetworkMetricsProvider gardener.ContainerNetworkMetricsProvider
 	Backends                        *backend.Registry
 	VMStacks                        *vmstack.Builder
+	VMImages                        *vmimage.Builder
+	VMDockerRootFS                  string
 }
 
 func (cmd *CommonCommand) createGardener(wiring *commandWiring) *gardener.Gardener {
@@ -271,6 +280,10 @@ func (cmd *CommonCommand) createGardener(wiring *commandWiring) *gardener.Garden
 	gdnr.Backends = wiring.Backends
 	if wiring.VMStacks != nil {
 		gdnr.VMStacks = wiring.VMStacks
+	}
+	if wiring.VMImages != nil {
+		gdnr.VMImages = wiring.VMImages
+		gdnr.VMDockerRootFS = wiring.VMDockerRootFS
 	}
 
 	return gdnr
@@ -324,6 +337,12 @@ func (cmd *CommonCommand) createWiring(logger lager.Logger, metricsProvider *met
 
 	volumizer := factory.WireVolumizer(logger)
 
+	vmImages, err := cmd.wireVMImages(logger, backends, volumizer)
+	if err != nil {
+		logger.Error("vm-image-builder-failed", err)
+		return nil, err
+	}
+
 	starters := []gardener.Starter{}
 	if !cmd.Server.SkipSetup {
 		starters = append(starters, factory.WireCgroupsStarter(logger))
@@ -375,6 +394,8 @@ func (cmd *CommonCommand) createWiring(logger lager.Logger, metricsProvider *met
 		ContainerNetworkMetricsProvider: factory.WireContainerNetworkMetricsProvider(containerizer, propManager),
 		Backends:                        backends.registry,
 		VMStacks:                        backends.vmStacks,
+		VMImages:                        vmImages,
+		VMDockerRootFS:                  backends.vmDockerRootFS,
 	}, nil
 }
 
@@ -866,6 +887,11 @@ type executionBackends struct {
 	// vmStacks builds the stack images of VM containers. It is nil unless
 	// --vm-stack-tarball is set and a vm-* backend is enabled.
 	vmStacks *vmstack.Builder
+
+	// vmDockerRootFS is the tarball that a VM container which asks for a
+	// Docker image runs on. It is empty unless --vm-docker-rootfs is set and
+	// a vm-* backend is enabled.
+	vmDockerRootFS string
 }
 
 // releaser returns the step that releases claimed block devices, or nil.
@@ -972,6 +998,9 @@ func (cmd *CommonCommand) wireExecutionBackends(log lager.Logger) (*executionBac
 	if err := cmd.checkVMStackFlags(kinds); err != nil {
 		return nil, err
 	}
+	if err := cmd.checkVMDockerFlags(kinds); err != nil {
+		return nil, err
+	}
 
 	if len(kinds) == 0 {
 		cmd.logUnusedBlockVolumes(log)
@@ -1060,9 +1089,62 @@ func (cmd *CommonCommand) wireExecutionBackends(log lager.Logger) (*executionBac
 		})
 	}
 
-	log.Info("enabled", lager.Data{"backends": kinds, "kvm-gid": kvmGid, "block-volumes": blockVolumes != nil, "vm-launch-flags": vmLaunchFlags, "vm-stacks": vmStacks != nil})
+	var vmDockerRootFS string
+	if kvmGid != 0 {
+		vmDockerRootFS = cmd.ExecutionBackends.VMDockerRootFS
+	}
 
-	return &executionBackends{registry: registry, kvmGid: kvmGid, blockVolumes: blockVolumes, vmLaunchFlags: vmLaunchFlags, vmStacks: vmStacks}, nil
+	log.Info("enabled", lager.Data{"backends": kinds, "kvm-gid": kvmGid, "block-volumes": blockVolumes != nil, "vm-launch-flags": vmLaunchFlags, "vm-stacks": vmStacks != nil, "vm-docker-images": vmDockerRootFS != ""})
+
+	return &executionBackends{registry: registry, kvmGid: kvmGid, blockVolumes: blockVolumes, vmLaunchFlags: vmLaunchFlags, vmStacks: vmStacks, vmDockerRootFS: vmDockerRootFS}, nil
+}
+
+// checkVMDockerFlags refuses Docker image flags that cannot work: a tarball
+// without a vm-* backend to use it, a tarball path that is not absolute, and
+// a cache budget that holds nothing.
+func (cmd *CommonCommand) checkVMDockerFlags(kinds []backend.Kind) error {
+	rootfs := cmd.ExecutionBackends.VMDockerRootFS
+	if rootfs == "" {
+		return nil
+	}
+
+	vmEnabled := false
+	for _, kind := range kinds {
+		vmEnabled = vmEnabled || backend.IsVM(kind)
+	}
+	if !vmEnabled {
+		return errors.New("--vm-docker-rootfs requires a vm-* --execution-backend, because only a VM container boots a Docker image in its guest")
+	}
+	if !filepath.IsAbs(rootfs) {
+		return fmt.Errorf("--vm-docker-rootfs must be an absolute path, got %q", rootfs)
+	}
+	if !filepath.IsAbs(cmd.ExecutionBackends.VMDockerImageCacheDir) {
+		return fmt.Errorf("--vm-docker-image-cache-dir must be an absolute path, got %q", cmd.ExecutionBackends.VMDockerImageCacheDir)
+	}
+	if cmd.ExecutionBackends.VMDockerImageCacheBytes <= 0 {
+		return fmt.Errorf("--vm-docker-image-cache-bytes must be positive, got %d", cmd.ExecutionBackends.VMDockerImageCacheBytes)
+	}
+	return nil
+}
+
+// wireVMImages builds the guest image builder of Docker image VM containers
+// over the container volumizer, or returns nil when the feature is off. The
+// builder packs each image with the artifacts' mksquashfs, and it maps the
+// store's root uid, which is the highest uid of the cell, back to 0.
+func (cmd *CommonCommand) wireVMImages(log lager.Logger, backends *executionBackends, volumizer vmimage.Volumizer) (*vmimage.Builder, error) {
+	if backends == nil || backends.vmDockerRootFS == "" {
+		return nil, nil
+	}
+	// #nosec G115 - the max valid uid of a Linux host fits in 32 bits
+	maxUID := uint32(mustGetMaxValidUID())
+	return vmimage.New(vmimage.Config{
+		Mksquashfs: filepath.Join(cmd.ExecutionBackends.VMArtifactsDir, "mksquashfs"),
+		CacheDir:   cmd.ExecutionBackends.VMDockerImageCacheDir,
+		CacheBytes: cmd.ExecutionBackends.VMDockerImageCacheBytes,
+		MaxUID:     maxUID,
+		Volumizer:  volumizer,
+		Logger:     log.Session("vm-image"),
+	})
 }
 
 // checkVMStackFlags refuses stack flags that cannot work: a tarball without a
@@ -1111,20 +1193,26 @@ func (cmd *CommonCommand) logUnusedBlockVolumes(log lager.Logger) {
 	}
 }
 
-// vmLaunchVolumeFlags returns the volume flags for the wrapped vm-launch of a
-// vm-* container, which are empty for the defaults.
+// vmLaunchVolumeFlags returns the volume, QEMU sandbox, and CPU flags for the
+// wrapped vm-launch of a vm-* container, which are empty for the defaults.
 func (cmd *CommonCommand) vmLaunchVolumeFlags() []string {
-	return processes.VMLaunchVolumeFlags(cmd.ExecutionBackends.VMVolumeShares, bundlerules.VMVirtiofsdPath, !cmd.ExecutionBackends.VMVolumeAsyncMounts)
+	flags := processes.VMLaunchVolumeFlags(cmd.ExecutionBackends.VMVolumeShares, bundlerules.VMVirtiofsdPath, !cmd.ExecutionBackends.VMVolumeAsyncMounts)
+	flags = append(flags, processes.VMLaunchQEMUSandboxFlags(cmd.ExecutionBackends.VMQemuSandbox)...)
+	return append(flags, processes.VMLaunchCPUFlags(cmd.ExecutionBackends.VMMaxVCPUs)...)
 }
 
-// logUnusedVolumeFlags notes that --vm-volume-shares or
-// --vm-volume-async-mounts has no effect because no vm-* backend is enabled.
+// logUnusedVolumeFlags notes that --vm-volume-shares,
+// --vm-volume-async-mounts, or --vm-max-vcpus has no effect because no vm-*
+// backend is enabled.
 func (cmd *CommonCommand) logUnusedVolumeFlags(log lager.Logger) {
 	if cmd.ExecutionBackends.VMVolumeShares {
 		log.Info("volume-shares-unused-without-a-vm-backend")
 	}
 	if cmd.ExecutionBackends.VMVolumeAsyncMounts {
 		log.Info("volume-async-mounts-unused-without-a-vm-backend")
+	}
+	if cmd.ExecutionBackends.VMMaxVCPUs > 0 {
+		log.Info("max-vcpus-unused-without-a-vm-backend")
 	}
 }
 

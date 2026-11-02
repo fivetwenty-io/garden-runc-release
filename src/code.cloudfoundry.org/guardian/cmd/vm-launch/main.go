@@ -7,7 +7,7 @@
 //
 // Usage:
 //
-//	vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--artifacts DIR] -- PATH [ARGS...]
+//	vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--max-vcpus N] [--artifacts DIR] -- PATH [ARGS...]
 //
 // When PATH is the CF launcher ("launcher APP-DIR START-COMMAND ..."), the
 // guest runs START-COMMAND. Otherwise it runs PATH and ARGS, shell-quoted.
@@ -272,12 +272,20 @@
 // guest's memory, as the unsized container mount is bounded by the
 // container's memory.
 //
-// Memory: the guest gets MEMORY_LIMIT less 192 MiB, which the container
-// keeps for the hypervisor and everything else it runs, with a floor of 128
-// MiB and a ceiling of 16 GiB. MEMORY_LIMIT must be whole megabytes, such as
-// 512m. When it is missing or malformed, or below the 320m that the floor
-// and the reserve need, the guest gets 128 MiB and vm-launch logs a line
-// that says so.
+// Memory: the guest gets MEMORY_LIMIT less what the container keeps for the
+// hypervisor and everything else it runs, which is 128 MiB on QEMU and 96 MiB
+// on Firecracker, plus 2 MiB for each GiB of the limit for the host page
+// tables, with a floor of 128 MiB and a ceiling of 16 GiB. MEMORY_LIMIT must
+// be whole megabytes, such as 512m. When it is missing or malformed, or below
+// what the floor and the reserve need, the guest gets 128 MiB and vm-launch
+// logs a line that says so.
+//
+// CPUs: the guest gets one vCPU for each CPU the container may run on, which
+// is the CPUs of its cpuset and otherwise every online CPU, less --max-vcpus
+// when the operator sets it, and at most 32. Firecracker takes 1 or an even
+// number, so an odd count above 1 loses one. The container's CPU weight still
+// bounds the guest's total CPU time. When the count cannot be read, the
+// guest gets one vCPU and vm-launch logs a line that says so.
 //
 // Guest root disk: when VCAP_APPLICATION has limits.disk, vm-launch creates
 // a sparse image for the guest root in its work directory, with mode 0600,
@@ -529,7 +537,18 @@ const stopDeadline = 8 * time.Second
 // volume are never changed by it.
 const volumeSyncMountsFlag = "volume-sync-mounts"
 
-const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--artifacts DIR] -- PATH [ARGS...]\n"
+// qemuSandboxFlag names the vm-launch flag that carries the operator's value
+// for QEMU's -sandbox option. Its default is qemuSandbox, an empty value
+// turns the sandbox off, and Garden renders it from a job property. Firecracker
+// ignores it.
+const qemuSandboxFlag = "qemu-sandbox"
+
+// maxVCPUsFlag names the vm-launch flag with which the operator caps the
+// guest's vCPU count. Zero, the default, leaves the count at the CPUs the
+// container may run on (see guestVCPUCount).
+const maxVCPUsFlag = "max-vcpus"
+
+const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--qemu-sandbox=OPTIONS] [--max-vcpus N] [--image-user USER [--image-default-env NAMES]] [--artifacts DIR] -- PATH [ARGS...]\n"
 
 type config struct {
 	backend   backend.Kind
@@ -557,6 +576,23 @@ type config struct {
 	// is false, an image with a journal mounts without them (see
 	// volumeSyncMountsFlag).
 	volumeSyncMounts bool
+	// qemuSandbox is the value of QEMU's -sandbox option, or empty for none
+	// (see qemuSandboxFlag).
+	qemuSandbox string
+	// maxVCPUs is the operator's cap on the guest's vCPU count, or 0 for
+	// none (see maxVCPUsFlag).
+	maxVCPUs int
+	// image, when set, makes this a launch of the Docker image guest (see
+	// imageguest.go).
+	image *imageConfig
+}
+
+// imageConfig is what Garden tells vm-launch about a Docker image guest: the
+// user that Diego asked for, and the variables that the process lacked
+// before Garden gave it defaults (see withImageDefaults).
+type imageConfig struct {
+	user       string
+	defaultEnv []string
 }
 
 // init holds the main goroutine, and with it run, to the thread-group
@@ -725,13 +761,30 @@ func run(argv []string, logger *log.Logger) int {
 		return exitLaunchError
 	}
 	// The guest runs the app on its stack only when the process is the CF
-	// launcher, Garden bound a usable stack image, every volume the app has
-	// is a private disk image, and the droplet image builds. Each condition is settled as soon as
-	// run can tell, and the first that fails gives the busybox guest, which
-	// is then exactly the guest of a launch without a stack image. guestMode
-	// is the line that names the guest and why, which run logs once the
-	// hypervisor is about to start.
-	stackImg, why := stackCandidate(cfg.args)
+	// launcher, Garden bound a usable stack image, and the droplet image
+	// builds. The stack guest mounts every kind of volume that the busybox
+	// guest does. Each condition is settled as soon as run can tell, and the
+	// first that fails gives the busybox guest, which is then exactly the
+	// guest of a launch without a stack image. guestMode is the line that
+	// names the guest and why, which run logs once the hypervisor is about
+	// to start.
+	//
+	// A launch with --image-user runs the Docker image guest or nothing. Its
+	// image takes the stack image's place, and every reason for the busybox
+	// guest refuses the launch instead (see toBusybox).
+	var stackImg *os.File
+	var imgUser imageUser
+	why := ""
+	switch {
+	case cfg.image != nil && !isLauncher(cfg.args):
+		why = "the process is not the CF launcher"
+	case cfg.image != nil:
+		if stackImg, imgUser, err = openGuestImage(cfg.image.user); err != nil {
+			why = strings.ReplaceAll(err.Error(), "\n", "; ")
+		}
+	default:
+		stackImg, why = stackCandidate(cfg.args)
+	}
 	defer func() { closeFile(stackImg, "the stack image", logger) }()
 	guestMode := ""
 	// toBusybox settles on the busybox guest for the reason why. A launcher
@@ -742,6 +795,10 @@ func run(argv []string, logger *log.Logger) int {
 	toBusybox := func(why string) bool {
 		closeFile(stackImg, "the stack image", logger)
 		stackImg = nil
+		if cfg.image != nil {
+			logger.Print("image guest: " + why)
+			return false
+		}
 		guestMode = "busybox guest: " + why
 		if len(sidecars) > 0 {
 			logger.Print(sidecarsRefusal(len(sidecars), why))
@@ -780,6 +837,12 @@ func run(argv []string, logger *log.Logger) int {
 	// directory exists and before CredHub is asked anything. Every volume
 	// is checked before any of them is prepared.
 	vols, err := volumesFromEnv(lookupEnv)
+	// The Docker image guest mounts no volumes yet, so a launch with any
+	// volume is refused before a provider is looked for.
+	if err == nil && cfg.image != nil && len(vols) > 0 {
+		toBusybox(fmt.Sprintf("the Docker image guest mounts no volumes, and the app has %d", len(vols)))
+		return exitLaunchError
+	}
 	if err == nil {
 		err = applyVolumeSettings(lookupEnv, vols)
 	}
@@ -814,13 +877,6 @@ func run(argv []string, logger *log.Logger) int {
 		return exitLaunchError
 	}
 	defer tools.Close()
-	// The stack guest mounts private disk images only, so a share or a BOSH
-	// disk keeps the busybox guest, with the first such volume named.
-	if stackImg != nil && len(selected) > 0 {
-		if ok, why := stackModeAllowsVolumes(selected); !ok && !toBusybox(why) {
-			return exitLaunchError
-		}
-	}
 	// The stack guest's launcher, argv, working directory, and host files
 	// are gathered and checked here, so that a launch the stack guest could
 	// not run fails before anything is prepared. The launcher stays open
@@ -834,6 +890,13 @@ func run(argv []string, logger *log.Logger) int {
 			}
 		}
 	}
+	// The Docker lifecycle's launcher enters the image's working directory
+	// itself, as the image's user, so every process starts at the top of the
+	// app root.
+	if stack != nil && cfg.image != nil {
+		stack.image = &guestImage{uid: imgUser.uid, gid: imgUser.gid}
+		stack.cwd = "/"
+	}
 	closeLauncher := func() {
 		if stack != nil {
 			closeFile(stack.launcher.file, "the launcher", logger)
@@ -841,7 +904,8 @@ func run(argv []string, logger *log.Logger) int {
 		}
 	}
 	defer closeLauncher()
-	memMiB := guestMemory(lookupEnv, logger)
+	memMiB := guestMemory(cfg.backend, lookupEnv, logger)
+	vcpus := guestVCPUCount(cfg.backend, countContainerCPUs, cfg.maxVCPUs, logger)
 	// The launcher derives DATABASE_URL from the resolved VCAP_SERVICES, so
 	// the references are resolved before buildGuestEnv.
 	services, resolved, err := resolveCredhubRefs(lookupEnv, cfg.credhub, defaultCredhubClient, sigs, logger)
@@ -852,10 +916,14 @@ func run(argv []string, logger *log.Logger) int {
 	if resolved {
 		env[vcapServicesEnv] = services
 	}
-	caBundle, err := guestCABundle(rootfsCABundles, lookupEnv, logger)
-	if err != nil {
-		logger.Print(err)
-		return exitLaunchError
+	// The Docker image guest keeps the image's own CA bundle, as a runC
+	// container of the image does, so it takes none from the container.
+	var caBundle []byte
+	if cfg.image == nil {
+		if caBundle, err = guestCABundle(rootfsCABundles, lookupEnv, logger); err != nil {
+			logger.Print(err)
+			return exitLaunchError
+		}
 	}
 	sysCerts, err := readSystemCerts(lookupEnv, logger)
 	if err != nil {
@@ -933,7 +1001,13 @@ func run(argv []string, logger *log.Logger) int {
 	// not build gives the busybox guest, whose environment is built then.
 	var droplet *os.File
 	defer func() { closeFile(droplet, "the droplet image", logger) }()
-	if stack != nil {
+	if stack != nil && stack.image != nil {
+		size := int64(-1)
+		if info, err := stackImg.Stat(); err == nil {
+			size = info.Size()
+		}
+		guestMode = fmt.Sprintf("image guest: the launcher runs on the Docker image as uid %d and gid %d, with an image of %d bytes", imgUser.uid, imgUser.gid, size)
+	} else if stack != nil {
 		img, sig, err := buildDropletImageWatching(sigs, dropletBuildTimeout, cfg.artifacts, dropletHome, workDir, containerDirs(vols)...)
 		if sig != nil {
 			logger.Printf("received %v while the droplet image was building", sig)
@@ -965,7 +1039,11 @@ func run(argv []string, logger *log.Logger) int {
 			logger.Print(err)
 			return exitLaunchError
 		}
-		files, err := sidecarGuestFilesOf(sidecars, stackGuestDenylist(identity != nil))
+		deny := stackGuestDenylist(identity != nil)
+		if stack.image != nil {
+			deny = imageGuestDenylist(identity != nil)
+		}
+		files, err := sidecarGuestFilesOf(sidecars, deny)
 		if err != nil {
 			logger.Print(err)
 			return exitLaunchError
@@ -976,7 +1054,12 @@ func run(argv []string, logger *log.Logger) int {
 		logger.Print(sidecarsRefusal(len(sidecars), "the stack guest has no app root"))
 		return exitLaunchError
 	}
-	if stack != nil {
+	if stack != nil && stack.image != nil {
+		if envFile, err = buildImageGuestEnvWithCerts(withImageDefaults(env, cfg.image.defaultEnv, imgUser), memMiB, identity != nil, sysCerts.dirOf(), logger); err != nil {
+			logger.Print(err)
+			return exitLaunchError
+		}
+	} else if stack != nil {
 		if envFile, err = buildStackGuestEnvWithCerts(env, memMiB, identity != nil, sysCerts.dirOf(), logger); err != nil {
 			logger.Print(err)
 			return exitLaunchError
@@ -1073,7 +1156,7 @@ func run(argv []string, logger *log.Logger) int {
 	// identity are refused before the hypervisor starts.
 	var sd *stackDrives
 	if stack != nil {
-		sd = &stackDrives{stack: stackImg, droplet: droplet}
+		sd = &stackDrives{stack: stackImg, droplet: droplet, image: stack.image != nil}
 	}
 	drives, err := newGuestDrivesWithStack(cfg.backend, prepared, rootImg, sd)
 	if err != nil {
@@ -1132,10 +1215,16 @@ func run(argv []string, logger *log.Logger) int {
 	defer shareSrv.stop(0)
 	shareSrv.setGuestMemory(memMiB)
 	files, drivePaths, initrdPath, monitorFD, rootPath := hypervisorFilesWithStack(prepared.files(), initrd, qemuMonitor, rootImg, sd)
-	hvArgv, err := hypervisorArgvWithStack(cfg.backend, cfg.artifacts, workDir, initrdPath, memMiB, nw, drivePaths, rootPath, monitorFD, sd, shareSrv.sockets()...)
+	hvArgv, err := hypervisorArgvWithVCPUs(cfg.backend, cfg.artifacts, workDir, initrdPath, memMiB, vcpus, nw, drivePaths, rootPath, monitorFD, sd, shareSrv.sockets()...)
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError
+	}
+	if cfg.backend == backend.VMQemu {
+		hvArgv = withQEMUSandbox(hvArgv, cfg.qemuSandbox)
+		if cfg.qemuSandbox == "" {
+			logger.Print("the QEMU sandbox is off")
+		}
 	}
 
 	select {
@@ -1433,13 +1522,36 @@ func parseArgs(argv []string) (config, error) {
 	allowShares := fs.Bool(allowVolumeSharesFlag, false, "allow an app to ask for a volume as a share in VM_VOLUMES, which only QEMU can serve")
 	virtiofsd := fs.String(virtiofsdFlag, "", "path of the executable that runs virtiofsd, which serves shares")
 	syncMounts := fs.Bool(volumeSyncMountsFlag, true, "mount every volume image with sync and dirsync; with =false, an image whose filesystem has a journal mounts without them")
+	sandbox := fs.String(qemuSandboxFlag, qemuSandbox, "the value of QEMU's -sandbox option, which turns on its seccomp filter; empty turns the sandbox off")
+	maxVCPUs := fs.Int(maxVCPUsFlag, 0, "the most vCPUs a guest gets; 0 gives it one for each CPU the container may run on")
+	imageUser := fs.String(imageUserFlag, "", "run the CF launcher on the Docker image that Garden bound into the container, as this user")
+	imageDefaults := fs.String(imageDefaultEnvFlag, "", "the names among HOME, PATH, and USER that hold Garden's defaults, which the Docker image's user replaces")
 	if err := fs.Parse(argv); err != nil {
 		return config{}, err
 	}
+	if *maxVCPUs < 0 {
+		return config{}, fmt.Errorf("--%s must be 0 or more, got %d", maxVCPUsFlag, *maxVCPUs)
+	}
 
-	cfg := config{backend: backend.Kind(*kind), transparent: *transparent, allowVolumeShares: *allowShares, volumeSyncMounts: *syncMounts}
-	virtiofsdSet := false
-	fs.Visit(func(f *flag.Flag) { virtiofsdSet = virtiofsdSet || f.Name == virtiofsdFlag })
+	cfg := config{backend: backend.Kind(*kind), transparent: *transparent, allowVolumeShares: *allowShares, volumeSyncMounts: *syncMounts, qemuSandbox: *sandbox, maxVCPUs: *maxVCPUs}
+	virtiofsdSet, imageSet, imageDefaultsSet := false, false, false
+	fs.Visit(func(f *flag.Flag) {
+		virtiofsdSet = virtiofsdSet || f.Name == virtiofsdFlag
+		imageSet = imageSet || f.Name == imageUserFlag
+		imageDefaultsSet = imageDefaultsSet || f.Name == imageDefaultEnvFlag
+	})
+	switch {
+	case imageSet && *imageUser == "":
+		return config{}, fmt.Errorf("--%s must not be empty", imageUserFlag)
+	case imageSet:
+		names, err := parseImageDefaultEnv(*imageDefaults)
+		if err != nil {
+			return config{}, err
+		}
+		cfg.image = &imageConfig{user: *imageUser, defaultEnv: names}
+	case imageDefaultsSet:
+		return config{}, fmt.Errorf("--%s needs --%s", imageDefaultEnvFlag, imageUserFlag)
+	}
 	if virtiofsdSet {
 		if *virtiofsd == "" {
 			return config{}, fmt.Errorf("--%s must not be empty", virtiofsdFlag)

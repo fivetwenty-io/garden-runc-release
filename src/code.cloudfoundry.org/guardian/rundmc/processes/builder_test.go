@@ -236,11 +236,8 @@ var _ = Describe("ProcBuilder", func() {
 		}
 
 		Describe("the AppArmor profile of the wrapped vm-launch process", func() {
-			// runc applies the container's profile to an exec'd process unless
-			// the process names a non-empty profile, so an empty profile here
-			// would leave QEMU confined.
-			It("is set to unconfined in a vm-qemu bundle, until a confined QEMU has been checked on a cell", func() {
-				Expect(preparedProc.ApparmorProfile).To(Equal("unconfined"))
+			It("is the bundle's profile in a vm-qemu bundle, so QEMU stays confined", func() {
+				Expect(preparedProc.ApparmorProfile).To(Equal("default-profile"))
 			})
 
 			Context("in a vm-qemu bundle without an AppArmor profile", func() {
@@ -248,7 +245,7 @@ var _ = Describe("ProcBuilder", func() {
 					bndl = bndl.WithApparmorProfile("")
 				})
 
-				It("names no profile, because there is nothing to lift", func() {
+				It("names no profile", func() {
 					Expect(preparedProc.ApparmorProfile).To(BeEmpty())
 				})
 			})
@@ -1388,6 +1385,35 @@ var _ = Describe("the volume flags of the wrapped vm-launch", func() {
 			Expect(processes.VMLaunchAllowVolumeSharesFlag).To(Equal("--allow-volume-shares"))
 			Expect(processes.VMLaunchVirtiofsdFlag).To(Equal("--virtiofsd-path"))
 			Expect(processes.VMLaunchVolumeSyncMountsFlag).To(Equal("--volume-sync-mounts"))
+			Expect(processes.VMLaunchQEMUSandboxFlag).To(Equal("--qemu-sandbox"))
+		})
+	})
+
+	Describe("VMLaunchQEMUSandboxFlags", func() {
+		It("passes nothing for the default, which vm-launch uses without a flag", func() {
+			Expect(processes.VMLaunchQEMUSandboxFlags(processes.VMQemuSandboxDefault)).To(BeEmpty())
+		})
+
+		It("passes a custom value as one argument", func() {
+			Expect(processes.VMLaunchQEMUSandboxFlags("on,spawn=deny")).To(Equal([]string{"--qemu-sandbox=on,spawn=deny"}))
+		})
+
+		It("passes an empty value, which turns the sandbox off", func() {
+			Expect(processes.VMLaunchQEMUSandboxFlags("")).To(Equal([]string{"--qemu-sandbox="}))
+		})
+	})
+
+	Describe("VMLaunchCPUFlags", func() {
+		DescribeTable("renders the flags for each setting",
+			func(maxVCPUs uint, expected []string) {
+				Expect(processes.VMLaunchCPUFlags(maxVCPUs)).To(Equal(expected))
+			},
+			Entry("the default of no cap passes nothing", uint(0), []string(nil)),
+			Entry("a cap passes the flag and the number", uint(4), []string{"--max-vcpus", "4"}),
+		)
+
+		It("names the flag vm-launch reads", func() {
+			Expect(processes.VMLaunchMaxVCPUsFlag).To(Equal("--max-vcpus"))
 		})
 	})
 

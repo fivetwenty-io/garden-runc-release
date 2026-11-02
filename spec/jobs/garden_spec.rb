@@ -535,6 +535,55 @@ describe 'garden' do
         end
       end
 
+      context 'vm_max_vcpus' do
+        let(:execution_tail) do
+          "\n; execution backends\n  execution-backend = vm-qemu\n  vm-artifacts-dir = /var/vcap/data/vm-runtime/artifacts\n  vm-launch-bin = /var/vcap/packages/guardian/bin/vm-launch\n"
+        end
+
+        def render_with(backends, extra)
+          template.render({ 'garden' => { 'execution_backends' => backends }.merge(extra) })
+        end
+
+        it 'declares a default of 0, which is no cap, and a description' do
+          garden_spec = YAML.load_file(File.join(File.dirname(__FILE__), '../../jobs/garden/spec'))
+          property = garden_spec['properties']['garden.vm_max_vcpus']
+          expect(property['default']).to eql(0)
+          expect(property['description']).not_to be_empty
+        end
+
+        [[], ['vm-qemu'], %w[vm-qemu vm-firecracker], ['oci-gvisor']].each do |backends|
+          it "renders byte for byte what it rendered before the property existed when it is 0 (#{backends.inspect})" do
+            expect(render_with(backends, { 'vm_max_vcpus' => 0 })).to eql(render_with(backends, {}))
+          end
+        end
+
+        context 'with a cap' do
+          let(:garden_properties) { { 'execution_backends' => ['vm-qemu'], 'vm_max_vcpus' => 4 } }
+
+          it 'renders the key after the vm keys and nothing else new' do
+            expect(server['vm-max-vcpus']).to eql(4)
+            expect(raw_template).to end_with(execution_tail + "  vm-max-vcpus = 4\n")
+          end
+        end
+
+        it 'renders the key on a vm-firecracker cell too' do
+          rendered = IniParse.parse(render_with(['vm-firecracker'], { 'vm_max_vcpus' => 2 }))['server']
+          expect(rendered['vm-max-vcpus']).to eql(2)
+        end
+
+        [[], ['oci-gvisor']].each do |backends|
+          it "raises for a cap when the backends are #{backends.inspect}" do
+            expect { render_with(backends, { 'vm_max_vcpus' => 2 }) }.to raise_error(/garden.vm_max_vcpus requires a vm-\* entry/)
+          end
+        end
+
+        ['2', -1, 1.5, true, []].each do |value|
+          it "raises for #{value.inspect}, which is not a whole number of 0 or more" do
+            expect { render_with(['vm-qemu'], { 'vm_max_vcpus' => value }) }.to raise_error(/garden.vm_max_vcpus must be 0 or a positive whole number/)
+          end
+        end
+      end
+
       context 'volume properties' do
         let(:volume_keys) { %w[vm-block-volumes vm-volume-shares vm-volume-async-mounts] }
         let(:defaults) { { 'vm_block_volumes' => false, 'vm_volume_shares' => false, 'vm_volume_sync_mounts' => true } }
@@ -664,6 +713,56 @@ describe 'garden' do
         end
       end
 
+      context 'qemu sandbox property' do
+        let(:sandbox_default) { 'on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny' }
+
+        def render_with(backends, extra)
+          template.render({ 'garden' => { 'execution_backends' => backends }.merge(extra) })
+        end
+
+        def render_server(backends, extra)
+          IniParse.parse(render_with(backends, extra))['server']
+        end
+
+        it 'declares the seccomp sandbox as the default' do
+          garden_spec = YAML.load_file(File.join(File.dirname(__FILE__), '../../jobs/garden/spec'))
+          property = garden_spec['properties']['garden.vm_qemu_sandbox']
+          expect(property['default']).to eql(sandbox_default)
+          expect(property['description']).not_to be_empty
+        end
+
+        [[], ['vm-qemu'], %w[vm-qemu vm-firecracker]].each do |backends|
+          it "renders no sandbox line by default (#{backends.inspect})" do
+            expect(render_with(backends, {})).not_to include('vm-qemu-sandbox')
+          end
+        end
+
+        it 'renders no line for the default value set explicitly' do
+          expect(render_with(['vm-qemu'], { 'vm_qemu_sandbox' => sandbox_default })).not_to include('vm-qemu-sandbox')
+        end
+
+        it 'renders a custom value after the other vm keys and parses it back' do
+          raw = render_with(['vm-qemu'], { 'vm_qemu_sandbox' => 'on,spawn=deny' })
+          expect(raw).to end_with("  vm-launch-bin = /var/vcap/packages/guardian/bin/vm-launch\n  vm-qemu-sandbox = on,spawn=deny\n")
+          expect(render_server(['vm-qemu'], { 'vm_qemu_sandbox' => 'on,spawn=deny' })['vm-qemu-sandbox']).to eql('on,spawn=deny')
+        end
+
+        it 'renders an empty key for an empty value, which turns the sandbox off' do
+          raw = render_with(['vm-qemu'], { 'vm_qemu_sandbox' => '' })
+          expect(raw).to match(/^  vm-qemu-sandbox = $/)
+        end
+
+        it 'raises for a value over several lines' do
+          expect { render_with(['vm-qemu'], { 'vm_qemu_sandbox' => "on\nfoo = bar" }) }
+            .to raise_error(/garden.vm_qemu_sandbox must be a one-line string/)
+        end
+
+        it 'raises for a non-default value without a vm-* backend' do
+          expect { render_with(['oci-gvisor'], { 'vm_qemu_sandbox' => '' }) }
+            .to raise_error(/garden.vm_qemu_sandbox requires a vm-\* entry/)
+        end
+      end
+
       context 'stack properties' do
         let(:tarballs) { %w[/var/vcap/packages/cflinuxfs4/rootfs.tar /var/vcap/packages/cflinuxfs3/rootfs.tar] }
 
@@ -743,6 +842,80 @@ describe 'garden' do
           it "raises for a wait of #{value.inspect}" do
             expect { render_with(['vm-qemu'], { 'vm_stack_wait_seconds' => value }) }
               .to raise_error(/garden.vm_stack_wait_seconds must be a positive whole number/)
+          end
+        end
+      end
+
+      context 'Docker image properties' do
+        let(:rootfs) { '/var/vcap/packages/cflinuxfs4/rootfs.tar' }
+
+        def render_with(backends, extra)
+          template.render({ 'garden' => { 'execution_backends' => backends }.merge(extra) })
+        end
+
+        def render_server(backends, extra)
+          IniParse.parse(render_with(backends, extra))['server']
+        end
+
+        it 'declares an empty tarball, the cache directory, and a 10 GiB budget' do
+          garden_spec = YAML.load_file(File.join(File.dirname(__FILE__), '../../jobs/garden/spec'))
+          properties = garden_spec['properties']
+          expect(properties['garden.vm_docker_rootfs']['default']).to eql('')
+          expect(properties['garden.vm_docker_image_cache_dir']['default']).to eql('/var/vcap/data/vm-runtime/images')
+          expect(properties['garden.vm_docker_image_cache_bytes']['default']).to eql(10 * 1024 * 1024 * 1024)
+          %w[garden.vm_docker_rootfs garden.vm_docker_image_cache_dir garden.vm_docker_image_cache_bytes].each do |name|
+            expect(properties[name]['description']).not_to be_empty
+          end
+        end
+
+        [[], ['vm-qemu'], %w[vm-qemu vm-firecracker], %w[oci-gvisor vm-qemu]].each do |backends|
+          it "renders no Docker image line by default (#{backends.inspect})" do
+            expect(render_with(backends, {})).not_to include('vm-docker')
+          end
+        end
+
+        it 'renders the tarball and the cache settings, which parse back' do
+          server = render_server(['vm-qemu'], { 'vm_docker_rootfs' => rootfs })
+          expect(server['vm-docker-rootfs']).to eql(rootfs)
+          expect(server['vm-docker-image-cache-dir']).to eql('/var/vcap/data/vm-runtime/images')
+          expect(server['vm-docker-image-cache-bytes']).to eql(10_737_418_240)
+        end
+
+        it 'renders a cache directory and a budget that the operator sets' do
+          server = render_server(['vm-firecracker'], {
+                                   'vm_docker_rootfs' => rootfs,
+                                   'vm_docker_image_cache_dir' => '/var/vcap/data/images',
+                                   'vm_docker_image_cache_bytes' => 1_048_576
+                                 })
+          expect(server['vm-docker-image-cache-dir']).to eql('/var/vcap/data/images')
+          expect(server['vm-docker-image-cache-bytes']).to eql(1_048_576)
+        end
+
+        it 'renders no cache setting without a tarball' do
+          expect(render_with(['vm-qemu'], { 'vm_docker_image_cache_bytes' => 1_048_576 })).not_to include('vm-docker')
+        end
+
+        it 'raises for a relative tarball path' do
+          expect { render_with(['vm-qemu'], { 'vm_docker_rootfs' => 'packages/cflinuxfs4/rootfs.tar' }) }
+            .to raise_error(/garden.vm_docker_rootfs must be an absolute path or empty/)
+        end
+
+        it 'raises for a relative cache directory' do
+          expect { render_with(['vm-qemu'], { 'vm_docker_rootfs' => rootfs, 'vm_docker_image_cache_dir' => 'images' }) }
+            .to raise_error(/garden.vm_docker_image_cache_dir must be an absolute path/)
+        end
+
+        [0, -1, '1024', 1.5].each do |value|
+          it "raises for a budget of #{value.inspect}" do
+            expect { render_with(['vm-qemu'], { 'vm_docker_image_cache_bytes' => value }) }
+              .to raise_error(/garden.vm_docker_image_cache_bytes must be a positive whole number of bytes/)
+          end
+        end
+
+        [[], ['oci-gvisor']].each do |backends|
+          it "raises when the tarball is set and the backends are #{backends.inspect}" do
+            expect { render_with(backends, { 'vm_docker_rootfs' => rootfs }) }
+              .to raise_error(/garden.vm_docker_rootfs requires a vm-\* entry/)
           end
         end
       end

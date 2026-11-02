@@ -36,20 +36,102 @@ const (
 	artQEMUShareDir = "qemu/share"
 )
 
-// Guest shape. Every VM has one vCPU. Its memory comes from the container's
-// MEMORY_LIMIT (see guestMemory).
-const guestVCPUs = 1
+// Guest vCPUs. A guest gets one vCPU for each CPU the container may run on,
+// the way a runC app can use every core it can see, so the container's CPU
+// weight still bounds the guest's total CPU time and the vCPU count only sets
+// how many cores the guest can use at once. The count is the container's
+// CPU affinity mask, which holds the cpuset the container is confined to and
+// otherwise every online CPU, less any operator maximum, and never above
+// maxGuestVCPUs.
+const (
+	// defaultGuestVCPUs is the guest's vCPU count when the container's CPUs
+	// cannot be counted, and the count every guest had before it was
+	// derived from them.
+	defaultGuestVCPUs = 1
+
+	// maxGuestVCPUs is Firecracker's limit of 32 vCPUs. QEMU takes more, but
+	// the guest kernel's own limit is not known here, so both use it.
+	maxGuestVCPUs = 32
+)
+
+// guestVCPUCount returns the guest's vCPU count: the CPUs that available
+// reports, less max when max is positive, capped at maxGuestVCPUs. Firecracker
+// takes a count that is 1 or an even number, so it rounds an odd count above 1
+// down by one. A count that cannot be read gives defaultGuestVCPUs and a log
+// line, and so does a container with no CPU. A count that max or the cap
+// lowers is logged, so an operator who finds a guest with fewer cores than
+// the cell can see the cause.
+func guestVCPUCount(kind backend.Kind, available func() (int, error), max int, logger *log.Logger) int {
+	cpus, err := available()
+	if err != nil {
+		logger.Printf("the container's CPUs cannot be counted (%v); the guest gets %d vCPU", err, defaultGuestVCPUs)
+		return defaultGuestVCPUs
+	}
+	if cpus < 1 {
+		logger.Printf("the container reports %d CPUs; the guest gets %d vCPU", cpus, defaultGuestVCPUs)
+		return defaultGuestVCPUs
+	}
+	count := cpus
+	if max > 0 && count > max {
+		logger.Printf("the container can run on %d CPUs and the operator maximum is %d; the guest gets %d vCPUs", cpus, max, max)
+		count = max
+	}
+	if count > maxGuestVCPUs {
+		logger.Printf("the container can run on %d CPUs and a guest has at most %d vCPUs; the guest gets %d", cpus, maxGuestVCPUs, maxGuestVCPUs)
+		count = maxGuestVCPUs
+	}
+	if kind == backend.VMFirecracker && count > 1 && count%2 == 1 {
+		count--
+	}
+	return count
+}
+
+// countContainerCPUs is how run counts the container's CPUs. A spec replaces
+// it so that the count does not depend on the machine that runs the suite.
+var countContainerCPUs = containerCPUs
+
+// containerCPUs counts the CPUs this process may run on. The kernel gives a
+// process in a cpuset the cpuset's CPUs and otherwise every online CPU, and
+// vm-launch's affinity is inherited by the hypervisor, so the count is also
+// the most CPUs the hypervisor's vCPU threads can use at once.
+func containerCPUs() (int, error) {
+	var set unix.CPUSet
+	if err := unix.SchedGetaffinity(0, &set); err != nil {
+		return 0, err
+	}
+	return set.Count(), nil
+}
 
 // Guest memory sizing. The guest gets MEMORY_LIMIT less a reserve for what
 // else the container holds, which is the hypervisor itself, vm-launch, the
 // initramfs, sshd sessions, and the health check, clamped to a floor and a
-// ceiling. The floor is the size every guest had before it was derived from
-// MEMORY_LIMIT, so a container below floor plus reserve keeps that size.
+// ceiling. The reserve is a fixed amount for each hypervisor plus a share
+// that grows with the guest, for the host page tables that map its memory.
+// The fixed amounts are what a guest that had filled its RAM held beyond that
+// RAM in the container's cgroup, about 80 MiB on QEMU and about 35 MiB on
+// Firecracker, with room for more sshd sessions. The floor is the size every
+// guest had before it was derived from MEMORY_LIMIT, so a container below
+// floor plus reserve keeps that size.
 const (
-	guestMemoryReserveMiB = 192
-	minGuestMemoryMiB     = 128
-	maxGuestMemoryMiB     = 16384
+	qemuMemoryReserveMiB        = 128
+	firecrackerMemoryReserveMiB = 96
+	minGuestMemoryMiB           = 128
+	maxGuestMemoryMiB           = 16384
+
+	// pageTableMiBPerGuestGiB is a conservative 2 MiB for each GiB of guest
+	// memory, which is eight bytes of page table for each 4 KiB page.
+	pageTableMiBPerGuestGiB = 2
 )
+
+// guestMemoryReserve returns what the container keeps for kind and a
+// container of limit MiB, in MiB.
+func guestMemoryReserve(kind backend.Kind, limit int) int {
+	base := qemuMemoryReserveMiB
+	if kind == backend.VMFirecracker {
+		base = firecrackerMemoryReserveMiB
+	}
+	return base + limit*pageTableMiBPerGuestGiB/1024
+}
 
 // memoryLimitPattern is the form Cloud Controller gives MEMORY_LIMIT: whole
 // megabytes with a lowercase m. Seven digits is far beyond any cell and keeps
@@ -61,7 +143,7 @@ var memoryLimitPattern = regexp.MustCompile(`^[1-9][0-9]{0,6}m$`)
 // small to hold the floor and the reserve; each of those logs one line, so an
 // operator who sees the hypervisor killed for memory can find the cause. The
 // lines name the limit only once it has parsed as a number.
-func guestMemory(lookupEnv func(string) (string, bool), logger *log.Logger) int {
+func guestMemory(kind backend.Kind, lookupEnv func(string) (string, bool), logger *log.Logger) int {
 	value, ok := lookupEnv("MEMORY_LIMIT")
 	if !ok {
 		logger.Printf("MEMORY_LIMIT is not set; the guest gets %d MiB", minGuestMemoryMiB)
@@ -72,17 +154,43 @@ func guestMemory(lookupEnv func(string) (string, bool), logger *log.Logger) int 
 		logger.Printf("MEMORY_LIMIT is not a whole number of megabytes such as 512m; the guest gets %d MiB", minGuestMemoryMiB)
 		return minGuestMemoryMiB
 	}
-	guest := limit - guestMemoryReserveMiB
+	reserve := guestMemoryReserve(kind, limit)
+	guest := limit - reserve
 	switch {
 	case guest < minGuestMemoryMiB:
 		logger.Printf("MEMORY_LIMIT %dm is below the %dm a guest of %d MiB needs with the %d MiB the container keeps for the hypervisor; the guest gets %d MiB and may be killed for memory, so give the app at least %dM",
-			limit, minGuestMemoryMiB+guestMemoryReserveMiB, minGuestMemoryMiB, guestMemoryReserveMiB, minGuestMemoryMiB, minGuestMemoryMiB+guestMemoryReserveMiB)
+			limit, minGuestMemoryMiB+reserve, minGuestMemoryMiB, reserve, minGuestMemoryMiB, minGuestMemoryMiB+reserve)
 		return minGuestMemoryMiB
 	case guest > maxGuestMemoryMiB:
 		logger.Printf("MEMORY_LIMIT %dm leaves more than the %d MiB a guest may have; the guest gets %d MiB", limit, maxGuestMemoryMiB, maxGuestMemoryMiB)
 		return maxGuestMemoryMiB
 	}
 	return guest
+}
+
+// qemuSandbox is the default value of QEMU's -sandbox option (see
+// qemuSandboxFlag): its own seccomp filter. It denies the
+// obsolete system calls, the privilege changes (setuid and the like), spawning
+// a process (fork and exec), and changes to resource limits and priorities.
+// QEMU as vm-launch starts it needs none of them: the user-mode network runs
+// in process, and no helper script or child process is configured.
+const qemuSandbox = "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"
+
+// withQEMUSandbox returns argv with the value of its -sandbox option replaced
+// by sandbox, or without the option when sandbox is empty. It copies argv.
+func withQEMUSandbox(argv []string, sandbox string) []string {
+	out := make([]string, 0, len(argv))
+	for i := 0; i < len(argv); i++ {
+		if argv[i] != "-sandbox" || i+1 >= len(argv) {
+			out = append(out, argv[i])
+			continue
+		}
+		if sandbox != "" {
+			out = append(out, "-sandbox", sandbox)
+		}
+		i++
+	}
+	return out
 }
 
 // qemuMachine is QEMU's -M option: the microvm machine under KVM, with guest
@@ -177,6 +285,12 @@ func checkArtifacts(kind backend.Kind, root string) error {
 // RAM as a shared memfd (see qemuShareArgs) and a vhost-user-fs device for
 // each share, after the volume drives and before the monitor.
 func qemuArgv(root, initrd string, memMiB int, nw *network, drives []volumeDrive, monitorFD int, shares ...shareSocket) []string {
+	return qemuArgvWithVCPUs(root, initrd, memMiB, defaultGuestVCPUs, nw, drives, monitorFD, shares...)
+}
+
+// qemuArgvWithVCPUs is qemuArgv for a guest of vcpus vCPUs, which qemuArgv
+// fixes at defaultGuestVCPUs.
+func qemuArgvWithVCPUs(root, initrd string, memMiB, vcpus int, nw *network, drives []volumeDrive, monitorFD int, shares ...shareSocket) []string {
 	art := func(rel string) string { return filepath.Join(root, rel) }
 	machine := qemuMachine
 	if len(shares) > 0 {
@@ -189,13 +303,18 @@ func qemuArgv(root, initrd string, memMiB int, nw *network, drives []volumeDrive
 		"-L", art(artQEMUShareDir),
 		"-M", machine,
 		"-cpu", "host",
-		"-smp", strconv.Itoa(guestVCPUs),
+		"-smp", strconv.Itoa(vcpus),
 		"-m", strconv.Itoa(memMiB),
 		"-nodefaults",
 		"-no-user-config",
 		"-nographic",
 		"-serial", "stdio",
 		"-no-reboot",
+		// The only monitor is the QMP socket below. -nodefaults already drops
+		// the default one, and naming none keeps a stdio monitor from ever
+		// reaching the guest's console.
+		"-monitor", "none",
+		"-sandbox", qemuSandbox,
 		"-kernel", art(artBzImage),
 		"-initrd", initrd,
 		"-append", qemuKernelArgs,
@@ -442,7 +561,9 @@ func stackDriveFDs(nVols int, hasMonitor, hasRoot bool) (stack, droplet int) {
 // stack and droplet images in sd, which come after the root image as the last
 // two files, so no other file's descriptor moves. A nil sd gives exactly what
 // hypervisorFiles gives. Both files of an sd are required (see
-// newGuestDrivesWithStack); a missing one is passed on as a nil file.
+// newGuestDrivesWithStack); a missing one is passed on as a nil file. The
+// Docker image guest's sd gives one file, the Docker image, in the stack's
+// place.
 func hypervisorFilesWithStack(vols []*attachment, initrd, monitor, root *os.File, sd *stackDrives) (files []*os.File, drives []volumeDrive, initrdPath string, monitorFD int, rootPath string) {
 	for _, att := range vols {
 		if att == nil || att.File == nil {
@@ -467,7 +588,10 @@ func hypervisorFilesWithStack(vols []*attachment, initrd, monitor, root *os.File
 		files = append(files, root)
 		rootPath = procSelfFD(firstExtraFD + len(files) - 1)
 	}
-	if sd != nil {
+	switch {
+	case sd != nil && sd.image:
+		files = append(files, sd.stack)
+	case sd != nil:
 		files = append(files, sd.stack, sd.droplet)
 	}
 	return files, drives, initrdPath, monitorFD, rootPath
@@ -569,9 +693,18 @@ func newFirecrackerConfig(root, initrd string, memMiB int, nw *network, drives [
 
 // newFirecrackerConfigWithStack is newFirecrackerConfig for a guest that also
 // has the stack and droplet images, as read-only drives on the descriptors
-// stack and droplet, after the root image and in that order. A nil sd gives
-// exactly the configuration newFirecrackerConfig gives.
+// stack and droplet, after the root image and in that order. A droplet
+// descriptor of 0 is the Docker image guest's, which has its image on stack
+// and no droplet drive. A nil sd gives exactly the configuration
+// newFirecrackerConfig gives.
 func newFirecrackerConfigWithStack(root, initrd string, memMiB int, nw *network, drives []volumeDrive, rootPath string, sd *stackFDs) firecrackerConfig {
+	return newFirecrackerConfigWithVCPUs(root, initrd, memMiB, defaultGuestVCPUs, nw, drives, rootPath, sd)
+}
+
+// newFirecrackerConfigWithVCPUs is newFirecrackerConfigWithStack for a guest
+// of vcpus vCPUs, which newFirecrackerConfigWithStack fixes at
+// defaultGuestVCPUs.
+func newFirecrackerConfigWithVCPUs(root, initrd string, memMiB, vcpus int, nw *network, drives []volumeDrive, rootPath string, sd *stackFDs) firecrackerConfig {
 	cfg := firecrackerConfig{
 		BootSource: firecrackerBootSource{
 			KernelImagePath: filepath.Join(root, artVmlinux),
@@ -579,7 +712,7 @@ func newFirecrackerConfigWithStack(root, initrd string, memMiB int, nw *network,
 			BootArgs:        firecrackerKernelArgs,
 		},
 		Drives:        []firecrackerDrive{},
-		MachineConfig: firecrackerMachineConfig{VCPUCount: guestVCPUs, MemSizeMiB: memMiB},
+		MachineConfig: firecrackerMachineConfig{VCPUCount: vcpus, MemSizeMiB: memMiB},
 	}
 	for _, d := range drives {
 		cfg.Drives = append(cfg.Drives, firecrackerDrive{
@@ -603,10 +736,14 @@ func newFirecrackerConfigWithStack(root, initrd string, memMiB int, nw *network,
 		})
 	}
 	if sd != nil {
-		for _, d := range []struct {
+		images := []struct {
 			id string
 			fd int
-		}{{stackDriveID, sd.stack}, {dropletDriveID, sd.droplet}} {
+		}{{stackDriveID, sd.stack}, {dropletDriveID, sd.droplet}}
+		if sd.droplet == 0 {
+			images = images[:1]
+		}
+		for _, d := range images {
 			cfg.Drives = append(cfg.Drives, firecrackerDrive{
 				DriveID:      d.id,
 				PathOnHost:   procSelfFD(d.fd),
@@ -623,7 +760,8 @@ func newFirecrackerConfigWithStack(root, initrd string, memMiB int, nw *network,
 }
 
 // stackFDs are the file descriptors the hypervisor gets the stack and droplet
-// images on.
+// images on. The Docker image guest has its image on stack and no droplet,
+// which is 0.
 type stackFDs struct {
 	stack, droplet int
 }
@@ -656,15 +794,27 @@ func hypervisorArgv(kind backend.Kind, root, workDir, initrd string, memMiB int,
 // stack and droplet images in sd, which hypervisorFilesWithStack passes as
 // the two files after the root image. The hypervisor attaches both as
 // read-only virtio-blk drives after the root image, the stack first, so no
-// other drive moves. Only whether sd is nil matters here, because the
-// descriptors follow from the drives, the monitor, and the root image (see
-// stackDriveFDs). A nil sd gives exactly the command line or configuration
+// other drive moves. Only whether sd is nil, and whether it is the Docker
+// image guest's, matter here, because the descriptors follow from the
+// drives, the monitor, and the root image (see stackDriveFDs). The Docker
+// image guest's image gets the stack's drive and serial, and it has no
+// droplet drive. A nil sd gives exactly the command line or configuration
 // hypervisorArgv gives.
 func hypervisorArgvWithStack(kind backend.Kind, root, workDir, initrd string, memMiB int, nw *network, drives []volumeDrive, rootPath string, monitorFD int, sd *stackDrives, shares ...shareSocket) ([]string, error) {
+	return hypervisorArgvWithVCPUs(kind, root, workDir, initrd, memMiB, defaultGuestVCPUs, nw, drives, rootPath, monitorFD, sd, shares...)
+}
+
+// hypervisorArgvWithVCPUs is hypervisorArgvWithStack for a guest of vcpus
+// vCPUs, which hypervisorArgvWithStack fixes at defaultGuestVCPUs. vcpus is
+// from guestVCPUCount, so it is 1 or more.
+func hypervisorArgvWithVCPUs(kind backend.Kind, root, workDir, initrd string, memMiB, vcpus int, nw *network, drives []volumeDrive, rootPath string, monitorFD int, sd *stackDrives, shares ...shareSocket) ([]string, error) {
 	var fds *stackFDs
 	if sd != nil {
 		stack, droplet := stackDriveFDs(len(drives), monitorFD > 0, rootPath != "")
 		fds = &stackFDs{stack: stack, droplet: droplet}
+		if sd.image {
+			fds.droplet = 0
+		}
 	}
 	if len(drives) > maxVolumes {
 		return nil, fmt.Errorf("%d volume drives, over the %d a guest can have", len(drives), maxVolumes)
@@ -689,20 +839,22 @@ func hypervisorArgvWithStack(kind backend.Kind, root, workDir, initrd string, me
 	}
 	switch kind {
 	case backend.VMQemu:
-		argv := qemuArgv(root, initrd, memMiB, nw, drives, monitorFD, shares...)
+		argv := qemuArgvWithVCPUs(root, initrd, memMiB, vcpus, nw, drives, monitorFD, shares...)
 		if rootPath != "" {
 			argv = append(argv, qemuRootDrive(rootPath)...)
 		}
 		if fds != nil {
 			argv = append(argv, qemuReadOnlyDrive(stackDriveID, qemuStackSerial, fds.stack)...)
-			argv = append(argv, qemuReadOnlyDrive(dropletDriveID, qemuDropletSerial, fds.droplet)...)
+			if fds.droplet != 0 {
+				argv = append(argv, qemuReadOnlyDrive(dropletDriveID, qemuDropletSerial, fds.droplet)...)
+			}
 		}
 		return append(argv, qemuBalloonArgs()...), nil
 	case backend.VMFirecracker:
 		if monitorFD != 0 {
 			return nil, errors.New("firecracker has no QMP monitor")
 		}
-		cfg, err := json.Marshal(newFirecrackerConfigWithStack(root, initrd, memMiB, nw, drives, rootPath, fds))
+		cfg, err := json.Marshal(newFirecrackerConfigWithVCPUs(root, initrd, memMiB, vcpus, nw, drives, rootPath, fds))
 		if err != nil {
 			return nil, fmt.Errorf("encoding firecracker config: %w", err)
 		}

@@ -27,6 +27,10 @@ const (
 	// vm-* container. It holds rootfs.squashfs.
 	VMStackMountPath = "/opt/garden-vm/stack"
 
+	// VMImageMountPath is where the files of a Docker image guest appear
+	// inside a vm-* container. It holds rootfs.squashfs, passwd, and group.
+	VMImageMountPath = "/opt/garden-vm/image"
+
 	// VMLaunchMountPath is where the host vm-launch binary appears inside a vm-* container.
 	VMLaunchMountPath = processes.VMLaunchPath
 
@@ -174,10 +178,22 @@ func (r ExecutionBackend) Apply(bndl goci.Bndl, spec spec.DesiredContainerSpec) 
 				Options:     []string{"bind", "ro", "nosuid", "nodev", "noexec"},
 			})
 		}
+		// A Docker image guest gets its image's files one by one, so nothing
+		// else that lands in the cache directory reaches the container.
+		if spec.VMImageDir != "" {
+			for _, name := range []string{"rootfs.squashfs", "passwd", "group"} {
+				mounts = append(mounts, specs.Mount{
+					Destination: VMImageMountPath + "/" + name,
+					Source:      filepath.Join(spec.VMImageDir, name),
+					Type:        "bind",
+					Options:     []string{"bind", "ro", "nosuid", "nodev", "noexec"},
+				})
+			}
+		}
 		bndl = bndl.WithMounts(mounts...)
 
-		// The bundle keeps its AppArmor profile. The process builder lifts it
-		// for the vm-launch process of a vm-qemu container only.
+		// The bundle keeps its AppArmor profile, and every process in the
+		// container runs under it, the wrapped vm-launch process included.
 		process := bndl.Process()
 		process.Capabilities = processes.WithoutCapability(process.Capabilities, processes.CapSetGID)
 		process.NoNewPrivileges = true
@@ -192,6 +208,9 @@ func (r ExecutionBackend) Apply(bndl goci.Bndl, spec spec.DesiredContainerSpec) 
 		annotations[k] = v
 	}
 	annotations[backend.AnnotationKey] = string(kind)
+	if backend.IsVM(kind) && spec.VMImageDir != "" {
+		annotations[backend.ImageAnnotationKey] = backend.DockerImage
+	}
 	bndl.Spec.Annotations = annotations
 
 	return bndl, nil

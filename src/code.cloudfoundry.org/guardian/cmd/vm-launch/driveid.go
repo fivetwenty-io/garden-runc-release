@@ -99,9 +99,12 @@ type guestDrives struct {
 // stackDrives are the open files of the stack image and the droplet image,
 // which the hypervisor attaches as read-only drives after the guest root
 // image. A nil *stackDrives is a guest without them, and every function that
-// takes one then behaves exactly as it does without the parameter.
+// takes one then behaves exactly as it does without the parameter. In the
+// Docker image guest, image is set, the Docker image takes the stack's
+// drive, and there is no droplet, so droplet must be nil.
 type stackDrives struct {
 	stack, droplet *os.File
+	image          bool
 }
 
 // driveFileStat returns the stat of the open file f. Specs replace it to
@@ -160,7 +163,8 @@ func newGuestDrives(kind backend.Kind, volumes preparedVolumes, root *os.File) (
 // serial rvm-stack on QEMU and the droplet rvm-droplet, and Firecracker's
 // identities are predicted from the two open files. Both files are required,
 // and either one sharing an identity with another drive is an error that
-// names both drives.
+// names both drives. The Docker image guest's sd holds the Docker image in
+// the stack's place and no droplet, and a droplet there is an error.
 func newGuestDrivesWithStack(kind backend.Kind, volumes preparedVolumes, root *os.File, sd *stackDrives) (guestDrives, error) {
 	if len(volumes) > maxVolumes {
 		return guestDrives{}, fmt.Errorf("%d volume drives, over the %d a guest can have", len(volumes), maxVolumes)
@@ -205,14 +209,22 @@ func newGuestDrivesWithStack(kind backend.Kind, volumes preparedVolumes, root *o
 		named = append(named, namedDriveID{name: "the guest root image", id: id})
 	}
 	if sd != nil {
-		for _, d := range []struct {
+		images := []struct {
 			name, serial string
 			file         *os.File
 			id           *string
 		}{
 			{"the stack image", qemuStackSerial, sd.stack, &drives.stackID},
 			{"the droplet image", qemuDropletSerial, sd.droplet, &drives.dropletID},
-		} {
+		}
+		if sd.image {
+			if sd.droplet != nil {
+				return guestDrives{}, errors.New("the Docker image guest has no droplet image, yet it was given one")
+			}
+			images = images[:1]
+			images[0].name = "the Docker image"
+		}
+		for _, d := range images {
 			if d.file == nil {
 				return guestDrives{}, fmt.Errorf("%s has no open disk to identify", d.name)
 			}

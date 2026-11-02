@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"code.cloudfoundry.org/guardian/backend"
@@ -905,9 +906,9 @@ var _ = Describe("run with the full guest environment", func() {
 		GinkgoT().Setenv("__GARDEN_VM_LAUNCH_WRAPPED", "1")
 
 		for _, kind := range []backend.Kind{backend.VMQemu, backend.VMFirecracker} {
-			hv := "qemu/ld-linux-x86-64.so.2"
+			hv, guestMiB := "qemu/ld-linux-x86-64.so.2", 383
 			if kind == backend.VMFirecracker {
-				hv = "firecracker/firecracker"
+				hv, guestMiB = "firecracker/firecracker", 415
 			}
 			initrdCopy := filepath.Join(scratch, string(kind)+".initrd")
 			writeFakeHypervisor(filepath.Join(art, hv), `cat "$initrd" > `+shellQuote(initrdCopy)+`
@@ -928,9 +929,9 @@ gzip -dc "$initrd" | grep -a -q -F `+shellQuote(secretSentinel)+` || { echo "no 
 			envPath := filepath.Join(scratch, string(kind)+".env")
 			Expect(os.WriteFile(envPath, []byte(envFile), 0o600)).To(Succeed())
 			got := sourceAndDumpEnv([]string{"/bin/sh"}, envPath)
-			Expect(got).To(HaveKeyWithValue("MEMORY_LIMIT", "320m"))
+			Expect(got).To(HaveKeyWithValue("MEMORY_LIMIT", strconv.Itoa(guestMiB)+"m"))
 			Expect(got).To(HaveKeyWithValue("DATABASE_URL", "postgres://u:"+secretSentinel+"@h/d"))
-			Expect(got["VCAP_APPLICATION"]).To(ContainSubstring(`"limits":{"mem":320}`))
+			Expect(got["VCAP_APPLICATION"]).To(ContainSubstring(`"limits":{"mem":` + strconv.Itoa(guestMiB) + `}`))
 			Expect(got["VCAP_APPLICATION"]).To(ContainSubstring(`"host":"0.0.0.0"`))
 			Expect(got).To(HaveKey("VCAP_SERVICES"))
 			for _, name := range []string{"PATH", "HOME", "TMPDIR", "USER", "CF_INSTANCE_KEY", "VCAP_PLATFORM_OPTIONS", "__GARDEN_VM_LAUNCH_WRAPPED"} {
