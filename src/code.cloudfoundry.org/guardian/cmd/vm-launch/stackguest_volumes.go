@@ -60,9 +60,9 @@ func checkStackVolumes(g guestContents) error {
 // whose app runs as uid guestAppUID. root_owner gives the root directory of
 // a blank image's new filesystem to that uid and gid, so that the app can
 // create files at the top of its volume, as it can at the top of its home.
-// An image that already holds a filesystem keeps the owner it has, so an
-// image that the busybox guest formatted, whose root belongs to root, stays
-// that way.
+// mke2fs leaves an image that already holds a filesystem alone, and
+// guestStackVolumeBinds gives the root of one that the busybox guest
+// formatted, which belongs to root, to the same uid.
 const guestStackVolumeMke2fsArgs = guestVolumeMke2fsArgs + ",root_owner=" + guestAppUID + ":" + guestAppUID
 
 // guestStackVolumeSetup is guestVolumeSetup for the stack guest. It is the
@@ -84,9 +84,23 @@ var guestStackVolumeSetup = strings.Replace(guestVolumeSetup, guestVolumeMke2fsA
 // a path that crosses a link fails the boot with a line that names both.
 // A mount point that cannot be made and a bind that fails end the boot with
 // a line that names the path too.
+//
+// Before the bind, a volume whose top directory belongs to root:root, as
+// one that the busybox guest formatted does, gets that directory alone given
+// to guestAppUID, never what it holds, so that the app can create files at
+// the top of its volume as it can on a volume that the stack guest
+// formatted. Any other owner stays as it is. The step never fails the boot,
+// and a stat or a chown that fails prints a line that names the path and
+// leaves the volume as it was, because the app may still use the volume's
+// subdirectories, and the status the app exits with is its own.
 const guestStackVolumeBinds = `rvm_vi=0
 while [ "$rvm_vi" -lt "$RVM_VOLUMES" ]; do
 	eval "rvm_vpath=\${RVM_VOL${rvm_vi}_PATH:-}"
+	if ! rvm_vown=$(stat -c %u:%g "$rvm_vpath" 2>&1); then
+		echo "vm-launch guest setup: reading the owner of the volume at $rvm_vpath failed (${rvm_vown:-it gave no reason}); leaving its owner as it is"
+	elif [ "$rvm_vown" = 0:0 ]; then
+		rvm_verr=$(chown ` + guestAppUID + `:` + guestAppUID + ` "$rvm_vpath" 2>&1) || echo "vm-launch guest setup: giving the top directory of the volume at $rvm_vpath to uid ` + guestAppUID + ` failed (${rvm_verr:-it gave no reason}); the app may not create files there"
+	fi
 	rvm_vat=` + guestAppRoot + `
 	rvm_vrest=${rvm_vpath#/}
 	while [ -n "$rvm_vrest" ]; do

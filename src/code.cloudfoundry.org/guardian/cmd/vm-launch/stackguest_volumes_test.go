@@ -4,6 +4,8 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -170,7 +172,7 @@ var _ = Describe("the volumes of the stack guest", func() {
 	})
 
 	Describe("in the guest's shell", func() {
-		var dir, bin, app, callLog string
+		var dir, bin, app, callLog, owners string
 
 		BeforeEach(func() {
 			dir = GinkgoT().TempDir()
@@ -192,6 +194,24 @@ var _ = Describe("the volumes of the stack guest", func() {
 			stub("sync", `[ "${SYNC_FAIL_AT:-}" != "$2" ] || { echo "sync: $2: Input/output error" >&2; exit 1; }`)
 			stub("kill", `exit 0`)
 			stub("sleep", `echo "the teardown waited, though no other process runs" >&2; exit 1`)
+			stub("chown", `[ "${CHOWN_FAIL_AT:-}" != "$2" ] || { echo "chown: $2: Read-only file system" >&2; exit 1; }`)
+			// stat records nothing. It prints the owner that the file
+			// owners lists for its path, or 2000:2000 for a path that
+			// owners does not list, and fails for the path STAT_FAIL_AT
+			// names.
+			owners = filepath.Join(dir, "owners")
+			Expect(os.WriteFile(filepath.Join(bin, "stat"), []byte(`#!/bin/sh
+if [ "${STAT_FAIL_AT:-}" = "$3" ]; then
+	echo "stat: can't stat '$3': No such file or directory" >&2
+	exit 1
+fi
+if [ -e `+shellQuote(owners)+` ]; then
+	while IFS=' ' read -r rvm_o rvm_p; do
+		[ "$rvm_p" != "$3" ] || { echo "$rvm_o"; exit 0; }
+	done <`+shellQuote(owners)+`
+fi
+echo 2000:2000
+`), 0o755)).To(Succeed())
 		})
 
 		// mountsFor is the part of /rvm/mounts that the binds and the
@@ -222,11 +242,15 @@ var _ = Describe("the volumes of the stack guest", func() {
 				`sync -f "`, filepath.Join(bin, "sync")+` -f "`,
 				"kill -", filepath.Join(bin, "kill")+" -",
 				"\tsleep ", "\t"+filepath.Join(bin, "sleep")+" ",
+				"$(stat -c ", "$("+filepath.Join(bin, "stat")+" -c ",
+				"$(chown ", "$("+filepath.Join(bin, "chown")+" ",
 				guestProcDir+"/[0-9]*", shellQuote(filepath.Join(dir, "proc"))+"/[0-9]*",
 			).Replace(script)
 			Expect(moved).NotTo(ContainSubstring(guestAppRoot))
 			Expect(strings.Count(moved, "mount -o bind")).To(Equal(strings.Count(moved, filepath.Join(bin, "mount")+" -o bind")))
 			Expect(strings.Count(moved, "umount ")).To(Equal(strings.Count(moved, filepath.Join(bin, "umount")+" ")))
+			Expect(strings.Count(moved, "stat -c ")).To(Equal(strings.Count(moved, filepath.Join(bin, "stat")+" -c ")))
+			Expect(strings.Count(moved, "chown ")).To(Equal(strings.Count(moved, filepath.Join(bin, "chown")+" ")))
 			Expect(os.MkdirAll(filepath.Join(dir, "proc"), 0o755)).To(Succeed())
 			full := strings.Replace(guestFailFunc, "reboot -nf", "echo REBOOT", 1) + pre + moved
 			cmd := exec.Command(shell.argv[0], append(slices.Clone(shell.argv[1:]), "-c", full)...)
@@ -283,6 +307,49 @@ var _ = Describe("the volumes of the stack guest", func() {
 				Expect(os.WriteFile(filepath.Join(app, "srv"), nil, 0o644)).To(Succeed())
 				out, _ := runScript(shell, mountsFor("/srv/data"), guestStackVolumeBinds+"echo BOUND\n")
 				Expect(out).To(HaveSuffix("vm-launch guest setup: creating the mount point of the volume at /srv/data in the app root failed\nREBOOT\n"), shell.name)
+			},
+			shellEntries(""),
+		)
+
+		DescribeTable("gives a volume's top directory that belongs to root:root, and that directory alone, to uid 2000 before its bind, and leaves any other owner as it is",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				Expect(os.WriteFile(owners, []byte("0:0 /home/vcap/data\n0:1000 /srv/group\n1000:0 /srv/user\n0:0 /srv/my data\n"), 0o644)).To(Succeed())
+				out, calls := runScript(shell, mountsFor("/home/vcap/data", "/srv/group", "/srv/user", "/srv/vcap", "/srv/my data"), guestStackVolumeBinds+"echo BOUND\n")
+				Expect(out).To(Equal("BOUND\n"), shell.name)
+				Expect(calls).To(Equal("chown 2000:2000 /home/vcap/data\n"+
+					"mkdir -p $DIR/app/home/vcap/data\nmount -o bind /home/vcap/data $DIR/app/home/vcap/data\n"+
+					"mkdir -p $DIR/app/srv/group\nmount -o bind /srv/group $DIR/app/srv/group\n"+
+					"mkdir -p $DIR/app/srv/user\nmount -o bind /srv/user $DIR/app/srv/user\n"+
+					"mkdir -p $DIR/app/srv/vcap\nmount -o bind /srv/vcap $DIR/app/srv/vcap\n"+
+					"chown 2000:2000 /srv/my data\n"+
+					"mkdir -p $DIR/app/srv/my data\nmount -o bind /srv/my data $DIR/app/srv/my data\n"), shell.name)
+			},
+			shellEntries(""),
+		)
+
+		DescribeTable("prints a line that names the volume and goes on to bind every volume when its owner cannot be read or changed",
+			func(shellOf func() guestShell, env, line string) {
+				shell := shellOf()
+				Expect(os.WriteFile(owners, []byte("0:0 /home/vcap/data\n0:0 /srv/two\n"), 0o644)).To(Succeed())
+				out, calls := runScript(shell, mountsFor("/home/vcap/data", "/srv/two"), guestStackVolumeBinds+"echo BOUND\n", env)
+				Expect(out).To(Equal(line+"BOUND\n"), shell.name)
+				Expect(calls).To(HaveSuffix("chown 2000:2000 /srv/two\nmkdir -p $DIR/app/srv/two\nmount -o bind /srv/two $DIR/app/srv/two\n"), shell.name)
+				Expect(calls).To(ContainSubstring("mount -o bind /home/vcap/data $DIR/app/home/vcap/data\n"), shell.name)
+			},
+			append(shellEntries("a stat that fails", "STAT_FAIL_AT=/home/vcap/data",
+				"vm-launch guest setup: reading the owner of the volume at /home/vcap/data failed (stat: can't stat '/home/vcap/data': No such file or directory); leaving its owner as it is\n"),
+				shellEntries("a chown that fails", "CHOWN_FAIL_AT=/home/vcap/data",
+					"vm-launch guest setup: giving the top directory of the volume at /home/vcap/data to uid 2000 failed (chown: /home/vcap/data: Read-only file system); the app may not create files there\n")...),
+		)
+
+		DescribeTable("keeps a status of 0 after a chown that fails",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				Expect(os.WriteFile(owners, []byte("0:0 /home/vcap/data\n"), 0o644)).To(Succeed())
+				out, _ := runScript(shell, mountsFor("/home/vcap/data"), guestStackVolumeBinds+"(exit 0)\nrvm_status=$?\n"+guestStackVolumeTeardown+"echo \"status=$rvm_status\"\n", "CHOWN_FAIL_AT=/home/vcap/data")
+				Expect(out).To(HavePrefix("vm-launch guest setup: giving the top directory of the volume at /home/vcap/data to uid 2000 failed"), shell.name)
+				Expect(out).To(HaveSuffix("; the app may not create files there\nstatus=0\n"), shell.name)
 			},
 			shellEntries(""),
 		)
@@ -349,6 +416,26 @@ var _ = Describe("the volumes of the stack guest", func() {
 	})
 })
 
+// The owner fields of an ext4 inode, which the low and high 16 bits of the
+// uid and the gid make up.
+const (
+	extInodeUID     = 0x02
+	extInodeGID     = 0x18
+	extInodeUIDHigh = 0x78
+	extInodeGIDHigh = 0x7a
+)
+
+// rootOwner returns the uid and gid of the root directory of the ext4
+// filesystem on img, as "uid:gid".
+func rootOwner(img *os.File) string {
+	GinkgoHelper()
+	inode, _ := readExtImage(img).rootInode()
+	field := func(lo, hi int) uint32 {
+		return uint32(binary.LittleEndian.Uint16(inode[lo:])) | uint32(binary.LittleEndian.Uint16(inode[hi:]))<<16
+	}
+	return fmt.Sprintf("%d:%d", field(extInodeUID, extInodeUIDHigh), field(extInodeGID, extInodeGIDHigh))
+}
+
 // realStackVolumeLauncher is the test launcher of the stack guest with a
 // volume at /home/vcap/data. It prints who it runs as and who owns the
 // volume's root, prints the file that an earlier boot left there, if any,
@@ -407,7 +494,7 @@ var _ = Describe("the stack guest with a volume against a real QEMU", func() {
 		return strings.ReplaceAll(stdout, "\r", "")
 	}
 
-	DescribeTable("formats a new image for vcap, lets the app write to it as uid 2000 through the bind, stops with status 0 after a clean unmount, and finds the file at the next boot",
+	DescribeTable("formats a new volume image for vcap, lets the app write to it as uid 2000 through the bind, stops with status 0 after a clean unmount, and finds the file at the next boot",
 		func(withRoot bool) {
 			img := openSizedFile(defaultImageSize)
 			out := bootStackVolume(img, withRoot)
@@ -432,4 +519,25 @@ var _ = Describe("the stack guest with a volume against a real QEMU", func() {
 		Entry("on a guest root disk", true),
 		Entry("with the app root's upper layer in RAM", false),
 	)
+
+	It("gives the top directory of a volume image whose root belongs to root:root, as the busybox guest formats one, to uid 2000, so the app can write there", func() {
+		img := openSizedFile(defaultImageSize)
+		out := bootStackVolume(img, false)
+		Expect(out).To(MatchRegexp(`(?m)^vol-wrote=2000:2000$`), out)
+		readExtImage(img).editRoot(func(inode []byte) {
+			for _, off := range []int{extInodeUID, extInodeGID, extInodeUIDHigh, extInodeGIDHigh} {
+				binary.LittleEndian.PutUint16(inode[off:], 0)
+			}
+		})
+		Expect(rootOwner(img)).To(Equal("0:0"))
+
+		out = bootStackVolume(img, false)
+		Expect(out).NotTo(ContainSubstring("vm-launch guest"), out)
+		Expect(out).To(MatchRegexp(`(?m)^rvm-volume: clean, [0-9]+/[0-9]+ files, [0-9]+/[0-9]+ blocks$`), out)
+		Expect(out).To(MatchRegexp(`(?m)^vol-root=2000:2000$`), out)
+		Expect(out).To(MatchRegexp(`(?m)^vol-found=written-by-2000$`), out)
+		Expect(out).To(MatchRegexp(`(?m)^vol-wrote=2000:2000$`), out)
+		Expect(out).To(ContainSubstring(exitTag(testNonce)+"0"), out)
+		Expect(rootOwner(img)).To(Equal("2000:2000"))
+	})
 })
