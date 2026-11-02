@@ -1148,6 +1148,9 @@ func run(argv []string, logger *log.Logger) int {
 	}
 	if cfg.backend == backend.VMQemu {
 		hvArgv = withQEMUSandbox(hvArgv, cfg.qemuSandbox)
+		if cfg.qemuSandbox == "" {
+			logger.Print("the QEMU sandbox is off")
+		}
 	}
 
 	select {
