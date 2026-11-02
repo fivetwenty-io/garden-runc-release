@@ -1434,7 +1434,7 @@ var _ = Describe("the volume flags of the wrapped vm-launch", func() {
 			Expect(processes.VMLaunchMemoryFlags(bundleWith(map[string]string{backend.AnnotationKey: "vm-qemu"}))).To(BeNil())
 		})
 
-		It("passes the flag for a bundle that records one, even a reserve of 0", func() {
+		It("passes the flag for a bundle that records a reserve, including the 0 that bundles written before the annotation was limited to raised limits carry", func() {
 			for _, value := range []string{"130", "0"} {
 				annotations := map[string]string{backend.MemoryReserveAnnotationKey: value}
 				Expect(processes.VMLaunchMemoryFlags(bundleWith(annotations))).To(Equal([]string{"--full-memory-limit"}))

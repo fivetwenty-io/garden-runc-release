@@ -138,8 +138,8 @@ func (r ExecutionBackend) Apply(bndl goci.Bndl, spec spec.DesiredContainerSpec) 
 	}
 
 	// reserveMiB is the reserve that a VM container's memory limit was raised
-	// by, or -1 when the guest does not have the whole limit.
-	reserveMiB := -1
+	// by, or 0 when the limit was not raised.
+	reserveMiB := 0
 	if backend.IsVM(kind) {
 		if bndl.Spec.Process == nil {
 			return goci.Bndl{}, fmt.Errorf("%w: %s needs a bundle process to confine", backend.ErrBackendUnavailable, kind)
