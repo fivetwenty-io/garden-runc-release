@@ -25,6 +25,7 @@ const (
 	cpioTypeRegular = 0o100000
 	cpioTypeCharDev = 0o020000
 	cpioTypeFIFO    = 0o010000
+	cpioTypeSymlink = 0o120000
 
 	cpioPermMask   = 0o7777
 	cpioHeaderSize = 110
@@ -93,9 +94,15 @@ func (c *cpioWriter) entry(name string, fileType, perm, nlink, size, major, mino
 }
 
 func (c *cpioWriter) header(name string, ino, mode, nlink, size, major, minor uint32) error {
+	return c.ownedHeader(name, ino, mode, 0, 0, nlink, size, major, minor)
+}
+
+// ownedHeader is header for an entry that uid and gid own. Every other entry
+// belongs to root.
+func (c *cpioWriter) ownedHeader(name string, ino, mode, uid, gid, nlink, size, major, minor uint32) error {
 	namesize := len(name) + 1
 	hdr := fmt.Sprintf("070701%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x",
-		ino, mode, 0, 0, nlink, 0, size, 0, 0, major, minor, namesize, 0)
+		ino, mode, uid, gid, nlink, 0, size, 0, 0, major, minor, namesize, 0)
 	if _, err := io.WriteString(c.w, hdr+name+"\x00"); err != nil {
 		return fmt.Errorf("cpio entry %q: writing header: %w", name, err)
 	}
@@ -1905,6 +1912,9 @@ type guestStack struct {
 	// systemCerts are the trusted certificate files that the app finds at
 	// CF_SYSTEM_CERT_PATH, or nil for an app without any.
 	systemCerts *systemCerts
+	// mirror is the container's mounts that the guest gets by rule (see
+	// mountMirror), or nil for none.
+	mirror *mountMirror
 	// fallbackEnv, when fallback is set, is the environment file of the
 	// busybox guest that stage 1 falls back to if it cannot mount the stack
 	// or the droplet image (see guestFallbackFunc).
@@ -1993,7 +2003,8 @@ func (s *guestStack) archiveSteps(cw *cpioWriter, file func(name string, perm ui
 	}
 	steps = append(steps, s.guestSidecarSteps(cw, file)...)
 	steps = append(steps, s.guestIdentitySteps(cw, file)...)
-	return append(steps, s.systemCerts.stackSteps(cw)...)
+	steps = append(steps, s.systemCerts.stackSteps(cw)...)
+	return append(steps, s.mirror.stackSteps(cw)...)
 }
 
 // guestSidecarSteps adds, for a guest with sidecars, the directory

@@ -323,7 +323,13 @@ func imageGuestDenylist(identity bool) map[string]bool {
 // buildImageGuestEnvWithCerts is buildStackGuestEnvWithCerts for the Docker
 // image guest, which keeps the variables imageGuestDenylist keeps.
 func buildImageGuestEnvWithCerts(env map[string]string, guestMiB int, identity bool, certDir string, logger *log.Logger) (string, error) {
-	deny := imageGuestDenylist(identity)
+	return buildImageGuestEnvKeeping(env, guestMiB, identity, certDir, nil, logger)
+}
+
+// buildImageGuestEnvKeeping is buildImageGuestEnvWithCerts for a guest that
+// also keeps the denied variables in keep (see buildStackGuestEnvKeeping).
+func buildImageGuestEnvKeeping(env map[string]string, guestMiB int, identity bool, certDir string, keep []string, logger *log.Logger) (string, error) {
+	deny := denylistKeeping(imageGuestDenylist(identity), keep)
 	if identity {
 		env = withEnvValue(withEnvValue(env, instanceCertEnv, guestInstanceCertPath), instanceKeyEnv, guestInstanceKeyPath)
 	}

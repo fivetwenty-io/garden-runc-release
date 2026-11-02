@@ -219,6 +219,7 @@ type CommonCommand struct {
 		VMMaxVCPUs          uint          `long:"vm-max-vcpus" description:"The most vCPUs a vm-* guest gets. By default, which is 0, a guest gets one vCPU for each CPU its container may run on, up to 32, so that it can use every core of the cell the way a runC app can, and its container's CPU weight still bounds its total CPU time. Garden passes --max-vcpus to vm-launch only when this is set."`
 		VMFullMemoryLimit   bool          `long:"vm-full-memory-limit" description:"Give the guest of a vm-* container the whole memory limit that the app asked for, so that MEMORY_LIMIT in the guest equals the manifest limit. Garden raises the container's own memory limit by the hypervisor's reserve, about 130 MiB for a vm-qemu container and 100 MiB for a vm-firecracker container of 1 GiB, and passes --full-memory-limit to vm-launch. The cell is then oversubscribed by that reserve for each VM container, so Diego's memory accounting no longer bounds the cell. Off by default, and then the guest gets the limit less the reserve."`
 		VMVolumeAsyncMounts bool          `long:"vm-volume-async-mounts" description:"Mount a journalled ext4 image volume of a vm-* container without sync and dirsync, which vm-launch otherwise uses. A legacy ext2 image without a journal keeps them. Garden passes --volume-sync-mounts=false to vm-launch only when this is set. Off by default."`
+		VMMirrorMounts      bool          `long:"vm-mirror-mounts" description:"Carry the bind mounts of a vm-* container, such as the file-based service bindings at /etc/cf-service-bindings, into its guest at the same paths, by rule. Garden passes --mirror-mounts to vm-launch only when this is set. Off by default."`
 		VMQemuSandbox       string        `long:"vm-qemu-sandbox" default:"on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny" description:"The value of QEMU's -sandbox option for a vm-qemu container, which turns on QEMU's own seccomp filter. An empty value turns the sandbox off. Garden passes --qemu-sandbox to vm-launch only when the value differs from the default."`
 		VMStackTarballs     []string      `long:"vm-stack-tarball" description:"Absolute path of a stack rootfs tarball to turn into a read-only squashfs image for vm-* containers, such as /var/vcap/packages/cflinuxfs4/rootfs.tar. A VM container whose rootfs is a listed tarball gets the image bound read-only at /opt/garden-vm/stack. Requires a vm-* backend. Can be specified multiple times."`
 		VMStackCacheDir     string        `long:"vm-stack-cache-dir" default:"/var/vcap/data/vm-runtime/stacks" description:"Host directory that caches the stack images, one directory for each tarball digest."`
@@ -1201,16 +1202,18 @@ func (cmd *CommonCommand) logUnusedBlockVolumes(log lager.Logger) {
 	}
 }
 
-// vmLaunchVolumeFlags returns the volume, QEMU sandbox, and CPU flags for the
+// vmLaunchVolumeFlags returns the volume, QEMU sandbox, CPU, and mount mirroring flags for the
 // wrapped vm-launch of a vm-* container, which are empty for the defaults.
 func (cmd *CommonCommand) vmLaunchVolumeFlags() []string {
 	flags := processes.VMLaunchVolumeFlags(cmd.ExecutionBackends.VMVolumeShares, bundlerules.VMVirtiofsdPath, !cmd.ExecutionBackends.VMVolumeAsyncMounts)
 	flags = append(flags, processes.VMLaunchQEMUSandboxFlags(cmd.ExecutionBackends.VMQemuSandbox)...)
-	return append(flags, processes.VMLaunchCPUFlags(cmd.ExecutionBackends.VMMaxVCPUs)...)
+	flags = append(flags, processes.VMLaunchCPUFlags(cmd.ExecutionBackends.VMMaxVCPUs)...)
+	return append(flags, processes.VMLaunchMirrorMountsFlags(cmd.ExecutionBackends.VMMirrorMounts)...)
 }
 
 // logUnusedVolumeFlags notes that --vm-volume-shares,
-// --vm-volume-async-mounts, --vm-max-vcpus, or --vm-full-memory-limit has no
+// --vm-volume-async-mounts, --vm-max-vcpus, --vm-full-memory-limit, or
+// --vm-mirror-mounts has no
 // effect because no vm-* backend is enabled.
 func (cmd *CommonCommand) logUnusedVolumeFlags(log lager.Logger) {
 	if cmd.ExecutionBackends.VMVolumeShares {
@@ -1224,6 +1227,9 @@ func (cmd *CommonCommand) logUnusedVolumeFlags(log lager.Logger) {
 	}
 	if cmd.ExecutionBackends.VMFullMemoryLimit {
 		log.Info("full-memory-limit-unused-without-a-vm-backend")
+	}
+	if cmd.ExecutionBackends.VMMirrorMounts {
+		log.Info("mirror-mounts-unused-without-a-vm-backend")
 	}
 }
 

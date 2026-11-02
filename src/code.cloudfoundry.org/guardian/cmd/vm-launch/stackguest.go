@@ -180,7 +180,10 @@ func (s *guestStack) hasAppRoot() bool { return s != nil }
 // well as, with an identity, whether the console still echoes. The boot
 // pair, the run section's FIFO, and the log FIFOs of every process are set
 // up before the start tag too (see guestRunSetup), and so are the trusted
-// certificate files, with or without the rest (see guestSystemCertsSetup).
+// certificate files, with or without the rest (see guestSystemCertsSetup),
+// and the mirrored mounts (see mountMirror.guestSetup). A guest that watches
+// mirrored files checks its console's echo as a guest with an identity
+// does.
 // The guest frames the output of every process (see guestProcessWrapper), so
 // no process holds the console, even an app that runs alone: none can read
 // the stop request or a pushed pair, and none can write a line that
@@ -207,10 +210,10 @@ func (s *guestStack) initScriptWithVolumes(nonce string, volume bool) string {
 	certs := guestSystemCertsSetup(s.systemCerts)
 	procs := s.processes()
 	checks := guestSidecarChecks(len(s.sidecars))
-	if s.identity != nil {
+	if s.identity != nil || s.mirror.watching() {
 		checks += guestIdentityEchoCheck(nonce)
 	}
-	checks += certs + guestRunSetup(s.identity != nil, procs)
+	checks += certs + s.mirror.guestSetup(nonce) + guestRunSetup(s.identity != nil, procs)
 	timeout := guestTimeoutSeconds
 	if volume {
 		timeout = guestVolumeTimeoutSeconds
@@ -222,7 +225,7 @@ func (s *guestStack) initScriptWithVolumes(nonce string, volume bool) string {
 		}
 		timeout = strconv.Itoa(int(wait / time.Second))
 	}
-	return stage2Script(nonce, volume, true, checks, guestRunSectionWithin(nonce, procs, s.identity != nil, exec, timeout))
+	return stage2Script(nonce, volume, true, checks, guestRunSectionMirroring(nonce, procs, s.identity != nil, s.mirror, exec, timeout))
 }
 
 // processes returns the app, from /rvm/argv and the guest environment, and
@@ -293,7 +296,8 @@ func guestSidecarChecks(sidecars int) string {
 // fallbackSteps adds, for a guest that can fall back to the busybox guest,
 // the busybox guest's stage 2 for nonce, which mounts the volumes when volume
 // is set, with the IPv6 setup when nw has an address, its environment with
-// mode 0600, and the commands that install its trusted certificates, below
+// mode 0600, and the commands that remove the mirrored mounts and install its
+// trusted certificates, below
 // guestFallbackDir.
 func (s *guestStack) fallbackSteps(cw *cpioWriter, file func(name string, perm uint32, content string) func() error, nonce string, volume bool, nw *network) []func() error {
 	if !s.fallback {
@@ -303,6 +307,8 @@ func (s *guestStack) fallbackSteps(cw *cpioWriter, file func(name string, perm u
 		func() error { return cw.Dir(strings.TrimPrefix(guestFallbackDir, "/"), 0o755) },
 		file(strings.TrimPrefix(guestFallbackInit, "/"), 0o755, withGuestIPv6(initScript(nonce, volume), nw)),
 		file(strings.TrimPrefix(guestFallbackEnv, "/"), 0o600, s.fallbackEnv),
-		file(strings.TrimPrefix(guestFallbackPrep, "/"), 0o644, s.systemCerts.fallbackPrep()),
+		// The mirror's commands come first, because rvm_fallback checks the
+		// status of the last of the certificates' commands.
+		file(strings.TrimPrefix(guestFallbackPrep, "/"), 0o644, s.mirror.fallbackPrep(nonce)+s.systemCerts.fallbackPrep()),
 	}
 }

@@ -322,6 +322,10 @@ end -%>
   unless vm_full_memory_limit == true || vm_full_memory_limit == false
     raise "garden.vm_full_memory_limit must be true or false, got #{vm_full_memory_limit.inspect}"
   end
+  vm_mirror_mounts = p("garden.vm_mirror_mounts")
+  unless vm_mirror_mounts == true || vm_mirror_mounts == false
+    raise "garden.vm_mirror_mounts must be true or false, got #{vm_mirror_mounts.inspect}"
+  end
   vm_stack_tarballs = p("garden.vm_stack_tarballs")
   unless vm_stack_tarballs.is_a?(Array)
     raise "garden.vm_stack_tarballs must be a list of absolute paths, got #{vm_stack_tarballs.inspect}"
@@ -369,6 +373,9 @@ end -%>
     if vm_full_memory_limit
       raise "garden.vm_full_memory_limit requires a vm-* entry in garden.execution_backends, because only a VM container has a guest memory size"
     end
+    if vm_mirror_mounts
+      raise "garden.vm_mirror_mounts requires a vm-* entry in garden.execution_backends, because only a VM container has a guest to mirror mounts into"
+    end
     unless vm_volume_sync_mounts
       raise "garden.vm_volume_sync_mounts requires a vm-* entry in garden.execution_backends, because only a VM container mounts an image volume"
     end
@@ -400,6 +407,9 @@ end -%>
 <% end -%>
 <% if vm_full_memory_limit -%>
   vm-full-memory-limit = true
+<% end -%>
+<% if vm_mirror_mounts -%>
+  vm-mirror-mounts = true
 <% end -%>
 <% vm_stack_tarballs.each do |tarball| -%>
   vm-stack-tarball = <%= tarball %>

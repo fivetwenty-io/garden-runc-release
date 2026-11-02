@@ -767,6 +767,48 @@ describe 'garden' do
         end
       end
 
+      context 'mirror mounts property' do
+        def render_with(backends, extra)
+          template.render({ 'garden' => { 'execution_backends' => backends }.merge(extra) })
+        end
+
+        it 'declares false as the default' do
+          garden_spec = YAML.load_file(File.join(File.dirname(__FILE__), '../../jobs/garden/spec'))
+          property = garden_spec['properties']['garden.vm_mirror_mounts']
+          expect(property['default']).to eql(false)
+          expect(property['description']).not_to be_empty
+        end
+
+        [[], ['vm-qemu'], %w[vm-qemu vm-firecracker]].each do |backends|
+          it "renders no mirror line by default (#{backends.inspect})" do
+            expect(render_with(backends, {})).not_to include('vm-mirror-mounts')
+          end
+        end
+
+        it 'renders no line when set to false' do
+          expect(render_with(['vm-qemu'], { 'vm_mirror_mounts' => false })).not_to include('vm-mirror-mounts')
+        end
+
+        it 'renders the line after the other vm keys when set to true and parses it back' do
+          raw = render_with(['vm-qemu'], { 'vm_mirror_mounts' => true })
+          expect(raw).to end_with("  vm-launch-bin = /var/vcap/packages/guardian/bin/vm-launch\n  vm-mirror-mounts = true\n")
+          expect(IniParse.parse(raw)['server']['vm-mirror-mounts']).to eql(true)
+        end
+
+        ['false', 'true', 'yes', 0, []].each do |value|
+          it "raises for #{value.inspect}, which is not a boolean" do
+            expect { render_with(['vm-qemu'], { 'vm_mirror_mounts' => value }) }.to raise_error(/garden.vm_mirror_mounts must be true or false/)
+          end
+        end
+
+        [[], ['oci-gvisor']].each do |backends|
+          it "raises for true when the backends are #{backends.inspect}" do
+            expect { render_with(backends, { 'vm_mirror_mounts' => true }) }
+              .to raise_error(/garden.vm_mirror_mounts requires a vm-\* entry in garden.execution_backends, because only a VM container has a guest to mirror mounts into/)
+          end
+        end
+      end
+
       context 'qemu sandbox property' do
         let(:sandbox_default) { 'on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny' }
 
