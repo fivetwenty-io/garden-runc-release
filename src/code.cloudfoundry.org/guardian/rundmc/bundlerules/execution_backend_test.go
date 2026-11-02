@@ -1,6 +1,7 @@
 package bundlerules_test
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 
@@ -526,5 +527,142 @@ var _ = Describe("the virtiofsd wrapper's path in a vm-* container", func() {
 	It("sits under the artifacts mount, where the runtime config installs it", func() {
 		Expect(bundlerules.VMVirtiofsdPath).To(Equal("/opt/garden-vm/artifacts/virtiofsd/virtiofsd-wrapper"))
 		Expect(bundlerules.VMVirtiofsdPath).To(HavePrefix(bundlerules.VMArtifactsMountPath + "/"))
+	})
+})
+
+var _ = Describe("the memory reserve of a vm-* container", func() {
+	const mib = int64(1 << 20)
+
+	var (
+		artifactsDir string
+		rule         bundlerules.ExecutionBackend
+		limits       specs.LinuxMemory
+	)
+
+	applied := func(kind backend.Kind) goci.Bndl {
+		bndl := goci.Bundle().
+			WithMounts(specs.Mount{Destination: "/proc", Source: "proc", Type: "proc"}).
+			WithCapabilities("CAP_CHOWN").
+			WithMemoryLimit(limits)
+		newBndl, err := rule.Apply(bndl, spec.DesiredContainerSpec{ExecutionBackend: string(kind)})
+		Expect(err).NotTo(HaveOccurred())
+		return newBndl
+	}
+
+	apply := func(kind backend.Kind) specs.LinuxMemory {
+		return *applied(kind).Resources().Memory
+	}
+
+	BeforeEach(func() {
+		artifactsDir = GinkgoT().TempDir()
+		rule = bundlerules.NewExecutionBackend(artifactsDir, "/var/vcap/packages/guardian/bin/vm-launch", 991)
+		for _, kind := range []backend.Kind{backend.VMQemu, backend.VMFirecracker} {
+			for _, rel := range bundlerules.DefaultVMArtifacts[kind] {
+				path := filepath.Join(artifactsDir, rel)
+				Expect(os.MkdirAll(filepath.Dir(path), 0o755)).To(Succeed())
+				Expect(os.WriteFile(path, []byte("x"), 0o644)).To(Succeed())
+			}
+		}
+		limit, swap := 1024*mib, 1024*mib
+		limits = specs.LinuxMemory{Limit: &limit, Swap: &swap}
+	})
+
+	It("leaves the limits as they were by default", func() {
+		for _, kind := range []backend.Kind{backend.VMQemu, backend.VMFirecracker} {
+			memory := apply(kind)
+			Expect(*memory.Limit).To(Equal(1024 * mib))
+			Expect(*memory.Swap).To(Equal(1024 * mib))
+			Expect(applied(kind).Spec.Annotations).NotTo(HaveKey(backend.MemoryReserveAnnotationKey))
+		}
+	})
+
+	When("the guest is to have the whole limit", func() {
+		BeforeEach(func() {
+			rule.FullMemoryLimit = true
+		})
+
+		It("raises the memory and swap limit of a vm-qemu container by the QEMU reserve", func() {
+			memory := apply(backend.VMQemu)
+			reserve := int64(backend.MemoryReserveMiB(backend.VMQemu, 1024)) * mib
+			Expect(reserve).To(Equal(130 * mib))
+			Expect(*memory.Limit).To(Equal(1024*mib + reserve))
+			Expect(*memory.Swap).To(Equal(1024*mib + reserve))
+		})
+
+		It("raises the limits of a vm-firecracker container by the Firecracker reserve", func() {
+			memory := apply(backend.VMFirecracker)
+			reserve := int64(backend.MemoryReserveMiB(backend.VMFirecracker, 1024)) * mib
+			Expect(reserve).To(Equal(98 * mib))
+			Expect(*memory.Limit).To(Equal(1024*mib + reserve))
+			Expect(*memory.Swap).To(Equal(1024*mib + reserve))
+		})
+
+		It("raises only the memory limit when the bundle has no swap limit", func() {
+			limits.Swap = nil
+			memory := apply(backend.VMQemu)
+			Expect(*memory.Limit).To(Equal(1024*mib + 130*mib))
+			Expect(memory.Swap).To(BeNil())
+		})
+
+		It("leaves an unlimited container unlimited", func() {
+			for _, unlimited := range []int64{0, -1, math.MaxInt64, math.MaxInt64 - 1} {
+				unlimited := unlimited
+				limits = specs.LinuxMemory{Limit: &unlimited}
+				Expect(*apply(backend.VMQemu).Limit).To(Equal(unlimited))
+			}
+		})
+
+		It("records the reserve in the bundle, so that the container keeps its guest across a restart", func() {
+			Expect(applied(backend.VMQemu).Spec.Annotations).To(HaveKeyWithValue(backend.MemoryReserveAnnotationKey, "130"))
+			Expect(applied(backend.VMFirecracker).Spec.Annotations).To(HaveKeyWithValue(backend.MemoryReserveAnnotationKey, "98"))
+			Expect(backend.FullMemoryLimitFromBundle(applied(backend.VMQemu))).To(BeTrue())
+		})
+
+		It("records no reserve for a container with no limit to raise", func() {
+			unlimited := int64(0)
+			limits = specs.LinuxMemory{Limit: &unlimited}
+			Expect(applied(backend.VMQemu).Spec.Annotations).NotTo(HaveKey(backend.MemoryReserveAnnotationKey))
+		})
+
+		It("raises the limit and the swap when they are one pointer, as the limits rule sets them", func() {
+			shared := 1024 * mib
+			limits = specs.LinuxMemory{Limit: &shared, Swap: &shared}
+			memory := apply(backend.VMQemu)
+			Expect(*memory.Limit).To(Equal(1024*mib + 130*mib))
+			Expect(*memory.Swap).To(Equal(1024*mib + 130*mib))
+			Expect(shared).To(Equal(1024 * mib))
+		})
+
+		It("leaves a limit alone when the reserve would overflow it, and a swap likewise", func() {
+			nearMax := int64(math.MaxInt64) - 10*mib
+			small := 1024 * mib
+			limits = specs.LinuxMemory{Limit: &nearMax}
+			Expect(*apply(backend.VMQemu).Limit).To(Equal(nearMax))
+			limits = specs.LinuxMemory{Limit: &small, Swap: &nearMax}
+			memory := apply(backend.VMQemu)
+			Expect(*memory.Limit).To(Equal(1024*mib + 130*mib))
+			Expect(*memory.Swap).To(Equal(nearMax))
+		})
+
+		It("leaves a gVisor bundle exactly as it is without the option", func() {
+			withOption := applied(backend.OCIGvisor)
+			rule.FullMemoryLimit = false
+			Expect(applied(backend.OCIGvisor)).To(Equal(withOption))
+			Expect(*withOption.Resources().Memory.Limit).To(Equal(1024 * mib))
+			Expect(withOption.Spec.Annotations).NotTo(HaveKey(backend.MemoryReserveAnnotationKey))
+		})
+
+		It("leaves a bundle with no memory limit as it is", func() {
+			bndl := goci.Bundle().WithMounts(specs.Mount{Destination: "/proc", Source: "proc", Type: "proc"}).WithCapabilities("CAP_CHOWN")
+			newBndl, err := rule.Apply(bndl, spec.DesiredContainerSpec{ExecutionBackend: string(backend.VMQemu)})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(newBndl.Resources().Memory).To(BeNil())
+		})
+
+		It("leaves a runc container's limits as they were", func() {
+			newBndl, err := rule.Apply(goci.Bundle().WithMemoryLimit(limits), spec.DesiredContainerSpec{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(*newBndl.Resources().Memory.Limit).To(Equal(1024 * mib))
+		})
 	})
 })

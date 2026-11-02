@@ -148,6 +148,7 @@ var _ = Describe("stage 1 of the stack guest", func() {
 			"mke2fs -F", filepath.Join(bin, "mke2fs")+" -F",
 			"/rvm/", dir+"/rvm/",
 			"cat /etc/", "cat "+dir+"/etc/",
+			">/etc/", ">"+dir+"/etc/",
 			"[ -e /etc/", "[ -e "+dir+"/etc/",
 		).Replace(guestFailFunc+vars+guestStackSetup) + "echo STAGE1_DONE\n"
 		Expect(strings.Count(script, filepath.Join(bin, "mount")+" -")).To(Equal(strings.Count(guestStackSetup, "mount -")))

@@ -1595,7 +1595,7 @@ var _ = Describe("run with a granted share", func() {
 		Expect(processGone(qemu)).To(BeTrue())
 		Expect(processGone(recordedPid(rec, 0))).To(BeTrue())
 		Expect(logBuf.String()).To(ContainSubstring(`virtiofsd for the share at "` + shareDir + `" exited with status 3; killing the hypervisor` + "\n"))
-		Expect(logBuf.String()).To(HaveSuffix(`the share at "` + shareDir + `" stopped being served before the guest reported a status; exiting 125` + "\n"))
+		Expect(logBuf.String()).To(HaveSuffix(`the share at "` + shareDir + `" stopped being served before the guest reported a status; exiting 125` + "\n" + "the hypervisor ended without a guest status\n"))
 		Expect(workDirsIn(tmp)).To(BeEmpty())
 	})
 
@@ -1664,7 +1664,7 @@ exit 0
 			Expect(logBuf.String()).NotTo(ContainSubstring("still ran"))
 			Expect(logBuf.String()).NotTo(ContainSubstring("killing the hypervisor"))
 			Expect(logBuf.String()).NotTo(ContainSubstring("stopped being served"))
-			Expect(logBuf.String()).To(HaveSuffix("guest ended without reporting a status; exiting 123\n"))
+			Expect(logBuf.String()).To(HaveSuffix("guest ended without reporting a status; exiting 123\n" + "the hypervisor ended without a guest status\n"))
 		})
 
 		It("kills a QEMU that still runs, and exits 125 with the share's line", func() {
@@ -1672,7 +1672,7 @@ exit 0
 			lingeringGuest()
 			Expect(runWith(vfs)).To(Equal(exitLaunchError), logBuf.String())
 			Expect(logBuf.String()).To(ContainSubstring(fmt.Sprintf(`virtiofsd for the share at "%s" exited with status 0, but the hypervisor still ran %v later; killing the hypervisor`, shareDir, virtiofsdDisconnectGrace)))
-			Expect(logBuf.String()).To(HaveSuffix(`the share at "` + shareDir + `" stopped being served before the guest reported a status; exiting 125` + "\n"))
+			Expect(logBuf.String()).To(HaveSuffix(`the share at "` + shareDir + `" stopped being served before the guest reported a status; exiting 125` + "\n" + "the hypervisor ended without a guest status\n"))
 		})
 	})
 

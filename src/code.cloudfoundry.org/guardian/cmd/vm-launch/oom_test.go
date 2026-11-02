@@ -321,9 +321,10 @@ echo "RVM_EXIT_$nonce=0"`)
 		code := runGuest(`echo "RVM_OOM_$nonce=2"`)
 		Expect(code).To(Equal(exitMissingMarker))
 		lines := strings.Split(strings.TrimSuffix(oomLog(), "\n"), "\n")
-		Expect(lines).To(HaveLen(2), logBuf.String())
+		Expect(lines).To(HaveLen(3), logBuf.String())
 		Expect(lines[0]).To(HavePrefix("vm-launch: the guest ran out of memory"))
 		Expect(lines[1]).To(ContainSubstring("exiting " + strconv.Itoa(exitMissingMarker)))
+		Expect(lines[2]).To(Equal("vm-launch: " + hypervisorDiedPrefix))
 	})
 
 	It("writes no line when the guest reports no kills", func() {

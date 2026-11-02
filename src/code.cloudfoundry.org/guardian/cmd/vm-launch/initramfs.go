@@ -523,7 +523,11 @@ func stage2Script(nonce string, volume, stack bool, checks, section string) stri
 	if !stack {
 		setup += guestShmSetup
 	}
-	setup += guestNetworkSetup + guestLimitsSetup + guestEnvChecks
+	setup += guestNetworkSetup
+	if !stack {
+		setup += guestHostnameSetup
+	}
+	setup += guestLimitsSetup + guestEnvChecks
 	if stack {
 		setup += guestStackChecks
 	}
@@ -689,6 +693,16 @@ func withGuestIPv6(stage2 string, nw *network) string {
 	}
 	return strings.Replace(stage2, guestNetworkSetup, guestNetworkSetup+guestNetworkSetup6, 1)
 }
+
+// guestHostnameSetup sets the busybox guest's hostname from /etc/hostname,
+// which holds the container's hostname when vm-launch could read it (see
+// guestContents.hostname). A guest without the file keeps the kernel's
+// default hostname, as it did before the file existed. The stack guest does
+// the same from /rvm/hostname in its own stage 1 (see guestStackSetup).
+const guestHostnameSetup = `if [ -s /etc/hostname ]; then
+	hostname -F /etc/hostname || rvm_fail "setting the guest's hostname failed"
+fi
+`
 
 // guestLimitsSetup prepares the command's open-files limit from
 // /rvm/limits. A guest kernel caps every process at fs.nr_open, which is
@@ -1857,6 +1871,13 @@ type guestContents struct {
 	// that runs /rvm/cmd on busybox. The stack and droplet drives' identities
 	// are in drives.
 	stack *guestStack
+	// hosts and hostname are the container's hosts file and hostname, which
+	// the busybox guest gets as /etc/hosts and /etc/hostname, so that a
+	// program that resolves its own hostname finds an address. They are
+	// empty when vm-launch could not read them, and a guest with a stack
+	// ignores them, because it takes the stack's own (see guestStack).
+	hosts    []byte
+	hostname string
 }
 
 // guestStack is the part of the initramfs of a guest with a stack that the
@@ -1894,6 +1915,11 @@ type guestStack struct {
 	// volumes. Its stage 1 is guestImageInit, and its processes run as the
 	// image's user (see guestImage).
 	image *guestImage
+	// windDown is how long the run section waits for its processes to exit
+	// after one has exited or a stop has begun (see stopTiming), or 0 for
+	// guestWindDown. A guest with volumes winds down one second sooner, as
+	// guestVolumeWindDown is one second under guestWindDown.
+	windDown time.Duration
 }
 
 // guestSidecar is one sidecar's two files in the stack guest. argv is its
@@ -2234,7 +2260,8 @@ func addSeals(f *os.File, seals int) error {
 // static busybox, the console and null device nodes, the command script at
 // /rvm/cmd, the guest network's /rvm/net and /etc/resolv.conf, the guest
 // environment as /rvm/env with mode 0600, the command's limits as
-// /rvm/limits, the drive identities and sizes as /rvm/disks, and the two
+// /rvm/limits, the container's /etc/hosts and /etc/hostname when it has them,
+// the drive identities and sizes as /rvm/disks, and the two
 // stages of the guest's boot that run it, /init and /rvm/init. With volumes
 // it also holds /rvm/mounts, and with a CA bundle it holds that at
 // /etc/ssl/certs/ca-certificates.crt. With a stack it also holds the
@@ -2313,6 +2340,12 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, g 
 		file("rvm/env", 0o600, g.env),
 		file("rvm/limits", 0o644, limitsFile(g.nofile)),
 		file("etc/resolv.conf", 0o644, g.nw.resolvConf),
+	}
+	if g.stack == nil && len(g.hosts) > 0 {
+		steps = append(steps, file("etc/hosts", 0o644, string(g.hosts)))
+	}
+	if g.stack == nil && g.hostname != "" {
+		steps = append(steps, file("etc/hostname", 0o644, g.hostname+"\n"))
 	}
 	if g.nw != nil && len(g.nw.ports) > 0 {
 		steps = append(steps, func() error { return cw.FIFO(strings.TrimPrefix(guestListenTick, "/"), 0o600) })

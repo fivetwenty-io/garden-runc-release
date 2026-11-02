@@ -7,7 +7,7 @@
 //
 // Usage:
 //
-//	vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--max-vcpus N] [--artifacts DIR] -- PATH [ARGS...]
+//	vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--max-vcpus N] [--full-memory-limit] [--artifacts DIR] -- PATH [ARGS...]
 //
 // When PATH is the CF launcher ("launcher APP-DIR START-COMMAND ..."), the
 // guest runs START-COMMAND. Otherwise it runs PATH and ARGS, shell-quoted.
@@ -211,8 +211,8 @@
 // The guest never gets PATH, HOME, TMPDIR, USER, PWD, OLDPWD, DEPS_DIR,
 // CF_INSTANCE_CERT, CF_INSTANCE_KEY, CF_SYSTEM_CERT_PATH,
 // SERVICE_BINDING_ROOT, VCAP_SERVICES_FILE_PATH, VCAP_PLATFORM_OPTIONS,
-// CF_VM_SIDECARS, or a name that starts with __GARDEN_, except that the stack
-// guest keeps PATH and USER, and CF_INSTANCE_CERT and CF_INSTANCE_KEY when it
+// CF_VM_SIDECARS, CF_VM_STOP_GRACE_SECONDS, or a name that starts with
+// __GARDEN_, except that the stack guest keeps PATH and USER, and CF_INSTANCE_CERT and CF_INSTANCE_KEY when it
 // holds the instance identity pair (see Sidecars and instance identity
 // below). It also never gets the variables that its
 // busybox sh sets for itself, because the shell would replace a value from
@@ -278,7 +278,10 @@
 // tables, with a floor of 128 MiB and a ceiling of 16 GiB. MEMORY_LIMIT must
 // be whole megabytes, such as 512m. When it is missing or malformed, or below
 // what the floor and the reserve need, the guest gets 128 MiB and vm-launch
-// logs a line that says so.
+// logs a line that says so. With --full-memory-limit, which Garden passes only
+// when the operator turned the option on, the guest gets the whole MEMORY_LIMIT
+// and no reserve comes off it, because Garden has raised the container's limit
+// by the reserve.
 //
 // CPUs: the guest gets one vCPU for each CPU the container may run on, which
 // is the CPUs of its cpuset and otherwise every online CPU, less --max-vcpus
@@ -518,8 +521,9 @@ const killGrace = 5 * time.Second
 const transparentProxyFlag = "transparent-proxy"
 
 // stopDeadline is how long the hypervisor may keep running after the first
-// SIGTERM or SIGINT, which is all the time a guest command gets to stop. Diego
-// sends SIGKILL 10 seconds after its SIGTERM, and the 2 seconds left cover
+// SIGTERM or SIGINT, which is all the time a guest command gets to stop. It is
+// the default, for a process that Diego passes no interval (see stopTiming).
+// Diego sends SIGKILL 10 seconds after its SIGTERM, and the 2 seconds left cover
 // the kernel freeing the guest's memory and vm-launch's own cleanup and exit
 // line, for every guest size vm-launch allows. With a share, a virtiofsd that
 // outlives a killed QEMU holds the last reference to the guest's memory, and
@@ -548,7 +552,15 @@ const qemuSandboxFlag = "qemu-sandbox"
 // container may run on (see guestVCPUCount).
 const maxVCPUsFlag = "max-vcpus"
 
-const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--qemu-sandbox=OPTIONS] [--max-vcpus N] [--image-user USER [--image-default-env NAMES]] [--artifacts DIR] -- PATH [ARGS...]\n"
+// fullMemoryLimitFlag names the vm-launch flag that sizes the guest at the
+// whole MEMORY_LIMIT, in place of the limit less the hypervisor's reserve.
+// Garden passes it only when the operator turned the option on, and then it
+// raises the container's own memory limit by the same reserve (see
+// backend.MemoryReserveMiB), so that the guest and the hypervisor both fit.
+// The cell is then oversubscribed by the reserve for each VM container.
+const fullMemoryLimitFlag = "full-memory-limit"
+
+const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--qemu-sandbox=OPTIONS] [--max-vcpus N] [--full-memory-limit] [--image-user USER [--image-default-env NAMES]] [--artifacts DIR] -- PATH [ARGS...]\n"
 
 type config struct {
 	backend   backend.Kind
@@ -582,6 +594,9 @@ type config struct {
 	// maxVCPUs is the operator's cap on the guest's vCPU count, or 0 for
 	// none (see maxVCPUsFlag).
 	maxVCPUs int
+	// fullMemoryLimit gives the guest the whole MEMORY_LIMIT (see
+	// fullMemoryLimitFlag).
+	fullMemoryLimit bool
 	// image, when set, makes this a launch of the Docker image guest (see
 	// imageguest.go).
 	image *imageConfig
@@ -904,6 +919,13 @@ func run(argv []string, logger *log.Logger) int {
 		stack.image = &guestImage{uid: imgUser.uid, gid: imgUser.gid}
 		stack.cwd = "/"
 	}
+	// Diego's graceful shutdown interval, when the executor passes it, sets
+	// how long the hypervisor may run after a signal and how long the stack
+	// guest winds down its processes.
+	hostDeadline, guestWindDownTime := stopTiming(lookupEnv, logger)
+	if stack != nil {
+		stack.windDown = guestWindDownTime
+	}
 	closeLauncher := func() {
 		if stack != nil {
 			closeFile(stack.launcher.file, "the launcher", logger)
@@ -911,7 +933,7 @@ func run(argv []string, logger *log.Logger) int {
 		}
 	}
 	defer closeLauncher()
-	memMiB := guestMemory(cfg.backend, lookupEnv, logger)
+	memMiB := guestMemory(cfg.backend, lookupEnv, cfg.fullMemoryLimit, logger)
 	vcpus := guestVCPUCount(cfg.backend, countContainerCPUs, cfg.maxVCPUs, logger)
 	// The launcher derives DATABASE_URL from the resolved VCAP_SERVICES, so
 	// the references are resolved before buildGuestEnv.
@@ -1177,6 +1199,15 @@ func run(argv []string, logger *log.Logger) int {
 		logger.Print(err)
 		return exitLaunchError
 	}
+	// The busybox guest gets the container's hostname and hosts file as the
+	// stack guest does. A file vm-launch cannot read is logged and left out,
+	// because the guest booted without one before. A guest that fell back to
+	// busybox from a stack gets them too.
+	var hosts []byte
+	var hostname string
+	if stack == nil {
+		hosts, hostname = readContainerHostFiles(logger)
+	}
 	initrd, err = buildGuestInitramfs(filepath.Join(cfg.artifacts, artBusybox), guestContents{
 		command:        cfg.command,
 		nonce:          nonce,
@@ -1192,6 +1223,8 @@ func run(argv []string, logger *log.Logger) int {
 		tools:          tools,
 		noVolumeSync:   !cfg.volumeSyncMounts,
 		stack:          stack,
+		hosts:          hosts,
+		hostname:       hostname,
 	})
 	// The archive holds the tools' and the launcher's bytes now, so the
 	// files close here. The deferred calls cover the returns before this
@@ -1261,7 +1294,7 @@ func run(argv []string, logger *log.Logger) int {
 
 	logger.Print(guestMode)
 	cmd := newHypervisorCmd(hvArgv, files)
-	sup := supervisor{stdout: os.Stdout, stderr: os.Stderr, logger: logger, signals: sigs, grace: killGrace, deadline: stopDeadline, started: closeInherited}
+	sup := supervisor{stdout: os.Stdout, stderr: os.Stderr, logger: logger, signals: sigs, grace: killGrace, deadline: hostDeadline, started: closeInherited}
 	sup.logs, sup.firstExit = relayCallbacks(hub)
 	if len(shares) > 0 {
 		// A virtiofsd that ends while QEMU runs kills it, which takes QEMU's
@@ -1404,6 +1437,9 @@ func run(argv []string, logger *log.Logger) int {
 	}
 	if reason != "" {
 		logger.Printf("%s; exiting %d", reason, code)
+	}
+	if hypervisorDied(res) {
+		logger.Print(hypervisorDiedPrefix)
 	}
 	return code
 }
@@ -1572,6 +1608,7 @@ func parseArgs(argv []string) (config, error) {
 	syncMounts := fs.Bool(volumeSyncMountsFlag, true, "mount every volume image with sync and dirsync; with =false, an image whose filesystem has a journal mounts without them")
 	sandbox := fs.String(qemuSandboxFlag, qemuSandbox, "the value of QEMU's -sandbox option, which turns on its seccomp filter; empty turns the sandbox off")
 	maxVCPUs := fs.Int(maxVCPUsFlag, 0, "the most vCPUs a guest gets; 0 gives it one for each CPU the container may run on")
+	fullMemory := fs.Bool(fullMemoryLimitFlag, false, "give the guest the whole MEMORY_LIMIT, which Garden has raised the container's limit to hold")
 	imageUser := fs.String(imageUserFlag, "", "run the CF launcher on the Docker image that Garden bound into the container, as this user")
 	imageDefaults := fs.String(imageDefaultEnvFlag, "", "the names among HOME, PATH, and USER that hold Garden's defaults, which the Docker image's user replaces")
 	if err := fs.Parse(argv); err != nil {
@@ -1581,7 +1618,7 @@ func parseArgs(argv []string) (config, error) {
 		return config{}, fmt.Errorf("--%s must be 0 or more, got %d", maxVCPUsFlag, *maxVCPUs)
 	}
 
-	cfg := config{backend: backend.Kind(*kind), transparent: *transparent, allowVolumeShares: *allowShares, volumeSyncMounts: *syncMounts, qemuSandbox: *sandbox, maxVCPUs: *maxVCPUs}
+	cfg := config{backend: backend.Kind(*kind), transparent: *transparent, allowVolumeShares: *allowShares, volumeSyncMounts: *syncMounts, qemuSandbox: *sandbox, maxVCPUs: *maxVCPUs, fullMemoryLimit: *fullMemory}
 	virtiofsdSet, imageSet, imageDefaultsSet := false, false, false
 	fs.Visit(func(f *flag.Flag) {
 		virtiofsdSet = virtiofsdSet || f.Name == virtiofsdFlag
@@ -1744,6 +1781,26 @@ var (
 	// to the container's handle and which the stack guest takes as its own.
 	containerHostname = os.Hostname
 )
+
+// readContainerHostFiles returns the container's hosts file and hostname for
+// the busybox guest. Each one that cannot be read, or that the guest could not
+// use as it is, is logged and returned empty, so the guest boots without it.
+func readContainerHostFiles(logger *log.Logger) ([]byte, string) {
+	hosts, err := os.ReadFile(containerHostsPath)
+	if err != nil {
+		logger.Printf("the busybox guest gets no /etc/hosts: reading the container's hosts file failed: %v", err)
+		hosts = nil
+	}
+	hostname, err := containerHostname()
+	if err == nil && (hostname == "" || len(hostname) > maxGuestHostnameBytes || strings.Trim(hostname, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-") != "") {
+		err = fmt.Errorf("%q is not 1 to %d letters, digits, dots, and hyphens", hostname, maxGuestHostnameBytes)
+	}
+	if err != nil {
+		logger.Printf("the busybox guest gets no /etc/hostname: the container's hostname is unusable: %v", err)
+		hostname = ""
+	}
+	return hosts, hostname
+}
 
 // newGuestStack gathers what the stack guest's initramfs holds for the CF
 // launcher argv args: the launcher itself, opened and checked as a guest

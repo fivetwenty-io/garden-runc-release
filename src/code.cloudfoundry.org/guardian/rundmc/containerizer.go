@@ -161,6 +161,7 @@ type Containerizer struct {
 	backendDispatch        bool
 	gvisorStreamer         Streamer
 	deviceReleaser         DeviceReleaser
+	vmStateDir             string
 
 	// guestMemory holds the newest guest memory sample of each VM container,
 	// and guestFigure remembers which containers Metrics last answered from it.
@@ -209,6 +210,15 @@ func WithBackendDispatch(gvisorStreamer Streamer) Option {
 	return func(c *Containerizer) {
 		c.backendDispatch = true
 		c.gvisorStreamer = gvisorStreamer
+	}
+}
+
+// WithVMCgroupState gives the Containerizer the directory where runc keeps a
+// container's state. It reads the container's memory cgroup from there when
+// the hypervisor of a VM container dies.
+func WithVMCgroupState(stateDir string) Option {
+	return func(c *Containerizer) {
+		c.vmStateDir = stateDir
 	}
 }
 

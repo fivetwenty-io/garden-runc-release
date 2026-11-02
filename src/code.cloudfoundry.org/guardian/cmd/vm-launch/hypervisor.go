@@ -105,32 +105,20 @@ func containerCPUs() (int, error) {
 // Guest memory sizing. The guest gets MEMORY_LIMIT less a reserve for what
 // else the container holds, which is the hypervisor itself, vm-launch, the
 // initramfs, sshd sessions, and the health check, clamped to a floor and a
-// ceiling. The reserve is a fixed amount for each hypervisor plus a share
-// that grows with the guest, for the host page tables that map its memory.
-// The fixed amounts are what a guest that had filled its RAM held beyond that
-// RAM in the container's cgroup, about 80 MiB on QEMU and about 35 MiB on
-// Firecracker, with room for more sshd sessions. The floor is the size every
-// guest had before it was derived from MEMORY_LIMIT, so a container below
-// floor plus reserve keeps that size.
+// ceiling. The reserve is the one in backend.MemoryReserveMiB, which Garden
+// adds to the container's limit instead when the operator asked for the guest
+// to have the whole limit (see fullMemoryLimitFlag). The floor is the size
+// every guest had before it was derived from MEMORY_LIMIT, so a container
+// below floor plus reserve keeps that size.
 const (
-	qemuMemoryReserveMiB        = 128
-	firecrackerMemoryReserveMiB = 96
-	minGuestMemoryMiB           = 128
-	maxGuestMemoryMiB           = 16384
-
-	// pageTableMiBPerGuestGiB is a conservative 2 MiB for each GiB of guest
-	// memory, which is eight bytes of page table for each 4 KiB page.
-	pageTableMiBPerGuestGiB = 2
+	minGuestMemoryMiB = 128
+	maxGuestMemoryMiB = 16384
 )
 
 // guestMemoryReserve returns what the container keeps for kind and a
 // container of limit MiB, in MiB.
 func guestMemoryReserve(kind backend.Kind, limit int) int {
-	base := qemuMemoryReserveMiB
-	if kind == backend.VMFirecracker {
-		base = firecrackerMemoryReserveMiB
-	}
-	return base + limit*pageTableMiBPerGuestGiB/1024
+	return backend.MemoryReserveMiB(kind, limit)
 }
 
 // memoryLimitPattern is the form Cloud Controller gives MEMORY_LIMIT: whole
@@ -143,7 +131,12 @@ var memoryLimitPattern = regexp.MustCompile(`^[1-9][0-9]{0,6}m$`)
 // small to hold the floor and the reserve; each of those logs one line, so an
 // operator who sees the hypervisor killed for memory can find the cause. The
 // lines name the limit only once it has parsed as a number.
-func guestMemory(kind backend.Kind, lookupEnv func(string) (string, bool), logger *log.Logger) int {
+//
+// With fullLimit the container is larger than MEMORY_LIMIT by the reserve,
+// because Garden added it, so the guest gets the whole limit and the reserve is
+// not taken from it. A limit below the floor still gets the floor, and a
+// limit over the ceiling gets the ceiling.
+func guestMemory(kind backend.Kind, lookupEnv func(string) (string, bool), fullLimit bool, logger *log.Logger) int {
 	value, ok := lookupEnv("MEMORY_LIMIT")
 	if !ok {
 		logger.Printf("MEMORY_LIMIT is not set; the guest gets %d MiB", minGuestMemoryMiB)
@@ -156,7 +149,13 @@ func guestMemory(kind backend.Kind, lookupEnv func(string) (string, bool), logge
 	}
 	reserve := guestMemoryReserve(kind, limit)
 	guest := limit - reserve
+	if fullLimit {
+		reserve, guest = 0, limit
+	}
 	switch {
+	case guest < minGuestMemoryMiB && fullLimit:
+		logger.Printf("MEMORY_LIMIT %dm is below the %d MiB a guest needs; the guest gets %d MiB and may be killed for memory, so give the app at least %dM", limit, minGuestMemoryMiB, minGuestMemoryMiB, minGuestMemoryMiB)
+		return minGuestMemoryMiB
 	case guest < minGuestMemoryMiB:
 		logger.Printf("MEMORY_LIMIT %dm is below the %dm a guest of %d MiB needs with the %d MiB the container keeps for the hypervisor; the guest gets %d MiB and may be killed for memory, so give the app at least %dM",
 			limit, minGuestMemoryMiB+reserve, minGuestMemoryMiB, reserve, minGuestMemoryMiB, minGuestMemoryMiB+reserve)

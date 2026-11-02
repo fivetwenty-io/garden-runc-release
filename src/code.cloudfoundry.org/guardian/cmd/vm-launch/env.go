@@ -53,6 +53,8 @@ const (
 // vm-launch's own description of the sidecars, which the guest gets as files
 // (see sidecarGuestFiles). CF_VM_SIDECAR_RELAY marks a launcher process as a
 // sidecar's log relay, and the guest never sees it (see relayEnv).
+// CF_VM_STOP_GRACE_SECONDS is Diego's graceful shutdown interval for
+// vm-launch alone (see stopGraceEnv).
 var guestEnvDenylist = map[string]bool{
 	"PATH":                    true,
 	"HOME":                    true,
@@ -69,6 +71,7 @@ var guestEnvDenylist = map[string]bool{
 	platformOptionsEnv:        true,
 	sidecarsEnvVar:            true,
 	relayEnv:                  true,
+	stopGraceEnv:              true,
 }
 
 // stackGuestEnvDenylist is guestEnvDenylist for a guest that runs the app on
@@ -165,10 +168,14 @@ func validEnvName(name string) bool {
 }
 
 // lastWinsEnv returns environ, in os.Environ form, as a map. When a name
-// appears more than once, the last value wins, as it does under runc and
-// bash: Garden lists the image's variables before the process's own, so the
-// last value is Diego's. os.Getenv keeps the first one instead, which is why
-// every reader of the environment goes through this map. An entry without
+// appears more than once, the last value wins, as it does under bash.
+// Garden lists the image's variables before the process's own, so the last
+// value is Diego's. Runc removes the duplicates before it starts the process
+// (prepareEnv in libcontainer), keeping the last value of each name, and that
+// is what makes a variable that an app sets itself lose to the executor's. A
+// process that is handed duplicates directly would see the first one through
+// os.Getenv, which is why every reader of the environment goes through this
+// map. An entry without
 // "=" names nothing a process can look up; it is left out with one line that
 // counts such entries and never repeats one.
 func lastWinsEnv(environ []string, logger *log.Logger) map[string]string {

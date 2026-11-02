@@ -139,6 +139,13 @@ type realSidecarRun struct {
 // ready and that the app has seen the pushed pair, it sends the supervisor
 // SIGTERM.
 func superviseRealSidecar(initial, next testIdentityPair, script string) realSidecarRun {
+	return superviseRealSidecarWithin(initial, next, script, nil)
+}
+
+// superviseRealSidecarWithin is superviseRealSidecar with the stop timing
+// that vm-launch derives from the process environment env (see stopTiming).
+func superviseRealSidecarWithin(initial, next testIdentityPair, script string, env map[string]string) realSidecarRun {
+	hostDeadline, windDown := stopTiming(lookupIn(env), log.New(GinkgoWriter, "", 0))
 	art := realArtifacts()
 	qemu := realQEMU()
 	requireMicrovm(qemu)
@@ -158,6 +165,7 @@ func superviseRealSidecar(initial, next testIdentityPair, script string) realSid
 		hosts:    []byte("127.0.0.1 localhost\n"),
 		sidecars: realSidecarFiles(script),
 		identity: &instanceIdentity{cert: initial.crt, key: initial.key},
+		windDown: windDown,
 	}
 	g.drives, err = newGuestDrivesWithStack(backend.VMQemu, nil, nil, sd)
 	Expect(err).NotTo(HaveOccurred())
@@ -193,7 +201,7 @@ func superviseRealSidecar(initial, next testIdentityPair, script string) realSid
 			logger:   log.New(logBuf, "", 0),
 			signals:  signals,
 			grace:    killGrace,
-			deadline: stopDeadline,
+			deadline: hostDeadline,
 			started: func() {
 				qemuProc = cmd.Process
 				close(running)
@@ -310,6 +318,18 @@ var _ = Describe("a stack guest with a sidecar and an instance identity against 
 		Expect(out).To(ContainSubstring("vm-launch guest: the app and its sidecars did not all exit within "+guestTimeoutSeconds+" seconds; ending the rest\n"), out)
 		Expect(r.ended.Sub(r.signalled)).To(BeNumerically(">=", guestWindDown))
 		Expect(r.ended.Sub(r.signalled)).To(BeNumerically("<", stopDeadline))
+		Expect(r.log).To(Equal("received terminated, asking the guest command to stop\n"))
+	})
+
+	It("ends a sidecar that ignores SIGTERM at the wind-down that Diego's shorter interval gives, before the host's matching deadline", func() {
+		r := superviseRealSidecarWithin(initial, next, realDeafSidecarScript, map[string]string{stopGraceEnv: "8"})
+		out := r.out
+
+		Expect(r.res.markerFound).To(BeTrue(), r.log)
+		Expect(codeOf(r.res)).To(Equal(7), out)
+		Expect(out).To(ContainSubstring("vm-launch guest: the app and its sidecars did not all exit within 4 seconds; ending the rest\n"), out)
+		Expect(r.ended.Sub(r.signalled)).To(BeNumerically(">=", 4*time.Second))
+		Expect(r.ended.Sub(r.signalled)).To(BeNumerically("<", 6*time.Second))
 		Expect(r.log).To(Equal("received terminated, asking the guest command to stop\n"))
 	})
 })

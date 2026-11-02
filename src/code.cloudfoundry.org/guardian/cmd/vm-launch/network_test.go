@@ -796,7 +796,20 @@ exit 3
 		Expect(runVM(backend.VMFirecracker)).To(Equal(exitHypervisorFailed), logBuf.String())
 		Expect(logBuf.String()).To(HaveSuffix("the guest listens on port " + p + "; it is open in the container\n" +
 			"the guest has stopped, so port " + p + " closes in the container\n" +
-			"hypervisor failed with exit status 3 before the guest reported a status; exiting " + strconv.Itoa(exitHypervisorFailed) + "\n"))
+			"hypervisor failed with exit status 3 before the guest reported a status; exiting " + strconv.Itoa(exitHypervisorFailed) + "\n" +
+			"the hypervisor ended without a guest status\n"))
+	})
+
+	It("writes the line that Garden reads after the exit line when the hypervisor dies without a status", func() {
+		port := freePort()
+		p := strconv.Itoa(port)
+		portHypervisor(filepath.Join(art, "firecracker/firecracker"), port, "exit 3\n")
+		GinkgoT().Setenv("PORT", p)
+
+		Expect(runVM(backend.VMFirecracker)).To(Equal(exitHypervisorFailed), logBuf.String())
+		Expect(logBuf.String()).To(HaveSuffix("hypervisor failed with exit status 3 before the guest reported a status; exiting " + strconv.Itoa(exitHypervisorFailed) + "\n" +
+			"the hypervisor ended without a guest status\n"))
+		Expect("vm-launch: " + hypervisorDiedPrefix).To(Equal("vm-launch: the hypervisor ended without a guest status"))
 	})
 
 	It("adds QEMU's forwarding rule when the guest listens and removes it when it stops", func() {

@@ -310,6 +310,35 @@ var _ = Describe("the CA bundle in the initramfs", func() {
 		Expect(string(byName["etc/ssl/certs/ca-certificates.crt"].data)).To(Equal(cert.pem))
 	})
 
+	It("holds the container's hosts file and hostname after resolv.conf, with a newline after the hostname", func() {
+		bb := filepath.Join(GinkgoT().TempDir(), "busybox")
+		Expect(os.WriteFile(bb, []byte("busybox"), 0o755)).To(Succeed())
+		g := taskGuest("true")
+		g.hosts = []byte("127.0.0.1 localhost\n10.0.0.2 handle\n")
+		g.hostname = "handle"
+		f, err := newInitramfs(bb, g)
+		Expect(err).NotTo(HaveOccurred())
+		defer f.Close()
+		names, byName := archiveEntries(fileBytes(f))
+		Expect(names).To(Equal([]string{"bin", "dev", "dev/console", "dev/null", "etc", "proc", "sys", "tmp", "rvm",
+			"bin/busybox", "rvm/cmd", "rvm/net", "rvm/env", "rvm/limits", "etc/resolv.conf",
+			"etc/hosts", "etc/hostname", "rvm/disks", "rvm/init", "init", cpioTrailer}))
+		Expect(string(byName["etc/hosts"].data)).To(Equal("127.0.0.1 localhost\n10.0.0.2 handle\n"))
+		Expect(string(byName["etc/hostname"].data)).To(Equal("handle\n"))
+		Expect(byName["etc/hosts"].mode).To(Equal(uint32(0o100644)))
+		Expect(string(byName["rvm/init"].data)).To(ContainSubstring("hostname -F /etc/hostname"))
+	})
+
+	It("leaves the host files out when the guest has none", func() {
+		bb := filepath.Join(GinkgoT().TempDir(), "busybox")
+		Expect(os.WriteFile(bb, []byte("busybox"), 0o755)).To(Succeed())
+		f, err := newInitramfs(bb, taskGuest("true"))
+		Expect(err).NotTo(HaveOccurred())
+		defer f.Close()
+		names, _ := archiveEntries(fileBytes(f))
+		Expect(names).NotTo(ContainElements("etc/hosts", "etc/hostname"))
+	})
+
 	It("leaves /etc/ssl out without a bundle", func() {
 		bb := filepath.Join(GinkgoT().TempDir(), "busybox")
 		Expect(os.WriteFile(bb, []byte("busybox"), 0o755)).To(Succeed())
@@ -415,5 +444,35 @@ var _ = Describe("run with trusted certificates", func() {
 		Expect(runVM(backend.VMQemu)).To(Equal(exitLaunchError))
 		Expect(logBuf.String()).To(ContainSubstring("the trusted certificates for the guest are over the 2097152 bytes a guest may have"))
 		Expect(argvFile).NotTo(BeAnExistingFile())
+	})
+})
+
+var _ = Describe("the container's host files for the busybox guest", func() {
+	var logBuf *strings.Builder
+
+	BeforeEach(func() {
+		logBuf = &strings.Builder{}
+		savedPath, savedName := containerHostsPath, containerHostname
+		DeferCleanup(func() { containerHostsPath, containerHostname = savedPath, savedName })
+	})
+
+	It("reads the hosts file and the hostname", func() {
+		containerHostsPath = filepath.Join(GinkgoT().TempDir(), "hosts")
+		Expect(os.WriteFile(containerHostsPath, []byte("10.0.0.2 handle\n"), 0o644)).To(Succeed())
+		containerHostname = func() (string, error) { return "handle", nil }
+		hosts, hostname := readContainerHostFiles(log.New(logBuf, "", 0))
+		Expect(string(hosts)).To(Equal("10.0.0.2 handle\n"))
+		Expect(hostname).To(Equal("handle"))
+		Expect(logBuf.String()).To(BeEmpty())
+	})
+
+	It("logs and leaves out a file it cannot read or a hostname the guest cannot set", func() {
+		containerHostsPath = filepath.Join(GinkgoT().TempDir(), "missing")
+		containerHostname = func() (string, error) { return "bad host name", nil }
+		hosts, hostname := readContainerHostFiles(log.New(logBuf, "", 0))
+		Expect(hosts).To(BeEmpty())
+		Expect(hostname).To(BeEmpty())
+		Expect(logBuf.String()).To(ContainSubstring("gets no /etc/hosts"))
+		Expect(logBuf.String()).To(ContainSubstring("gets no /etc/hostname"))
 	})
 })

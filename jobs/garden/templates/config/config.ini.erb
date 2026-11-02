@@ -318,6 +318,10 @@ end -%>
   unless vm_max_vcpus.is_a?(Integer) && vm_max_vcpus >= 0
     raise "garden.vm_max_vcpus must be 0 or a positive whole number of vCPUs, got #{vm_max_vcpus.inspect}"
   end
+  vm_full_memory_limit = p("garden.vm_full_memory_limit")
+  unless vm_full_memory_limit == true || vm_full_memory_limit == false
+    raise "garden.vm_full_memory_limit must be true or false, got #{vm_full_memory_limit.inspect}"
+  end
   vm_stack_tarballs = p("garden.vm_stack_tarballs")
   unless vm_stack_tarballs.is_a?(Array)
     raise "garden.vm_stack_tarballs must be a list of absolute paths, got #{vm_stack_tarballs.inspect}"
@@ -362,6 +366,9 @@ end -%>
     if vm_max_vcpus > 0
       raise "garden.vm_max_vcpus requires a vm-* entry in garden.execution_backends, because only a VM container has vCPUs"
     end
+    if vm_full_memory_limit
+      raise "garden.vm_full_memory_limit requires a vm-* entry in garden.execution_backends, because only a VM container has a guest memory size"
+    end
     unless vm_volume_sync_mounts
       raise "garden.vm_volume_sync_mounts requires a vm-* entry in garden.execution_backends, because only a VM container mounts an image volume"
     end
@@ -390,6 +397,9 @@ end -%>
 <% end -%>
 <% if vm_max_vcpus > 0 -%>
   vm-max-vcpus = <%= vm_max_vcpus %>
+<% end -%>
+<% if vm_full_memory_limit -%>
+  vm-full-memory-limit = true
 <% end -%>
 <% vm_stack_tarballs.each do |tarball| -%>
   vm-stack-tarball = <%= tarball %>

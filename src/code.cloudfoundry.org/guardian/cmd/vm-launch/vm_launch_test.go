@@ -1574,6 +1574,23 @@ var _ = Describe("run with a stack image", func() {
 		expectTodaysGuest([]string{launcher, "app", "true", ""}, "the stack image "+stackImg+" uses squashfs compressor 1, and the guest reads only lz4")
 	})
 
+	It("gives the guest that a failed droplet build leaves the container's hosts file and hostname", func() {
+		hostsPath := filepath.Join(dir, "container-hosts")
+		Expect(os.WriteFile(hostsPath, []byte("10.0.0.2 handle\n"), 0o644)).To(Succeed())
+		saved, savedName := containerHostsPath, containerHostname
+		containerHostsPath, containerHostname = hostsPath, func() (string, error) { return "handle", nil }
+		defer func() { containerHostsPath, containerHostname = saved, savedName }()
+		Expect(os.WriteFile(filepath.Join(art, artMksquashfs), []byte("#!/bin/sh\necho 'cannot read the droplet' >&2\nexit 1\n"), 0o755)).To(Succeed())
+
+		initrd, _ := guestOf([]string{launcher, "app", "true", ""})
+
+		Expect(logBuf.String()).To(ContainSubstring("busybox guest: building the droplet image"))
+		_, byName := archiveEntries(initrd)
+		Expect(string(byName["etc/hosts"].data)).To(Equal("10.0.0.2 handle\n"))
+		Expect(string(byName["etc/hostname"].data)).To(Equal("handle\n"))
+		Expect(string(byName["rvm/init"].data)).To(ContainSubstring("hostname -F /etc/hostname"))
+	})
+
 	It("keeps today's guest when the droplet image does not build, with the tool's output on the line", func() {
 		Expect(os.WriteFile(filepath.Join(art, artMksquashfs), []byte("#!/bin/sh\necho 'cannot read the droplet' >&2\nexit 1\n"), 0o755)).To(Succeed())
 		expectTodaysGuest([]string{launcher, "app", "true", ""}, "building the droplet image with "+filepath.Join(art, artMksquashfs)+": exit status 1; cannot read the droplet")

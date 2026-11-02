@@ -970,3 +970,13 @@ grep -E ' /home/vcap/(shared|disk) ' /proc/mounts | cut -d ' ' -f 2,3 | sed 's/^
 		Entry("with the mount point kept as an empty directory", false),
 	)
 })
+
+var _ = Describe("the fallback of the stack guest to the busybox guest", func() {
+	It("installs the container's hosts file and hostname before it runs the busybox guest's stage 2", func() {
+		install := `cat ` + guestHosts + ` >/etc/hosts && cat ` + guestHostname + ` >/etc/hostname`
+		Expect(strings.Count(guestFallbackFunc, install)).To(Equal(1))
+		Expect(strings.Index(guestFallbackFunc, install)).To(BeNumerically(">", strings.Index(guestFallbackFunc, ". "+guestFallbackPrep)))
+		Expect(strings.Index(guestFallbackFunc, install)).To(BeNumerically("<", strings.Index(guestFallbackFunc, "exec /bin/sh "+guestStage2)))
+		Expect(strings.Index(guestFallbackFunc, install)).To(BeNumerically("<", strings.Index(guestFallbackFunc, "mount -t overlay")))
+	})
+})

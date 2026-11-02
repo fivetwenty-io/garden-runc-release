@@ -87,6 +87,13 @@ const (
 	// flag only for a positive cap.
 	VMLaunchMaxVCPUsFlag = "--max-vcpus"
 
+	// VMLaunchFullMemoryLimitFlag tells vm-launch to size the guest at the
+	// whole MEMORY_LIMIT, because Garden has raised the container's own
+	// memory limit by the hypervisor's reserve. vm-launch defaults to the
+	// limit less the reserve, so VMLaunchMemoryFlags passes the flag only
+	// for a container whose bundle records the raise.
+	VMLaunchFullMemoryLimitFlag = "--full-memory-limit"
+
 	// portEnvPrefix starts the environment entry that names the port of a
 	// process that serves one. vm-launch forwards ports only when the entry
 	// is present, whatever its value, and exits when the value is no port.
@@ -229,6 +236,20 @@ func VMLaunchCPUFlags(maxVCPUs uint) []string {
 	return []string{VMLaunchMaxVCPUsFlag, strconv.FormatUint(uint64(maxVCPUs), 10)}
 }
 
+// VMLaunchMemoryFlags returns the vm-launch flag that gives the guest the
+// whole MEMORY_LIMIT when the container's bundle records that Garden raised
+// the container's memory limit by the reserve (see
+// backend.MemoryReserveAnnotationKey), or none otherwise, so that vm-launch
+// gets the arguments it gets today. It reads the bundle and not Garden's
+// configuration, so a container keeps the guest it was created for after the
+// operator changes the option.
+func VMLaunchMemoryFlags(bndl goci.Bndl) []string {
+	if !backend.FullMemoryLimitFromBundle(bndl) {
+		return nil
+	}
+	return []string{VMLaunchFullMemoryLimitFlag}
+}
+
 // WithVMLaunchFlags makes BuildProcess pass flags to the vm-launch process
 // that the containerizer wrapped in a vm-* container, after the transparent
 // proxy flag when it adds one and before vm-launch's own arguments. It never
@@ -322,6 +343,7 @@ func (p *ProcBuilder) BuildProcess(bndl goci.Bndl, spec garden.ProcessSpec, user
 	}
 	if wrapped {
 		args = append(args, p.vmLaunchFlags...)
+		args = append(args, VMLaunchMemoryFlags(bndl)...)
 	}
 	args = append(args, spec.Args...)
 

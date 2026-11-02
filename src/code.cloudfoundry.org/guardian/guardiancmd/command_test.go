@@ -538,6 +538,11 @@ var _ = Describe("execution backend flags", func() {
 			Expect(parsed.ExecutionBackends.VMVolumeAsyncMounts).To(BeFalse())
 		})
 
+		It("keeps the guest at the reduced memory limit unless --vm-full-memory-limit is given", func() {
+			Expect(parse().ExecutionBackends.VMFullMemoryLimit).To(BeFalse())
+			Expect(parse("--vm-full-memory-limit").ExecutionBackends.VMFullMemoryLimit).To(BeTrue())
+		})
+
 		It("defaults --vm-qemu-sandbox to the seccomp sandbox and takes a custom or an empty value", func() {
 			Expect(parse().ExecutionBackends.VMQemuSandbox).To(Equal(processes.VMQemuSandboxDefault))
 			Expect(parse("--vm-qemu-sandbox=on,spawn=deny").ExecutionBackends.VMQemuSandbox).To(Equal("on,spawn=deny"))
@@ -639,6 +644,29 @@ var _ = Describe("execution backend flags", func() {
 					"--virtiofsd-path", "/opt/garden-vm/artifacts/virtiofsd/virtiofsd-wrapper",
 					"--volume-sync-mounts=false",
 				}))
+			})
+
+			It("passes no vm-launch flag for the full memory limit, which the container's bundle carries, and turns the rule's raise on", func() {
+				Expect(cmd.ExecutionBackends.VMFullMemoryLimit).To(BeFalse())
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.fullMemoryLimit).To(BeFalse())
+
+				cmd.ExecutionBackends.VMFullMemoryLimit = true
+				backends, err = cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.fullMemoryLimit).To(BeTrue())
+				Expect(backends.vmLaunchFlags).To(BeEmpty())
+			})
+
+			It("leaves the full memory limit off when the vm-* backends were dropped for want of a kvm gid", func() {
+				cmd.ExecutionBackends.VMFullMemoryLimit = true
+				lookupKVMGroup = func(name string) (*user.Group, error) { return nil, user.UnknownGroupError(name) }
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.fullMemoryLimit).To(BeFalse())
+				Expect(log).To(gbytes.Say("full-memory-limit-unused-without-a-vm-backend"))
 			})
 
 			It("passes nothing when the vm-* backends were dropped for want of a kvm gid", func() {
