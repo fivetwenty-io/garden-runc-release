@@ -479,7 +479,15 @@ func (v *vmCPUCounter) report(cgroup garden.ContainerCPUStat, sample vmCPUSample
 	v.at = now
 
 	if v.source != vmCPUFromGuest {
-		base := vmCPUMax(v.reported, cgroup)
+		// Only the first switch to the guest's figures takes the cgroup's
+		// reading as its base. The cgroup of a container that has run on the
+		// guest's figures holds the hypervisor's and the idle time as well, so
+		// a return from a stale spell carries on from the last figure, which
+		// followed the cgroup's rise only while the sample was stale.
+		base := v.reported
+		if before == vmCPUFromCgroup {
+			base = vmCPUMax(v.reported, cgroup)
+		}
 		v.offset = garden.ContainerCPUStat{
 			Usage:  vmCPUSub(base.Usage, v.guest.User+v.guest.System),
 			User:   vmCPUSub(base.User, v.guest.User),

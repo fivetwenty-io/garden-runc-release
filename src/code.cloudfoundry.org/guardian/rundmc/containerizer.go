@@ -844,7 +844,17 @@ func (c *Containerizer) RemoveBundle(log lager.Logger, handle string) error {
 	if err := c.depot.Destroy(log, handle); err != nil {
 		log.Debug("failed-to-remove-bundle-dir")
 	}
-	return c.runtime.RemoveBundle(log, handle)
+	err := c.runtime.RemoveBundle(log, handle)
+
+	// A Metrics call that read the container's stats before Destroy can make
+	// its counter and take a sample from late output after Destroy removed
+	// them, while the bundle is still there. With the bundle gone, nothing
+	// can make them again, since Metrics checks the bundle when it makes a
+	// counter.
+	c.guestCPUCounters.Delete(handle)
+	c.guestCPU.Remove(handle)
+
+	return err
 }
 
 func (c *Containerizer) Info(log lager.Logger, handle string) (spec.ActualContainerSpec, error) {

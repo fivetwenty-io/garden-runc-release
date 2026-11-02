@@ -1303,6 +1303,39 @@ var _ = Describe("Rundmc", func() {
 						Expect(rundmc.HasGuestCPUCounter(containerizer, "some-handle")).To(BeFalse())
 					})
 
+					It("returns from a stale spell by the guest's own rise, however far the cgroup is above the guest", func() {
+						run()
+						cpu()
+
+						// The cgroup keeps adding the hypervisor's and the idle
+						// time on top of the guest's.
+						fakeCPUCgrouper.ReadTotalCgroupUsageReturns(stat(900e9, 100e9), nil)
+						now = now.Add(15 * time.Second)
+						first := cpu()
+						Expect(first).To(Equal(stat(30e6, 10e6)))
+
+						now = now.Add(time.Minute)
+						Expect(cpu()).To(Equal(first))
+
+						_, _ = writer.Write([]byte(laterCPULine))
+						Expect(cpu()).To(Equal(stat(50e6, 20e6)))
+					})
+
+					It("keeps no counter after the bundle is removed, whatever Metrics made in between", func() {
+						run()
+						cpu()
+						Expect(containerizer.Destroy(logger, "some-handle")).To(Succeed())
+						Expect(rundmc.HasGuestCPUCounter(containerizer, "some-handle")).To(BeFalse())
+
+						// The bundle outlives Destroy until RemoveBundle, and a
+						// Metrics call that read the stats first makes a counter.
+						Expect(cpu().Usage).NotTo(BeZero())
+						Expect(rundmc.HasGuestCPUCounter(containerizer, "some-handle")).To(BeTrue())
+
+						Expect(containerizer.RemoveBundle(logger, "some-handle")).To(Succeed())
+						Expect(rundmc.HasGuestCPUCounter(containerizer, "some-handle")).To(BeFalse())
+					})
+
 					It("reports the cgroup figure when the launcher wrote no sample", func() {
 						lines = nil
 
