@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -102,16 +103,6 @@ func (s *agentShim) run(args []string) (agentExit, error) {
 		return agentExit{}, err
 	}
 	defer conn.Close()
-	if _, err := io.WriteString(conn, agentKindSession+"\n"); err != nil {
-		return agentExit{}, fmt.Errorf("writing to the guest agent relay: %w", err)
-	}
-	line, err := readLine(conn, agentMaxLine)
-	if err != nil {
-		return agentExit{}, fmt.Errorf("reading the guest agent relay's answer: %w", err)
-	}
-	if line != "ok" {
-		return agentExit{}, errors.New(strings.TrimPrefix(line, "error: "))
-	}
 
 	req := agentRequest{Kind: agentKindSession, Args: args, Env: s.env}
 	tty := isTerminal(s.stdin)
@@ -124,10 +115,24 @@ func (s *agentShim) run(args []string) (agentExit, error) {
 		}
 		defer restore()
 	}
-	fw := &agentFrameWriter{w: conn}
-	if err := fw.writeJSON(agentFrameRequest, req); err != nil {
-		return agentExit{}, fmt.Errorf("sending the session to the guest agent: %w", err)
+	// The line and the request go in one write, because the relay holds its
+	// answer until the agent has answered the request.
+	var hello bytes.Buffer
+	hello.WriteString(agentKindSession + "\n")
+	if err := (&agentFrameWriter{w: &hello}).writeJSON(agentFrameRequest, req); err != nil {
+		return agentExit{}, fmt.Errorf("encoding the session for the guest agent: %w", err)
 	}
+	if _, err := conn.Write(hello.Bytes()); err != nil {
+		return agentExit{}, fmt.Errorf("writing to the guest agent relay: %w", err)
+	}
+	line, err := readLine(conn, agentMaxLine)
+	if err != nil {
+		return agentExit{}, fmt.Errorf("reading the guest agent relay's answer: %w", err)
+	}
+	if line != "ok" {
+		return agentExit{}, errors.New(strings.TrimPrefix(line, "error: "))
+	}
+	fw := &agentFrameWriter{w: conn}
 	br := bufio.NewReaderSize(conn, agentMaxData+agentFrameHeaderLen)
 	payload, err := readAgentFrameOf(br, agentFrameReady)
 	if err != nil {

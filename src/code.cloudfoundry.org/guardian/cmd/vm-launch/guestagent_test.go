@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -21,6 +22,7 @@ import (
 	"code.cloudfoundry.org/guardian/backend"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"golang.org/x/sys/unix"
 )
 
 // testAgentKey is the boot key of the agents the specs run, as hex.
@@ -497,7 +499,7 @@ var _ = Describe("the guest agent relay", func() {
 	}
 
 	startRelay := func(key string, dial func() (agentConn, error), off string) *agentRelay {
-		r, err := newAgentRelay(path, []byte(key), dial, off, logger)
+		r, err := newAgentRelay(path, []byte(key), dial, off, 5*time.Second, logger)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(r.close)
 		return r
@@ -551,7 +553,7 @@ var _ = Describe("the guest agent relay", func() {
 		if os.Getuid() == 0 {
 			Skip("root may always use the relay")
 		}
-		r, err := newAgentRelay(path, []byte(testAgentKey), dialAgent(a), "", logger)
+		r, err := newAgentRelay(path, []byte(testAgentKey), dialAgent(a), "", time.Second, logger)
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(r.close)
 		c, err := net.Dial("unix", path)
@@ -576,6 +578,53 @@ var _ = Describe("the guest agent relay", func() {
 		Expect(shim.run([]string{"-c", "echo up"})).To(Equal(agentExit{Code: 0}))
 		Expect(stdout.String()).To(Equal("up\n"))
 		Expect(tries.Load()).To(BeNumerically("==", 3))
+	})
+
+	It("tries the agent again when it ends the connection before it answers", func() {
+		var tries atomic.Int32
+		dial := dialAgent(a)
+		startRelay(testAgentKey, func() (agentConn, error) {
+			if tries.Add(1) < 3 {
+				// An agent with all its handshakes pending closes the
+				// connection without an answer.
+				agentSide, relaySide := agentSocketPair()
+				agentSide.Close()
+				return relaySide, nil
+			}
+			return dial()
+		}, "")
+		shim, stdout, _ := newShim("", nil, make(chan os.Signal))
+		Expect(shim.run([]string{"-c", "echo answered"})).To(Equal(agentExit{Code: 0}))
+		Expect(stdout.String()).To(Equal("answered\n"))
+		Expect(tries.Load()).To(BeNumerically("==", 3))
+
+		tries.Store(0)
+		_, answer := ask("forward 127.0.0.1 " + strconv.Itoa(upperServer()))
+		Expect(answer).To(Equal("ok"))
+		Expect(tries.Load()).To(BeNumerically("==", 3))
+	})
+
+	It("stops waiting for the agent as soon as it closes", func() {
+		var tries atomic.Int32
+		r, err := newAgentRelay(path, []byte(testAgentKey), func() (agentConn, error) {
+			tries.Add(1)
+			return nil, errors.New("the guest is still booting")
+		}, "", agentRelayWait, logger)
+		Expect(err).NotTo(HaveOccurred())
+		c, err := net.Dial("unix", path)
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = c.Close() })
+		_, err = io.WriteString(c, "forward 127.0.0.1 8080\n")
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(tries.Load, 5*time.Second).Should(BeNumerically(">=", 2))
+
+		start := time.Now()
+		r.close()
+		Expect(time.Since(start)).To(BeNumerically("<", time.Second))
+		Expect(c.SetReadDeadline(time.Now().Add(5 * time.Second))).To(Succeed())
+		answer, err := io.ReadAll(c)
+		Expect(err).To(Or(Not(HaveOccurred()), MatchError(syscall.ECONNRESET)))
+		Expect(string(answer)).To(Or(BeEmpty(), Equal("error: the guest agent relay closed\n")))
 	})
 
 	It("runs the shim's session in the guest with its arguments, input, environment, output, and exit code", func() {
@@ -618,10 +667,12 @@ var _ = Describe("the guest agent relay", func() {
 	})
 
 	It("cannot reach the agent with another boot's key", func() {
-		startRelay(strings.Repeat("cd", agentKeyBytes), dialAgent(a), "")
+		r, err := newAgentRelay(path, []byte(strings.Repeat("cd", agentKeyBytes)), dialAgent(a), "", 500*time.Millisecond, logger)
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(r.close)
 		shim, _, _ := newShim("", nil, make(chan os.Signal))
-		_, err := shim.run([]string{"-c", "true"})
-		Expect(err).To(MatchError(ContainSubstring("the guest agent")))
+		_, err = shim.run([]string{"-c", "true"})
+		Expect(err).To(MatchError(HavePrefix("the guest agent did not answer within 500ms: ")))
 		Expect(a.runDir).NotTo(BeADirectory())
 	})
 
@@ -644,9 +695,9 @@ var _ = Describe("the guest agent relay", func() {
 	})
 
 	It("ends its clients' connections when it closes", func() {
-		r, err := newAgentRelay(path, []byte(testAgentKey), dialAgent(a), "", logger)
+		r, err := newAgentRelay(path, []byte(testAgentKey), dialAgent(a), "", time.Second, logger)
 		Expect(err).NotTo(HaveOccurred())
-		c, answer := ask(agentKindSession)
+		c, answer := ask("forward 127.0.0.1 " + strconv.Itoa(upperServer()))
 		Expect(answer).To(Equal("ok"))
 		r.close()
 		Expect(c.SetReadDeadline(time.Now().Add(5 * time.Second))).To(Succeed())
@@ -789,6 +840,39 @@ var _ = Describe("the host side of the guest agent", func() {
 		Expect(err).To(MatchError(`the guest agent does not support backend "garden-runc"`))
 		_, _, err = reserveVsockCID(filepath.Join(dir, "vhost-vsock"))
 		Expect(err).To(MatchError(HavePrefix("opening " + filepath.Join(dir, "vhost-vsock") + " failed: ")))
+	})
+
+	It("draws another vsock address while the one it drew is in use, and gives up after a fixed number", func() {
+		device := writeTempFile("vhost-vsock", "")
+		old := setVsockGuestCID
+		DeferCleanup(func() { setVsockGuestCID = old })
+		var tried []uint32
+		inUse := 2
+		setVsockGuestCID = func(_ *os.File, cid uint32) error {
+			tried = append(tried, cid)
+			if len(tried) <= inUse {
+				return unix.EADDRINUSE
+			}
+			return nil
+		}
+		f, cid, err := reserveVsockCID(device)
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = f.Close() })
+		Expect(tried).To(HaveLen(3))
+		Expect(cid).To(Equal(tried[2]))
+		for _, c := range tried {
+			Expect(c).To(BeNumerically(">=", vsockFirstGuestCID))
+			Expect(c).To(BeNumerically("<", vsockLastGuestCID))
+		}
+
+		tried, inUse = nil, vsockCIDAttempts
+		_, _, err = reserveVsockCID(device)
+		Expect(err).To(MatchError(fmt.Sprintf("every one of %d random vsock addresses was in use", vsockCIDAttempts)))
+		Expect(tried).To(HaveLen(vsockCIDAttempts))
+
+		setVsockGuestCID = func(*os.File, uint32) error { return unix.EPERM }
+		_, _, err = reserveVsockCID(device)
+		Expect(err).To(MatchError("reserving a vsock address on " + device + " failed: operation not permitted"))
 	})
 
 	It("connects through Firecracker's vsock socket with its CONNECT handshake", func() {

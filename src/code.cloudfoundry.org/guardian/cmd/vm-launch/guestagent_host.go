@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -137,7 +138,7 @@ func newHostAgent(kind backend.Kind, workDir, socket string, logger *log.Logger)
 	if a.off != "" {
 		logger.Print(a.off)
 	}
-	relay, err := newAgentRelay(socket, []byte(a.key), dial, a.off, logger)
+	relay, err := newAgentRelay(socket, []byte(a.key), dial, a.off, agentRelayWait, logger)
 	if err != nil {
 		a.close()
 		return nil, err
@@ -238,18 +239,28 @@ func reserveVsockCID(device string) (*os.File, uint32, error) {
 			return nil, 0, fmt.Errorf("drawing a vsock address failed: %w", err)
 		}
 		cid := vsockFirstGuestCID + binary.BigEndian.Uint32(buf[:])%(vsockLastGuestCID-vsockFirstGuestCID)
-		value := uint64(cid)
-		_, _, errno := unix.Syscall(unix.SYS_IOCTL, f.Fd(), vhostVsockSetGuestCID, uintptr(unsafe.Pointer(&value)))
-		if errno == 0 {
+		err := setVsockGuestCID(f, cid)
+		if err == nil {
 			return f, cid, nil
 		}
-		if errno != unix.EADDRINUSE {
+		if !errors.Is(err, unix.EADDRINUSE) {
 			f.Close()
-			return nil, 0, fmt.Errorf("reserving a vsock address on %s failed: %w", device, errno)
+			return nil, 0, fmt.Errorf("reserving a vsock address on %s failed: %w", device, err)
 		}
 	}
 	f.Close()
 	return nil, 0, fmt.Errorf("every one of %d random vsock addresses was in use", vsockCIDAttempts)
+}
+
+// setVsockGuestCID gives the guest of the vhost-vsock device f the address
+// cid, and fails with EADDRINUSE when another guest on the host has it.
+// Specs replace it.
+var setVsockGuestCID = func(f *os.File, cid uint32) error {
+	value := uint64(cid)
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, f.Fd(), vhostVsockSetGuestCID, uintptr(unsafe.Pointer(&value))); errno != 0 {
+		return errno
+	}
+	return nil
 }
 
 // dialVsock connects to port on the guest at cid within timeout. The
@@ -401,12 +412,14 @@ type agentRelay struct {
 	mu     sync.Mutex
 	conns  map[io.Closer]struct{}
 	closed bool
-	wg     sync.WaitGroup
+	// done is closed by close, which ends every wait for the agent.
+	done chan struct{}
+	wg   sync.WaitGroup
 }
 
 // newAgentRelay listens at path, mode 0600, and serves clients until
-// close.
-func newAgentRelay(path string, key []byte, dial func() (agentConn, error), off string, logger *log.Logger) (*agentRelay, error) {
+// close, waiting up to wait for the agent to answer each one.
+func newAgentRelay(path string, key []byte, dial func() (agentConn, error), off string, wait time.Duration, logger *log.Logger) (*agentRelay, error) {
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("removing the stale guest agent socket %s: %w", path, err)
 	}
@@ -418,7 +431,7 @@ func newAgentRelay(path string, key []byte, dial func() (agentConn, error), off 
 		ln.Close()
 		return nil, fmt.Errorf("making the guest agent socket %s private: %w", path, err)
 	}
-	r := &agentRelay{ln: ln, key: key, dial: dial, off: off, wait: agentRelayWait, uid: os.Getuid(), logger: logger, conns: map[io.Closer]struct{}{}}
+	r := &agentRelay{ln: ln, key: key, dial: dial, off: off, wait: wait, uid: os.Getuid(), logger: logger, conns: map[io.Closer]struct{}{}, done: make(chan struct{})}
 	r.wg.Add(1)
 	go r.serve()
 	return r, nil
@@ -467,6 +480,9 @@ func (r *agentRelay) untrack(c io.Closer) {
 // waits for their goroutines.
 func (r *agentRelay) close() {
 	r.mu.Lock()
+	if !r.closed {
+		close(r.done)
+	}
 	r.closed = true
 	r.ln.Close()
 	for c := range r.conns {
@@ -504,32 +520,48 @@ func (r *agentRelay) handle(c *net.UnixConn) {
 		answer("the guest agent relay takes %q or %q, not %q", agentKindSession, agentKindForward+" HOST PORT", line)
 		return
 	}
-	if err := c.SetReadDeadline(time.Time{}); err != nil {
-		return
-	}
 	if r.dial == nil {
 		answer("%s", r.off)
 		return
 	}
-	agent, err := r.connect()
+	// A session's request comes from the client, which sends it right after
+	// its line, and a forward's is the relay's own.
+	var request []byte
+	if forward == nil {
+		if request, err = readAgentFrameOf(c, agentFrameRequest); err != nil {
+			answer("reading the session's request: %v", err)
+			return
+		}
+	} else if request, err = json.Marshal(forward); err != nil {
+		answer("encoding the forward's request: %v", err)
+		return
+	}
+	if err := c.SetReadDeadline(time.Time{}); err != nil {
+		return
+	}
+	agent, ready, err := r.open(request)
 	if err != nil {
 		answer("%v", err)
 		return
 	}
-	if !r.track(agent) {
-		agent.Close()
-		return
-	}
 	defer r.untrack(agent)
-	if forward != nil {
-		r.forward(c, agent, *forward)
+	if ready.Error != "" {
+		answer("%s", ready.Error)
 		return
 	}
 	if _, err := io.WriteString(c, "ok\n"); err != nil {
 		return
 	}
-	// The client's frames and the agent's pass through unchanged. When
-	// either side ends, both connections close.
+	if forward != nil {
+		r.forward(c, agent)
+		return
+	}
+	// The client reads the agent's answer after the relay's, and then the
+	// client's frames and the agent's pass through unchanged. When either
+	// side ends, both connections close.
+	if (&agentFrameWriter{w: c}).writeJSON(agentFrameReady, ready) != nil {
+		return
+	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -557,58 +589,86 @@ func (r *agentRelay) checkPeer(c *net.UnixConn) error {
 	return nil
 }
 
-// connect dials the agent until it answers or r.wait has passed, and sends
-// the hello.
-func (r *agentRelay) connect() (agentConn, error) {
+// errAgentRelayClosed ends a client's wait for the agent when the relay
+// closes.
+var errAgentRelayClosed = errors.New("the guest agent relay closed")
+
+// open connects to the agent, sends the hello and request, and returns the
+// connection, which close can end, and the agent's answer. A dial that
+// fails, or an agent that ends the connection before it answers, as one
+// with all its handshakes pending does, is tried again until r.wait has
+// passed or the relay closes.
+func (r *agentRelay) open(request []byte) (agentConn, agentReady, error) {
 	deadline := time.Now().Add(r.wait)
 	for {
-		agent, err := r.dial()
-		if err == nil {
-			fw := &agentFrameWriter{w: agent}
-			if err = fw.write(agentFrameHello, r.key); err == nil {
-				return agent, nil
-			}
-			agent.Close()
+		agent, ready, err := r.try(request)
+		if err == nil || errors.Is(err, errAgentRelayClosed) || errors.Is(err, errAgentAnswer) {
+			return agent, ready, err
 		}
 		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("the guest agent did not answer within %v: %v", r.wait, err)
+			return nil, agentReady{}, fmt.Errorf("the guest agent did not answer within %v: %v", r.wait, err)
 		}
-		time.Sleep(agentDialRetry)
+		retry := time.NewTimer(agentDialRetry)
+		select {
+		case <-r.done:
+			retry.Stop()
+			return nil, agentReady{}, errAgentRelayClosed
+		case <-retry.C:
+		}
 	}
 }
 
-// forward asks the agent for a forward to req's address and then turns the
-// client's raw bytes into data frames and the agent's data frames back into
-// raw bytes, passing on the end of each direction.
-func (r *agentRelay) forward(c *net.UnixConn, agent agentConn, req agentRequest) {
+// errAgentAnswer marks an answer from the agent that trying again would not
+// change.
+var errAgentAnswer = errors.New("the guest agent's answer")
+
+// try makes one connection to the agent for open.
+func (r *agentRelay) try(request []byte) (agentConn, agentReady, error) {
+	var ready agentReady
+	agent, err := r.dial()
+	if err != nil {
+		return nil, ready, err
+	}
+	if !r.track(agent) {
+		agent.Close()
+		return nil, ready, errAgentRelayClosed
+	}
+	fail := func(err error) (agentConn, agentReady, error) {
+		r.untrack(agent)
+		return nil, ready, err
+	}
 	fw := &agentFrameWriter{w: agent}
-	if err := fw.writeJSON(agentFrameRequest, req); err != nil {
-		fmt.Fprintf(c, "error: asking the guest agent for the forward: %v\n", err)
-		return
+	if err := fw.write(agentFrameHello, r.key); err != nil {
+		return fail(err)
+	}
+	if err := fw.write(agentFrameRequest, request); err != nil {
+		return fail(err)
 	}
 	if err := agent.SetReadDeadline(time.Now().Add(agentHelloTimeout + guestAgentDialTimeout)); err != nil {
-		return
+		return fail(err)
 	}
-	payload, err := readAgentFrameOf(agent, agentFrameReady)
+	var header [agentFrameHeaderLen]byte
+	if _, err := io.ReadFull(agent, header[:]); err != nil {
+		return fail(fmt.Errorf("the agent ended the connection before it answered: %w", err))
+	}
+	payload, err := readAgentFrameOf(io.MultiReader(bytes.NewReader(header[:]), agent), agentFrameReady)
 	if err != nil {
-		fmt.Fprintf(c, "error: reading the guest agent's answer: %v\n", err)
-		return
+		return fail(fmt.Errorf("%w: %v", errAgentAnswer, err))
 	}
-	var ready agentReady
 	if err := json.Unmarshal(payload, &ready); err != nil {
-		fmt.Fprintf(c, "error: decoding the guest agent's answer: %v\n", err)
-		return
-	}
-	if ready.Error != "" {
-		fmt.Fprintf(c, "error: %s\n", ready.Error)
-		return
+		return fail(fmt.Errorf("%w could not be decoded: %v", errAgentAnswer, err))
 	}
 	if err := agent.SetReadDeadline(time.Time{}); err != nil {
-		return
+		return fail(err)
 	}
-	if _, err := io.WriteString(c, "ok\n"); err != nil {
-		return
-	}
+	return agent, ready, nil
+}
+
+// forward turns the client's raw bytes into data frames for the agent, which
+// has opened the forward, and the agent's data frames back into raw bytes,
+// passing on the end of each direction.
+func (r *agentRelay) forward(c *net.UnixConn, agent agentConn) {
+	fw := &agentFrameWriter{w: agent}
 	toGuest := make(chan struct{})
 	go func() {
 		defer close(toGuest)
