@@ -757,6 +757,13 @@ const guestSetLimits = `ulimit -n "$RVM_NOFILE_HARD" && ulimit -S -n "$RVM_NOFIL
 // loopback address, 127.0.0.0/8, ends in 7F; ::1 and ::ffff:127.0.0.0/104
 // are the IPv6 loopback forms.
 //
+// While every port is up the watcher waits guestListenSteadyWait seconds
+// between looks, and while any port is down it waits one second, so the
+// start of an app is seen as fast as before and an idle guest with a
+// listening app spends a quarter of the CPU on the tables. Measured in a guest
+// under QEMU, the looks at one second took about 17 of the 23 ticks an idle
+// guest used in a minute.
+//
 // The watcher runs no other process once it has started: it reads the
 // tables with the shell's read, and it waits out each second with a read
 // that times out on guestListenTick, a FIFO that nothing writes. A shell
@@ -806,9 +813,9 @@ if [ -n "${RVM_PORTS:-}" ]; then
 	done
 	(
 		if [ -p ` + guestListenTick + ` ] && command exec 3<>` + guestListenTick + `; then
-			rvm_pause() { read -t 1 -u 3 rvm_tick; }
+			rvm_pause() { read -t "${rvm_step:-1}" -u 3 rvm_tick; }
 		else
-			rvm_pause() { sleep 1; }
+			rvm_pause() { sleep "${rvm_step:-1}"; }
 		fi
 		rvm_upset=" "
 		rvm_look=0
@@ -841,6 +848,7 @@ if [ -n "${RVM_PORTS:-}" ]; then
 				rvm_look=0
 			fi
 			rvm_nextup=" "
+			rvm_steady=1
 			for rvm_pp in $rvm_ports; do
 				rvm_hex=${rvm_pp#*:}
 				case "$rvm_seen" in
@@ -859,9 +867,16 @@ if [ -n "${RVM_PORTS:-}" ]; then
 				fi
 				if [ "$rvm_was" = 1 ]; then
 					rvm_nextup="$rvm_nextup$rvm_hex "
+				else
+					rvm_steady=
 				fi
 			done
 			rvm_upset=$rvm_nextup
+			if [ -n "$rvm_steady" ]; then
+				rvm_step=` + strconv.Itoa(guestListenSteadyWait) + `
+			else
+				rvm_step=1
+			fi
 			rvm_pause
 		done
 	) </dev/null &
@@ -923,6 +938,15 @@ wait "$rvm_cpuwatch" 2>/dev/null
 // guestListenRefresh is how many looks the listen watcher makes between the
 // lines in which it reports every port, changed or not.
 const guestListenRefresh = 5
+
+// guestListenSteadyWait is how many seconds the listen watcher waits between
+// looks once every port is up, in place of the one second it waits while a
+// port is down. The first look after a port goes down, and the first after an
+// app starts to listen, still come at the pace of the state before them, so a
+// port that closes is seen at most this many seconds late, while a guest that
+// is idle with its app listening reads its tables a quarter as often. The
+// refresh of guestListenRefresh looks is then that many times this long.
+const guestListenSteadyWait = 4
 
 // guestListenTick is the FIFO the listen watcher waits on. The initramfs of
 // a guest with ports holds it, and nothing ever writes it.

@@ -1433,6 +1433,18 @@ rvm_round_end() { rvm_rounds=$((rvm_rounds + 1)); [ "$rvm_rounds" -lt ` + strcon
 `
 	}
 
+	DescribeTable("waits guestListenSteadyWait seconds between looks only while every port is up",
+		func(ports []int, wantStep string) {
+			shell := guestBusyboxShell()
+			up := procNetLine("00000000:1F90", "0A")
+			prelude := "rvm_round_end() { echo \"step=$rvm_step\"; exit 0; }\n"
+			out := watchPorts(shell, ports, up, "", prelude, ports)
+			Expect(out).To(HaveSuffix("step="+wantStep+"\n"), out)
+		},
+		Entry("every port up", []int{8080}, strconv.Itoa(guestListenSteadyWait)),
+		Entry("one port down", []int{8080, 8081}, "1"),
+	)
+
 	DescribeTable("reports every port, changed or not, once in every guestListenRefresh looks",
 		func(shellOf func() guestShell) {
 			shell := shellOf()
