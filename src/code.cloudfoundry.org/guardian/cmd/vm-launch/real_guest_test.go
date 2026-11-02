@@ -503,7 +503,7 @@ echo "resolved=$(grep -c ' busybox-handle$' /etc/hosts)"`)
 
 	It("boots with the vCPUs and the memory that vm-launch derives, and the command sees both", func() {
 		logger := log.New(GinkgoWriter, "", 0)
-		memMiB := guestMemory(backend.VMQemu, envMap(map[string]string{"MEMORY_LIMIT": "384m"}), logger)
+		memMiB := guestMemory(backend.VMQemu, envMap(map[string]string{"MEMORY_LIMIT": "384m"}), false, logger)
 		vcpus := guestVCPUCount(backend.VMQemu, func() (int, error) { return 2, nil }, 0, logger)
 		Expect(memMiB).To(Equal(256))
 		Expect(vcpus).To(Equal(2))
@@ -537,6 +537,39 @@ echo "memory_limit=$MEMORY_LIMIT"`)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(kib).To(BeNumerically("<=", memMiB*1024), out)
 		Expect(kib).To(BeNumerically(">", (memMiB-64)*1024), out)
+		Expect(out).To(ContainSubstring(exitTag(testNonce) + "0"))
+	})
+
+	It("boots a guest with the whole of a 1G limit when the full limit is asked for, and the command sees it", func() {
+		logger := log.New(GinkgoWriter, "", 0)
+		env := envMap(map[string]string{"MEMORY_LIMIT": "1024m"})
+		Expect(guestMemory(backend.VMQemu, env, false, logger)).To(Equal(894))
+		memMiB := guestMemory(backend.VMQemu, env, true, logger)
+		Expect(memMiB).To(Equal(1024))
+		envFile, err := buildGuestEnv(map[string]string{memoryLimitEnv: "1024m"}, memMiB, logger)
+		Expect(err).NotTo(HaveOccurred())
+
+		g := taskGuest(`echo "memtotal_kib=$(sed -n 's/^MemTotal: *\([0-9]*\) kB$/\1/p' /proc/meminfo)"
+echo "memory_limit=$MEMORY_LIMIT"`)
+		g.env = envFile
+		withRealRoot(&g)
+		out := bootRealGuestEdited(g, nil, realRootImage(), func(argv []string, files []*os.File) ([]string, []*os.File) {
+			edited := append([]string(nil), argv...)
+			for i, a := range edited {
+				if a == "-m" {
+					edited[i+1] = strconv.Itoa(memMiB)
+				}
+			}
+			return edited, files
+		})
+		Expect(out).To(ContainSubstring(startTag(testNonce)), out)
+		Expect(out).To(ContainSubstring("memory_limit=1024m"))
+		m := regexp.MustCompile(`(?m)^memtotal_kib=(\d+)\r?$`).FindStringSubmatch(out)
+		Expect(m).NotTo(BeNil(), out)
+		kib, err := strconv.Atoi(m[1])
+		Expect(err).NotTo(HaveOccurred())
+		Expect(kib).To(BeNumerically("<=", 1024*1024), out)
+		Expect(kib).To(BeNumerically(">", (1024-64)*1024), out)
 		Expect(out).To(ContainSubstring(exitTag(testNonce) + "0"))
 	})
 

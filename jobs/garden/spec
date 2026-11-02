@@ -325,6 +325,25 @@ properties:
       garden.execution_backends.
     default: 0
 
+  garden.vm_full_memory_limit:
+    description: |
+      Give the guest of a vm-* container the whole memory limit the app asked
+      for. By default a guest gets the limit less a reserve for the
+      hypervisor and the guest's page tables, so a 1G app sees about 894m on
+      vm-qemu and 926m on vm-firecracker, and the container's own limit
+      stays equal to the app's limit, so the cell is never oversubscribed.
+      Set this to true and the guest sees the full limit, 1024m for a 1G
+      app, while Garden raises the container's memory and swap limits by the
+      same reserve so that the hypervisor is not killed for it. Each VM
+      container then uses up to about 100 to 130 MiB more than Diego
+      accounted for, so a cell packed to its memory capacity is
+      oversubscribed by that much per VM, and Diego's memory accounting no
+      longer bounds the cell. The job renders vm-full-memory-limit only when
+      the value is true, and Garden then passes --full-memory-limit to
+      vm-launch, so the default changes no argument and no limit. True
+      requires a vm-* entry in garden.execution_backends.
+    default: false
+
   garden.vm_volume_sync_mounts:
     description: |
       Mount a journalled ext4 image volume of a vm-* container with sync and

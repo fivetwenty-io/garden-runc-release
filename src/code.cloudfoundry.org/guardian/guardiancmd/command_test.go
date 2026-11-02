@@ -538,6 +538,11 @@ var _ = Describe("execution backend flags", func() {
 			Expect(parsed.ExecutionBackends.VMVolumeAsyncMounts).To(BeFalse())
 		})
 
+		It("keeps the guest at the reduced memory limit unless --vm-full-memory-limit is given", func() {
+			Expect(parse().ExecutionBackends.VMFullMemoryLimit).To(BeFalse())
+			Expect(parse("--vm-full-memory-limit").ExecutionBackends.VMFullMemoryLimit).To(BeTrue())
+		})
+
 		It("defaults --vm-qemu-sandbox to the seccomp sandbox and takes a custom or an empty value", func() {
 			Expect(parse().ExecutionBackends.VMQemuSandbox).To(Equal(processes.VMQemuSandboxDefault))
 			Expect(parse("--vm-qemu-sandbox=on,spawn=deny").ExecutionBackends.VMQemuSandbox).To(Equal("on,spawn=deny"))

@@ -87,6 +87,13 @@ const (
 	// flag only for a positive cap.
 	VMLaunchMaxVCPUsFlag = "--max-vcpus"
 
+	// VMLaunchFullMemoryLimitFlag tells vm-launch to size the guest at the
+	// whole MEMORY_LIMIT, because Garden has raised the container's own
+	// memory limit by the hypervisor's reserve. vm-launch defaults to the
+	// limit less the reserve, so VMLaunchMemoryFlags passes the flag only
+	// when the operator turned the option on.
+	VMLaunchFullMemoryLimitFlag = "--full-memory-limit"
+
 	// portEnvPrefix starts the environment entry that names the port of a
 	// process that serves one. vm-launch forwards ports only when the entry
 	// is present, whatever its value, and exits when the value is no port.
@@ -227,6 +234,16 @@ func VMLaunchCPUFlags(maxVCPUs uint) []string {
 		return nil
 	}
 	return []string{VMLaunchMaxVCPUsFlag, strconv.FormatUint(uint64(maxVCPUs), 10)}
+}
+
+// VMLaunchMemoryFlags returns the vm-launch flag that gives the guest the
+// whole MEMORY_LIMIT, or none for the default of false, so that vm-launch gets
+// the arguments it gets today.
+func VMLaunchMemoryFlags(fullMemoryLimit bool) []string {
+	if !fullMemoryLimit {
+		return nil
+	}
+	return []string{VMLaunchFullMemoryLimitFlag}
 }
 
 // WithVMLaunchFlags makes BuildProcess pass flags to the vm-launch process

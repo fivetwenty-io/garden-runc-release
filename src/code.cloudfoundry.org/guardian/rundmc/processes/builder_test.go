@@ -1417,6 +1417,20 @@ var _ = Describe("the volume flags of the wrapped vm-launch", func() {
 		})
 	})
 
+	Describe("VMLaunchMemoryFlags", func() {
+		DescribeTable("renders the flags for each setting",
+			func(full bool, expected []string) {
+				Expect(processes.VMLaunchMemoryFlags(full)).To(Equal(expected))
+			},
+			Entry("the default passes nothing", false, []string(nil)),
+			Entry("the full limit passes the flag", true, []string{"--full-memory-limit"}),
+		)
+
+		It("names the flag vm-launch reads", func() {
+			Expect(processes.VMLaunchFullMemoryLimitFlag).To(Equal("--full-memory-limit"))
+		})
+	})
+
 	Context("when no flag is set", func() {
 		It("builds the argv it built before: the path, then vm-launch's own arguments", func() {
 			Expect(build().Args).To(Equal(append([]string{processes.VMLaunchPath}, launcherArgs...)))

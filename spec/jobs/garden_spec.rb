@@ -584,6 +584,60 @@ describe 'garden' do
         end
       end
 
+      context 'vm_full_memory_limit' do
+        let(:execution_tail) do
+          "\n; execution backends\n  execution-backend = vm-qemu\n  vm-artifacts-dir = /var/vcap/data/vm-runtime/artifacts\n  vm-launch-bin = /var/vcap/packages/guardian/bin/vm-launch\n"
+        end
+
+        def render_with(backends, extra)
+          template.render({ 'garden' => { 'execution_backends' => backends }.merge(extra) })
+        end
+
+        it 'declares a default of false and a description' do
+          garden_spec = YAML.load_file(File.join(File.dirname(__FILE__), '../../jobs/garden/spec'))
+          property = garden_spec['properties']['garden.vm_full_memory_limit']
+          expect(property['default']).to eql(false)
+          expect(property['description']).not_to be_empty
+        end
+
+        [[], ['vm-qemu'], %w[vm-qemu vm-firecracker], ['oci-gvisor']].each do |backends|
+          it "renders byte for byte what it rendered before the property existed when it is false (#{backends.inspect})" do
+            expect(render_with(backends, { 'vm_full_memory_limit' => false })).to eql(render_with(backends, {}))
+          end
+        end
+
+        context 'when it is true' do
+          let(:garden_properties) { { 'execution_backends' => ['vm-qemu'], 'vm_full_memory_limit' => true } }
+
+          it 'renders the key after the vm keys and nothing else new' do
+            expect(server['vm-full-memory-limit']).to be(true).or eql('true')
+            expect(raw_template).to end_with(execution_tail + "  vm-full-memory-limit = true\n")
+          end
+        end
+
+        it 'renders the key after vm-max-vcpus' do
+          rendered = render_with(['vm-qemu'], { 'vm_full_memory_limit' => true, 'vm_max_vcpus' => 4 })
+          expect(rendered).to end_with("  vm-max-vcpus = 4\n  vm-full-memory-limit = true\n")
+        end
+
+        it 'renders the key on a vm-firecracker cell too' do
+          rendered = IniParse.parse(render_with(['vm-firecracker'], { 'vm_full_memory_limit' => true }))['server']
+          expect(rendered['vm-full-memory-limit'].to_s).to eql('true')
+        end
+
+        [[], ['oci-gvisor']].each do |backends|
+          it "raises for true when the backends are #{backends.inspect}" do
+            expect { render_with(backends, { 'vm_full_memory_limit' => true }) }.to raise_error(/garden.vm_full_memory_limit requires a vm-\* entry/)
+          end
+        end
+
+        ['true', 1, []].each do |value|
+          it "raises for #{value.inspect}, which is not true or false" do
+            expect { render_with(['vm-qemu'], { 'vm_full_memory_limit' => value }) }.to raise_error(/garden.vm_full_memory_limit must be true or false/)
+          end
+        end
+      end
+
       context 'volume properties' do
         let(:volume_keys) { %w[vm-block-volumes vm-volume-shares vm-volume-async-mounts] }
         let(:defaults) { { 'vm_block_volumes' => false, 'vm_volume_shares' => false, 'vm_volume_sync_mounts' => true } }

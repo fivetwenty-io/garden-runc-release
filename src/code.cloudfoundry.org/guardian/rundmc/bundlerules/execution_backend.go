@@ -2,6 +2,7 @@ package bundlerules
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -108,6 +109,13 @@ type ExecutionBackend struct {
 	// rule for each device that a descriptor bind mount names. It is nil
 	// unless block volumes are turned on, and then no bind mount is inspected.
 	BlockVolumes *PDIDevices
+
+	// FullMemoryLimit raises the memory limit of a VM container by the
+	// hypervisor's reserve (see backend.MemoryReserveMiB), so that vm-launch
+	// can give the guest the whole limit that the app asked for. The cell is
+	// then oversubscribed by the reserve for each VM container, about 130 MiB
+	// on vm-qemu and 100 MiB on vm-firecracker for a container of 1 GiB.
+	FullMemoryLimit bool
 }
 
 // NewExecutionBackend returns the rule with the default required artifact table.
@@ -156,6 +164,9 @@ func (r ExecutionBackend) Apply(bndl goci.Bndl, spec spec.DesiredContainerSpec) 
 			nodes = append(nodes, blockNodes...)
 		}
 		bndl = withDeviceNodes(bndl, nodes...)
+		if r.FullMemoryLimit {
+			bndl = withMemoryReserve(bndl, kind)
+		}
 		mounts := []specs.Mount{
 			{
 				Destination: VMArtifactsMountPath,
@@ -304,3 +315,32 @@ func withDeviceNodes(bndl goci.Bndl, nodes ...deviceNode) goci.Bndl {
 	bndl.Spec.Linux = &linux
 	return bndl
 }
+
+// withMemoryReserve adds the hypervisor's reserve for kind to the bundle's
+// memory limit, and to its memory and swap limit when it has one, so that the
+// two stay as far apart as they were. A bundle with no limit, or a limit that
+// is zero or the largest the kernel takes, is unlimited and stays as it is.
+func withMemoryReserve(bndl goci.Bndl, kind backend.Kind) goci.Bndl {
+	resources := bndl.Resources()
+	if resources == nil || resources.Memory == nil || resources.Memory.Limit == nil {
+		return bndl
+	}
+	memory := *resources.Memory
+	limit := *memory.Limit
+	if limit <= 0 || limit >= math.MaxInt64-reserveHeadroomBytes {
+		return bndl
+	}
+	reserve := int64(backend.MemoryReserveMiB(kind, int(limit>>20))) << 20
+	raised := limit + reserve
+	memory.Limit = &raised
+	if memory.Swap != nil && *memory.Swap > 0 && *memory.Swap < math.MaxInt64-reserveHeadroomBytes {
+		swap := *memory.Swap + reserve
+		memory.Swap = &swap
+	}
+	return bndl.WithMemoryLimit(memory)
+}
+
+// reserveHeadroomBytes keeps withMemoryReserve from overflowing: a limit
+// within this many bytes of the largest int64 is treated as no limit. It is
+// far above any reserve.
+const reserveHeadroomBytes = 1 << 40

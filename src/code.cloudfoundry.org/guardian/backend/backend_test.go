@@ -344,3 +344,13 @@ var _ = Describe("DockerImageRef", func() {
 		Entry("an empty spec", garden.ContainerSpec{}, garden.ImageRef{}, false),
 	)
 })
+
+var _ = Describe("MemoryReserveMiB", func() {
+	It("adds two MiB for each GiB of the limit to a fixed amount for each hypervisor", func() {
+		Expect(backend.MemoryReserveMiB(backend.VMQemu, 512)).To(Equal(129))
+		Expect(backend.MemoryReserveMiB(backend.VMQemu, 1024)).To(Equal(130))
+		Expect(backend.MemoryReserveMiB(backend.VMQemu, 8192)).To(Equal(144))
+		Expect(backend.MemoryReserveMiB(backend.VMFirecracker, 1024)).To(Equal(98))
+		Expect(backend.MemoryReserveMiB(backend.VMFirecracker, 8192)).To(Equal(112))
+	})
+})

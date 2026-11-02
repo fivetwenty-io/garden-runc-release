@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"code.cloudfoundry.org/guardian/backend"
+	"code.cloudfoundry.org/guardian/rundmc/processes"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -28,7 +29,7 @@ var _ = Describe("guest memory", func() {
 
 	DescribeTable("sizes the guest from MEMORY_LIMIT less the reserve",
 		func(limit string, want int) {
-			Expect(guestMemory(backend.VMQemu, envMap(map[string]string{"MEMORY_LIMIT": limit}), logger)).To(Equal(want))
+			Expect(guestMemory(backend.VMQemu, envMap(map[string]string{"MEMORY_LIMIT": limit}), false, logger)).To(Equal(want))
 			Expect(logBuf.String()).To(BeEmpty())
 		},
 		Entry("the floor plus the reserve", "256m", 128),
@@ -40,13 +41,33 @@ var _ = Describe("guest memory", func() {
 
 	DescribeTable("keeps a smaller reserve for Firecracker, whose process is smaller",
 		func(limit string, want int) {
-			Expect(guestMemory(backend.VMFirecracker, envMap(map[string]string{"MEMORY_LIMIT": limit}), logger)).To(Equal(want))
+			Expect(guestMemory(backend.VMFirecracker, envMap(map[string]string{"MEMORY_LIMIT": limit}), false, logger)).To(Equal(want))
 			Expect(logBuf.String()).To(BeEmpty())
 		},
 		Entry("the floor plus the reserve", "224m", 128),
 		Entry("a 512M app", "512m", 415),
 		Entry("a 1G app", "1024m", 926),
 	)
+
+	DescribeTable("gives the guest the whole MEMORY_LIMIT with the full limit option, and takes no reserve off it",
+		func(kind backend.Kind, limit string, want int) {
+			Expect(guestMemory(kind, envMap(map[string]string{"MEMORY_LIMIT": limit}), true, logger)).To(Equal(want))
+			Expect(logBuf.String()).To(BeEmpty())
+		},
+		Entry("a 512M app on QEMU", backend.VMQemu, "512m", 512),
+		Entry("a 1G app on QEMU", backend.VMQemu, "1024m", 1024),
+		Entry("a 1G app on Firecracker", backend.VMFirecracker, "1024m", 1024),
+		Entry("the floor", backend.VMQemu, "128m", 128),
+		Entry("the ceiling", backend.VMQemu, "16384m", 16384),
+	)
+
+	It("keeps the floor and the ceiling with the full limit option, and says so", func() {
+		Expect(guestMemory(backend.VMQemu, envMap(map[string]string{"MEMORY_LIMIT": "100m"}), true, logger)).To(Equal(128))
+		Expect(logBuf.String()).To(Equal("MEMORY_LIMIT 100m is below the 128 MiB a guest needs; the guest gets 128 MiB and may be killed for memory, so give the app at least 128M\n"))
+		logBuf.Reset()
+		Expect(guestMemory(backend.VMQemu, envMap(map[string]string{"MEMORY_LIMIT": "20000m"}), true, logger)).To(Equal(16384))
+		Expect(logBuf.String()).To(ContainSubstring("leaves more than the 16384 MiB a guest may have"))
+	})
 
 	It("scales the reserve with the limit for the host page tables", func() {
 		Expect(guestMemoryReserve(backend.VMQemu, 512)).To(Equal(129))
@@ -57,7 +78,7 @@ var _ = Describe("guest memory", func() {
 	It("keeps the floor for a container too small for it and the reserve, and names both numbers", func() {
 		for _, limit := range []string{"255m", "200m", "1m"} {
 			logBuf.Reset()
-			Expect(guestMemory(backend.VMQemu, envMap(map[string]string{"MEMORY_LIMIT": limit}), logger)).To(Equal(128), limit)
+			Expect(guestMemory(backend.VMQemu, envMap(map[string]string{"MEMORY_LIMIT": limit}), false, logger)).To(Equal(128), limit)
 			Expect(logBuf.String()).To(ContainSubstring("MEMORY_LIMIT "+limit+" is below the 256m a guest of 128 MiB needs with the 128 MiB"), limit)
 			Expect(logBuf.String()).To(ContainSubstring("give the app at least 256M"), limit)
 			Expect(strings.Count(logBuf.String(), "\n")).To(Equal(1), limit)
@@ -65,18 +86,18 @@ var _ = Describe("guest memory", func() {
 	})
 
 	It("caps the guest at the ceiling and says so", func() {
-		Expect(guestMemory(backend.VMQemu, envMap(map[string]string{"MEMORY_LIMIT": "9999999m"}), logger)).To(Equal(16384))
+		Expect(guestMemory(backend.VMQemu, envMap(map[string]string{"MEMORY_LIMIT": "9999999m"}), false, logger)).To(Equal(16384))
 		Expect(logBuf.String()).To(Equal("MEMORY_LIMIT 9999999m leaves more than the 16384 MiB a guest may have; the guest gets 16384 MiB\n"))
 	})
 
 	It("gives the floor and logs one line when MEMORY_LIMIT is missing", func() {
-		Expect(guestMemory(backend.VMQemu, envMap(map[string]string{}), logger)).To(Equal(128))
+		Expect(guestMemory(backend.VMQemu, envMap(map[string]string{}), false, logger)).To(Equal(128))
 		Expect(logBuf.String()).To(Equal("MEMORY_LIMIT is not set; the guest gets 128 MiB\n"))
 	})
 
 	DescribeTable("gives the floor, and logs one line without the value, when MEMORY_LIMIT is malformed",
 		func(limit string) {
-			Expect(guestMemory(backend.VMQemu, envMap(map[string]string{"MEMORY_LIMIT": limit}), logger)).To(Equal(128))
+			Expect(guestMemory(backend.VMQemu, envMap(map[string]string{"MEMORY_LIMIT": limit}), false, logger)).To(Equal(128))
 			Expect(logBuf.String()).To(Equal("MEMORY_LIMIT is not a whole number of megabytes such as 512m; the guest gets 128 MiB\n"))
 		},
 		Entry("letters", "abc"),
@@ -138,6 +159,35 @@ var _ = Describe("run with MEMORY_LIMIT", func() {
 		raw, err := os.ReadFile(fcCopy)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(string(raw)).To(ContainSubstring(`"machine-config":{"vcpu_count":1,"mem_size_mib":926}`))
+	})
+
+	It("boots QEMU and Firecracker with the whole limit when the full limit flag is given", func() {
+		GinkgoT().Setenv("MEMORY_LIMIT", "1024m")
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), "")
+		Expect(run([]string{"--backend", "vm-qemu", "--full-memory-limit", "--artifacts", art, "--", "/tmp/lifecycle/launcher", "app", "true", ""}, log.New(logBuf, "", 0))).To(Equal(0), logBuf.String())
+		argv, err := os.ReadFile(argvFile)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(argv)).To(ContainSubstring("\n-m\n1024\n"))
+
+		fcCopy := filepath.Join(GinkgoT().TempDir(), "fc.json")
+		writeFakeHypervisor(filepath.Join(art, "firecracker/firecracker"),
+			`p=; for a in "$@"; do [ "$p" = --config-file ] && cp "$a" `+shellQuote(fcCopy)+`; p=$a; done
+`)
+		Expect(run([]string{"--backend", "vm-firecracker", "--full-memory-limit", "--artifacts", art, "--", "/tmp/lifecycle/launcher", "app", "true", ""}, log.New(logBuf, "", 0))).To(Equal(0), logBuf.String())
+		raw, err := os.ReadFile(fcCopy)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(raw)).To(ContainSubstring(`"machine-config":{"vcpu_count":1,"mem_size_mib":1024}`))
+	})
+
+	It("takes --full-memory-limit, which is off by default, under the name Garden passes", func() {
+		Expect("--" + fullMemoryLimitFlag).To(Equal(processes.VMLaunchFullMemoryLimitFlag))
+		Expect(usage).To(ContainSubstring("[--full-memory-limit]"))
+		cfg, err := parseArgs([]string{"--backend", "vm-qemu", "--", "true"})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cfg.fullMemoryLimit).To(BeFalse())
+		cfg, err = parseArgs([]string{"--backend", "vm-qemu", "--full-memory-limit", "--", "true"})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cfg.fullMemoryLimit).To(BeTrue())
 	})
 
 	It("boots a guest of 128 MiB and warns when MEMORY_LIMIT is below 256m", func() {

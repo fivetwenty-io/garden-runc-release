@@ -7,7 +7,7 @@
 //
 // Usage:
 //
-//	vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--max-vcpus N] [--artifacts DIR] -- PATH [ARGS...]
+//	vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--max-vcpus N] [--full-memory-limit] [--artifacts DIR] -- PATH [ARGS...]
 //
 // When PATH is the CF launcher ("launcher APP-DIR START-COMMAND ..."), the
 // guest runs START-COMMAND. Otherwise it runs PATH and ARGS, shell-quoted.
@@ -278,7 +278,10 @@
 // tables, with a floor of 128 MiB and a ceiling of 16 GiB. MEMORY_LIMIT must
 // be whole megabytes, such as 512m. When it is missing or malformed, or below
 // what the floor and the reserve need, the guest gets 128 MiB and vm-launch
-// logs a line that says so.
+// logs a line that says so. With --full-memory-limit, which Garden passes only
+// when the operator turned the option on, the guest gets the whole MEMORY_LIMIT
+// and no reserve comes off it, because Garden has raised the container's limit
+// by the reserve.
 //
 // CPUs: the guest gets one vCPU for each CPU the container may run on, which
 // is the CPUs of its cpuset and otherwise every online CPU, less --max-vcpus
@@ -549,7 +552,15 @@ const qemuSandboxFlag = "qemu-sandbox"
 // container may run on (see guestVCPUCount).
 const maxVCPUsFlag = "max-vcpus"
 
-const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--qemu-sandbox=OPTIONS] [--max-vcpus N] [--image-user USER [--image-default-env NAMES]] [--artifacts DIR] -- PATH [ARGS...]\n"
+// fullMemoryLimitFlag names the vm-launch flag that sizes the guest at the
+// whole MEMORY_LIMIT, in place of the limit less the hypervisor's reserve.
+// Garden passes it only when the operator turned the option on, and then it
+// raises the container's own memory limit by the same reserve (see
+// backend.MemoryReserveMiB), so that the guest and the hypervisor both fit.
+// The cell is then oversubscribed by the reserve for each VM container.
+const fullMemoryLimitFlag = "full-memory-limit"
+
+const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--qemu-sandbox=OPTIONS] [--max-vcpus N] [--full-memory-limit] [--image-user USER [--image-default-env NAMES]] [--artifacts DIR] -- PATH [ARGS...]\n"
 
 type config struct {
 	backend   backend.Kind
@@ -583,6 +594,9 @@ type config struct {
 	// maxVCPUs is the operator's cap on the guest's vCPU count, or 0 for
 	// none (see maxVCPUsFlag).
 	maxVCPUs int
+	// fullMemoryLimit gives the guest the whole MEMORY_LIMIT (see
+	// fullMemoryLimitFlag).
+	fullMemoryLimit bool
 	// image, when set, makes this a launch of the Docker image guest (see
 	// imageguest.go).
 	image *imageConfig
@@ -912,7 +926,7 @@ func run(argv []string, logger *log.Logger) int {
 		}
 	}
 	defer closeLauncher()
-	memMiB := guestMemory(cfg.backend, lookupEnv, logger)
+	memMiB := guestMemory(cfg.backend, lookupEnv, cfg.fullMemoryLimit, logger)
 	vcpus := guestVCPUCount(cfg.backend, countContainerCPUs, cfg.maxVCPUs, logger)
 	// The launcher derives DATABASE_URL from the resolved VCAP_SERVICES, so
 	// the references are resolved before buildGuestEnv.
@@ -1548,6 +1562,7 @@ func parseArgs(argv []string) (config, error) {
 	syncMounts := fs.Bool(volumeSyncMountsFlag, true, "mount every volume image with sync and dirsync; with =false, an image whose filesystem has a journal mounts without them")
 	sandbox := fs.String(qemuSandboxFlag, qemuSandbox, "the value of QEMU's -sandbox option, which turns on its seccomp filter; empty turns the sandbox off")
 	maxVCPUs := fs.Int(maxVCPUsFlag, 0, "the most vCPUs a guest gets; 0 gives it one for each CPU the container may run on")
+	fullMemory := fs.Bool(fullMemoryLimitFlag, false, "give the guest the whole MEMORY_LIMIT, which Garden has raised the container's limit to hold")
 	imageUser := fs.String(imageUserFlag, "", "run the CF launcher on the Docker image that Garden bound into the container, as this user")
 	imageDefaults := fs.String(imageDefaultEnvFlag, "", "the names among HOME, PATH, and USER that hold Garden's defaults, which the Docker image's user replaces")
 	if err := fs.Parse(argv); err != nil {
@@ -1557,7 +1572,7 @@ func parseArgs(argv []string) (config, error) {
 		return config{}, fmt.Errorf("--%s must be 0 or more, got %d", maxVCPUsFlag, *maxVCPUs)
 	}
 
-	cfg := config{backend: backend.Kind(*kind), transparent: *transparent, allowVolumeShares: *allowShares, volumeSyncMounts: *syncMounts, qemuSandbox: *sandbox, maxVCPUs: *maxVCPUs}
+	cfg := config{backend: backend.Kind(*kind), transparent: *transparent, allowVolumeShares: *allowShares, volumeSyncMounts: *syncMounts, qemuSandbox: *sandbox, maxVCPUs: *maxVCPUs, fullMemoryLimit: *fullMemory}
 	virtiofsdSet, imageSet, imageDefaultsSet := false, false, false
 	fs.Visit(func(f *flag.Flag) {
 		virtiofsdSet = virtiofsdSet || f.Name == virtiofsdFlag
