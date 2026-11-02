@@ -15,6 +15,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"golang.org/x/sys/unix"
 )
 
 // squashTool returns the artifacts directory that realArtifactsEnv names, or
@@ -168,6 +169,139 @@ var _ = Describe("the droplet image without the tool", func() {
 		_, err := buildDropletImage(context.Background(), art, GinkgoT().TempDir(), GinkgoT().TempDir())
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring(filepath.Join(art, "mksquashfs")))
+	})
+})
+
+// mountTmpfs mounts a tmpfs on dir and unmounts it when the spec ends, or
+// skips the spec when the process may not mount.
+func mountTmpfs(dir string) {
+	GinkgoHelper()
+	if err := unix.Mount("tmpfs", dir, "tmpfs", 0, ""); err != nil {
+		Skip("mounting a tmpfs on " + dir + " needs privileges: " + err.Error())
+	}
+	DeferCleanup(func() { _ = unix.Unmount(dir, unix.MNT_DETACH) })
+}
+
+var _ = Describe("relativeToHome", func() {
+	It("returns a path inside the home relative to it", func() {
+		rel, ok := relativeToHome("/home/vcap", "/home/vcap/persist/deep")
+		Expect(ok).To(BeTrue())
+		Expect(rel).To(Equal("persist/deep"))
+	})
+
+	It("refuses the home itself, its parent, and any path outside it", func() {
+		for _, dir := range []string{"/home/vcap", "/home", "/data", "/home/vcapx", "/"} {
+			_, ok := relativeToHome("/home/vcap", dir)
+			Expect(ok).To(BeFalse(), dir)
+		}
+	})
+})
+
+var _ = Describe("the arguments of the droplet build", func() {
+	// argsOf builds with a fake tool that records its arguments and makes an
+	// empty image, and returns the arguments.
+	argsOf := func(home, work string, exclude ...string) []string {
+		GinkgoHelper()
+		record := filepath.Join(GinkgoT().TempDir(), "args")
+		art := writeFakeSquashTool("printf '%s\\n' \"$@\" >" + record + "\n: >\"$2\"\n")
+		img, err := buildDropletImage(context.Background(), art, home, work, exclude...)
+		Expect(err).NotTo(HaveOccurred())
+		defer img.file.Close()
+		raw, err := os.ReadFile(record)
+		Expect(err).NotTo(HaveOccurred())
+		return strings.Split(strings.TrimSpace(string(raw)), "\n")
+	}
+
+	// excludesOf returns the values that follow the -e in args, which are
+	// all of the arguments after it.
+	excludesOf := func(args []string) []string {
+		for i, a := range args {
+			if a == "-e" {
+				return args[i+1:]
+			}
+		}
+		return nil
+	}
+
+	It("never leaves the home's filesystem", func() {
+		args := argsOf("/home/vcap", GinkgoT().TempDir())
+		Expect(args).To(ContainElement("-one-file-system"))
+	})
+
+	It("leaves out each volume path under the home, and nothing else", func() {
+		args := argsOf("/home/vcap", GinkgoT().TempDir(),
+			"/home/vcap/persist", "/home/vcap/deep/er", "/data", "/home/vcap", "/home/vcapx")
+		Expect(excludesOf(args)).To(Equal([]string{"persist", "deep/er"}))
+	})
+
+	It("leaves out the work directory and the volume paths together", func() {
+		home := GinkgoT().TempDir()
+		work := filepath.Join(home, ".work")
+		Expect(os.Mkdir(work, 0o700)).To(Succeed())
+		args := argsOf(home, work, filepath.Join(home, "persist"))
+		Expect(excludesOf(args)).To(Equal([]string{".work", "persist"}))
+	})
+
+	It("gives all of the excludes after one -e, with the work directory first", func() {
+		home := GinkgoT().TempDir()
+		work := filepath.Join(home, "tmp")
+		Expect(os.Mkdir(work, 0o700)).To(Succeed())
+		args := argsOf(home, work, filepath.Join(home, "persist"), filepath.Join(home, "deep", "er"))
+		Expect(args[len(args)-4:]).To(Equal([]string{"-e", "tmp", "persist", "deep/er"}))
+		Expect(args).To(ContainElement("-one-file-system"))
+	})
+
+	It("passes the excludes through the signal-watching build too", func() {
+		record := filepath.Join(GinkgoT().TempDir(), "args")
+		art := writeFakeSquashTool("printf '%s\\n' \"$@\" >" + record + "\n: >\"$2\"\n")
+		img, sig, err := buildDropletImageWatching(make(chan os.Signal), time.Hour, art, "/home/vcap", GinkgoT().TempDir(), "/home/vcap/persist")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(sig).To(BeNil())
+		defer img.file.Close()
+		raw, err := os.ReadFile(record)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(excludesOf(strings.Split(strings.TrimSpace(string(raw)), "\n"))).To(Equal([]string{"persist"}))
+	})
+})
+
+var _ = Describe("the droplet image with a mount under the home, built by the real QEMU artifacts mksquashfs", func() {
+	var home, work string
+
+	BeforeEach(func() {
+		home = GinkgoT().TempDir()
+		work = GinkgoT().TempDir()
+		writeHomeTree(home)
+		Expect(os.Mkdir(filepath.Join(home, "persist"), 0o755)).To(Succeed())
+		mountTmpfs(filepath.Join(home, "persist"))
+		Expect(os.WriteFile(filepath.Join(home, "persist", "in-the-mount"), []byte("mount\n"), 0o644)).To(Succeed())
+	})
+
+	It("holds an empty directory for the mount and none of what it holds", func() {
+		art := squashTool("mksquashfs")
+		squashTool("unsquashfs")
+
+		img, err := buildDropletImage(context.Background(), art, home, work)
+		Expect(err).NotTo(HaveOccurred())
+		defer img.file.Close()
+
+		listing := listSquashfs(art, img.file)
+		Expect(listing).To(ContainSubstring("/app/run.sh"))
+		Expect(listing).To(MatchRegexp(`(?m)^d\S+ 2000/2000 .* \S*/persist$`))
+		Expect(listing).NotTo(ContainSubstring("in-the-mount"))
+	})
+
+	It("holds nothing of a volume path that it is told to leave out", func() {
+		art := squashTool("mksquashfs")
+		squashTool("unsquashfs")
+
+		img, err := buildDropletImage(context.Background(), art, home, work, filepath.Join(home, "persist"))
+		Expect(err).NotTo(HaveOccurred())
+		defer img.file.Close()
+
+		listing := listSquashfs(art, img.file)
+		Expect(listing).To(ContainSubstring("/app/run.sh"))
+		Expect(listing).NotTo(ContainSubstring("persist"))
+		Expect(listing).NotTo(ContainSubstring("in-the-mount"))
 	})
 })
 
