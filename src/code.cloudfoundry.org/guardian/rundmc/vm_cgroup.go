@@ -34,12 +34,18 @@ type runcState struct {
 
 // vmCgroupDir returns the directory of the container's memory cgroup, from the
 // cgroup paths that runc saved in the container's state. Runc keeps the paths
-// that are in force, so they follow the container when Garden moves it to
-// another cgroup, and they carry the mount point of the controller. In
-// containerd mode on cgroup v2 runc runs the container in an init child of the
-// cgroup that holds its limits and its event counts, so the parent is the one
-// to read.
+// that are in force, and they carry the mount point of the controller. Garden
+// updates them when it moves a container to another cgroup in containerd mode
+// only, so in runrunc mode a punished container is still read from its old
+// cgroup. In containerd mode on cgroup v2 runc runs the container in an init
+// child of the cgroup that holds its limits and its event counts, so the
+// parent is the one to read. A container whose handle is init has a cgroup
+// named init of its own, so the child is recognised by its parent's name.
 func vmCgroupDir(stateDir, handle string) (string, error) {
+	if stateDir == "" {
+		return "", errors.New("no runc state directory is configured")
+	}
+
 	raw, err := os.ReadFile(filepath.Join(stateDir, handle, "state.json"))
 	if err != nil {
 		return "", err
@@ -52,7 +58,7 @@ func vmCgroupDir(stateDir, handle string) (string, error) {
 
 	if vmCgroupUnified() {
 		dir := state.CgroupPaths[""]
-		if dir != "" && filepath.Base(dir) == vmInitCgroupName {
+		if filepath.Base(dir) == vmInitCgroupName && filepath.Base(filepath.Dir(dir)) == handle {
 			dir = filepath.Dir(dir)
 		}
 		return dir, nil
