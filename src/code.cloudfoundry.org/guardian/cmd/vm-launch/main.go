@@ -567,7 +567,7 @@ const maxVCPUsFlag = "max-vcpus"
 // The cell is then oversubscribed by the reserve for each VM container.
 const fullMemoryLimitFlag = "full-memory-limit"
 
-const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--qemu-sandbox=OPTIONS] [--max-vcpus N] [--full-memory-limit] [--mirror-mounts] [--image-user USER [--image-default-env NAMES]] [--artifacts DIR] -- PATH [ARGS...]\n"
+const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--qemu-sandbox=OPTIONS] [--max-vcpus N] [--full-memory-limit] [--mirror-mounts] [--guest-agent] [--image-user USER [--image-default-env NAMES]] [--artifacts DIR] -- PATH [ARGS...]\n"
 
 type config struct {
 	backend   backend.Kind
@@ -606,6 +606,9 @@ type config struct {
 	fullMemoryLimit bool
 	// mirrorMounts turns on mirrored mounts (see mirrorMountsFlag).
 	mirrorMounts bool
+	// guestAgent gives the guest the agent that runs cf ssh sessions in it
+	// (see guestAgentFlag).
+	guestAgent bool
 	// image, when set, makes this a launch of the Docker image guest (see
 	// imageguest.go).
 	image *imageConfig
@@ -628,16 +631,27 @@ func init() {
 }
 
 func main() {
+	// Garden binds vm-launch over /bin/bash when the guest agent is on, and
+	// under that name it is the shim that runs a cf ssh session in the
+	// guest.
+	if isGuestShell(os.Args[0]) {
+		os.Exit(runGuestShell(os.Args[1:]))
+	}
 	logger := log.New(os.Stderr, "vm-launch: ", 0)
 	os.Exit(dispatch(os.Args[1:], logger))
 }
 
-// dispatch runs the relay when argv starts with "relay", and otherwise runs
-// the launch. The relay is a sidecar's log process in the container. It skips
-// the core dump and boot setup, and makes itself undumpable on its own.
+// dispatch runs the relay when argv starts with "relay", the guest agent
+// when it starts with "guest-agent", and otherwise the launch. The relay is
+// a sidecar's log process in the container. It skips the core dump and boot
+// setup, and makes itself undumpable on its own. The guest agent runs in
+// the guest, where stage 2 starts it.
 func dispatch(argv []string, logger *log.Logger) int {
 	if len(argv) > 0 && argv[0] == "relay" {
 		return runRelay(argv[1:])
+	}
+	if len(argv) > 0 && argv[0] == guestAgentCommand {
+		return runGuestAgent(argv[1:])
 	}
 	return run(argv, logger)
 }
@@ -939,6 +953,8 @@ func run(argv []string, logger *log.Logger) int {
 		if stack != nil {
 			closeFile(stack.launcher.file, "the launcher", logger)
 			stack.launcher.file = nil
+			closeFile(stack.shell.file, "the lifecycle shell", logger)
+			stack.shell.file = nil
 		}
 	}
 	defer closeLauncher()
@@ -1040,6 +1056,23 @@ func run(argv []string, logger *log.Logger) int {
 			logger.Printf("removing work dir: %v", err)
 		}
 	}()
+
+	// The guest agent's relay listens from here on, so a cf ssh session that
+	// starts while the guest boots waits for the agent rather than failing.
+	var agent *hostAgent
+	if cfg.guestAgent {
+		if agent, err = newHostAgent(cfg.backend, workDir, agentSocketPath, logger); err != nil {
+			logger.Print(err)
+			return exitLaunchError
+		}
+		defer agent.close()
+	}
+	// A cf ssh session that the guest agent runs finds the lifecycle's shell
+	// in the guest, as one in a runC container does. A guest without the
+	// agent has no use for it.
+	if stack != nil && agent.inGuest() {
+		stack.shell = openLifecycleShell(cfg.args[0], logger)
+	}
 
 	// The droplet image is built before the guest root is sized, so the
 	// root image gets only the quota the droplet leaves. An image that does
@@ -1199,6 +1232,7 @@ func run(argv []string, logger *log.Logger) int {
 		stackImg = nil
 		closeFile(droplet, "the droplet image", logger)
 		droplet = nil
+		agent.closeDevice()
 	}
 	defer closeInherited()
 	if rootSize > 0 {
@@ -1231,6 +1265,11 @@ func run(argv []string, logger *log.Logger) int {
 	if stack == nil {
 		hosts, hostname = readContainerHostFiles(logger)
 	}
+	agentFiles, err := agent.guestFiles(stack)
+	if err != nil {
+		logger.Print(err)
+		return exitLaunchError
+	}
 	initrd, err = buildGuestInitramfs(filepath.Join(cfg.artifacts, artBusybox), guestContents{
 		command:        cfg.command,
 		nonce:          nonce,
@@ -1248,6 +1287,7 @@ func run(argv []string, logger *log.Logger) int {
 		stack:          stack,
 		hosts:          hosts,
 		hostname:       hostname,
+		agent:          agentFiles,
 	})
 	// The archive holds the tools' and the launcher's bytes now, so the
 	// files close here. The deferred calls cover the returns before this
@@ -1295,6 +1335,10 @@ func run(argv []string, logger *log.Logger) int {
 		if cfg.qemuSandbox == "" {
 			logger.Print("the QEMU sandbox is off")
 		}
+	}
+	if files, hvArgv, err = agent.hypervisor(cfg.backend, workDir, files, hvArgv); err != nil {
+		logger.Print(err)
+		return exitLaunchError
 	}
 
 	select {
@@ -1678,6 +1722,7 @@ func parseArgs(argv []string) (config, error) {
 	maxVCPUs := fs.Int(maxVCPUsFlag, 0, "the most vCPUs a guest gets; 0 gives it one for each CPU the container may run on")
 	fullMemory := fs.Bool(fullMemoryLimitFlag, false, "give the guest the whole MEMORY_LIMIT, which Garden has raised the container's limit to hold")
 	mirror := fs.Bool(mirrorMountsFlag, false, "give a guest with an app root the container's small read-only bind mounts at their own paths, by rule")
+	guestAgent := fs.Bool(guestAgentFlag, false, "run cf ssh sessions in the guest through a guest agent, reached over vsock")
 	imageUser := fs.String(imageUserFlag, "", "run the CF launcher on the Docker image that Garden bound into the container, as this user")
 	imageDefaults := fs.String(imageDefaultEnvFlag, "", "the names among HOME, PATH, and USER that hold Garden's defaults, which the Docker image's user replaces")
 	if err := fs.Parse(argv); err != nil {
@@ -1687,7 +1732,7 @@ func parseArgs(argv []string) (config, error) {
 		return config{}, fmt.Errorf("--%s must be 0 or more, got %d", maxVCPUsFlag, *maxVCPUs)
 	}
 
-	cfg := config{backend: backend.Kind(*kind), transparent: *transparent, allowVolumeShares: *allowShares, volumeSyncMounts: *syncMounts, qemuSandbox: *sandbox, maxVCPUs: *maxVCPUs, fullMemoryLimit: *fullMemory, mirrorMounts: *mirror}
+	cfg := config{backend: backend.Kind(*kind), transparent: *transparent, allowVolumeShares: *allowShares, volumeSyncMounts: *syncMounts, qemuSandbox: *sandbox, maxVCPUs: *maxVCPUs, fullMemoryLimit: *fullMemory, mirrorMounts: *mirror, guestAgent: *guestAgent}
 	virtiofsdSet, imageSet, imageDefaultsSet := false, false, false
 	fs.Visit(func(f *flag.Flag) {
 		virtiofsdSet = virtiofsdSet || f.Name == virtiofsdFlag
@@ -1916,6 +1961,32 @@ func newGuestStack(args []string) (*guestStack, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// openLifecycleShell opens the lifecycle's shell, which sits beside the
+// launcher, and checks it as a guest tool is. The shell is optional, since
+// the Docker lifecycle has none, so a launch whose shell is absent runs
+// without it, and so does one whose shell is unusable, which is logged.
+func openLifecycleShell(launcher string, logger *log.Logger) guestTool {
+	dir, err := filepath.Abs(filepath.Dir(launcher))
+	if err != nil {
+		logger.Printf("the guest has no lifecycle shell: resolving the launcher's directory: %v", err)
+		return guestTool{}
+	}
+	if _, err := os.Lstat(filepath.Join(dir, lifecycleShellName)); errors.Is(err, os.ErrNotExist) {
+		return guestTool{}
+	}
+	realDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		logger.Printf("the guest has no lifecycle shell: resolving the launcher's directory %s: %v", dir, err)
+		return guestTool{}
+	}
+	shell, err := openGuestTool(dir, realDir, lifecycleShellName)
+	if err != nil {
+		logger.Printf("the guest has no lifecycle shell: %s", strings.TrimSuffix(err.Error(), noGuestToolsHint))
+		return guestTool{}
+	}
+	return shell
 }
 
 // workDirStatfs is the statfs that sizes the guest root image from the

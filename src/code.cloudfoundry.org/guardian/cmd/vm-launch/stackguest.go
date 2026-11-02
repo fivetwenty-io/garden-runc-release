@@ -32,6 +32,12 @@ const (
 	guestStackLauncher = "/tmp/lifecycle/launcher"
 )
 
+// lifecycleShellName is the lifecycle's shell, which a cf ssh session runs
+// to get the app's environment and its profile scripts. It sits beside the
+// launcher in the container, and a guest with the agent has it at
+// /tmp/lifecycle/shell.
+const lifecycleShellName = "shell"
+
 // The busybox guest that stage 1 falls back to when it cannot mount the stack
 // or the droplet image (see guestFallbackFunc). A guest that can fall back
 // holds the busybox guest's stage 2, its environment, and the commands that

@@ -99,6 +99,11 @@ const (
 	// defaults to mirroring nothing, so VMLaunchMirrorMountsFlags passes the
 	// flag only when the operator turns it on.
 	VMLaunchMirrorMountsFlag = "--mirror-mounts"
+	// VMLaunchGuestAgentFlag makes vm-launch start the guest agent in the
+	// guest and serve the cf ssh shell, command, and signals through it.
+	// vm-launch defaults to no agent, so VMLaunchGuestAgentFlags passes the
+	// flag only when the operator turns the agent on.
+	VMLaunchGuestAgentFlag = "--guest-agent"
 
 	// portEnvPrefix starts the environment entry that names the port of a
 	// process that serves one. vm-launch forwards ports only when the entry
@@ -266,11 +271,22 @@ func VMLaunchMirrorMountsFlags(on bool) []string {
 	return []string{VMLaunchMirrorMountsFlag}
 }
 
+// VMLaunchGuestAgentFlags returns the vm-launch flags that turn on the guest
+// agent. It returns none when the agent is off, so that vm-launch gets the
+// arguments it gets today, and VMLaunchGuestAgentFlag when it is on.
+func VMLaunchGuestAgentFlags(on bool) []string {
+	if !on {
+		return nil
+	}
+	return []string{VMLaunchGuestAgentFlag}
+}
+
 // WithVMLaunchFlags makes BuildProcess pass flags to the vm-launch process
 // that the containerizer wrapped in a vm-* container, after the transparent
 // proxy flag when it adds one and before vm-launch's own arguments. It never
-// adds them to any other process. VMLaunchVolumeFlags builds the volume part of the usual list
-// and VMLaunchCPUFlags the CPU part. The builder keeps a copy.
+// adds them to any other process. VMLaunchVolumeFlags builds the volume part of the usual list,
+// VMLaunchCPUFlags the CPU part, and VMLaunchGuestAgentFlags the guest agent
+// part. The builder keeps a copy.
 func WithVMLaunchFlags(flags ...string) Option {
 	kept := append([]string(nil), flags...)
 	return func(p *ProcBuilder) {

@@ -35,6 +35,11 @@ const (
 	// VMLaunchMountPath is where the host vm-launch binary appears inside a vm-* container.
 	VMLaunchMountPath = processes.VMLaunchPath
 
+	// VMGuestShellPath is where the guest agent's client takes the place of
+	// the user's shell. diego-sshd runs /bin/bash for a cf ssh session, and
+	// the vm-launch bound here serves that shell as the agent's client.
+	VMGuestShellPath = "/bin/bash"
+
 	// miscMajor is the character device major shared by the misc devices below.
 	miscMajor int64 = 10
 )
@@ -63,6 +68,12 @@ var (
 	// Mode 0666 matches the usual host node; opening it grants nothing without CAP_NET_ADMIN or a pre-created tap.
 	// Its group stays root, because a world-accessible node does not depend on it.
 	tunNode = deviceNode{path: "/dev/net/tun", devType: "c", major: miscMajor, minor: 200, mode: 0666, access: "rwm"}
+
+	// vhostVsockNode is /dev/vhost-vsock. vm-launch opens it to give QEMU a
+	// vhost-vsock device with a reserved guest address, which is how the guest
+	// agent is reached. Its group is the kvm gid, so only the wrapped
+	// vm-launch, which holds that gid, can open it.
+	vhostVsockNode = deviceNode{path: "/dev/vhost-vsock", devType: "c", major: miscMajor, minor: 241, mode: 0660, access: "rwm"}
 )
 
 // DefaultVMArtifacts lists, per VM backend, the files that must exist under
@@ -88,6 +99,7 @@ var DefaultVMArtifacts = map[backend.Kind][]string{
 // capability set of the bundle process and NoNewPrivileges is set, which stops
 // setgid binaries from changing the effective gid. With BlockVolumes set, a VM
 // container also gets the block device that each descriptor bind mount names.
+// With GuestAgent set, a VM container also gets what the guest agent needs.
 type ExecutionBackend struct {
 	// ArtifactsDir is the host directory holding the VM artifacts.
 	ArtifactsDir string
@@ -116,6 +128,17 @@ type ExecutionBackend struct {
 	// then oversubscribed by the reserve for each VM container, about 130 MiB
 	// on vm-qemu and 100 MiB on vm-firecracker for a container of 1 GiB.
 	FullMemoryLimit bool
+	// GuestAgent gives a VM container what the guest agent needs: vm-launch
+	// bound read-only over /bin/bash, which diego-sshd runs as the user's
+	// shell and which vm-launch then serves as the agent's client, and, for
+	// vm-qemu, /dev/vhost-vsock, on which vm-launch reserves the guest's
+	// vsock address. It is false unless the operator turns the agent on.
+	GuestAgent bool
+
+	// HostVhostVsock says that the host has /dev/vhost-vsock, without which
+	// a vm-qemu container gets no node for it, and its guest runs without the
+	// agent rather than failing to be created.
+	HostVhostVsock bool
 }
 
 // NewExecutionBackend returns the rule with the default required artifact table.
@@ -156,6 +179,11 @@ func (r ExecutionBackend) Apply(bndl goci.Bndl, spec spec.DesiredContainerSpec) 
 		if kind == backend.VMFirecracker {
 			nodes = append(nodes, tunNode)
 		}
+		if r.GuestAgent && r.HostVhostVsock && kind == backend.VMQemu {
+			vsock := vhostVsockNode
+			vsock.gid = r.KVMGid
+			nodes = append(nodes, vsock)
+		}
 		// Claimed last, because it creates host nodes. Nothing below can fail,
 		// and a failure later in the create is cleaned up by the destroy that
 		// follows it, which releases the claim.
@@ -183,6 +211,15 @@ func (r ExecutionBackend) Apply(bndl goci.Bndl, spec spec.DesiredContainerSpec) 
 				Type:        "bind",
 				Options:     []string{"bind", "ro", "nosuid", "nodev"},
 			},
+		}
+		// The mount leaves out noexec, because diego-sshd executes it as the shell.
+		if r.GuestAgent {
+			mounts = append(mounts, specs.Mount{
+				Destination: VMGuestShellPath,
+				Source:      r.LaunchBin,
+				Type:        "bind",
+				Options:     []string{"bind", "ro", "nosuid", "nodev"},
+			})
 		}
 		if spec.VMStackDir != "" {
 			mounts = append(mounts, specs.Mount{

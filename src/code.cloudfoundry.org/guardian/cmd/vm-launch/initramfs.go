@@ -1885,6 +1885,10 @@ type guestContents struct {
 	// ignores them, because it takes the stack's own (see guestStack).
 	hosts    []byte
 	hostname string
+	// agent is the guest agent for cf ssh (see guestagent.go), or nil for a
+	// guest without one. Stage 2 starts it before the start tag, and a
+	// stack guest's busybox fallback starts it in busybox mode.
+	agent *guestAgentFiles
 }
 
 // guestStack is the part of the initramfs of a guest with a stack that the
@@ -1900,7 +1904,10 @@ type guestContents struct {
 // and the sidecars through the run section (see guestStack.initScript).
 // Without either, the archive is the stack guest's as it was before them.
 type guestStack struct {
-	launcher            guestTool
+	launcher guestTool
+	// shell is the lifecycle's shell, which the guest has beside the
+	// launcher, or a tool with no file for a guest without it.
+	shell               guestTool
 	argv, cwd, hostname string
 	hosts               []byte
 	// sidecars are the app's sidecars, which run beside the app in the app
@@ -1987,8 +1994,9 @@ func (s *guestStack) check() error {
 }
 
 // archiveSteps returns the archive steps that add the lifecycle directory,
-// the launcher, and the stack guest's command and host files, and then the
-// sidecars' files and the identity pair when the guest has them.
+// the launcher, the lifecycle's shell when the guest has it, and the stack
+// guest's command and host files, and then the sidecars' files and the
+// identity pair when the guest has them.
 func (s *guestStack) archiveSteps(cw *cpioWriter, file func(name string, perm uint32, content string) func() error) []func() error {
 	lifecycle := strings.TrimPrefix(guestLifecycle, "/")
 	steps := []func() error{
@@ -1996,11 +2004,18 @@ func (s *guestStack) archiveSteps(cw *cpioWriter, file func(name string, perm ui
 		func() error {
 			return cw.File(lifecycle+"/launcher", 0o755, s.launcher.size, io.NewSectionReader(s.launcher.file, 0, s.launcher.size))
 		},
+	}
+	if s.shell.file != nil {
+		steps = append(steps, func() error {
+			return cw.File(lifecycle+"/"+lifecycleShellName, 0o755, s.shell.size, io.NewSectionReader(s.shell.file, 0, s.shell.size))
+		})
+	}
+	steps = append(steps,
 		file(strings.TrimPrefix(guestArgv, "/"), 0o644, s.argv),
 		file(strings.TrimPrefix(guestCwd, "/"), 0o644, s.cwd),
 		file(strings.TrimPrefix(guestHosts, "/"), 0o644, string(s.hosts)),
 		file(strings.TrimPrefix(guestHostname, "/"), 0o644, s.hostname+"\n"),
-	}
+	)
 	steps = append(steps, s.guestSidecarSteps(cw, file)...)
 	steps = append(steps, s.guestIdentitySteps(cw, file)...)
 	steps = append(steps, s.systemCerts.stackSteps(cw)...)
@@ -2379,9 +2394,31 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, g 
 			file(bundle, 0o644, string(g.caBundle)),
 		)
 	}
+	stackFile := file
+	if g.agent != nil {
+		mode := g.agent.mode
+		if stage2, err = withGuestAgentStart(stage2, g.nonce, mode); err != nil {
+			return err
+		}
+		steps = append(steps, g.agent.archiveSteps(cw, file)...)
+		// The busybox fallback's stage 2 starts the agent too, in busybox
+		// mode, because its command runs in the initramfs.
+		stackFile = func(name string, perm uint32, content string) func() error {
+			if name != strings.TrimPrefix(guestFallbackInit, "/") {
+				return file(name, perm, content)
+			}
+			return func() error {
+				fallback, err := withGuestAgentStart(content, g.nonce, agentModeBusybox)
+				if err != nil {
+					return err
+				}
+				return file(name, perm, fallback)()
+			}
+		}
+	}
 	if g.stack != nil {
 		steps = append(steps, g.stack.archiveSteps(cw, file)...)
-		steps = append(steps, g.stack.fallbackSteps(cw, file, g.nonce, len(g.vols) > 0, g.nw)...)
+		steps = append(steps, g.stack.fallbackSteps(cw, stackFile, g.nonce, len(g.vols) > 0, g.nw)...)
 	} else {
 		steps = append(steps, g.systemCerts.busyboxSteps(cw)...)
 	}
@@ -2399,4 +2436,40 @@ func writeInitramfsArchive(w io.Writer, busybox io.Reader, busyboxSize int64, g 
 		}
 	}
 	return nil
+}
+
+// archiveSteps adds the agent's directory, binary, and configuration, all
+// of them root's alone.
+func (a *guestAgentFiles) archiveSteps(cw *cpioWriter, file func(name string, perm uint32, content string) func() error) []func() error {
+	return []func() error{
+		func() error { return cw.Dir(strings.TrimPrefix(guestAgentDir, "/"), 0o700) },
+		func() error {
+			return cw.File(strings.TrimPrefix(guestAgentBin, "/"), 0o700, a.bin.size, io.NewSectionReader(a.bin.file, 0, a.bin.size))
+		},
+		file(strings.TrimPrefix(guestAgentConfig, "/"), 0o600, a.config),
+	}
+}
+
+// guestAgentStart is the line of stage 2 that starts the agent in mode, in
+// the background, with no input. Its output is the console's, on which it
+// writes only when it cannot start. The agent sets its oom_score_adj to
+// -1000 first, as the wrappers do, so the guest kernel never ends it and
+// leaves the app with no cf ssh until it restarts. Its memory is bounded by
+// its session and handshake limits, and each session sets its own back to
+// 0 (see newGuestAgent).
+func guestAgentStart(mode string) string {
+	return "( echo -1000 >/proc/self/oom_score_adj; exec " + guestAgentBin + " " + guestAgentCommand + " " + mode + " ) </dev/null &\n"
+}
+
+// withGuestAgentStart returns stage 2 with the agent's start line just
+// before the start tag, after every setup step, so the agent starts once
+// the network, the limits, and the volumes are in place, and before the
+// app does. Stage 2 has exactly one start tag line, and anything else is
+// refused.
+func withGuestAgentStart(stage2, nonce, mode string) (string, error) {
+	tag := "echo " + startTag(nonce) + "\n"
+	if n := strings.Count(stage2, tag); n != 1 {
+		return "", fmt.Errorf("stage 2 has %d start tag lines, and the guest agent starts before exactly one", n)
+	}
+	return strings.Replace(stage2, tag, guestAgentStart(mode)+tag, 1), nil
 }

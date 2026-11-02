@@ -300,6 +300,7 @@ end -%>
     "garden.vm_block_volumes" => p("garden.vm_block_volumes"),
     "garden.vm_volume_shares" => p("garden.vm_volume_shares"),
     "garden.vm_volume_sync_mounts" => p("garden.vm_volume_sync_mounts"),
+    "garden.vm_guest_agent" => p("garden.vm_guest_agent"),
   }
   vm_volume_settings.each do |name, value|
     unless value == true || value == false
@@ -309,6 +310,7 @@ end -%>
   vm_block_volumes = vm_volume_settings["garden.vm_block_volumes"]
   vm_volume_shares = vm_volume_settings["garden.vm_volume_shares"]
   vm_volume_sync_mounts = vm_volume_settings["garden.vm_volume_sync_mounts"]
+  vm_guest_agent = vm_volume_settings["garden.vm_guest_agent"]
   vm_qemu_sandbox = p("garden.vm_qemu_sandbox")
   vm_qemu_sandbox_default = "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"
   unless vm_qemu_sandbox.is_a?(String) && !vm_qemu_sandbox.match?(/[\r\n]/)
@@ -376,6 +378,9 @@ end -%>
     if vm_mirror_mounts
       raise "garden.vm_mirror_mounts requires a vm-* entry in garden.execution_backends, because only a VM container has a guest to mirror mounts into"
     end
+    if vm_guest_agent
+      raise "garden.vm_guest_agent requires a vm-* entry in garden.execution_backends, because only a VM container has a guest to run the agent"
+    end
     unless vm_volume_sync_mounts
       raise "garden.vm_volume_sync_mounts requires a vm-* entry in garden.execution_backends, because only a VM container mounts an image volume"
     end
@@ -398,6 +403,9 @@ end -%>
 <% end -%>
 <% unless vm_volume_sync_mounts -%>
   vm-volume-async-mounts = true
+<% end -%>
+<% if vm_guest_agent -%>
+  vm-guest-agent = true
 <% end -%>
 <% if vm_qemu_sandbox != vm_qemu_sandbox_default -%>
   vm-qemu-sandbox = <%= vm_qemu_sandbox %>

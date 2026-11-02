@@ -638,6 +638,37 @@ var _ = Describe("execution backend flags", func() {
 				Expect(backends.vmLaunchFlags).To(Equal([]string{"--volume-sync-mounts=false"}))
 			})
 
+			It("passes --guest-agent alone when the guest agent is on", func() {
+				cmd.ExecutionBackends.VMGuestAgent = true
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vmLaunchFlags).To(Equal([]string{"--guest-agent"}))
+			})
+
+			It("passes no --guest-agent when the guest agent is off", func() {
+				cmd.ExecutionBackends.VMGuestAgent = false
+				cmd.ExecutionBackends.VMVolumeShares = true
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vmLaunchFlags).NotTo(ContainElement("--guest-agent"))
+			})
+
+			It("passes --guest-agent after the volume and CPU flags", func() {
+				cmd.ExecutionBackends.VMVolumeAsyncMounts = true
+				cmd.ExecutionBackends.VMMaxVCPUs = 4
+				cmd.ExecutionBackends.VMGuestAgent = true
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vmLaunchFlags).To(Equal([]string{
+					"--volume-sync-mounts=false",
+					"--max-vcpus", "4",
+					"--guest-agent",
+				}))
+			})
+
 			It("passes all three flags when both settings differ from the defaults", func() {
 				cmd.ExecutionBackends.VMVolumeShares = true
 				cmd.ExecutionBackends.VMVolumeAsyncMounts = true
@@ -710,12 +741,91 @@ var _ = Describe("execution backend flags", func() {
 				Expect(backends.vmLaunchFlags).To(BeEmpty())
 				Expect(log).To(gbytes.Say("volume-shares-unused-without-a-vm-backend"))
 			})
+
+			It("says the guest agent is unused when the vm-* backends were dropped for want of a kvm gid", func() {
+				cmd.ExecutionBackends.VMGuestAgent = true
+				lookupKVMGroup = func(name string) (*user.Group, error) { return nil, user.UnknownGroupError(name) }
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vmLaunchFlags).To(BeEmpty())
+				Expect(log).To(gbytes.Say("guest-agent-unused-without-a-vm-backend"))
+			})
+		})
+
+		Context("with the guest agent on", func() {
+			var (
+				originalVsock  string
+				originalDevice [2]uint32
+			)
+
+			BeforeEach(func() {
+				cmd.ExecutionBackends.Enabled = []string{"vm-qemu"}
+				cmd.ExecutionBackends.VMLaunchBin = launchBin
+				cmd.ExecutionBackends.VMGuestAgent = true
+				originalVsock, originalDevice = hostVhostVsockPath, hostVhostVsockDevice
+			})
+
+			AfterEach(func() {
+				hostVhostVsockPath, hostVhostVsockDevice = originalVsock, originalDevice
+			})
+
+			It("gives vm-qemu containers /dev/vhost-vsock when the host has the character device", func() {
+				// /dev/null stands in for the device, with its own numbers.
+				hostVhostVsockPath = "/dev/null"
+				hostVhostVsockDevice = [2]uint32{1, 3}
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vhostVsock).To(BeTrue())
+				Expect(log.LogMessages()).NotTo(ContainElement(ContainSubstring("guest-agent-vhost-vsock-unavailable")))
+			})
+
+			It("gives no container /dev/vhost-vsock and says so once when the host has no such device", func() {
+				hostVhostVsockPath = filepath.Join(GinkgoT().TempDir(), "vhost-vsock")
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vhostVsock).To(BeFalse())
+				Expect(backends.vmLaunchFlags).To(ContainElement("--guest-agent"))
+				Expect(log).To(gbytes.Say("guest-agent-vhost-vsock-unavailable"))
+				Expect(log).NotTo(gbytes.Say("guest-agent-vhost-vsock-unavailable"))
+			})
+
+			It("gives no container /dev/vhost-vsock when the host's path is not a character device", func() {
+				hostVhostVsockPath = launchBin
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vhostVsock).To(BeFalse())
+				Expect(log).To(gbytes.Say(`guest-agent-vhost-vsock-unavailable.*not a character device`))
+			})
+
+			It("gives no container /dev/vhost-vsock when the host's character device has other numbers", func() {
+				hostVhostVsockPath = "/dev/null"
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vhostVsock).To(BeFalse())
+				Expect(log).To(gbytes.Say(`guest-agent-vhost-vsock-unavailable.*device 1:3 is not vhost-vsock, which is 10:241`))
+			})
+
+			It("does not look for /dev/vhost-vsock when vm-qemu is not enabled", func() {
+				cmd.ExecutionBackends.Enabled = []string{"vm-firecracker"}
+				hostVhostVsockPath = filepath.Join(GinkgoT().TempDir(), "vhost-vsock")
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(backends.vhostVsock).To(BeFalse())
+				Expect(log.LogMessages()).NotTo(ContainElement(ContainSubstring("guest-agent-vhost-vsock-unavailable")))
+			})
 		})
 
 		It("passes nothing and says so when only oci-gvisor is enabled", func() {
 			cmd.ExecutionBackends.VMVolumeShares = true
 			cmd.ExecutionBackends.VMVolumeAsyncMounts = true
 			cmd.ExecutionBackends.VMMirrorMounts = true
+			cmd.ExecutionBackends.VMGuestAgent = true
 			cmd.ExecutionBackends.Enabled = []string{"oci-gvisor"}
 			cmd.Containerd.Socket = "/run/containerd.sock"
 
@@ -725,6 +835,7 @@ var _ = Describe("execution backend flags", func() {
 			Expect(log).To(gbytes.Say("volume-shares-unused-without-a-vm-backend"))
 			Expect(log).To(gbytes.Say("volume-async-mounts-unused-without-a-vm-backend"))
 			Expect(log).To(gbytes.Say("mirror-mounts-unused-without-a-vm-backend"))
+			Expect(log).To(gbytes.Say("guest-agent-unused-without-a-vm-backend"))
 		})
 
 		It("passes nothing when no backend is enabled", func() {
@@ -979,6 +1090,30 @@ var _ = Describe("VM stack flags", func() {
 			Expect(parsed.ExecutionBackends.VMDockerRootFS).To(BeEmpty())
 			Expect(parsed.ExecutionBackends.VMDockerImageCacheDir).To(Equal("/var/vcap/data/vm-runtime/images"))
 			Expect(parsed.ExecutionBackends.VMDockerImageCacheBytes).To(Equal(int64(10 << 30)))
+		})
+
+		It("has the guest agent off unless --vm-guest-agent is given", func() {
+			parsed := &CommonCommand{}
+			_, err := flags.NewParser(parsed, flags.IgnoreUnknown).ParseArgs([]string{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(parsed.ExecutionBackends.VMGuestAgent).To(BeFalse())
+
+			parsed = &CommonCommand{}
+			_, err = flags.NewParser(parsed, flags.IgnoreUnknown).ParseArgs([]string{"--vm-guest-agent"})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(parsed.ExecutionBackends.VMGuestAgent).To(BeTrue())
+		})
+
+		It("parses the guest agent line that the garden job renders", func() {
+			ini := filepath.Join(GinkgoT().TempDir(), "config.ini")
+			Expect(os.WriteFile(ini, []byte("[server]\n  vm-guest-agent = true\n"), 0o644)).To(Succeed())
+
+			gdn := &GdnCommand{ServerCommand: &ServerCommand{CommonCommand: &CommonCommand{}}}
+			parser := flags.NewParser(gdn, flags.IgnoreUnknown)
+			parser.NamespaceDelimiter = "-"
+			Expect(flags.NewIniParser(parser).ParseFile(ini)).To(Succeed())
+
+			Expect(gdn.ServerCommand.ExecutionBackends.VMGuestAgent).To(BeTrue())
 		})
 
 		It("accepts every Docker image flag", func() {

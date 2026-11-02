@@ -620,6 +620,9 @@ type firecrackerConfig struct {
 	MachineConfig     firecrackerMachineConfig      `json:"machine-config"`
 	NetworkInterfaces []firecrackerNetworkInterface `json:"network-interfaces,omitempty"`
 	Balloon           *firecrackerBalloon           `json:"balloon,omitempty"`
+	// Vsock is the guest agent's device, which only a launch with the agent
+	// has (see withFirecrackerVsock).
+	Vsock *firecrackerVsock `json:"vsock,omitempty"`
 }
 
 type firecrackerBootSource struct {

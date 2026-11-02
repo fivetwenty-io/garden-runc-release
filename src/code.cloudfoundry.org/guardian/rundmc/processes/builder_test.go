@@ -1483,6 +1483,20 @@ var _ = Describe("the volume flags of the wrapped vm-launch", func() {
 		})
 	})
 
+	Describe("VMLaunchGuestAgentFlags", func() {
+		It("passes nothing when the guest agent is off", func() {
+			Expect(processes.VMLaunchGuestAgentFlags(false)).To(BeEmpty())
+		})
+
+		It("passes the flag when the guest agent is on", func() {
+			Expect(processes.VMLaunchGuestAgentFlags(true)).To(Equal([]string{"--guest-agent"}))
+		})
+
+		It("names the flag vm-launch reads", func() {
+			Expect(processes.VMLaunchGuestAgentFlag).To(Equal("--guest-agent"))
+		})
+	})
+
 	Context("when no flag is set", func() {
 		It("builds the argv it built before: the path, then vm-launch's own arguments", func() {
 			Expect(build().Args).To(Equal(append([]string{processes.VMLaunchPath}, launcherArgs...)))

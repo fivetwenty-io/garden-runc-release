@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"time"
 
@@ -218,6 +219,7 @@ type CommonCommand struct {
 		VMVolumeShares      bool          `long:"vm-volume-shares" description:"Let an app on a vm-qemu container ask for a volume as a share in VM_VOLUMES. Garden passes --allow-volume-shares and the virtiofsd wrapper's path to vm-launch. Off by default, and a share is refused on vm-firecracker whatever its value."`
 		VMMaxVCPUs          uint          `long:"vm-max-vcpus" description:"The most vCPUs a vm-* guest gets. By default, which is 0, a guest gets one vCPU for each CPU its container may run on, up to 32, so that it can use every core of the cell the way a runC app can, and its container's CPU weight still bounds its total CPU time. Garden passes --max-vcpus to vm-launch only when this is set."`
 		VMFullMemoryLimit   bool          `long:"vm-full-memory-limit" description:"Give the guest of a vm-* container the whole memory limit that the app asked for, so that MEMORY_LIMIT in the guest equals the manifest limit. Garden raises the container's own memory limit by the hypervisor's reserve, about 130 MiB for a vm-qemu container and 100 MiB for a vm-firecracker container of 1 GiB, and passes --full-memory-limit to vm-launch. The cell is then oversubscribed by that reserve for each VM container, so Diego's memory accounting no longer bounds the cell. Off by default, and then the guest gets the limit less the reserve."`
+		VMGuestAgent        bool          `long:"vm-guest-agent" description:"Give each vm-* container the guest agent, which runs a cf ssh session, command, and signals inside the guest as the app user. Garden passes --guest-agent to vm-launch, binds vm-launch read-only over /bin/bash in the container so that diego-sshd's shell reaches the agent, and adds /dev/vhost-vsock to a vm-qemu container when the host has it. Off by default."`
 		VMVolumeAsyncMounts bool          `long:"vm-volume-async-mounts" description:"Mount a journalled ext4 image volume of a vm-* container without sync and dirsync, which vm-launch otherwise uses. A legacy ext2 image without a journal keeps them. Garden passes --volume-sync-mounts=false to vm-launch only when this is set. Off by default."`
 		VMMirrorMounts      bool          `long:"vm-mirror-mounts" description:"Carry the bind mounts of a vm-* container, such as the file-based service bindings at /etc/cf-service-bindings, into its guest at the same paths, by rule. Garden passes --mirror-mounts to vm-launch only when this is set. Off by default."`
 		VMQemuSandbox       string        `long:"vm-qemu-sandbox" default:"on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny" description:"The value of QEMU's -sandbox option for a vm-qemu container, which turns on QEMU's own seccomp filter. An empty value turns the sandbox off. Garden passes --qemu-sandbox to vm-launch only when the value differs from the default."`
@@ -693,6 +695,8 @@ func (cmd *CommonCommand) wireContainerizer(
 		executionBackendRule := bundlerules.NewExecutionBackend(cmd.ExecutionBackends.VMArtifactsDir, cmd.ExecutionBackends.VMLaunchBin, backends.kvmGid)
 		executionBackendRule.BlockVolumes = backends.blockVolumes
 		executionBackendRule.FullMemoryLimit = backends.fullMemoryLimit
+		executionBackendRule.GuestAgent = cmd.ExecutionBackends.VMGuestAgent
+		executionBackendRule.HostVhostVsock = backends.vhostVsock
 		bundleRules = append(bundleRules, executionBackendRule)
 	}
 
@@ -901,6 +905,11 @@ type executionBackends struct {
 	// Docker image runs on. It is empty unless --vm-docker-rootfs is set and
 	// a vm-* backend is enabled.
 	vmDockerRootFS string
+
+	// vhostVsock says that the host has the /dev/vhost-vsock that the guest
+	// agent of a vm-qemu container needs. It is false unless the agent is on
+	// and vm-qemu is enabled.
+	vhostVsock bool
 }
 
 // releaser returns the step that releases claimed block devices, or nil.
@@ -976,6 +985,30 @@ func (b *executionBackends) tapGroup() (uint32, bool) {
 
 // lookupKVMGroup resolves the host group that owns /dev/kvm. Tests replace it.
 var lookupKVMGroup = user.LookupGroup
+
+// hostVhostVsockPath is the host's vhost-vsock device, and
+// hostVhostVsockDevice is its major and minor number, 10:241, which is
+// VHOST_VSOCK_MINOR on the misc major. Tests replace both.
+var (
+	hostVhostVsockPath   = "/dev/vhost-vsock"
+	hostVhostVsockDevice = [2]uint32{10, 241}
+)
+
+// hostHasVhostVsock reports whether the host has its vhost-vsock device,
+// which is a character device with vhost-vsock's numbers, and logs once at
+// start-up when it does not, because then no vm-qemu guest on the cell gets
+// the guest agent.
+func hostHasVhostVsock(log lager.Logger) bool {
+	major, minor, err := charDeviceNumbers(hostVhostVsockPath)
+	if want := hostVhostVsockDevice; err == nil && (major != want[0] || minor != want[1]) {
+		err = fmt.Errorf("device %d:%d is not vhost-vsock, which is %d:%d", major, minor, want[0], want[1])
+	}
+	if err != nil {
+		log.Info("guest-agent-vhost-vsock-unavailable", lager.Data{"path": hostVhostVsockPath, "error": err.Error()})
+		return false
+	}
+	return true
+}
 
 // kvmGroupName is the host group that owns /dev/kvm.
 const kvmGroupName = "kvm"
@@ -1103,9 +1136,11 @@ func (cmd *CommonCommand) wireExecutionBackends(log lager.Logger) (*executionBac
 		vmDockerRootFS = cmd.ExecutionBackends.VMDockerRootFS
 	}
 
+	vhostVsock := kvmGid != 0 && cmd.ExecutionBackends.VMGuestAgent && slices.Contains(kinds, backend.VMQemu) && hostHasVhostVsock(log)
+
 	log.Info("enabled", lager.Data{"backends": kinds, "kvm-gid": kvmGid, "block-volumes": blockVolumes != nil, "vm-launch-flags": vmLaunchFlags, "vm-stacks": vmStacks != nil, "vm-docker-images": vmDockerRootFS != ""})
 
-	return &executionBackends{registry: registry, kvmGid: kvmGid, blockVolumes: blockVolumes, vmLaunchFlags: vmLaunchFlags, fullMemoryLimit: kvmGid != 0 && cmd.ExecutionBackends.VMFullMemoryLimit, vmStacks: vmStacks, vmDockerRootFS: vmDockerRootFS}, nil
+	return &executionBackends{registry: registry, kvmGid: kvmGid, blockVolumes: blockVolumes, vmLaunchFlags: vmLaunchFlags, fullMemoryLimit: kvmGid != 0 && cmd.ExecutionBackends.VMFullMemoryLimit, vmStacks: vmStacks, vmDockerRootFS: vmDockerRootFS, vhostVsock: vhostVsock}, nil
 }
 
 // checkVMDockerFlags refuses Docker image flags that cannot work: a tarball
@@ -1202,19 +1237,21 @@ func (cmd *CommonCommand) logUnusedBlockVolumes(log lager.Logger) {
 	}
 }
 
-// vmLaunchVolumeFlags returns the volume, QEMU sandbox, CPU, and mount mirroring flags for the
-// wrapped vm-launch of a vm-* container, which are empty for the defaults.
+// vmLaunchVolumeFlags returns the volume, QEMU sandbox, CPU, mount mirroring,
+// and guest agent flags for the wrapped vm-launch of a vm-* container, which
+// are empty for the defaults.
 func (cmd *CommonCommand) vmLaunchVolumeFlags() []string {
 	flags := processes.VMLaunchVolumeFlags(cmd.ExecutionBackends.VMVolumeShares, bundlerules.VMVirtiofsdPath, !cmd.ExecutionBackends.VMVolumeAsyncMounts)
 	flags = append(flags, processes.VMLaunchQEMUSandboxFlags(cmd.ExecutionBackends.VMQemuSandbox)...)
 	flags = append(flags, processes.VMLaunchCPUFlags(cmd.ExecutionBackends.VMMaxVCPUs)...)
-	return append(flags, processes.VMLaunchMirrorMountsFlags(cmd.ExecutionBackends.VMMirrorMounts)...)
+	flags = append(flags, processes.VMLaunchMirrorMountsFlags(cmd.ExecutionBackends.VMMirrorMounts)...)
+	return append(flags, processes.VMLaunchGuestAgentFlags(cmd.ExecutionBackends.VMGuestAgent)...)
 }
 
 // logUnusedVolumeFlags notes that --vm-volume-shares,
-// --vm-volume-async-mounts, --vm-max-vcpus, --vm-full-memory-limit, or
-// --vm-mirror-mounts has no
-// effect because no vm-* backend is enabled.
+// --vm-volume-async-mounts, --vm-max-vcpus, --vm-full-memory-limit,
+// --vm-mirror-mounts, or --vm-guest-agent has no effect because no vm-*
+// backend is enabled.
 func (cmd *CommonCommand) logUnusedVolumeFlags(log lager.Logger) {
 	if cmd.ExecutionBackends.VMVolumeShares {
 		log.Info("volume-shares-unused-without-a-vm-backend")
@@ -1230,6 +1267,9 @@ func (cmd *CommonCommand) logUnusedVolumeFlags(log lager.Logger) {
 	}
 	if cmd.ExecutionBackends.VMMirrorMounts {
 		log.Info("mirror-mounts-unused-without-a-vm-backend")
+	}
+	if cmd.ExecutionBackends.VMGuestAgent {
+		log.Info("guest-agent-unused-without-a-vm-backend")
 	}
 }
 
