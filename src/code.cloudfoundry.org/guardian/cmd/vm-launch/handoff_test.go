@@ -411,6 +411,21 @@ var _ = Describe("the handoff identity of a volume", func() {
 		}
 	})
 
+	It("ignores a process_id that is not a string, and still names the image", func() {
+		for _, id := range []string{`123`, `true`, `null`, `["` + handoffProcessID + `"]`, `{"id":"` + handoffProcessID + `"}`} {
+			env := map[string]string{
+				vcapServicesEnv:    vcapWith(map[string][]string{"juicefs": {mountJSON("/data", "rw")}}),
+				vcapApplicationEnv: `{"application_id":"` + testAppID + `","process_type":"web","process_id":` + id + `}`,
+				instanceIndexEnv:   "0",
+			}
+			vols, err := volumesFromEnv(envMap(env))
+			Expect(err).NotTo(HaveOccurred(), id)
+			Expect(vols).To(HaveLen(1), id)
+			Expect(vols[0].ProcessID).To(BeEmpty(), id)
+			Expect(vols[0].ImageName).To(Equal("rvm-disk-"+testAppID+"-web-0.img"), id)
+		}
+	})
+
 	It("reaches the provider through prepare, which watches the volume root once the disk is held", func() {
 		requireOpenat2()
 		dir := GinkgoT().TempDir()

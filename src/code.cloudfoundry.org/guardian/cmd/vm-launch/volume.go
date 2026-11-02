@@ -230,8 +230,8 @@ func volumesFromEnv(lookup func(string) (string, bool)) ([]guestVolume, error) {
 		return nil, fmt.Errorf("%s %s is not an instance index from 0 to %d", instanceIndexEnv, quoteForLog(index), maxInstanceIndex)
 	}
 	processID := ""
-	if applicationIDPattern.MatchString(app.ProcessID) {
-		processID = app.ProcessID
+	if applicationIDPattern.MatchString(string(app.ProcessID)) {
+		processID = string(app.ProcessID)
 	}
 	vols := make([]guestVolume, len(mounts))
 	for i, m := range mounts {
@@ -261,11 +261,26 @@ func shareDirs(lookup func(string) (string, bool), dirs []string) map[string]boo
 // vcapApplication is the part of VCAP_APPLICATION vm-launch reads. The
 // application id and the process type are checked before they reach a file
 // name. The process id never reaches one, and a value that is not a
-// lowercase UUID only keeps the instance out of the handoff.
+// lowercase UUID, or is not a string at all, only keeps the instance out of
+// the handoff.
 type vcapApplication struct {
-	ApplicationID string `json:"application_id"`
-	ProcessType   string `json:"process_type"`
-	ProcessID     string `json:"process_id"`
+	ApplicationID string        `json:"application_id"`
+	ProcessType   string        `json:"process_type"`
+	ProcessID     lenientString `json:"process_id"`
+}
+
+// lenientString is a JSON string that takes any other JSON value as the
+// empty string, so that a field vm-launch reads only for an option never
+// fails the decode of the object around it.
+type lenientString string
+
+func (s *lenientString) UnmarshalJSON(b []byte) error {
+	var v string
+	if json.Unmarshal(b, &v) != nil {
+		v = ""
+	}
+	*s = lenientString(v)
+	return nil
 }
 
 // applicationFromEnv decodes VCAP_APPLICATION. application_id must be a
