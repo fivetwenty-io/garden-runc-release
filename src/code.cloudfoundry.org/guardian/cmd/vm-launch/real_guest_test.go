@@ -1031,3 +1031,28 @@ echo served`)
 		Expect(logBuf.String()).NotTo(ContainSubstring(strconv.Itoa(unused)))
 	})
 })
+
+var _ = Describe("the guest IPv6 network against a real QEMU", func() {
+	It("gives the guest the IPv6 address and default route that /rvm/net names, and reaches QEMU's gateway over them", func() {
+		nw := taskNetwork()
+		nw.enableIPv6(backend.VMQemu)
+		g := taskGuest(`ip -6 addr show dev eth0
+ip -6 route
+if ping -6 -c 1 -W 5 fec0::2 >/dev/null 2>&1; then echo GATEWAY6_UP; else echo GATEWAY6_DOWN; fi
+echo done6`)
+		g.nw = nw
+		out := bootRealGuest(g)
+		Expect(out).To(ContainSubstring("inet6 fec0::15/64"), out)
+		Expect(out).To(ContainSubstring("default via fec0::2 dev eth0"), out)
+		Expect(out).To(ContainSubstring("GATEWAY6_UP"), out)
+		Expect(out).To(ContainSubstring("done6"), out)
+	})
+
+	It("boots an IPv4 only network with no IPv6 address on eth0", func() {
+		g := taskGuest(`ip -6 addr show dev eth0 scope global
+echo done4`)
+		out := bootRealGuest(g)
+		Expect(out).NotTo(ContainSubstring("inet6 fec0"), out)
+		Expect(out).To(ContainSubstring("done4"), out)
+	})
+})

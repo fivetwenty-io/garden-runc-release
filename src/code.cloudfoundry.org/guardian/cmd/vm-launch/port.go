@@ -382,6 +382,34 @@ func (p proxyPort) closePort() error {
 	return nil
 }
 
+// dualPort opens a port on the container's IPv4 addresses with v4 and on its
+// IPv6 addresses with v6. The IPv4 listener decides the open: a port that
+// the IPv6 listener cannot take stays open on IPv4 alone, with a line saying
+// why, because the IPv4 port is the one Diego's health check reads.
+type dualPort struct {
+	v4, v6 portOpener
+	port   int
+	logger *log.Logger
+}
+
+func (d dualPort) openPort() error {
+	if err := d.v4.openPort(); err != nil {
+		return err
+	}
+	if err := d.v6.openPort(); err != nil {
+		d.logger.Printf("port %d is open over IPv4 only; opening it over IPv6 failed: %v", d.port, err)
+	}
+	return nil
+}
+
+func (d dualPort) closePort() error {
+	err := d.v6.closePort()
+	if err4 := d.v4.closePort(); err4 != nil {
+		return err4
+	}
+	return err
+}
+
 // qmpPort opens the port as a QEMU forwarding rule from the container's
 // port to the guest's, which it adds and removes through QEMU's QMP monitor.
 type qmpPort struct {
@@ -697,6 +725,9 @@ func newQMPSocket() (net.Conn, *os.File, error) {
 type portReservation struct {
 	lock net.Listener
 	fd   int
+	// fd6 is the IPv6 socket of the port, or -1 without one (see
+	// reserveIPv6).
+	fd6 int
 }
 
 // reservePort reserves port with two sockets. The first is a listener on
@@ -718,7 +749,7 @@ func reservePort(port int) (*portReservation, error) {
 		lock.Close()
 		return nil, fmt.Errorf("reserving port %d: %w", port, err)
 	}
-	return &portReservation{lock: lock, fd: fd}, nil
+	return &portReservation{lock: lock, fd: fd, fd6: -1}, nil
 }
 
 func reserveTCPPort(port int) (int, error) {
@@ -737,9 +768,42 @@ func reserveTCPPort(port int) (int, error) {
 	return fd, nil
 }
 
+// reserveIPv6 also reserves port on the container's IPv6 addresses, with a
+// socket as reserveTCPPort makes for IPv4, which takes IPv6 connections only.
+// It does nothing when the port has the socket already.
+func (r *portReservation) reserveIPv6(port int) error {
+	if r.fd6 >= 0 {
+		return nil
+	}
+	fd, err := unix.Socket(unix.AF_INET6, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return os.NewSyscallError("socket", err)
+	}
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+		unix.Close(fd)
+		return os.NewSyscallError("setsockopt", err)
+	}
+	if err := unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_V6ONLY, 1); err != nil {
+		unix.Close(fd)
+		return os.NewSyscallError("setsockopt", err)
+	}
+	if err := unix.Bind(fd, &unix.SockaddrInet6{Port: port}); err != nil {
+		unix.Close(fd)
+		return os.NewSyscallError("bind", err)
+	}
+	r.fd6 = fd
+	return nil
+}
+
 // Close releases the port.
 func (r *portReservation) Close() error {
 	err := r.lock.Close()
+	if r.fd6 >= 0 {
+		if cerr := unix.Close(r.fd6); err == nil && cerr != nil {
+			err = os.NewSyscallError("close", cerr)
+		}
+		r.fd6 = -1
+	}
 	if cerr := unix.Close(r.fd); err == nil && cerr != nil {
 		err = os.NewSyscallError("close", cerr)
 	}

@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/netip"
 	"sync"
 	"syscall"
 	"time"
@@ -151,7 +152,7 @@ func (p *tcpProxy) Listen(listenAddr, upstream string) error {
 	case busy:
 		return errors.New("the port proxy is already listening")
 	}
-	ln, err := net.Listen("tcp", listenAddr)
+	ln, err := net.Listen(listenNetwork(listenAddr), listenAddr)
 	if err != nil {
 		return fmt.Errorf("listening for the guest port: %w", err)
 	}
@@ -169,6 +170,20 @@ func (p *tcpProxy) Listen(listenAddr, upstream string) error {
 	p.wg.Add(1)
 	go p.acceptLoop(ln, upstream)
 	return nil
+}
+
+// listenNetwork is the network a listener on addr uses: tcp6 for an IPv6
+// address, which makes the wildcard address :: IPv6 only, so that it never
+// takes the IPv4 connections of the same port, and tcp for any other.
+func listenNetwork(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "tcp"
+	}
+	if ip, err := netip.ParseAddr(host); err == nil && ip.Is6() && !ip.Is4In6() {
+		return "tcp6"
+	}
+	return "tcp"
 }
 
 // StopListening closes the listener on listenAddr, if there is one, so new

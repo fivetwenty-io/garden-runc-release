@@ -824,6 +824,13 @@ func run(argv []string, logger *log.Logger) int {
 		logger.Print(err)
 		return exitLaunchError
 	}
+	if interfaceHasIPv6(containerNIC) {
+		nw.enableIPv6(cfg.backend)
+		logger.Printf("the container has an IPv6 address; the ports also accept connections over IPv6")
+		if nw.address6 != "" {
+			logger.Printf("the guest gets the IPv6 address %s", nw.address6)
+		}
+	}
 	// The proxy serves ports only, so only then does it need the
 	// capability. The hypervisor is confined whatever the flag says (see
 	// sup.prepare below).
@@ -953,6 +960,13 @@ func run(argv []string, logger *log.Logger) int {
 	}
 	for i, port := range nw.ports {
 		reservation, err := reservePort(port)
+		if err == nil && nw.listen6 {
+			// The IPv6 port is best effort, as its listener is: the port
+			// works over IPv4 without it.
+			if err6 := reservation.reserveIPv6(port); err6 != nil {
+				logger.Printf("reserving port %d over IPv6: %v", port, err6)
+			}
+		}
 		if err != nil {
 			logger.Print(err)
 			if errors.Is(err, syscall.EADDRINUSE) {
@@ -1295,10 +1309,30 @@ func run(argv []string, logger *log.Logger) int {
 			proxy := newProxy(upstreamDialPolicy, logger, opts...)
 			defer proxy.Close()
 			open = func(port int) portOpener {
-				return proxyPort{proxy: proxy, addr: nw.listenAddr(port), upstream: nw.upstream(port)}
+				v4 := proxyPort{proxy: proxy, addr: nw.listenAddr(port), upstream: nw.upstream(port)}
+				if !nw.listen6 {
+					return v4
+				}
+				v6 := proxyPort{proxy: proxy, addr: nw.listenAddr6(port), upstream: nw.upstream6(port)}
+				return dualPort{v4: v4, v6: v6, port: port, logger: logger}
 			}
 		} else {
-			open = func(port int) portOpener { return qmpPort{monitor: qmp, port: port} }
+			// QEMU's forwarding rules take IPv4 host addresses only, so the
+			// IPv6 listeners are the port proxy's, which hands each
+			// connection to the IPv4 rule of the same port.
+			var proxy6 *tcpProxy
+			if nw.listen6 {
+				proxy6 = newProxy(upstreamDialPolicy, logger)
+				defer proxy6.Close()
+			}
+			open = func(port int) portOpener {
+				v4 := qmpPort{monitor: qmp, port: port}
+				if proxy6 == nil {
+					return v4
+				}
+				v6 := proxyPort{proxy: proxy6, addr: nw.listenAddr6(port), upstream: nw.upstream6(port)}
+				return dualPort{v4: v4, v6: v6, port: port, logger: logger}
+			}
 		}
 		// The explicit gates.end after sup.run is the one that ends the
 		// gates, as it must come before the exit line. A panic out of
