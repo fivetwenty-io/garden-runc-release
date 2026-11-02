@@ -1433,6 +1433,48 @@ rvm_round_end() { rvm_rounds=$((rvm_rounds + 1)); [ "$rvm_rounds" -lt ` + strcon
 `
 	}
 
+	// The pause itself, run with rvm_step set to each pace and with read and
+	// sleep replaced by functions that print their arguments, so a pause
+	// that ignores rvm_step, or waits one second at the steady pace, fails.
+	DescribeTable("passes rvm_step to the pause, with the FIFO and without it",
+		func(withFIFO bool, want string) {
+			shell := guestBusyboxShell()
+			tick := filepath.Join(GinkgoT().TempDir(), "no-tick")
+			if withFIFO {
+				tick = newTick()
+			}
+			watch := watchOnStdout(tick)
+			from, to := strings.Index(watch, "\t\tif [ -p "), strings.Index(watch, "\n\t\trvm_upset=\" \"\n")
+			Expect(from).To(BeNumerically(">=", 0), watch)
+			Expect(to).To(BeNumerically(">", from), watch)
+			script := "(\nread() { echo \"read $*\"; }\nsleep() { echo \"sleep $*\"; }\n" + watch[from:to] + `
+		rvm_pause
+		rvm_step=` + strconv.Itoa(guestListenSteadyWait) + `
+		rvm_pause
+		rvm_step=1
+		rvm_pause
+) </dev/null
+`
+			out, err := runBounded(shell.argv[0], append(shell.argv[1:], "-c", script),
+				[]string{"PATH=" + watcherPath(shell)})
+			Expect(err).NotTo(HaveOccurred(), string(out))
+			steady := strconv.Itoa(guestListenSteadyWait)
+			Expect(string(out)).To(Equal(strings.NewReplacer("N", "1", "S", steady).Replace(want)))
+		},
+		Entry("waits on the FIFO", true, "read -t N -u 3 rvm_tick\nread -t S -u 3 rvm_tick\nread -t N -u 3 rvm_tick\n"),
+		Entry("waits with sleep when the guest has no FIFO", false, "sleep N\nsleep S\nsleep N\n"),
+	)
+
+	// A listen line that fails to write must not leave the watcher at the
+	// steady pace, as the port that closed is still reported as open.
+	It("waits one second after a listen line that fails to write, even when its port was up", func() {
+		shell := guestBusyboxShell()
+		// echo fails and prints nothing, as a write to a console that fails.
+		prelude := "echo() { return 1; }\nrvm_round_end() { printf 'step=%s\\n' \"$rvm_step\"; exit 0; }\n"
+		out := watchPorts(shell, []int{8080}, "", noTable, prelude, []int{8080})
+		Expect(out).To(Equal("step=1\n"))
+	})
+
 	DescribeTable("waits guestListenSteadyWait seconds between looks only while every port is up",
 		func(ports []int, wantStep string) {
 			shell := guestBusyboxShell()
@@ -1466,7 +1508,11 @@ rvm_round_end() { rvm_rounds=$((rvm_rounds + 1)); [ "$rvm_rounds" -lt ` + strcon
 	DescribeTable("reports the last answer in the full report when that look fails",
 		func(shellOf func() guestShell) {
 			shell := shellOf()
-			Expect(watchPorts(shell, []int{8080}, unreadable, "", rounds(guestListenRefresh), []int{8080})).To(Equal(listening), shell.name)
+			// A port that is up waits the steady pace after its first look, so the
+			// report comes at the second look, once 1 and the steady wait add up
+			// to guestListenRefresh seconds.
+			Expect(guestListenSteadyWait + 1).To(Equal(guestListenRefresh))
+			Expect(watchPorts(shell, []int{8080}, unreadable, "", rounds(2), []int{8080})).To(Equal(listening), shell.name)
 			Expect(watchPorts(shell, []int{8080}, unreadable, "", rounds(guestListenRefresh), nil)).To(Equal(notListening), shell.name)
 		},
 		shellEntries(""),

@@ -31,7 +31,8 @@
 // over Garden's tap device. vm-launch reserves each port when it starts, so
 // connections are refused, and it opens a port only while something in the
 // guest listens on it at an address other than loopback, which the guest
-// reports within a second of a change, even once the app has used up the
+// reports within a second when it starts to listen, and within
+// guestListenSteadyWait seconds when it stops while every port listens, even once the app has used up the
 // processes the guest can start. Each port opens and closes on its own, so a
 // port that the app never listens on stays closed for the whole run. So, as
 // for a runc app, a connection to a port, and with it Diego's port health

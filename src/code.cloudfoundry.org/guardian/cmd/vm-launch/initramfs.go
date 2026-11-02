@@ -741,15 +741,17 @@ const guestSetLimits = `ulimit -n "$RVM_NOFILE_HARD" && ulimit -S -n "$RVM_NOFIL
 // a background watcher that tells vm-launch whether anything in the guest
 // listens on each port, so that vm-launch opens a port of the container only
 // while the guest listens on it, as a container's port refuses connections
-// until its app listens. Once a second, the watcher looks in /proc/net/tcp
-// and /proc/net/tcp6 for listening sockets on the ports at an address other
+// until its app listens. Once a second while any port is down, and every
+// guestListenSteadyWait seconds while every port is up, the watcher looks in
+// /proc/net/tcp and /proc/net/tcp6 for listening sockets on the ports at an address other
 // than loopback, which is what a connection forwarded from the container
 // reaches, in one pass over the tables, and prints a listen line, the listen
 // tag, the port, a colon, and 1 or 0, each time the answer for a port
 // changes. The ports change independently of each other. Every
-// guestListenRefresh looks, it prints the answer for every port whether or
-// not it changed, so a listen line that vm-launch lost, as when the console
-// dropped it, is made good within that many seconds; vm-launch takes each
+// guestListenRefresh seconds of waiting, to the next look, it prints the
+// answer for every port whether or not it changed, so a listen line that
+// vm-launch lost, as when the console dropped it, is made good within about
+// that many seconds, or within the wait of a look when that is longer; vm-launch takes each
 // line as the port's state, so a line that repeats the state changes
 // nothing. It starts after the start tag, so vm-launch reads every listen
 // line as part of the command's run. The kernel writes an IPv4
@@ -760,12 +762,12 @@ const guestSetLimits = `ulimit -n "$RVM_NOFILE_HARD" && ulimit -S -n "$RVM_NOFIL
 // While every port is up the watcher waits guestListenSteadyWait seconds
 // between looks, and while any port is down it waits one second, so the
 // start of an app is seen as fast as before and an idle guest with a
-// listening app spends a quarter of the CPU on the tables. Measured in a guest
-// under QEMU, the looks at one second took about 17 of the 23 ticks an idle
-// guest used in a minute.
+// listening app spends a quarter of the CPU on the tables. A port that closes
+// is seen at most guestListenSteadyWait seconds late. A listen line that fails
+// to write makes the next wait one second, so it is retried at once.
 //
 // The watcher runs no other process once it has started: it reads the
-// tables with the shell's read, and it waits out each second with a read
+// tables with the shell's read, and it waits out each look with a read
 // that times out on guestListenTick, a FIFO that nothing writes. A shell
 // exits when it cannot fork, so a watcher that ran commands would stop in a
 // guest short of memory or of processes, and leave the port as it was for
@@ -796,7 +798,7 @@ const guestSetLimits = `ulimit -n "$RVM_NOFILE_HARD" && ulimit -S -n "$RVM_NOFIL
 // The watcher opens /dev/console for each listen line, so it writes through
 // its own open file and not the one it shares with the command, which the
 // command may have made non-blocking. It takes a new state only once the
-// line is written, so a line that fails is written again a second later.
+// line is written, so a line that fails is written again after one second.
 func guestListenWatch(nonce string) string {
 	return `rvm_watch=
 if [ -n "${RVM_PORTS:-}" ]; then
@@ -841,7 +843,7 @@ if [ -n "${RVM_PORTS:-}" ]; then
 				done 2>/dev/null <"$rvm_table"
 				[ -n "$rvm_head" ] || rvm_failed=1
 			done
-			rvm_look=$((rvm_look + 1))
+			rvm_look=$((rvm_look + ${rvm_step:-1}))
 			rvm_all=
 			if [ "$rvm_look" -ge ` + strconv.Itoa(guestListenRefresh) + ` ]; then
 				rvm_all=1
@@ -863,7 +865,7 @@ if [ -n "${RVM_PORTS:-}" ]; then
 					rvm_now=$rvm_was
 				fi
 				if [ "$rvm_now" != "$rvm_was" ] || [ -n "$rvm_all" ]; then
-					echo "` + listenTag(nonce) + `${rvm_pp%:*}:$rvm_now" >/dev/console && rvm_was=$rvm_now
+					echo "` + listenTag(nonce) + `${rvm_pp%:*}:$rvm_now" >/dev/console && rvm_was=$rvm_now || rvm_steady=
 				fi
 				if [ "$rvm_was" = 1 ]; then
 					rvm_nextup="$rvm_nextup$rvm_hex "
@@ -935,8 +937,10 @@ const guestCPUStop = `kill "$rvm_cpuwatch" 2>/dev/null
 wait "$rvm_cpuwatch" 2>/dev/null
 `
 
-// guestListenRefresh is how many looks the listen watcher makes between the
-// lines in which it reports every port, changed or not.
+// guestListenRefresh is how many seconds of waiting the listen watcher lets
+// pass between the lines in which it reports every port, changed or not. At
+// the steady pace it is reached at the second look, after guestListenSteadyWait
+// seconds.
 const guestListenRefresh = 5
 
 // guestListenSteadyWait is how many seconds the listen watcher waits between
@@ -945,7 +949,8 @@ const guestListenRefresh = 5
 // app starts to listen, still come at the pace of the state before them, so a
 // port that closes is seen at most this many seconds late, while a guest that
 // is idle with its app listening reads its tables a quarter as often. The
-// refresh of guestListenRefresh looks is then that many times this long.
+// refresh counts seconds of waiting, so it stays about guestListenRefresh
+// seconds at either pace.
 const guestListenSteadyWait = 4
 
 // guestListenTick is the FIFO the listen watcher waits on. The initramfs of

@@ -359,18 +359,18 @@ var _ = Describe("the initramfs of a guest without a stack", func() {
 	// as it did for the hostname setup and the CPU watcher.
 	It("is byte for byte the archive it was before the stack guest, for a task, an LRP with a root disk and a CA bundle, and a guest with a volume", func() {
 		task := taskGuest("true")
-		Expect(archiveSum(task)).To(Equal("648dfdb06aa985a027f3416c0ba2e019435258a8edb7bf04e9716185d9e36023"))
+		Expect(archiveSum(task)).To(Equal("bff1968d337114ea0a331048c071d3e68d514ceba725e2c8f224b17d7fa0114e"))
 
 		lrp := taskGuest("exec ./server")
 		lrp.nw = &network{ports: []int{8080}, address: qemuGuestCIDR, gateway: qemuGateway, resolvConf: "nameserver 10.0.2.3\n"}
 		lrp.rootBytes, lrp.rootInodeRatio, lrp.drives.rootID = 64<<20, inodeRatioFor(64<<20), qemuRootSerial
 		lrp.caBundle = []byte("-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n")
-		Expect(archiveSum(lrp)).To(Equal("7e9eb60fda03ab27fae3f9ce8e2f289687c2abdbd48d5cb446ad35a1442d5665"))
+		Expect(archiveSum(lrp)).To(Equal("2e6e2d7ccf827c50beec23faf7690edeee1ff4f76a13c204ab39213fb048ca78"))
 
 		vol := taskGuest("true")
 		vol.vols = []guestVolume{{ContainerDir: "/home/vcap/data", ImageName: "rvm-disk-0.img"}}
 		vol.drives.volumes = qemuImageDrives(defaultImageSize)
-		Expect(archiveSum(vol)).To(Equal("c9a25fa30fed44ddf04689e022e5294985fbcd9e83995a1f892d91a8de90e637"))
+		Expect(archiveSum(vol)).To(Equal("5d21232ca53b87c18b333d7803fd269432b1f831807fe9f8e137751b0523d35c"))
 	})
 })
 

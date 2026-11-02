@@ -17,7 +17,7 @@ import (
 
 // dialPolicy says how the proxy reaches the guest. vm-launch listens only
 // while the guest app does (see portGate), but the guest's report of that
-// lags by up to a second, so a connection that arrives as the guest app
+// lags by up to guestListenSteadyWait seconds, so a connection that arrives as the guest app
 // restarts its listener waits for it instead of failing: the proxy retries
 // the upstream dial with exponential backoff until giveUp has passed since
 // the client connected, or unansweredGiveUp when the last dial got no answer
@@ -36,9 +36,12 @@ type dialPolicy struct {
 // sees a guest boot, and a dial that the guest refuses means the guest app
 // has closed its listener. That is an app that restarts its listener, which
 // 2 seconds covers, or an app that stopped listening, whose port the gate
-// closes at the guest's next look, within a second. Either way, a client of
-// an app that stopped listening learns it within 2 seconds, so the gorouter
-// can try another instance for a request that it retries.
+// closes at the guest's next look, within guestListenSteadyWait seconds. The
+// 2 seconds do not depend on that lag, because each client's wait starts when
+// the client connects. Either way, a client of an app that stopped listening
+// learns it within 2 seconds, even while the port stays open for a few
+// seconds, so the gorouter can try another instance for a request that it
+// retries.
 //
 // A dial that gets no answer within attemptTimeout means a guest app whose
 // accept queue is full, or a guest too busy to answer, and the app may
