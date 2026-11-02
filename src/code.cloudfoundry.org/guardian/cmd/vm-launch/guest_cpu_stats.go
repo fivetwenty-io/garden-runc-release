@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 )
 
 // guestClockTick is the length in nanoseconds of one tick in the guest's
@@ -33,20 +34,30 @@ type cpuReporter struct {
 	w      io.Writer
 	latest chan [2]uint64
 	done   chan struct{}
+	ended  chan struct{}
 	once   sync.Once
 }
 
 func newCPUReporter(w io.Writer) *cpuReporter {
-	r := &cpuReporter{w: w, latest: make(chan [2]uint64, 1), done: make(chan struct{})}
+	r := &cpuReporter{w: w, latest: make(chan [2]uint64, 1), done: make(chan struct{}), ended: make(chan struct{})}
 	go r.run()
 
 	return r
 }
 
 func (r *cpuReporter) run() {
+	defer close(r.ended)
+
 	for {
 		select {
 		case <-r.done:
+			// A line that waits at the end is the newest figure there is.
+			select {
+			case ticks := <-r.latest:
+				_, _ = io.WriteString(r.w, guestCPULine(ticks[0], ticks[1]))
+			default:
+			}
+
 			return
 		case ticks := <-r.latest:
 			_, _ = io.WriteString(r.w, guestCPULine(ticks[0], ticks[1]))
@@ -71,7 +82,18 @@ func (r *cpuReporter) report(userTicks, systemTicks uint64) {
 	}
 }
 
-// close ends the writer goroutine. A write that is blocked stays blocked.
+// cpuReporterCloseWait is how long close waits for the writer to write the
+// line that waits at the end.
+const cpuReporterCloseWait = 200 * time.Millisecond
+
+// close ends the writer goroutine after it has written the line that waits,
+// if its writer is not blocked. A write that is blocked stays blocked, and
+// close does not wait for it for longer than cpuReporterCloseWait.
 func (r *cpuReporter) close() {
 	r.once.Do(func() { close(r.done) })
+
+	select {
+	case <-r.ended:
+	case <-time.After(cpuReporterCloseWait):
+	}
 }

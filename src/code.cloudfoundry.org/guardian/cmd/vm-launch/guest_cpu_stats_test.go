@@ -259,14 +259,78 @@ var _ = Describe("the guest CPU watcher", func() {
 		shellEntries("a line that stops before the interrupt columns", "cpu  10 0 5\n", cpuTag(testNonce)+"10:5\n"),
 	)
 
-	It("reports in a guest where the FIFO cannot be made, waiting with sleep", func() {
-		stat := "cpu  10 0 5 100 0 0 0\n"
-		missing := filepath.Join(GinkgoT().TempDir(), "no", "such", "dir", "tick")
-		for _, shell := range []guestShell{hostShell(), guestBusyboxShell()} {
-			watch := guestCPUWatch(testNonce)
-			Expect(watch).To(ContainSubstring("rvm_cpupause() { sleep 5; }"))
-			Expect(watchWith(shell, stat, missing)).To(Equal(cpuTag(testNonce) + "10:5\n"))
+	// timedWatch runs the watcher for 2.7 seconds against a /proc/stat that
+	// holds stat, with its interval cut to one second and the FIFO at tick,
+	// and returns the lines it wrote on the console.
+	timedWatch := func(shell guestShell, stat, tick string) []string {
+		dir := GinkgoT().TempDir()
+		proc := filepath.Join(dir, "stat")
+		Expect(os.WriteFile(proc, []byte(stat), 0o644)).To(Succeed())
+		con := filepath.Join(dir, "console")
+
+		watch := guestCPUWatch(testNonce)
+		for _, from := range []string{"read -t 5 -u 4", "sleep 5"} {
+			Expect(strings.Count(watch, from)).To(Equal(1), from)
 		}
+		watch = strings.Replace(watch, "/proc/stat", proc, 1)
+		watch = strings.Replace(watch, ">/dev/console", ">>"+con, 1)
+		watch = strings.ReplaceAll(watch, guestCPUTick, tick)
+		watch = strings.Replace(watch, "read -t 5 -u 4", "read -t 1 -u 4", 1)
+		watch = strings.Replace(watch, "sleep 5", "sleep 1", 1)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		var errOut bytes.Buffer
+		cmd := exec.CommandContext(ctx, shell.argv[0], append(shell.argv[1:], "-c", watch+"sleep 2.7\nkill \"$rvm_cpuwatch\"\nwait \"$rvm_cpuwatch\" 2>/dev/null\nexit 0\n")...)
+		cmd.Stderr = &errOut
+		Expect(cmd.Run()).To(Succeed(), errOut.String())
+
+		raw, err := os.ReadFile(con)
+		Expect(err).NotTo(HaveOccurred())
+
+		return strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
+	}
+
+	DescribeTable("waits out each interval on the FIFO, with no process between its lines",
+		func(shellOf func() guestShell) {
+			tick := filepath.Join(GinkgoT().TempDir(), "tick")
+			lines := timedWatch(shellOf(), "cpu  10 0 5 100 0 0 0\n", tick)
+
+			// A line at the start and one at each second after it.
+			Expect(len(lines)).To(BeNumerically(">=", 3))
+			Expect(len(lines)).To(BeNumerically("<=", 4))
+
+			info, err := os.Stat(tick)
+			Expect(err).NotTo(HaveOccurred(), "the watcher did not make the FIFO")
+			Expect(info.Mode()&os.ModeNamedPipe).NotTo(BeZero(), "the tick is not a FIFO")
+		},
+		// Only the guest's busybox has a read that times out.
+		Entry("in the guest's busybox sh", guestBusyboxShell),
+	)
+
+	DescribeTable("waits with sleep in a guest where the FIFO cannot be made",
+		func(shellOf func() guestShell) {
+			tick := filepath.Join(GinkgoT().TempDir(), "no", "such", "dir", "tick")
+			lines := timedWatch(shellOf(), "cpu  10 0 5 100 0 0 0\n", tick)
+
+			// A read on a descriptor that never opened returns at once, so a
+			// watcher that took the FIFO branch would write hundreds of lines.
+			Expect(len(lines)).To(BeNumerically(">=", 3))
+			Expect(len(lines)).To(BeNumerically("<=", 4))
+			Expect(lines[0]).To(Equal(cpuTag(testNonce) + "10:5"))
+			Expect(tick).NotTo(BeAnExistingFile())
+		},
+		Entry("in /bin/sh", hostShell),
+		Entry("in the guest's busybox sh", guestBusyboxShell),
+	)
+
+	It("is started from a reporter in main, and never writes its line from the console copy", func() {
+		src, err := os.ReadFile("main.go")
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(string(src)).To(ContainSubstring("cpuOut := newCPUReporter(logger.Writer())"))
+		Expect(string(src)).To(ContainSubstring("sup.cpu = cpuOut.report"))
+		Expect(string(src)).NotTo(ContainSubstring("guestCPULine("))
 	})
 
 	It("runs no process between its lines", func() {
@@ -345,6 +409,17 @@ var _ = Describe("the CPU reporter", func() {
 		r.report(7, 3)
 
 		Eventually(gate.lines).Should(Equal([]string{guestCPULine(7, 3)}))
+	})
+
+	It("writes the line that waits when it is closed", func() {
+		gate := &gateWriter{release: make(chan struct{})}
+		close(gate.release)
+		r := newCPUReporter(gate)
+
+		r.report(4, 2)
+		r.close()
+
+		Expect(gate.lines()).To(ContainElement(guestCPULine(4, 2)))
 	})
 
 	It("does not block the caller while the writer is blocked, and delivers the newest figures afterwards", func() {
