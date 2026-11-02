@@ -179,6 +179,9 @@ func startPortGate(opener portOpener, port int, retry backoff, logger *log.Logge
 		ended:  make(chan struct{}),
 		done:   make(chan struct{}),
 	}
+	if b, ok := opener.(interface{ bindGate(*portGate) }); ok {
+		b.bindGate(g)
+	}
 	go g.loop()
 	return g
 }
@@ -373,9 +376,18 @@ type proxyPort struct {
 	// guest address its connections go to.
 	addr     string
 	upstream string
+	// network is the listener's network, or empty to take addr's own (see
+	// listenNetwork). A port that also listens over IPv6 sets tcp4 on its
+	// IPv4 listener, which would otherwise take both families.
+	network string
 }
 
-func (p proxyPort) openPort() error { return p.proxy.Listen(p.addr, p.upstream) }
+func (p proxyPort) openPort() error {
+	if p.network != "" {
+		return p.proxy.ListenNetwork(p.network, p.addr, p.upstream)
+	}
+	return p.proxy.Listen(p.addr, p.upstream)
+}
 
 func (p proxyPort) closePort() error {
 	p.proxy.StopListening(p.addr)
@@ -390,19 +402,36 @@ type dualPort struct {
 	v4, v6 portOpener
 	port   int
 	logger *log.Logger
+	// gate is the port's gate once it has started (see bindGate), which logs
+	// a line only while it has not ended.
+	gate *portGate
 }
 
-func (d dualPort) openPort() error {
+// bindGate hands the opener the gate that runs it, before the gate acts.
+func (d *dualPort) bindGate(g *portGate) { d.gate = g }
+
+// logf logs through the gate, so that a line about a port the hypervisor has
+// already left is dropped as the gate's own are, and through the logger when
+// there is no gate.
+func (d *dualPort) logf(format string, args ...any) {
+	if d.gate != nil {
+		d.gate.logf(format, args...)
+		return
+	}
+	d.logger.Printf(format, args...)
+}
+
+func (d *dualPort) openPort() error {
 	if err := d.v4.openPort(); err != nil {
 		return err
 	}
 	if err := d.v6.openPort(); err != nil {
-		d.logger.Printf("port %d is open over IPv4 only; opening it over IPv6 failed: %v", d.port, err)
+		d.logf("port %d is open over IPv4 only; opening it over IPv6 failed: %v", d.port, err)
 	}
 	return nil
 }
 
-func (d dualPort) closePort() error {
+func (d *dualPort) closePort() error {
 	err := d.v6.closePort()
 	if err4 := d.v4.closePort(); err4 != nil {
 		return err4

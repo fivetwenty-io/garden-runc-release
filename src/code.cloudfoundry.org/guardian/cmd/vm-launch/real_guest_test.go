@@ -1052,7 +1052,7 @@ echo done6`)
 		g := taskGuest(`ip -6 addr show dev eth0 scope global
 echo done4`)
 		out := bootRealGuest(g)
-		Expect(out).NotTo(ContainSubstring("inet6 fec0"), out)
+		Expect(out).NotTo(ContainSubstring("inet6 fec0::15"), out)
 		Expect(out).To(ContainSubstring("done4"), out)
 	})
 })

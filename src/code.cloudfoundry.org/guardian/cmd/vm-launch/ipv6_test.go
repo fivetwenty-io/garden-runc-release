@@ -148,27 +148,111 @@ var _ = Describe("IPv6 for the guest", func() {
 		})
 	})
 
+	Describe("both listeners of one port", func() {
+		It("open together with the real proxy, accept over each family, and raise no warning", func() {
+			ipv6Loopback()
+			// A server for the proxy to reach, and a free port for the
+			// listeners, which both families share.
+			up := listenLocal()
+			serve(up, echo)
+			l, err := net.Listen("tcp", "127.0.0.1:0")
+			Expect(err).NotTo(HaveOccurred())
+			port := l.Addr().(*net.TCPAddr).Port
+			Expect(l.Close()).To(Succeed())
+
+			var logs safeBuffer
+			logger := log.New(&logs, "", 0)
+			proxy := newProxy(testDialPolicy, logger)
+			DeferCleanup(proxy.Close)
+			n := &network{address: fcGuestCIDR, gateway: fcHostIP, ports: []int{port}}
+			n.enableIPv6(backend.VMFirecracker)
+			upstream := up.Addr().String()
+			d := &dualPort{
+				v4:     proxyPort{proxy: proxy, addr: n.listenAddr(port), upstream: upstream, network: "tcp4"},
+				v6:     proxyPort{proxy: proxy, addr: n.listenAddr6(port), upstream: upstream},
+				port:   port,
+				logger: logger,
+			}
+			Expect(d.openPort()).To(Succeed())
+			Expect(logs.String()).To(BeEmpty())
+
+			for _, target := range []string{"tcp4:127.0.0.1", "tcp6:::1"} {
+				network, host, _ := strings.Cut(target, ":")
+				c, err := net.Dial(network, net.JoinHostPort(host, strconv.Itoa(port)))
+				Expect(err).NotTo(HaveOccurred(), target)
+				_, err = c.Write([]byte("hi"))
+				Expect(err).NotTo(HaveOccurred())
+				Expect(c.(*net.TCPConn).CloseWrite()).To(Succeed())
+				got, err := io.ReadAll(c)
+				Expect(err).NotTo(HaveOccurred(), target)
+				Expect(string(got)).To(Equal("hi"), target)
+				c.Close()
+			}
+
+			Expect(d.closePort()).To(Succeed())
+			_, err = net.Dial("tcp6", net.JoinHostPort("::1", strconv.Itoa(port)))
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("stops accepting over IPv6 when the proxy stops accepting, as it does once the hypervisor is gone", func() {
+			ipv6Loopback()
+			up := listenLocal()
+			serve(up, echo)
+			l, err := net.Listen("tcp", "127.0.0.1:0")
+			Expect(err).NotTo(HaveOccurred())
+			port := l.Addr().(*net.TCPAddr).Port
+			Expect(l.Close()).To(Succeed())
+			proxy := newProxy(testDialPolicy, log.New(io.Discard, "", 0))
+			DeferCleanup(proxy.Close)
+			Expect(proxyPort{proxy: proxy, addr: net.JoinHostPort("::", strconv.Itoa(port)), upstream: up.Addr().String()}.openPort()).To(Succeed())
+			proxy.StopAccepting()
+			_, err = net.Dial("tcp6", net.JoinHostPort("::1", strconv.Itoa(port)))
+			Expect(err).To(HaveOccurred())
+		})
+	})
+
+	Describe("the fallback guest", func() {
+		It("gets the IPv6 setup when the network has an address, and none otherwise", func() {
+			stack := &guestStack{fallback: true}
+			contents := func(nw *network) string {
+				var got string
+				file := func(name string, _ uint32, content string) func() error {
+					if strings.HasSuffix(name, strings.TrimPrefix(guestFallbackInit, "/")) {
+						got = content
+					}
+					return func() error { return nil }
+				}
+				stack.fallbackSteps(nil, file, testNonce, false, nw)
+				return got
+			}
+			n := taskNetwork()
+			Expect(contents(n)).To(Equal(initScript(testNonce, false)))
+			n.enableIPv6(backend.VMQemu)
+			Expect(contents(n)).To(ContainSubstring(guestNetworkSetup6))
+		})
+	})
+
 	Describe("dualPort", func() {
 		var logs strings.Builder
 		logger := func() *log.Logger { logs.Reset(); return log.New(&logs, "", 0) }
 
 		It("opens and closes both", func() {
 			v4, v6 := &countingOpener{}, &countingOpener{}
-			d := dualPort{v4: v4, v6: v6, port: 8080, logger: logger()}
+			d := &dualPort{v4: v4, v6: v6, port: 8080, logger: logger()}
 			Expect(d.openPort()).To(Succeed())
 			Expect(d.closePort()).To(Succeed())
 			Expect([]int{v4.opens, v4.closes, v6.opens, v6.closes}).To(Equal([]int{1, 1, 1, 1}))
 		})
 
 		It("stays open over IPv4 when IPv6 cannot open, and says so", func() {
-			d := dualPort{v4: &countingOpener{}, v6: &countingOpener{openErr: errors.New("busy")}, port: 8080, logger: logger()}
+			d := &dualPort{v4: &countingOpener{}, v6: &countingOpener{openErr: errors.New("busy")}, port: 8080, logger: logger()}
 			Expect(d.openPort()).To(Succeed())
 			Expect(logs.String()).To(ContainSubstring("port 8080 is open over IPv4 only"))
 		})
 
 		It("fails when IPv4 cannot open, and leaves IPv6 closed", func() {
 			v6 := &countingOpener{}
-			d := dualPort{v4: &countingOpener{openErr: syscallInUse()}, v6: v6, port: 8080, logger: logger()}
+			d := &dualPort{v4: &countingOpener{openErr: syscallInUse()}, v6: v6, port: 8080, logger: logger()}
 			err := d.openPort()
 			Expect(isPortConflict(err)).To(BeTrue())
 			Expect(v6.opens).To(Equal(0))

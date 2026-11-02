@@ -278,15 +278,16 @@ func guestSidecarChecks(sidecars int) string {
 
 // fallbackSteps adds, for a guest that can fall back to the busybox guest,
 // the busybox guest's stage 2 for nonce, which mounts the volumes when volume
-// is set, its environment with mode 0600, and the commands that install its
-// trusted certificates, below guestFallbackDir.
-func (s *guestStack) fallbackSteps(cw *cpioWriter, file func(name string, perm uint32, content string) func() error, nonce string, volume bool) []func() error {
+// is set, with the IPv6 setup when nw has an address, its environment with
+// mode 0600, and the commands that install its trusted certificates, below
+// guestFallbackDir.
+func (s *guestStack) fallbackSteps(cw *cpioWriter, file func(name string, perm uint32, content string) func() error, nonce string, volume bool, nw *network) []func() error {
 	if !s.fallback {
 		return nil
 	}
 	return []func() error{
 		func() error { return cw.Dir(strings.TrimPrefix(guestFallbackDir, "/"), 0o755) },
-		file(strings.TrimPrefix(guestFallbackInit, "/"), 0o755, initScript(nonce, volume)),
+		file(strings.TrimPrefix(guestFallbackInit, "/"), 0o755, withGuestIPv6(initScript(nonce, volume), nw)),
 		file(strings.TrimPrefix(guestFallbackEnv, "/"), 0o600, s.fallbackEnv),
 		file(strings.TrimPrefix(guestFallbackPrep, "/"), 0o644, s.systemCerts.fallbackPrep()),
 	}

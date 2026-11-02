@@ -29,9 +29,10 @@ const (
 )
 
 // QEMU user-mode networking also carries an IPv6 network, which QEMU turns on
-// by default. As with the IPv4 one, the guest configures it statically with
-// the addresses QEMU's router advertisements would give it: the guest takes
-// the same host number as its IPv4 address, and QEMU is the gateway.
+// by default. As with the IPv4 one, the guest configures it statically. Its
+// router advertisements would give the guest an address derived from its MAC
+// address, so the guest takes its own in the same prefix, with the same host
+// number as its IPv4 address, and QEMU is the gateway.
 const (
 	qemuGuestCIDR6 = "fec0::15/64"
 	qemuGateway6   = "fec0::2"

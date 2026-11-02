@@ -1298,6 +1298,8 @@ func run(argv []string, logger *log.Logger) int {
 	}
 	sup.closePorts = stopMetrics
 	var gates *portGates
+	// ipv6Proxies are the proxies that hold IPv6 listeners.
+	var ipv6Proxies []*tcpProxy
 	if len(nw.ports) > 0 {
 		// One proxy or one monitor serves every port's opener.
 		var open func(port int) portOpener
@@ -1308,13 +1310,19 @@ func run(argv []string, logger *log.Logger) int {
 			}
 			proxy := newProxy(upstreamDialPolicy, logger, opts...)
 			defer proxy.Close()
+			if nw.listen6 {
+				ipv6Proxies = append(ipv6Proxies, proxy)
+			}
 			open = func(port int) portOpener {
 				v4 := proxyPort{proxy: proxy, addr: nw.listenAddr(port), upstream: nw.upstream(port)}
 				if !nw.listen6 {
 					return v4
 				}
+				// A plain listener on 0.0.0.0 takes IPv6 connections too,
+				// so with an IPv6 listener beside it this one takes IPv4 only.
+				v4.network = "tcp4"
 				v6 := proxyPort{proxy: proxy, addr: nw.listenAddr6(port), upstream: nw.upstream6(port)}
-				return dualPort{v4: v4, v6: v6, port: port, logger: logger}
+				return &dualPort{v4: v4, v6: v6, port: port, logger: logger}
 			}
 		} else {
 			// QEMU's forwarding rules take IPv4 host addresses only, so the
@@ -1324,6 +1332,7 @@ func run(argv []string, logger *log.Logger) int {
 			if nw.listen6 {
 				proxy6 = newProxy(upstreamDialPolicy, logger)
 				defer proxy6.Close()
+				ipv6Proxies = append(ipv6Proxies, proxy6)
 			}
 			open = func(port int) portOpener {
 				v4 := qmpPort{monitor: qmp, port: port}
@@ -1331,7 +1340,7 @@ func run(argv []string, logger *log.Logger) int {
 					return v4
 				}
 				v6 := proxyPort{proxy: proxy6, addr: nw.listenAddr6(port), upstream: nw.upstream6(port)}
-				return dualPort{v4: v4, v6: v6, port: port, logger: logger}
+				return &dualPort{v4: v4, v6: v6, port: port, logger: logger}
 			}
 		}
 		// The explicit gates.end after sup.run is the one that ends the
@@ -1365,6 +1374,11 @@ func run(argv []string, logger *log.Logger) int {
 	if gates != nil {
 		// The gates' last lines about the ports come before the exit line.
 		gates.end()
+	}
+	// Whatever the gates left open over IPv6 stops accepting now that the
+	// guest is gone, rather than when this function returns.
+	for _, p := range ipv6Proxies {
+		p.StopAccepting()
 	}
 	// The hub's queued lines reach a relay, or else vm-launch's own output,
 	// before the exit line, and a sidecar that exited first holds the stop

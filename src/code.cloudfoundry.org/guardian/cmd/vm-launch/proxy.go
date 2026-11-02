@@ -142,6 +142,14 @@ func newProxy(policy dialPolicy, logger *log.Logger, opts ...proxyOption) *tcpPr
 // proxy already listens on listenAddr, and with errProxyStopped after
 // StopAccepting or Close. The listener is bound when it returns.
 func (p *tcpProxy) Listen(listenAddr, upstream string) error {
+	return p.ListenNetwork(listenNetwork(listenAddr), listenAddr, upstream)
+}
+
+// ListenNetwork is Listen on the named network, tcp4 or tcp6 to take one
+// address family only. A plain tcp listener on a wildcard address takes both
+// families, so it would hold the port against a tcp6 listener of the same
+// port.
+func (p *tcpProxy) ListenNetwork(network, listenAddr, upstream string) error {
 	p.mu.Lock()
 	_, busy := p.listeners[listenAddr]
 	stopped := p.stopped
@@ -152,7 +160,7 @@ func (p *tcpProxy) Listen(listenAddr, upstream string) error {
 	case busy:
 		return errors.New("the port proxy is already listening")
 	}
-	ln, err := net.Listen(listenNetwork(listenAddr), listenAddr)
+	ln, err := net.Listen(network, listenAddr)
 	if err != nil {
 		return fmt.Errorf("listening for the guest port: %w", err)
 	}
