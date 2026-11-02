@@ -17,8 +17,8 @@ const (
 )
 
 // The stack's own tools, which stage 2 runs inside the app root to enter the
-// app's working directory and drop to the app's user (see
-// guestStackRunCommand), and the launcher's path there, which is where Diego
+// app's working directory and drop to the app's user (see stackExec), and
+// the launcher's path there, which is where Diego
 // puts it in a container. Stage 1 checks that all three are executable before
 // it hands over, so a stack without them fails the boot with a named step
 // instead of a command that cannot start.
@@ -167,17 +167,18 @@ hostname -F ` + guestHostname + ` || rvm_fail "setting the guest's hostname fail
 // nil stack is the busybox guest, which has none.
 func (s *guestStack) hasAppRoot() bool { return s != nil }
 
-// initScript is the stack guest's stage 2. A guest with sidecars or an
-// instance identity runs the app and its sidecars through the run section
-// (see guestRunSection), and checks each sidecar's files before the start
-// tag, as well as, with an identity, whether the console still echoes. The
-// boot pair, the run section's FIFO, and the log FIFOs of every process are
-// set up before the start tag too (see guestRunSetup), and so are the
-// trusted certificate files, with or without the rest (see
-// guestSystemCertsSetup). Such a guest frames the output of every process
-// (see guestProcessWrapper), so no process holds the console. Any other
-// stack guest runs stackInitScript, whose app shares the console with stage
-// 2.
+// initScript is the stack guest's stage 2. Every stack guest runs the app
+// and its sidecars, if it has any, through the run section (see
+// guestRunSection), and checks each sidecar's files before the start tag, as
+// well as, with an identity, whether the console still echoes. The boot
+// pair, the run section's FIFO, and the log FIFOs of every process are set
+// up before the start tag too (see guestRunSetup), and so are the trusted
+// certificate files, with or without the rest (see guestSystemCertsSetup).
+// The guest frames the output of every process (see guestProcessWrapper), so
+// no process holds the console, even an app that runs alone: none can read
+// the stop request or a pushed pair, and none can write a line that
+// vm-launch would take for the guest's own. Only the busybox guest, whose
+// command runs as root, shares the console with stage 2.
 func (s *guestStack) initScript(nonce string) string {
 	return s.initScriptWithVolumes(nonce, false)
 }
@@ -191,9 +192,6 @@ func (s *guestStack) initScript(nonce string) string {
 // before the host's stop deadline.
 func (s *guestStack) initScriptWithVolumes(nonce string, volume bool) string {
 	certs := guestSystemCertsSetup(s.systemCerts)
-	if len(s.sidecars) == 0 && s.identity == nil {
-		return stage2Script(nonce, volume, true, certs, "")
-	}
 	procs := s.processes()
 	checks := guestSidecarChecks(len(s.sidecars))
 	if s.identity != nil {
@@ -210,7 +208,7 @@ func (s *guestStack) initScriptWithVolumes(nonce string, volume bool) string {
 // processes returns the app, from /rvm/argv and the guest environment, and
 // then each sidecar, from its own argv and its environment over the guest's.
 // Every process starts in the app's working directory. The app records its
-// pid in guestAppPid, as it does without sidecars.
+// pid in guestAppPid, as the busybox guest's command does.
 func (s *guestStack) processes() []guestProcess {
 	procs := []guestProcess{{index: 0, argvPath: guestArgv, envPaths: []string{"/rvm/env"}, dir: s.cwd, pidPath: guestAppPid}}
 	for i := range s.sidecars {
@@ -226,17 +224,28 @@ func (s *guestStack) processes() []guestProcess {
 	return procs
 }
 
-// stackExec is the stack guest's guestExec. It runs a process as
-// guestStackRunCommand runs the app: it sources the process's environment
-// files, sets its arguments from its argv file with eval, moves the loader
-// variables into the arguments (see guestLoaderHold), and execs busybox
-// chroot into the app root, where the stack's setpriv drops to uid 2000
-// before the stack's env enters the working directory, puts the loader
-// variables back, and execs the argv (see guestStackDrop).
+// stackExec is the stack guest's guestExec, with which it runs the app and
+// each sidecar: it sources the process's environment files, sets its
+// arguments from its argv file with eval, which the quoting makes exact for
+// any bytes, newlines and quotes included, moves the loader variables into
+// the arguments (see guestLoaderHold), and execs busybox chroot into the app
+// root. There the stack's setpriv sets the real, effective, and saved uid
+// and gid to 2000, takes vcap's supplementary groups from the stack's
+// /etc/group, and sets no_new_privs, as Garden does for a container's
+// processes, and the stack's env, as uid 2000, enters the working
+// directory, puts the loader variables back, and execs the argv (see
+// guestStackDrop). The working directory is entered only after the drop, so
+// a link in the droplet cannot make root resolve it. Every one of those
+// programs execs in place, so the pid that the run section recorded is the
+// launcher's, then bash's, and then the start command's own, as it is under
+// runC, and the control reader's SIGTERM reaches the process.
+//
 // The working directory is quoted into the line, and the run section has
 // already recorded the pid and set the open-files limit, so nothing after
 // the first source reads a shell variable that the environment files can
-// set.
+// set, because they may set any name. A PATH from them does not choose
+// chroot or cat, which are named by the busybox binary's path (see
+// guestRootCat), and the stack's programs are named by their paths.
 func stackExec(p guestProcess) string {
 	line := ""
 	for _, env := range p.envPaths {

@@ -12,7 +12,7 @@ import (
 	. "github.com/onsi/gomega"
 )
 
-var _ = Describe("the stack guest's command", func() {
+var _ = Describe("the stack guest's process line", func() {
 	var dir, bin string
 
 	// show starts each stub, which prints its name, its pid, each argument
@@ -86,12 +86,16 @@ exit "${LAUNCHER_RC:-0}"
 		).Replace(text)
 	}
 
-	// run runs the command and the status line in the guest's busybox sh,
-	// with the open-files limit at 256 soft and the current hard limit, and
-	// returns its standard output and the pid the subshell recorded.
+	// run runs the app's line from stackExec in the guest's busybox sh, in a
+	// subshell that records its pid and sets the open-files limit as the run
+	// section's process subshell does (see guestProcessWrapper), with the
+	// limit at 256 soft and the current hard limit, and returns its standard
+	// output, which ends with the status line, and the pid the subshell
+	// recorded.
 	run := func(env ...string) (string, string) {
 		GinkgoHelper()
-		text := script("RVM_NOFILE_HARD=$(ulimit -H -n) RVM_NOFILE_SOFT=256\n"+guestStackRunCommand+guestRunStatus) + "echo \"status=$rvm_status\"\n"
+		app := guestProcess{index: 0, argvPath: guestArgv, envPaths: []string{"/rvm/env"}, dir: "/home/vcap", pidPath: guestAppPid}
+		text := script("RVM_NOFILE_HARD=$(ulimit -H -n) RVM_NOFILE_SOFT=256\n( { read -r rvm_self rvm_rest </proc/self/stat && echo \"$rvm_self\" >"+guestAppPid+"; } && "+guestSetLimits+" && "+stackExec(app)+" ) </dev/null\nrvm_status=$?\n") + "echo \"status=$rvm_status\"\n"
 		Expect(text).To(ContainSubstring("exec " + filepath.Join(bin, "chroot") + " " + dir + "/rvm/app "))
 		cmd := exec.Command(guestBusybox(), "sh", "-c", text)
 		cmd.Env = append([]string{"PATH=" + bin + ":/usr/bin:/bin"}, env...)
@@ -192,11 +196,6 @@ exit "${LAUNCHER_RC:-0}"
 		Expect(strings.TrimSuffix(out, after)).NotTo(ContainSubstring("=["))
 		Expect(out).NotTo(ContainSubstring("[LD_NOT_A_LOADER_NAME="))
 		Expect(filepath.Join(dir, "pwned")).NotTo(BeAnExistingFile())
-	})
-
-	It("starts as the rvm.6 guest's command does", func() {
-		Expect(guestRunCommand).To(HavePrefix(guestRunPrefix))
-		Expect(guestStackRunCommand).To(HavePrefix(guestRunPrefix))
 	})
 
 	// check runs rvm_fail and the checks in the guest's busybox sh with
