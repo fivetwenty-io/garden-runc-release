@@ -407,9 +407,15 @@ const (
 )
 
 // vmCPUCounter is the CPU counter that Metrics reports for one VM container.
-// It starts from the cgroup, moves on to the guest's figures on top of the
-// cgroup's last reading, and holds its last figure when the guest's samples
-// go stale. It never decreases in any of its three fields.
+// It starts from the cgroup, moves on to the guest's figures, and while the
+// guest's samples are stale it follows the cgroup's rise. It never decreases
+// in any of its three fields.
+//
+// The cgroup holds the guest's vCPU threads, so by the time the first sample
+// arrives its figure already includes the guest's time. The counter therefore
+// makes the guest's time the part of the cgroup figure that it replaces. Its
+// offset is the cgroup's reading minus the guest's, the time the container
+// spent on everything else, and the figure is the offset plus the guest's.
 type vmCPUCounter struct {
 	mu sync.Mutex
 
@@ -417,38 +423,48 @@ type vmCPUCounter struct {
 	offset   garden.ContainerCPUStat
 	guest    vmCPUSample
 	at       time.Time
+	cgroup   garden.ContainerCPUStat
 	reported garden.ContainerCPUStat
 }
 
-func (v *vmCPUCounter) mode() vmCPUSource {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-
-	return v.source
+// vmCPUReading is a figure that vmCPUCounter.report returns, with the source
+// of the counter before and after the reading.
+type vmCPUReading struct {
+	Stat          garden.ContainerCPUStat
+	Before, After vmCPUSource
 }
 
 // report returns the figure for a reading at now, given the cgroup's figure,
 // the container's guest sample when it is fresh, the container's age, and the
 // number of vCPUs that bound the guest's rise.
-func (v *vmCPUCounter) report(cgroup garden.ContainerCPUStat, sample vmCPUSample, fresh bool, now time.Time, age time.Duration, cores int) garden.ContainerCPUStat {
+func (v *vmCPUCounter) report(cgroup garden.ContainerCPUStat, sample vmCPUSample, fresh bool, now time.Time, age time.Duration, cores int) vmCPUReading {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+
+	before := v.source
+	rise := vmCPUDelta(cgroup, v.cgroup)
+	v.cgroup = cgroup
 
 	if !fresh {
 		if v.source == vmCPUFromCgroup {
 			v.reported = vmCPUMax(v.reported, cgroup)
-			return v.reported
+		} else {
+			// Nothing in the guest can be trusted to say how much the app
+			// used, so the counter follows the cgroup's rise, which the guest
+			// cannot forge.
+			v.source = vmCPUHeld
+			v.reported = garden.ContainerCPUStat{
+				Usage:  v.reported.Usage + rise.Usage,
+				User:   v.reported.User + rise.User,
+				System: v.reported.System + rise.System,
+			}
 		}
 
-		v.source = vmCPUHeld
-		return v.reported
+		return vmCPUReading{Stat: v.reported, Before: before, After: v.source}
 	}
 
-	var window time.Duration
-	if v.source == vmCPUFromCgroup {
-		v.offset = vmCPUMax(v.reported, cgroup)
-		window = age
-	} else {
+	window := age
+	if v.source != vmCPUFromCgroup {
 		window = now.Sub(v.at)
 	}
 
@@ -461,7 +477,16 @@ func (v *vmCPUCounter) report(cgroup garden.ContainerCPUStat, sample vmCPUSample
 		System: min(max(sample.System, v.guest.System), v.guest.System+limit),
 	}
 	v.at = now
-	v.source = vmCPUFromGuest
+
+	if v.source != vmCPUFromGuest {
+		base := vmCPUMax(v.reported, cgroup)
+		v.offset = garden.ContainerCPUStat{
+			Usage:  vmCPUSub(base.Usage, v.guest.User+v.guest.System),
+			User:   vmCPUSub(base.User, v.guest.User),
+			System: vmCPUSub(base.System, v.guest.System),
+		}
+		v.source = vmCPUFromGuest
+	}
 
 	v.reported = vmCPUMax(v.reported, garden.ContainerCPUStat{
 		Usage:  v.offset.Usage + v.guest.User + v.guest.System,
@@ -469,7 +494,20 @@ func (v *vmCPUCounter) report(cgroup garden.ContainerCPUStat, sample vmCPUSample
 		System: v.offset.System + v.guest.System,
 	})
 
-	return v.reported
+	return vmCPUReading{Stat: v.reported, Before: before, After: v.source}
+}
+
+func vmCPUSub(a, b uint64) uint64 {
+	if b > a {
+		return 0
+	}
+
+	return a - b
+}
+
+// vmCPUDelta is how much each field of now is above before, or zero.
+func vmCPUDelta(now, before garden.ContainerCPUStat) garden.ContainerCPUStat {
+	return garden.ContainerCPUStat{Usage: vmCPUSub(now.Usage, before.Usage), User: vmCPUSub(now.User, before.User), System: vmCPUSub(now.System, before.System)}
 }
 
 func vmCPUMax(a, b garden.ContainerCPUStat) garden.ContainerCPUStat {

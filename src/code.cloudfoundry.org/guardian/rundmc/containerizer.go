@@ -989,38 +989,49 @@ func (c *Containerizer) applyGuestMemory(log lager.Logger, handle string, metric
 //
 // The executor reads this counter from the start of the container, and the
 // consumers of Diego's metrics take the difference between two readings, so
-// the counter must never decrease. Until the container has a guest sample the
-// cgroup figure is reported. The first guest sample is added to the last
-// cgroup figure, so the counter carries on from it. From then on the cgroup is
-// not used again. While the sample is stale the last figure is held, and when
-// a fresh sample returns the counter moves on by what the guest used since.
-// The guest counter's rise since the last reading is bounded by what the
-// vCPUs could have run in the time, so a figure that a command in the guest
-// forged cannot overflow the consumers' arithmetic.
+// the counter must never decrease (see vmCPUCounter). Until the container has
+// a guest sample the cgroup figure is reported. The first guest sample
+// replaces the guest's share of the cgroup figure, so the counter carries on
+// from it without counting the guest's time twice. From then on the cgroup is
+// not reported as it is. While the sample is stale the counter follows the
+// cgroup's rise, and when a fresh sample returns it carries on from there. The
+// guest counter's rise since the last reading is bounded by what the vCPUs
+// could have run in the time, so a figure that a command in the guest forged
+// cannot overflow the consumers' arithmetic.
 func (c *Containerizer) applyGuestCPU(log lager.Logger, handle string, age time.Duration, metrics *gardener.ActualContainerMetrics) {
-	loaded, _ := c.guestCPUCounters.LoadOrStore(handle, &vmCPUCounter{})
+	loaded, existed := c.guestCPUCounters.LoadOrStore(handle, &vmCPUCounter{})
+	if !existed && !c.bundleExists(log, handle) {
+		// Destroy ran between the bundle's lookup and now, and its removal
+		// of the counter came first.
+		c.guestCPUCounters.Delete(handle)
+		return
+	}
 	counter := loaded.(*vmCPUCounter)
 
 	sample, fresh := c.guestCPU.Fresh(handle)
-	now := c.guestCPU.clock()
 
 	cores := c.guestCPUCores
 	if cores <= 0 {
 		cores = runtime.NumCPU()
 	}
 
-	previous := counter.mode()
-	reported := counter.report(metrics.CPU, sample, fresh, now, age, cores)
-	metrics.CPU = reported
+	reading := counter.report(metrics.CPU, sample, fresh, c.guestCPU.clock(), age, cores)
+	metrics.CPU = reading.Stat
 
-	if current := counter.mode(); current != previous {
-		switch current {
+	if reading.After != reading.Before {
+		switch reading.After {
 		case vmCPUFromGuest:
 			log.Info("vm-cpu-from-guest", lager.Data{"handle": handle})
 		case vmCPUHeld:
 			log.Info("vm-cpu-held", lager.Data{"handle": handle})
 		}
 	}
+}
+
+// bundleExists says whether the runtime still has the container's bundle.
+func (c *Containerizer) bundleExists(log lager.Logger, handle string) bool {
+	_, _, err := c.runtime.BundleInfo(log, handle)
+	return !isNotFound(err)
 }
 
 func (c *Containerizer) Shutdown() error {

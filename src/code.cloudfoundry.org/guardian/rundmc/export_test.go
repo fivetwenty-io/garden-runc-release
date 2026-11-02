@@ -36,3 +36,9 @@ func SetGuestCPUClock(c *Containerizer, now func() time.Time) {
 func SetGuestCPUCores(c *Containerizer, cores int) {
 	c.guestCPUCores = cores
 }
+
+// HasGuestCPUCounter says whether the container has a CPU counter.
+func HasGuestCPUCounter(c *Containerizer, handle string) bool {
+	_, ok := c.guestCPUCounters.Load(handle)
+	return ok
+}

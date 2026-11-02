@@ -928,6 +928,24 @@ var _ = Describe("Rundmc", func() {
 						Expect(usage()).To(Equal(uint64(50)))
 					})
 
+					It("leaves no counter behind when a Metrics call races the container's destruction", func() {
+						run()
+						calls := 0
+						bundle := bundleFor(map[string]string{backend.AnnotationKey: string(kind)})
+						bundle.Spec.Linux = &specs.Linux{Resources: &specs.LinuxResources{}}
+						fakeOCIRuntime.BundleInfoStub = func(lager.Logger, string) (string, goci.Bndl, error) {
+							calls++
+							if calls == 1 {
+								return "/bundle", bundle, nil
+							}
+
+							return "", goci.Bndl{}, garden.ContainerNotFoundError{Handle: "some-handle"}
+						}
+
+						Expect(cpu()).To(Equal(cgroupCPU))
+						Expect(rundmc.HasGuestCPUCounter(containerizer, "some-handle")).To(BeFalse())
+					})
+
 					It("reports the cgroup figure when the launcher wrote no sample", func() {
 						lines = nil
 
@@ -1091,7 +1109,7 @@ var _ = Describe("Rundmc", func() {
 
 						run()
 
-						Expect(cpu()).To(Equal(garden.ContainerCPUStat{Usage: 9000 + 40000000, User: 6000 + 30000000, System: 3000 + 10000000}))
+						Expect(cpu()).To(Equal(garden.ContainerCPUStat{Usage: 40000000, User: 30000000, System: 10000000}))
 					})
 
 					It("reports the newest sample", func() {
@@ -1099,7 +1117,7 @@ var _ = Describe("Rundmc", func() {
 
 						run()
 
-						Expect(cpu()).To(Equal(garden.ContainerCPUStat{Usage: 9000 + 70000000, User: 6000 + 50000000, System: 3000 + 20000000}))
+						Expect(cpu()).To(Equal(garden.ContainerCPUStat{Usage: 70000000, User: 50000000, System: 20000000}))
 					})
 
 					It("keeps the user and system times adding up to the usage", func() {
@@ -1131,14 +1149,86 @@ var _ = Describe("Rundmc", func() {
 						Expect(cpu()).To(Equal(fresh))
 					})
 
-					It("never goes back to the cgroup once it has reported a guest sample", func() {
+					// stat is a cgroup figure whose user and system times add up
+					// to its usage.
+					stat := func(user, system uint64) garden.ContainerCPUStat {
+						return garden.ContainerCPUStat{Usage: user + system, User: user, System: system}
+					}
+
+					It("does not count the guest's time twice, since the cgroup already holds it", func() {
+						// The cgroup holds 600 ms and 400 ms of the container's own
+						// work, and the guest's 30 ms and 10 ms are inside it.
+						fakeCPUCgrouper.ReadTotalCgroupUsageReturns(stat(600e6, 400e6), nil)
+						Expect(cpu()).To(Equal(stat(600e6, 400e6)))
+
 						run()
-						fresh := cpu()
+						fakeCPUCgrouper.ReadTotalCgroupUsageReturns(stat(630e6, 410e6), nil)
+						now = now.Add(15 * time.Second)
+						Expect(cpu()).To(Equal(stat(630e6, 410e6)))
 
-						fakeCPUCgrouper.ReadTotalCgroupUsageReturns(garden.ContainerCPUStat{Usage: 1e12, User: 6e11, System: 4e11}, nil)
+						// The guest used 20 ms and 10 ms more, and the cgroup rose with it.
+						_, _ = writer.Write([]byte(laterCPULine))
+						fakeCPUCgrouper.ReadTotalCgroupUsageReturns(stat(650e6, 420e6), nil)
+						now = now.Add(15 * time.Second)
+						Expect(cpu()).To(Equal(stat(650e6, 420e6)))
+					})
+
+					It("follows the cgroup's rise while the sample is stale, and never its fall", func() {
+						run()
+						fakeCPUCgrouper.ReadTotalCgroupUsageReturns(stat(100, 50), nil)
+						held := cpu()
+						Expect(held).To(Equal(stat(30e6, 10e6)))
+
 						now = now.Add(time.Minute)
+						Expect(cpu()).To(Equal(held))
 
-						Expect(cpu()).To(Equal(fresh))
+						fakeCPUCgrouper.ReadTotalCgroupUsageReturns(stat(160, 90), nil)
+						Expect(cpu()).To(Equal(stat(30e6+60, 10e6+40)))
+
+						fakeCPUCgrouper.ReadTotalCgroupUsageReturns(stat(10, 10), nil)
+						Expect(cpu()).To(Equal(stat(30e6+60, 10e6+40)))
+
+						fakeCPUCgrouper.ReadTotalCgroupUsageReturns(stat(30, 20), nil)
+						Expect(cpu()).To(Equal(stat(30e6+80, 10e6+50)))
+					})
+
+					It("keeps rising when the guest's watcher has died and the sample never returns", func() {
+						run()
+						fakeCPUCgrouper.ReadTotalCgroupUsageReturns(stat(0, 0), nil)
+						cpu()
+						now = now.Add(time.Hour)
+
+						var last uint64
+						for i := uint64(1); i <= 3; i++ {
+							fakeCPUCgrouper.ReadTotalCgroupUsageReturns(stat(i*1e9, i*1e9), nil)
+							now = now.Add(time.Minute)
+							got := cpu()
+							Expect(got.Usage).To(BeNumerically(">", last))
+							last = got.Usage
+						}
+					})
+
+					It("carries on from the advanced figure, and adds only what the guest used, when samples return", func() {
+						run()
+						fakeCPUCgrouper.ReadTotalCgroupUsageReturns(stat(0, 0), nil)
+						cpu()
+
+						now = now.Add(time.Minute)
+						fakeCPUCgrouper.ReadTotalCgroupUsageReturns(stat(900e6, 100e6), nil)
+						held := cpu()
+						Expect(held.Usage).To(BeNumerically(">=", uint64(1e9)))
+
+						_, _ = writer.Write([]byte(laterCPULine))
+						returned := cpu()
+						Expect(returned.Usage).To(BeNumerically(">=", held.Usage))
+						Expect(returned.User).To(BeNumerically(">=", held.User))
+						Expect(returned.System).To(BeNumerically(">=", held.System))
+
+						_, _ = writer.Write([]byte("vm-launch-metrics v1 cpu user=60000000 system=20000000\n"))
+						now = now.Add(15 * time.Second)
+						after := cpu()
+						Expect(after.User - returned.User).To(Equal(uint64(10e6)))
+						Expect(after.System - returned.System).To(BeZero())
 					})
 
 					It("carries on from the held figure when a new sample arrives", func() {
@@ -1149,7 +1239,7 @@ var _ = Describe("Rundmc", func() {
 						Expect(cpu()).To(Equal(first))
 
 						_, _ = writer.Write([]byte(laterCPULine))
-						Expect(cpu()).To(Equal(garden.ContainerCPUStat{Usage: 9000 + 70000000, User: 6000 + 50000000, System: 3000 + 20000000}))
+						Expect(cpu()).To(Equal(garden.ContainerCPUStat{Usage: 70000000, User: 50000000, System: 20000000}))
 					})
 
 					It("does not decrease through the cgroup, the first sample, a stale spell, and the return", func() {
@@ -1241,14 +1331,14 @@ var _ = Describe("Rundmc", func() {
 
 						metrics, err := containerizer.Metrics(logger, "some-handle")
 						Expect(err).NotTo(HaveOccurred())
-						Expect(metrics.CPU.Usage).To(Equal(uint64(9000 + 40000000)))
+						Expect(metrics.CPU.Usage).To(Equal(uint64(40000000)))
 						Expect(metrics.Memory.TotalUsageTowardLimit).To(Equal(uint64(300)))
 					})
 
 					It("removes the sample when its own process ends, and holds the figure", func() {
 						process := run()
 						held := cpu()
-						Expect(held.Usage).To(Equal(uint64(9000 + 40000000)))
+						Expect(held.Usage).To(Equal(uint64(40000000)))
 
 						_, err := process.Wait()
 						Expect(err).NotTo(HaveOccurred())
@@ -1258,7 +1348,7 @@ var _ = Describe("Rundmc", func() {
 
 					It("forgets the counter when the container is destroyed", func() {
 						run()
-						Expect(cpu().Usage).To(Equal(uint64(9000 + 40000000)))
+						Expect(cpu().Usage).To(Equal(uint64(40000000)))
 
 						Expect(containerizer.Destroy(logger, "some-handle")).To(Succeed())
 
