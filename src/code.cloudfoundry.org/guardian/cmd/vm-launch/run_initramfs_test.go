@@ -353,22 +353,23 @@ var _ = Describe("the initramfs of a guest without a stack", func() {
 		return hex.EncodeToString(sum[:])
 	}
 
-	// The sums are those of the archives from before the stack guest, so
-	// that a guest without a stack boots the very initramfs it always did.
+	// The sums are those of the archives a guest without a stack builds from
+	// the container's host files, which these guests have none of, so that
+	// the archive changes only where the hostname setup is added to stage 2.
 	It("is byte for byte the archive it was before the stack guest, for a task, an LRP with a root disk and a CA bundle, and a guest with a volume", func() {
 		task := taskGuest("true")
-		Expect(archiveSum(task)).To(Equal("56a82e4104526177e88073e7e336bb9b7587555ccf5ccac5942991a35f39d3ea"))
+		Expect(archiveSum(task)).To(Equal("16d420432125dfd1c413ad96fda75a4d016583d4a78998762deea5ddb18a88ed"))
 
 		lrp := taskGuest("exec ./server")
 		lrp.nw = &network{ports: []int{8080}, address: qemuGuestCIDR, gateway: qemuGateway, resolvConf: "nameserver 10.0.2.3\n"}
 		lrp.rootBytes, lrp.rootInodeRatio, lrp.drives.rootID = 64<<20, inodeRatioFor(64<<20), qemuRootSerial
 		lrp.caBundle = []byte("-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n")
-		Expect(archiveSum(lrp)).To(Equal("112057c868b6523968d6afd3ecb590b1355796692189cab097defa817ebc9603"))
+		Expect(archiveSum(lrp)).To(Equal("e485b74e6eefeb8ae18e8e52eb475049b5acc54581ed968ab2123679e45642f6"))
 
 		vol := taskGuest("true")
 		vol.vols = []guestVolume{{ContainerDir: "/home/vcap/data", ImageName: "rvm-disk-0.img"}}
 		vol.drives.volumes = qemuImageDrives(defaultImageSize)
-		Expect(archiveSum(vol)).To(Equal("93cbe815c6c3235c643ba59e761f5b2365bc6f8b40acb9ad3e3c031b7dce200f"))
+		Expect(archiveSum(vol)).To(Equal("2438cbecf4d9808db20ed010669f6ed63f43bdf30c29bc1b639b9502441fb527"))
 	})
 })
 
@@ -552,7 +553,7 @@ var _ = Describe("the initramfs of a guest with a stack", func() {
 	// from: without a /dev/shm of its own, and with the argv and working
 	// directory checks after the environment checks.
 	stackBase := func() string {
-		return strings.NewReplacer(guestShmSetup, "", guestEnvChecks, guestEnvChecks+guestStackChecks).Replace(initScript(testNonce, false))
+		return strings.NewReplacer(guestShmSetup, "", guestHostnameSetup, "", guestEnvChecks, guestEnvChecks+guestStackChecks).Replace(initScript(testNonce, false))
 	}
 
 	It("runs the launcher in stage 2 after the argv and working directory checks, through the run section, and mounts no /dev/shm of its own", func() {

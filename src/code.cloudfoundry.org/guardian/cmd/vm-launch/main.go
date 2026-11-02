@@ -905,14 +905,6 @@ func run(argv []string, logger *log.Logger) int {
 	if stack != nil {
 		stack.windDown = guestWindDownTime
 	}
-	// The busybox guest gets the container's hostname and hosts file as the
-	// stack guest does. A file vm-launch cannot read is logged and left out,
-	// because the guest booted without one before.
-	var hosts []byte
-	var hostname string
-	if stack == nil {
-		hosts, hostname = readContainerHostFiles(logger)
-	}
 	closeLauncher := func() {
 		if stack != nil {
 			closeFile(stack.launcher.file, "the launcher", logger)
@@ -1178,6 +1170,15 @@ func run(argv []string, logger *log.Logger) int {
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError
+	}
+	// The busybox guest gets the container's hostname and hosts file as the
+	// stack guest does. A file vm-launch cannot read is logged and left out,
+	// because the guest booted without one before. A guest that fell back to
+	// busybox from a stack gets them too.
+	var hosts []byte
+	var hostname string
+	if stack == nil {
+		hosts, hostname = readContainerHostFiles(logger)
 	}
 	initrd, err = buildGuestInitramfs(filepath.Join(cfg.artifacts, artBusybox), guestContents{
 		command:        cfg.command,
