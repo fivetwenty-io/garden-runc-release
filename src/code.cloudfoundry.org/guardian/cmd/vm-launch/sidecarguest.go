@@ -41,13 +41,20 @@ func guestSidecarFile(index int, name string) string {
 // seconds is the most grace that still leaves 2 seconds, as Diego leaves
 // vm-launch after stopDeadline, for the stop line's trip, the SIGKILL, which
 // can wait up to a second for a pid file that is still empty, the OOM
-// report, and the exit line's trip back. A stack guest runs no volume
-// teardown after the section, so nothing else shares that time.
-// guestTimeoutSeconds is the same time as the text the guest's shell takes,
-// and a spec keeps the two in step and the gap in place.
+// report, and the exit line's trip back. guestTimeoutSeconds is the same
+// time as the text the guest's shell takes, and a spec keeps the two in step
+// and the gap in place.
+//
+// A stack guest with volumes runs its volume teardown after the section,
+// and the teardown shares that time too (see guestStackRunVolumeTeardown).
+// That guest's wind-down is guestVolumeWindDown, which leaves the 2 seconds
+// and guestTeardownKillWait, the one wait of that teardown.
 const (
 	guestWindDown       = 6 * time.Second
 	guestTimeoutSeconds = "6"
+
+	guestVolumeWindDown       = 5 * time.Second
+	guestVolumeTimeoutSeconds = "5"
 )
 
 // guestRunSection is the part of stage 2 that runs the app and its sidecars
@@ -86,6 +93,13 @@ const (
 // with the status in rvm_status, the FIFO and fd 5 closed, and the control
 // reader stopped.
 func guestRunSection(nonce string, procs []guestProcess, identity bool, exec guestExec) string {
+	return guestRunSectionWithin(nonce, procs, identity, exec, guestTimeoutSeconds)
+}
+
+// guestRunSectionWithin is guestRunSection with a wind-down of timeout
+// seconds, in the text the guest's shell takes, in place of
+// guestTimeoutSeconds.
+func guestRunSectionWithin(nonce string, procs []guestProcess, identity bool, exec guestExec, timeout string) string {
 	var b strings.Builder
 	b.WriteString(`command exec 4<>` + guestEvents + ` || rvm_fail "opening the event FIFO ` + guestEvents + ` failed"
 `)
@@ -99,7 +113,7 @@ func guestRunSection(nonce string, procs []guestProcess, identity bool, exec gue
 	for _, p := range procs {
 		b.WriteString(guestProcessWrapper(p, exec) + " |\n")
 	}
-	b.WriteString(guestEventLoop(nonce, procs))
+	b.WriteString(guestEventLoopWithin(nonce, procs, timeout))
 	b.WriteString("rvm_status=$?\ncommand exec 4>&- 5>&-\n" + guestStopReaderStop)
 	return b.String()
 }
@@ -242,6 +256,12 @@ rvm_drain() {
 // The shell's reports of a sleep or a timer that SIGTERM ended go to
 // /dev/null.
 func guestEventLoop(nonce string, procs []guestProcess) string {
+	return guestEventLoopWithin(nonce, procs, guestTimeoutSeconds)
+}
+
+// guestEventLoopWithin is guestEventLoop with a timer of timeout seconds, in
+// the text the guest's shell takes, in place of guestTimeoutSeconds.
+func guestEventLoopWithin(nonce string, procs []guestProcess, timeout string) string {
 	var signal, names strings.Builder
 	for _, p := range procs {
 		idx := strconv.Itoa(p.index)
@@ -284,7 +304,7 @@ func guestEventLoop(nonce string, procs []guestProcess) string {
 		(
 			rvm_term=
 			trap 'rvm_term=1' TERM
-			sleep ` + guestTimeoutSeconds + ` &
+			sleep ` + timeout + ` &
 			rvm_sleep=$!
 			[ -n "$rvm_term" ] || wait "$rvm_sleep"
 			kill "$rvm_sleep" 2>/dev/null
@@ -315,7 +335,7 @@ func guestEventLoop(nonce string, procs []guestProcess) string {
 			fi
 			;;
 		timeout)
-			echo "vm-launch guest: the app and its sidecars did not all exit within ` + guestTimeoutSeconds + ` seconds; ending the rest"
+			echo "vm-launch guest: the app and its sidecars did not all exit within ` + timeout + ` seconds; ending the rest"
 			rvm_signal KILL
 			break
 			;;

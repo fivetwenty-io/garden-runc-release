@@ -10,7 +10,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"time"
 
 	"code.cloudfoundry.org/guardian/backend"
 	. "github.com/onsi/ginkgo/v2"
@@ -97,24 +99,40 @@ var _ = Describe("the volumes of the stack guest", func() {
 			Expect(script).NotTo(ContainSubstring(guestVolumeSetup))
 		})
 
-		It("binds and unbinds the volumes in a guest whose app runs through the run section too", func() {
+		It("binds the volumes in a guest whose app runs through the run section too, which winds down within guestVolumeWindDown and has the teardown with no SIGTERM wait", func() {
 			s := &guestStack{sidecars: []guestSidecar{{argv: "'sidecar'"}}}
 			script := s.initScriptWithVolumes(testNonce, true)
 			start := strings.Index(script, "echo "+startTag(testNonce)+"\n")
 			Expect(strings.Index(script, guestStackVolumeBinds)).To(BeNumerically("<", start))
-			Expect(strings.Index(script, guestStackVolumeTeardown)).To(BeNumerically(">", start))
-			Expect(strings.Index(script, guestStackVolumeTeardown)).To(BeNumerically(">", strings.Index(script, guestRunSection(testNonce, s.processes(), false, stackExec))))
+			section := guestRunSectionWithin(testNonce, s.processes(), false, stackExec, guestVolumeTimeoutSeconds)
+			Expect(strings.Index(script, section)).To(BeNumerically(">", start))
+			Expect(strings.Index(script, guestStackRunVolumeTeardown)).To(BeNumerically(">", strings.Index(script, section)))
+			Expect(script).NotTo(ContainSubstring(guestStackVolumeTeardown))
+			Expect(script).To(ContainSubstring("sleep " + guestVolumeTimeoutSeconds + " &\n"))
+			Expect(script).NotTo(ContainSubstring("sleep " + guestTimeoutSeconds + " &\n"))
+
+			// Without volumes, the section keeps the longer wind-down.
+			Expect(s.initScriptWithVolumes(testNonce, false)).To(ContainSubstring(guestRunSection(testNonce, s.processes(), false, stackExec)))
 		})
 
 		It("unbinds after the processes the command left are stopped, and before any volume's last flush and unmount", func() {
 			Expect(guestVolumeTeardown).To(Equal(guestVolumeTeardownStop + guestVolumeTeardownUnmount))
-			Expect(guestVolumeTeardownStop).To(HaveSuffix("rvm_vbad=\n"))
-			Expect(guestStackVolumeTeardown).To(HavePrefix(guestVolumeTeardownStop))
-			Expect(guestStackVolumeTeardown).To(HaveSuffix(guestVolumeTeardownUnmount))
-			unbind := strings.TrimSuffix(strings.TrimPrefix(guestStackVolumeTeardown, guestVolumeTeardownStop), guestVolumeTeardownUnmount)
-			Expect(unbind).To(ContainSubstring(`umount "` + guestAppRoot + `$rvm_vpath"`))
-			Expect(unbind).NotTo(ContainSubstring("sync"))
-			Expect(unbind).NotTo(ContainSubstring("kill"))
+			Expect(guestVolumeTeardownStop).To(Equal(guestVolumeTeardownFlush + guestVolumeTeardownTerm + guestVolumeTeardownKill))
+			Expect(guestVolumeTeardownKill).To(HaveSuffix("rvm_vbad=\n"))
+			Expect(guestStackVolumeTeardown).To(Equal(guestVolumeTeardownStop + guestStackVolumeUnbinds + guestVolumeTeardownUnmount))
+			Expect(guestStackRunVolumeTeardown).To(Equal(guestVolumeTeardownFlush + guestVolumeTeardownKill + guestStackVolumeUnbinds + guestVolumeTeardownUnmount))
+			Expect(guestVolumeTeardownTerm).To(ContainSubstring("kill -TERM -1"))
+			Expect(guestStackVolumeUnbinds).To(ContainSubstring(`umount "$rvm_vat"`))
+			Expect(guestStackVolumeUnbinds).NotTo(ContainSubstring("sync"))
+			Expect(guestStackVolumeUnbinds).NotTo(ContainSubstring("kill"))
+		})
+
+		It("fits a run section's wind-down and the one wait of the volume teardown after it 2 seconds before the host's stop deadline", func() {
+			Expect(guestVolumeWindDown + guestTeardownKillWait + 2*time.Second).To(BeNumerically("<=", stopDeadline))
+			Expect(guestVolumeTimeoutSeconds).To(Equal(strconv.Itoa(int(guestVolumeWindDown / time.Second))))
+			Expect(guestVolumeWindDown % time.Second).To(BeZero())
+			Expect(guestStackRunVolumeTeardown).NotTo(ContainSubstring("kill -TERM"))
+			Expect(strings.Count(guestStackRunVolumeTeardown, "sleep ")).To(Equal(strings.Count(guestVolumeTeardownKill, "sleep ")))
 		})
 	})
 
@@ -172,7 +190,7 @@ var _ = Describe("the volumes of the stack guest", func() {
 	})
 
 	Describe("in the guest's shell", func() {
-		var dir, bin, app, callLog, owners string
+		var dir, bin, app, callLog, owners, ids string
 
 		BeforeEach(func() {
 			dir = GinkgoT().TempDir()
@@ -189,21 +207,38 @@ var _ = Describe("the volumes of the stack guest", func() {
 				Expect(os.WriteFile(filepath.Join(bin, name), []byte(script), 0o755)).To(Succeed())
 			}
 			stub("mkdir", `exec /bin/mkdir "$@"`)
-			stub("mount", `[ "${MOUNT_FAIL_AT:-}" != "$4" ] || exit 32`)
+			stub("mount", `case "$2" in
+remount,*) [ "${REMOUNT_FAIL_AT:-}" != "$3" ] || exit 32 ;;
+*) [ "${MOUNT_FAIL_AT:-}" != "$4" ] || exit 32 ;;
+esac`)
 			stub("umount", `[ "${UMOUNT_FAIL_AT:-}" != "$1" ] || { echo "umount: can't unmount $1: Device or resource busy" >&2; exit 1; }`)
 			stub("sync", `[ "${SYNC_FAIL_AT:-}" != "$2" ] || { echo "sync: $2: Input/output error" >&2; exit 1; }`)
 			stub("kill", `exit 0`)
 			stub("sleep", `echo "the teardown waited, though no other process runs" >&2; exit 1`)
 			stub("chown", `[ "${CHOWN_FAIL_AT:-}" != "$2" ] || { echo "chown: $2: Read-only file system" >&2; exit 1; }`)
-			// stat records nothing. It prints the owner that the file
-			// owners lists for its path, or 2000:2000 for a path that
-			// owners does not list, and fails for the path STAT_FAIL_AT
-			// names.
+			// stat records nothing, and fails for the path STAT_FAIL_AT
+			// names. For an owner, it prints the one that the file owners
+			// lists for its path, or 2000:2000 for a path that owners does
+			// not list. For a device and an inode, it prints the identity
+			// that the file ids lists for its path, or one made from the
+			// path with the app root taken off, so that a volume and its
+			// path in the app root match unless ids says otherwise.
 			owners = filepath.Join(dir, "owners")
+			ids = filepath.Join(dir, "ids")
 			Expect(os.WriteFile(filepath.Join(bin, "stat"), []byte(`#!/bin/sh
 if [ "${STAT_FAIL_AT:-}" = "$3" ]; then
 	echo "stat: can't stat '$3': No such file or directory" >&2
 	exit 1
+fi
+if [ "$2" = %d:%i ]; then
+	if [ -e `+shellQuote(ids)+` ]; then
+		while IFS=' ' read -r rvm_i rvm_p; do
+			[ "$rvm_p" != "$3" ] || { echo "$rvm_i"; exit 0; }
+		done <`+shellQuote(ids)+`
+	fi
+	rvm_a=`+shellQuote(app)+`
+	echo "id:${3#"$rvm_a"}"
+	exit 0
 fi
 if [ -e `+shellQuote(owners)+` ]; then
 	while IFS=' ' read -r rvm_o rvm_p; do
@@ -236,18 +271,20 @@ echo 2000:2000
 			GinkgoHelper()
 			moved := strings.NewReplacer(
 				guestAppRoot, app,
-				`mkdir -p "`, filepath.Join(bin, "mkdir")+` -p "`,
+				`mkdir "`, filepath.Join(bin, "mkdir")+` "`,
 				"mount -o bind ", filepath.Join(bin, "mount")+" -o bind ",
+				"mount -o remount,", filepath.Join(bin, "mount")+" -o remount,",
 				`umount "`, filepath.Join(bin, "umount")+` "`,
 				`sync -f "`, filepath.Join(bin, "sync")+` -f "`,
 				"kill -", filepath.Join(bin, "kill")+" -",
 				"\tsleep ", "\t"+filepath.Join(bin, "sleep")+" ",
 				"$(stat -c ", "$("+filepath.Join(bin, "stat")+" -c ",
-				"$(chown ", "$("+filepath.Join(bin, "chown")+" ",
+				"chown "+guestAppUID+":", filepath.Join(bin, "chown")+" "+guestAppUID+":",
 				guestProcDir+"/[0-9]*", shellQuote(filepath.Join(dir, "proc"))+"/[0-9]*",
 			).Replace(script)
 			Expect(moved).NotTo(ContainSubstring(guestAppRoot))
-			Expect(strings.Count(moved, "mount -o bind")).To(Equal(strings.Count(moved, filepath.Join(bin, "mount")+" -o bind")))
+			Expect(strings.Count(moved, "mount -o ")).To(Equal(strings.Count(moved, filepath.Join(bin, "mount")+" -o ")))
+			Expect(strings.Count(moved, "mkdir ")).To(Equal(strings.Count(moved, filepath.Join(bin, "mkdir")+" ")))
 			Expect(strings.Count(moved, "umount ")).To(Equal(strings.Count(moved, filepath.Join(bin, "umount")+" ")))
 			Expect(strings.Count(moved, "stat -c ")).To(Equal(strings.Count(moved, filepath.Join(bin, "stat")+" -c ")))
 			Expect(strings.Count(moved, "chown ")).To(Equal(strings.Count(moved, filepath.Join(bin, "chown")+" ")))
@@ -264,31 +301,42 @@ echo 2000:2000
 			return string(out), string(calls)
 		}
 
-		DescribeTable("binds each volume to the same path in the app root, in volume order, making the mount point first",
+		// bindCalls are the calls that bind the volume at path, after
+		// rvm_vwalk makes each directory in made and gives it to uid 2000.
+		bindCalls := func(path string, made ...string) string {
+			calls := ""
+			for _, m := range made {
+				calls += "mkdir $DIR/app" + m + "\nchown 2000:2000 $DIR/app" + m + "\n"
+			}
+			return calls + "mount -o bind " + path + " $DIR/app" + path + "\nmount -o remount,bind,nosuid,nodev,noatime $DIR/app" + path + "\n"
+		}
+
+		DescribeTable("binds each volume to the same path in the app root, in volume order, with nosuid and nodev, making each directory on the way that does not exist for uid 2000",
 			func(shellOf func() guestShell) {
 				shell := shellOf()
 				out, calls := runScript(shell, mountsFor("/home/vcap/data", "/srv/my data"), guestStackVolumeBinds+"echo BOUND\n")
 				Expect(out).To(Equal("BOUND\n"), shell.name)
-				Expect(calls).To(Equal("mkdir -p $DIR/app/home/vcap/data\n"+
-					"mount -o bind /home/vcap/data $DIR/app/home/vcap/data\n"+
-					"mkdir -p $DIR/app/srv/my data\n"+
-					"mount -o bind /srv/my data $DIR/app/srv/my data\n"), shell.name)
+				Expect(calls).To(Equal(bindCalls("/home/vcap/data", "/home/vcap/data")+bindCalls("/srv/my data", "/srv", "/srv/my data")), shell.name)
 				Expect(filepath.Join(app, "srv", "my data")).To(BeADirectory())
 			},
 			shellEntries(""),
 		)
 
 		DescribeTable("fails the boot with a line that names the path, and binds nothing more, when a volume's path crosses a symbolic link in the app root",
-			func(shellOf func() guestShell, link string) {
+			func(shellOf func() guestShell, link, path string) {
 				shell := shellOf()
 				Expect(os.Symlink(link, filepath.Join(app, "home", "vcap", "linked"))).To(Succeed())
-				out, calls := runScript(shell, mountsFor("/srv/first", "/home/vcap/linked/data", "/srv/third"), guestStackVolumeBinds+"echo BOUND\n")
-				Expect(out).To(Equal("vm-launch guest setup: the volume path /home/vcap/linked/data crosses the symbolic link /home/vcap/linked in the app root, so the guest will not bind the volume there\nREBOOT\n"), shell.name)
-				Expect(calls).To(Equal("mkdir -p $DIR/app/srv/first\nmount -o bind /srv/first $DIR/app/srv/first\n"), shell.name)
+				out, calls := runScript(shell, mountsFor("/srv/first", path, "/srv/third"), guestStackVolumeBinds+"echo BOUND\n")
+				Expect(out).To(Equal("vm-launch guest setup: the volume path "+path+" crosses the symbolic link /home/vcap/linked in the app root, so the guest will not bind the volume there\nREBOOT\n"), shell.name)
+				Expect(calls).To(Equal(bindCalls("/srv/first", "/srv", "/srv/first")), shell.name)
 				Expect("/rvm-s5-elsewhere").NotTo(BeAnExistingFile())
 			},
-			append(shellEntries("an absolute link", "/rvm-s5-elsewhere"),
-				shellEntries("a relative link", "../../srv")...),
+			slices.Concat(
+				shellEntries("an absolute link on the way", "/rvm-s5-elsewhere", "/home/vcap/linked/data"),
+				shellEntries("a relative link on the way", "../../srv", "/home/vcap/linked/data"),
+				shellEntries("an absolute link at the mount point", "/rvm-s5-elsewhere", "/home/vcap/linked"),
+				shellEntries("a relative link at the mount point", "../../srv", "/home/vcap/linked"),
+			),
 		)
 
 		DescribeTable("fails the boot with a line that names the path when the bind fails",
@@ -296,7 +344,17 @@ echo 2000:2000
 				shell := shellOf()
 				out, calls := runScript(shell, mountsFor("/home/vcap/data", "/srv/two"), guestStackVolumeBinds+"echo BOUND\n", "MOUNT_FAIL_AT="+filepath.Join(app, "home", "vcap", "data"))
 				Expect(out).To(Equal("vm-launch guest setup: binding the volume at /home/vcap/data into the app root failed\nREBOOT\n"), shell.name)
-				Expect(calls).To(Equal("mkdir -p $DIR/app/home/vcap/data\nmount -o bind /home/vcap/data $DIR/app/home/vcap/data\n"), shell.name)
+				Expect(calls).To(Equal("mkdir $DIR/app/home/vcap/data\nchown 2000:2000 $DIR/app/home/vcap/data\nmount -o bind /home/vcap/data $DIR/app/home/vcap/data\n"), shell.name)
+			},
+			shellEntries(""),
+		)
+
+		DescribeTable("fails the boot with a line that names the path when the bind cannot be made nosuid and nodev",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				out, calls := runScript(shell, mountsFor("/home/vcap/data", "/srv/two"), guestStackVolumeBinds+"echo BOUND\n", "REMOUNT_FAIL_AT="+filepath.Join(app, "home", "vcap", "data"))
+				Expect(out).To(Equal("vm-launch guest setup: making the bind of the volume at /home/vcap/data in the app root nosuid and nodev failed\nREBOOT\n"), shell.name)
+				Expect(calls).To(Equal(bindCalls("/home/vcap/data", "/home/vcap/data")), shell.name)
 			},
 			shellEntries(""),
 		)
@@ -311,19 +369,27 @@ echo 2000:2000
 			shellEntries(""),
 		)
 
+		DescribeTable("fails the boot with a line that names the directory when a directory it made on the way cannot be given to uid 2000",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				out, calls := runScript(shell, mountsFor("/srv/data"), guestStackVolumeBinds+"echo BOUND\n", "CHOWN_FAIL_AT="+filepath.Join(app, "srv"))
+				Expect(out).To(HaveSuffix("vm-launch guest setup: giving /srv, which the guest made for the volume at /srv/data, to uid 2000 failed\nREBOOT\n"), shell.name)
+				Expect(calls).To(Equal("mkdir $DIR/app/srv\nchown 2000:2000 $DIR/app/srv\n"), shell.name)
+			},
+			shellEntries(""),
+		)
+
 		DescribeTable("gives a volume's top directory that belongs to root:root, and that directory alone, to uid 2000 before its bind, and leaves any other owner as it is",
 			func(shellOf func() guestShell) {
 				shell := shellOf()
 				Expect(os.WriteFile(owners, []byte("0:0 /home/vcap/data\n0:1000 /srv/group\n1000:0 /srv/user\n0:0 /srv/my data\n"), 0o644)).To(Succeed())
 				out, calls := runScript(shell, mountsFor("/home/vcap/data", "/srv/group", "/srv/user", "/srv/vcap", "/srv/my data"), guestStackVolumeBinds+"echo BOUND\n")
 				Expect(out).To(Equal("BOUND\n"), shell.name)
-				Expect(calls).To(Equal("chown 2000:2000 /home/vcap/data\n"+
-					"mkdir -p $DIR/app/home/vcap/data\nmount -o bind /home/vcap/data $DIR/app/home/vcap/data\n"+
-					"mkdir -p $DIR/app/srv/group\nmount -o bind /srv/group $DIR/app/srv/group\n"+
-					"mkdir -p $DIR/app/srv/user\nmount -o bind /srv/user $DIR/app/srv/user\n"+
-					"mkdir -p $DIR/app/srv/vcap\nmount -o bind /srv/vcap $DIR/app/srv/vcap\n"+
-					"chown 2000:2000 /srv/my data\n"+
-					"mkdir -p $DIR/app/srv/my data\nmount -o bind /srv/my data $DIR/app/srv/my data\n"), shell.name)
+				Expect(calls).To(Equal("chown 2000:2000 /home/vcap/data\n"+bindCalls("/home/vcap/data", "/home/vcap/data")+
+					bindCalls("/srv/group", "/srv", "/srv/group")+
+					bindCalls("/srv/user", "/srv/user")+
+					bindCalls("/srv/vcap", "/srv/vcap")+
+					"chown 2000:2000 /srv/my data\n"+bindCalls("/srv/my data", "/srv/my data")), shell.name)
 			},
 			shellEntries(""),
 		)
@@ -334,8 +400,8 @@ echo 2000:2000
 				Expect(os.WriteFile(owners, []byte("0:0 /home/vcap/data\n0:0 /srv/two\n"), 0o644)).To(Succeed())
 				out, calls := runScript(shell, mountsFor("/home/vcap/data", "/srv/two"), guestStackVolumeBinds+"echo BOUND\n", env)
 				Expect(out).To(Equal(line+"BOUND\n"), shell.name)
-				Expect(calls).To(HaveSuffix("chown 2000:2000 /srv/two\nmkdir -p $DIR/app/srv/two\nmount -o bind /srv/two $DIR/app/srv/two\n"), shell.name)
-				Expect(calls).To(ContainSubstring("mount -o bind /home/vcap/data $DIR/app/home/vcap/data\n"), shell.name)
+				Expect(calls).To(HaveSuffix("chown 2000:2000 /srv/two\n"+bindCalls("/srv/two", "/srv", "/srv/two")), shell.name)
+				Expect(calls).To(ContainSubstring(bindCalls("/home/vcap/data", "/home/vcap/data")), shell.name)
 			},
 			append(shellEntries("a stat that fails", "STAT_FAIL_AT=/home/vcap/data",
 				"vm-launch guest setup: reading the owner of the volume at /home/vcap/data failed (stat: can't stat '/home/vcap/data': No such file or directory); leaving its owner as it is\n"),
@@ -354,16 +420,11 @@ echo 2000:2000
 			shellEntries(""),
 		)
 
-		// teardownCalls are the calls of a teardown of image volumes at
-		// paths, with no process left behind and nothing failing: the early
-		// flush and the stop, then the unbinds, and then each volume's last
-		// flush and unmount, all last first.
-		teardownCalls := func(paths ...string) string {
+		// unbindCalls are the calls of a teardown of image volumes at paths
+		// after the stop, with nothing failing: the unbinds, and then each
+		// volume's last flush and unmount, all last first.
+		unbindCalls := func(paths ...string) string {
 			calls := ""
-			for i := len(paths) - 1; i >= 0; i-- {
-				calls += "sync -f " + paths[i] + "\n"
-			}
-			calls += "kill -TERM -1\nkill -KILL -1\n"
 			for i := len(paths) - 1; i >= 0; i-- {
 				calls += "umount $DIR/app" + paths[i] + "\n"
 			}
@@ -372,10 +433,31 @@ echo 2000:2000
 			}
 			return calls
 		}
+		// earlyCalls are the calls of the early flush of image volumes at
+		// paths, last first.
+		earlyCalls := func(paths ...string) string {
+			calls := ""
+			for i := len(paths) - 1; i >= 0; i-- {
+				calls += "sync -f " + paths[i] + "\n"
+			}
+			return calls
+		}
+		// teardownCalls are the calls of a teardown of image volumes at
+		// paths, with no process left behind and nothing failing: the early
+		// flush and the stop, then the unbinds, and then each volume's last
+		// flush and unmount, all last first.
+		teardownCalls := func(paths ...string) string {
+			return earlyCalls(paths...) + "kill -TERM -1\nkill -KILL -1\n" + unbindCalls(paths...)
+		}
+		teardownOf := func(shell guestShell, script, status string, paths []string, env ...string) (string, string) {
+			GinkgoHelper()
+			return runScript(shell, mountsFor(paths...)+"(exit "+status+")\nrvm_status=$?\n", guestStackVolumeWalk+script+"echo \"status=$rvm_status\"\n", env...)
+		}
 		teardown := func(shell guestShell, status string, paths []string, env ...string) (string, string) {
 			GinkgoHelper()
-			return runScript(shell, mountsFor(paths...)+"(exit "+status+")\nrvm_status=$?\n", guestStackVolumeTeardown+"echo \"status=$rvm_status\"\n", env...)
+			return teardownOf(shell, guestStackVolumeTeardown, status, paths, env...)
 		}
+		flushFailLine := "vm-launch guest: the command exited 0, but a volume did not flush or unmount, so the guest reports the status " + guestFlushFailStatus + "\n"
 
 		DescribeTable("unbinds every volume from the app root, last first, after the stop and before the volumes' own flushes and unmounts, and keeps a status of 0",
 			func(shellOf func() guestShell) {
@@ -402,6 +484,70 @@ echo 2000:2000
 			},
 			append(shellEntries("after a command that exited 0", "0", guestFlushFailStatus),
 				shellEntries("after a command that failed, which keeps its status", "3", "3")...),
+		)
+
+		DescribeTable("never unmounts what the app root holds at a volume's path once that path crosses a symbolic link, reports the volume as one that did not unmount, and still unbinds, flushes, and unmounts the others",
+			func(shellOf func() guestShell, link, path string) {
+				shell := shellOf()
+				Expect(os.Symlink(link, filepath.Join(app, "home", "vcap", "linked"))).To(Succeed())
+				paths := []string{path, "/srv/two"}
+				out, calls := teardown(shell, "0", paths)
+				Expect(out).To(Equal("vm-launch guest: the path of the volume at "+path+" in the app root now crosses the symbolic link /home/vcap/linked, so the guest cannot unbind the volume or unmount it cleanly\n"+
+					flushFailLine+"status="+guestFlushFailStatus+"\n"), shell.name)
+				Expect(calls).To(Equal(earlyCalls(paths...)+"kill -TERM -1\nkill -KILL -1\n"+
+					"umount $DIR/app/srv/two\n"+
+					"sync -f /srv/two\numount /srv/two\nsync -f "+path+"\numount "+path+"\n"), shell.name)
+			},
+			slices.Concat(
+				shellEntries("an absolute link on the way", "/rvm-s5-elsewhere", "/home/vcap/linked/data"),
+				shellEntries("a relative link on the way", "../../srv", "/home/vcap/linked/data"),
+				shellEntries("an absolute link at the mount point", "/rvm-s5-elsewhere", "/home/vcap/linked"),
+				shellEntries("a relative link at the mount point", "../../srv", "/home/vcap/linked"),
+			),
+		)
+
+		DescribeTable("never unmounts what the app root holds at a volume's path when it is not the volume's own top directory, or cannot be read, and reports the volume as one that did not unmount",
+			func(shellOf func() guestShell, idsOf func() string, env func() []string, lineOf func() string) {
+				shell := shellOf()
+				Expect(os.WriteFile(ids, []byte(idsOf()), 0o644)).To(Succeed())
+				paths := []string{"/home/vcap/data", "/srv/two"}
+				out, calls := teardown(shell, "0", paths, env()...)
+				Expect(out).To(Equal(lineOf()+flushFailLine+"status="+guestFlushFailStatus+"\n"), shell.name)
+				Expect(calls).To(Equal(earlyCalls(paths...)+"kill -TERM -1\nkill -KILL -1\n"+
+					"umount $DIR/app/home/vcap/data\n"+
+					"sync -f /srv/two\numount /srv/two\nsync -f /home/vcap/data\numount /home/vcap/data\n"), shell.name)
+			},
+			slices.Concat(
+				shellEntries("a directory that is not the volume's",
+					func() string { return "64768:2 " + filepath.Join(app, "srv", "two") + "\n" },
+					func() []string { return nil },
+					func() string {
+						return "vm-launch guest: the volume at /srv/two is no longer what the app root holds at its path, so the guest cannot unbind the volume or unmount it cleanly\n"
+					}),
+				shellEntries("a volume whose top directory cannot be read",
+					func() string { return "" },
+					func() []string { return []string{"STAT_FAIL_AT=/srv/two"} },
+					func() string {
+						return "vm-launch guest: reading the top directory of the volume at /srv/two failed (stat: can't stat '/srv/two': No such file or directory), so the guest cannot unbind the volume or unmount it cleanly\n"
+					}),
+				shellEntries("a path in the app root that cannot be read",
+					func() string { return "" },
+					func() []string { return []string{"STAT_FAIL_AT=" + filepath.Join(app, "srv", "two")} },
+					func() string {
+						return "vm-launch guest: reading what the app root holds at the path of the volume at /srv/two failed (stat: can't stat '" + filepath.Join(app, "srv", "two") + "': No such file or directory), so the guest cannot unbind the volume or unmount it cleanly\n"
+					}),
+			),
+		)
+
+		DescribeTable("after a run section, sends what is left SIGKILL with no SIGTERM first, and then unbinds, flushes, and unmounts every volume, last first",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				paths := []string{"/home/vcap/data", "/srv/two"}
+				out, calls := teardownOf(shell, guestStackRunVolumeTeardown, "0", paths)
+				Expect(out).To(Equal("status=0\n"), shell.name)
+				Expect(calls).To(Equal(earlyCalls(paths...)+"kill -KILL -1\n"+unbindCalls(paths...)), shell.name)
+			},
+			shellEntries(""),
 		)
 
 		DescribeTable("still reports a volume that does not flush after its bind unmounted",
@@ -437,11 +583,13 @@ func rootOwner(img *os.File) string {
 }
 
 // realStackVolumeLauncher is the test launcher of the stack guest with a
-// volume at /home/vcap/data. It prints who it runs as and who owns the
-// volume's root, prints the file that an earlier boot left there, if any,
-// and then writes the file and prints who owns it.
+// volume at /home/vcap/data. It prints who it runs as, the volume's line in
+// the app's mount table, and who owns the volume's root, prints the file that
+// an earlier boot left there, if any, and then writes the file and prints who
+// owns it.
 const realStackVolumeLauncher = `#!/bin/sh
 echo "vol-id=$(id -u)"
+echo "vol-mount=$(/bin/busybox grep ' /home/vcap/data ' /proc/self/mounts)"
 echo "vol-root=$(stat -c %u:%g /home/vcap/data)"
 if [ -e /home/vcap/data/proof ]; then
 	echo "vol-found=$(cat /home/vcap/data/proof)"
@@ -494,12 +642,14 @@ var _ = Describe("the stack guest with a volume against a real QEMU", func() {
 		return strings.ReplaceAll(stdout, "\r", "")
 	}
 
-	DescribeTable("formats a new volume image for vcap, lets the app write to it as uid 2000 through the bind, stops with status 0 after a clean unmount, and finds the file at the next boot",
+	DescribeTable("formats a new volume image for vcap, lets the app write to it as uid 2000 through a nosuid and nodev bind, stops with status 0 after a clean unmount, and finds the file at the next boot",
 		func(withRoot bool) {
 			img := openSizedFile(defaultImageSize)
 			out := bootStackVolume(img, withRoot)
 			Expect(out).NotTo(ContainSubstring("vm-launch guest"), out)
 			Expect(out).To(MatchRegexp(`(?m)^vol-id=2000$`), out)
+			Expect(out).To(MatchRegexp(`(?m)^vol-mount=\S+ /home/vcap/data ext4 \S*\bnosuid\b`), out)
+			Expect(out).To(MatchRegexp(`(?m)^vol-mount=\S+ /home/vcap/data ext4 \S*\bnodev\b`), out)
 			Expect(out).To(MatchRegexp(`(?m)^vol-root=2000:2000$`), out)
 			Expect(out).To(MatchRegexp(`(?m)^vol-wrote=2000:2000$`), out)
 			Expect(out).NotTo(ContainSubstring("vol-found="), out)

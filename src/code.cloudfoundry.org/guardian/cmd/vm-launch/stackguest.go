@@ -185,7 +185,10 @@ func (s *guestStack) initScript(nonce string) string {
 // initScriptWithVolumes is initScript for a guest that mounts volumes when
 // volume is set. Stage 2 then mounts them as the busybox guest's does and
 // binds each into the app root, and its teardown unbinds them before it
-// unmounts them (see guestStackVolumeBinds and guestStackVolumeTeardown).
+// unmounts them (see guestStackVolumeBinds and guestStackVolumeTeardown). A
+// guest that runs a run section with volumes winds down within
+// guestVolumeWindDown, so that the volume teardown after the section fits
+// before the host's stop deadline.
 func (s *guestStack) initScriptWithVolumes(nonce string, volume bool) string {
 	certs := guestSystemCertsSetup(s.systemCerts)
 	if len(s.sidecars) == 0 && s.identity == nil {
@@ -197,7 +200,11 @@ func (s *guestStack) initScriptWithVolumes(nonce string, volume bool) string {
 		checks += guestIdentityEchoCheck(nonce)
 	}
 	checks += certs + guestRunSetup(s.identity != nil, procs)
-	return stage2Script(nonce, volume, true, checks, guestRunSection(nonce, procs, s.identity != nil, stackExec))
+	timeout := guestTimeoutSeconds
+	if volume {
+		timeout = guestVolumeTimeoutSeconds
+	}
+	return stage2Script(nonce, volume, true, checks, guestRunSectionWithin(nonce, procs, s.identity != nil, stackExec, timeout))
 }
 
 // processes returns the app, from /rvm/argv and the guest environment, and
