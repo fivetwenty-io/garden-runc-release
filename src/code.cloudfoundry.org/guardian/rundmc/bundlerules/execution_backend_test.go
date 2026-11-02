@@ -193,7 +193,7 @@ var _ = Describe("ExecutionBackendRule", func() {
 			}))
 		})
 
-		It("keeps the AppArmor profile, which only the wrapped vm-launch process gives up", func() {
+		It("keeps the AppArmor profile, and so does the wrapped vm-launch process", func() {
 			Expect(newBndl.Process().ApparmorProfile).To(Equal("garden-default"))
 		})
 

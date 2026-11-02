@@ -664,6 +664,56 @@ describe 'garden' do
         end
       end
 
+      context 'qemu sandbox property' do
+        let(:sandbox_default) { 'on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny' }
+
+        def render_with(backends, extra)
+          template.render({ 'garden' => { 'execution_backends' => backends }.merge(extra) })
+        end
+
+        def render_server(backends, extra)
+          IniParse.parse(render_with(backends, extra))['server']
+        end
+
+        it 'declares the seccomp sandbox as the default' do
+          garden_spec = YAML.load_file(File.join(File.dirname(__FILE__), '../../jobs/garden/spec'))
+          property = garden_spec['properties']['garden.vm_qemu_sandbox']
+          expect(property['default']).to eql(sandbox_default)
+          expect(property['description']).not_to be_empty
+        end
+
+        [[], ['vm-qemu'], %w[vm-qemu vm-firecracker]].each do |backends|
+          it "renders no sandbox line by default (#{backends.inspect})" do
+            expect(render_with(backends, {})).not_to include('vm-qemu-sandbox')
+          end
+        end
+
+        it 'renders no line for the default value set explicitly' do
+          expect(render_with(['vm-qemu'], { 'vm_qemu_sandbox' => sandbox_default })).not_to include('vm-qemu-sandbox')
+        end
+
+        it 'renders a custom value after the other vm keys and parses it back' do
+          raw = render_with(['vm-qemu'], { 'vm_qemu_sandbox' => 'on,spawn=deny' })
+          expect(raw).to end_with("  vm-launch-bin = /var/vcap/packages/guardian/bin/vm-launch\n  vm-qemu-sandbox = on,spawn=deny\n")
+          expect(render_server(['vm-qemu'], { 'vm_qemu_sandbox' => 'on,spawn=deny' })['vm-qemu-sandbox']).to eql('on,spawn=deny')
+        end
+
+        it 'renders an empty key for an empty value, which turns the sandbox off' do
+          raw = render_with(['vm-qemu'], { 'vm_qemu_sandbox' => '' })
+          expect(raw).to match(/^  vm-qemu-sandbox = $/)
+        end
+
+        it 'raises for a value over several lines' do
+          expect { render_with(['vm-qemu'], { 'vm_qemu_sandbox' => "on\nfoo = bar" }) }
+            .to raise_error(/garden.vm_qemu_sandbox must be a one-line string/)
+        end
+
+        it 'raises for a non-default value without a vm-* backend' do
+          expect { render_with(['oci-gvisor'], { 'vm_qemu_sandbox' => '' }) }
+            .to raise_error(/garden.vm_qemu_sandbox requires a vm-\* entry/)
+        end
+      end
+
       context 'stack properties' do
         let(:tarballs) { %w[/var/vcap/packages/cflinuxfs4/rootfs.tar /var/vcap/packages/cflinuxfs3/rootfs.tar] }
 

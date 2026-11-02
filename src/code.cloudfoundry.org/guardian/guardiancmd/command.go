@@ -216,6 +216,7 @@ type CommonCommand struct {
 		VMBlockVolumes      bool          `long:"vm-block-volumes" description:"Give a vm-* container the block device named by each bind mount whose source is a read-only pdi: descriptor tmpfs, as a root:kvm 0660 node at /dev/pdi/MAJOR-MINOR with a read-write device cgroup rule. A device that is the wrong size, mounted, held, or busy on the host refuses the container. The descriptor bind mount must be read-write. Off by default."`
 		VMVolumeShares      bool          `long:"vm-volume-shares" description:"Let an app on a vm-qemu container ask for a volume as a share in VM_VOLUMES. Garden passes --allow-volume-shares and the virtiofsd wrapper's path to vm-launch. Off by default, and a share is refused on vm-firecracker whatever its value."`
 		VMVolumeAsyncMounts bool          `long:"vm-volume-async-mounts" description:"Mount a journalled ext4 image volume of a vm-* container without sync and dirsync, which vm-launch otherwise uses. A legacy ext2 image without a journal keeps them. Garden passes --volume-sync-mounts=false to vm-launch only when this is set. Off by default."`
+		VMQemuSandbox       string        `long:"vm-qemu-sandbox" default:"on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny" description:"The value of QEMU's -sandbox option for a vm-qemu container, which turns on QEMU's own seccomp filter. An empty value turns the sandbox off. Garden passes --qemu-sandbox to vm-launch only when the value differs from the default."`
 		VMStackTarballs     []string      `long:"vm-stack-tarball" description:"Absolute path of a stack rootfs tarball to turn into a read-only squashfs image for vm-* containers, such as /var/vcap/packages/cflinuxfs4/rootfs.tar. A VM container whose rootfs is a listed tarball gets the image bound read-only at /opt/garden-vm/stack. Requires a vm-* backend. Can be specified multiple times."`
 		VMStackCacheDir     string        `long:"vm-stack-cache-dir" default:"/var/vcap/data/vm-runtime/stacks" description:"Host directory that caches the stack images, one directory for each tarball digest."`
 		VMStackWait         time.Duration `long:"vm-stack-wait" default:"20s" description:"How long a VM container create waits for a stack image that is still being built. When it is not ready in that time the container is created without it."`
@@ -1111,10 +1112,11 @@ func (cmd *CommonCommand) logUnusedBlockVolumes(log lager.Logger) {
 	}
 }
 
-// vmLaunchVolumeFlags returns the volume flags for the wrapped vm-launch of a
-// vm-* container, which are empty for the defaults.
+// vmLaunchVolumeFlags returns the volume and QEMU sandbox flags for the
+// wrapped vm-launch of a vm-* container, which are empty for the defaults.
 func (cmd *CommonCommand) vmLaunchVolumeFlags() []string {
-	return processes.VMLaunchVolumeFlags(cmd.ExecutionBackends.VMVolumeShares, bundlerules.VMVirtiofsdPath, !cmd.ExecutionBackends.VMVolumeAsyncMounts)
+	flags := processes.VMLaunchVolumeFlags(cmd.ExecutionBackends.VMVolumeShares, bundlerules.VMVirtiofsdPath, !cmd.ExecutionBackends.VMVolumeAsyncMounts)
+	return append(flags, processes.VMLaunchQEMUSandboxFlags(cmd.ExecutionBackends.VMQemuSandbox)...)
 }
 
 // logUnusedVolumeFlags notes that --vm-volume-shares or

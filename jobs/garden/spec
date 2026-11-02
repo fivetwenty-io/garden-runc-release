@@ -322,6 +322,20 @@ properties:
       vm-* entry in garden.execution_backends.
     default: true
 
+  garden.vm_qemu_sandbox:
+    description: |
+      The value of QEMU's -sandbox option for a vm-qemu container, which turns
+      on QEMU's own seccomp filter on top of the container's. The default
+      denies the obsolete system calls, privilege changes, spawning a process,
+      and changes to resource limits, none of which QEMU needs to run a guest.
+      An empty string turns the sandbox off, which is the way back if a QEMU
+      build lacks seccomp support or a guest fails with a seccomp kill. The
+      job renders --vm-qemu-sandbox only when the value differs from the
+      default, and Garden then passes --qemu-sandbox to vm-launch, so the
+      default changes no argument. Firecracker ignores it. A value other than
+      the default requires a vm-* entry in garden.execution_backends.
+    default: "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"
+
   garden.vm_stack_tarballs:
     description: |
       Absolute paths of the stack rootfs tarballs, such as

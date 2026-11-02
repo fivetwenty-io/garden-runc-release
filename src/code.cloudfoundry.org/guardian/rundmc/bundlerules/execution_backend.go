@@ -176,8 +176,8 @@ func (r ExecutionBackend) Apply(bndl goci.Bndl, spec spec.DesiredContainerSpec) 
 		}
 		bndl = bndl.WithMounts(mounts...)
 
-		// The bundle keeps its AppArmor profile. The process builder lifts it
-		// for the vm-launch process of a vm-qemu container only.
+		// The bundle keeps its AppArmor profile, and every process in the
+		// container runs under it, the wrapped vm-launch process included.
 		process := bndl.Process()
 		process.Capabilities = processes.WithoutCapability(process.Capabilities, processes.CapSetGID)
 		process.NoNewPrivileges = true

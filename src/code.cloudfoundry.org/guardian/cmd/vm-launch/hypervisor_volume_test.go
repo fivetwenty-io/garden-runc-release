@@ -51,6 +51,8 @@ var (
 		"/opt/garden-vm/artifacts/qemu/qemu-system-x86_64-microvm", "-L", "/opt/garden-vm/artifacts/qemu/share",
 		"-M", "microvm,accel=kvm,dump-guest-core=off", "-cpu", "host", "-smp", "1", "-m", "128",
 		"-nodefaults", "-no-user-config", "-nographic", "-serial", "stdio", "-no-reboot",
+		"-monitor", "none",
+		"-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny",
 		"-kernel", "/opt/garden-vm/artifacts/kernel/bzImage", "-initrd", "/proc/self/fd/3",
 		"-append", "console=ttyS0 reboot=t panic=-1 rdinit=/init pci=off quiet",
 	}

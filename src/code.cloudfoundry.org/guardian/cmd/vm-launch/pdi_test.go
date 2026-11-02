@@ -417,6 +417,8 @@ stat -L -c %d%r%i /proc/self/fd/3 /proc/self/fd/5 >`+shellQuote(filepath.Join(ou
 		"-nodefaults", "-no-user-config", "-nographic",
 		"-serial", "stdio",
 		"-no-reboot",
+		"-monitor", "none",
+		"-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny",
 		"-kernel", "@ART/kernel/bzImage",
 		"-initrd", "/proc/self/fd/4",
 		"-append", "console=ttyS0 reboot=t panic=-1 rdinit=/init pci=off quiet",
