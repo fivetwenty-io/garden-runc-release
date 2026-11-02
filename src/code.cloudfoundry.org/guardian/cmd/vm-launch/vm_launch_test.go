@@ -1521,6 +1521,47 @@ var _ = Describe("run with a stack image", func() {
 		Expect(heldFilesEndingIn("droplet.sqfs (deleted)")).To(BeZero())
 	})
 
+	Describe("with mirrored mounts", func() {
+		var bindings string
+
+		BeforeEach(func() {
+			bindings = filepath.Join(dir, "bindings")
+			Expect(os.MkdirAll(filepath.Join(bindings, "svc"), 0o755)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(bindings, "svc", "uri"), []byte("postgres://"), 0o644)).To(Succeed())
+			GinkgoT().Setenv("SERVICE_BINDING_ROOT", bindings)
+			DeferCleanup(func(saved string) { mountInfoPath = saved }, mountInfoPath)
+		})
+
+		It("reads no mount table without --mirror-mounts, and the guest gets none of the mounts or their variable", func() {
+			// A launch that read this table would fail, because it is not
+			// there.
+			mountInfoPath = filepath.Join(dir, "no-mountinfo")
+			initrd, _ := guestOf(launchArg)
+			names, byName := archiveEntries(initrd)
+			for _, name := range names {
+				Expect(name).NotTo(HavePrefix(strings.TrimPrefix(guestMirrorStage, "/")))
+			}
+			Expect(string(byName["rvm/env"].data)).NotTo(ContainSubstring("SERVICE_BINDING_ROOT"))
+			Expect(logBuf.String()).NotTo(ContainSubstring("mirror"))
+		})
+
+		It("stages each mirrored mount in the initramfs and keeps its variable in the guest's environment with --mirror-mounts", func() {
+			mountInfoPath = writeMountTable(dir, mountInfoLine(5, bindings, "ro", "ext4"))
+			initrdCopy := filepath.Join(art, "initrd-copy")
+			writeFakeHypervisor(qemu, `cp "$initrd" `+shellQuote(initrdCopy)+" || exit 1\n")
+			Expect(run(append([]string{"--backend", string(backend.VMQemu), "--mirror-mounts", "--artifacts", art, "--"}, launchArg...), log.New(logBuf, "", 0))).To(Equal(0), logBuf.String())
+
+			initrd, err := os.ReadFile(initrdCopy)
+			Expect(err).NotTo(HaveOccurred())
+			_, byName := archiveEntries(initrd)
+			stage := strings.TrimPrefix(mirrorStage(0), "/")
+			Expect(string(byName[stage+"/svc/uri"].data)).To(Equal("postgres://"))
+			Expect(string(byName["rvm/env"].data)).To(ContainSubstring("SERVICE_BINDING_ROOT"))
+			Expect(string(byName["rvm/init"].data)).To(ContainSubstring("mount -o bind " + mirrorStage(0) + " " + shellQuote(guestAppRoot+bindings)))
+			Expect(logBuf.String()).To(ContainSubstring("mirroring 1 of the container's mounts into the guest, read-only: " + quoteForLog(bindings)))
+		})
+	})
+
 	It("gives Firecracker the stack and the droplet as read-only drives after the volumes and the root", func() {
 		letFirecrackerSeeVMLaunch()
 		fcCopy := filepath.Join(art, "fc-copy.json")
