@@ -423,90 +423,107 @@ var _ = Describe("a real QEMU guest with the virtio balloon", func() {
 		expectMemoryReturned(run)
 	})
 
-	It("fits the balloon on the guest with the most drives, a stack guest with four volumes, a root, the stack, and the droplet beside the NIC, and every drive still answers with its own serial", func() {
-		art := realArtifacts()
-		qemu := realQEMU()
-		requireMicrovm(qemu)
+	DescribeTable("fits the balloon on the guest with the most devices, a stack guest with four volumes, a root, the stack, and the droplet beside the NIC, and every drive still answers with its own serial",
+		func(shared []int) {
+			art := realArtifacts()
+			qemu := realQEMU()
+			requireMicrovm(qemu)
 
-		// A stack guest mounts private disk images, so the guest with the
-		// most devices is a stack guest with the root, all four volumes,
-		// the stack, and the droplet. Its launcher only says that it ran and
-		// then waits, with the stack's own busybox, so that the host can
-		// look at the guest's devices while the guest runs.
-		sd := &stackDrives{stack: realStackImage(art), droplet: realDropletImage(art)}
-		launcher := "#!/bin/sh\necho balloon-command-ran\nexec /bin/busybox sleep 120\n"
-		lf, err := os.Open(writeTempFile("launcher", launcher))
-		Expect(err).NotTo(HaveOccurred())
-		DeferCleanup(lf.Close)
-		g := taskGuest("")
-		g.stack = &guestStack{
-			launcher: guestTool{name: "launcher", file: lf, size: int64(len(launcher))},
-			argv:     shellJoin([]string{stackLauncherPath, "/home/vcap/app", "", "{}"}),
-			cwd:      "/home/vcap",
-			hostname: "stack-guest-0",
-			hosts:    []byte("127.0.0.1 localhost\n"),
-		}
-		var vols []*os.File
-		var sizes []int64
-		for i := range maxVolumes {
-			vols = append(vols, openSizedFile(defaultImageSize))
-			sizes = append(sizes, defaultImageSize)
-			g.vols = append(g.vols, guestVolume{ContainerDir: "/home/vcap/data" + strconv.Itoa(i), ImageName: "volume.img"})
-		}
-		Expect(vols).To(HaveLen(4), "this spec is for the guest with the most volume drives")
-		withRealRoot(&g)
-		root := realRootImage()
-		g.drives, err = newGuestDrivesWithStack(backend.VMQemu, nil, root, sd)
-		Expect(err).NotTo(HaveOccurred())
-		g.drives.volumes = qemuImageDrives(sizes...)
-		marked := withUserspaceMark(newRealInitramfs(g))
-
-		runRealBalloonGuest(func(qmp *os.File) ([]string, []*os.File) {
-			files, drives, initrdPath, monitorFD, rootPath := hypervisorFilesWithStack(imageAttachments(vols...), marked, qmp, root, sd)
-			argv, err := hypervisorArgvWithStack(backend.VMQemu, art, GinkgoT().TempDir(), initrdPath, realBalloonGuestMiB, g.nw, drives, rootPath, monitorFD, sd)
+			// Each volume is one device, a drive or a share, so the guest with
+			// the most devices is a stack guest with the root, all four
+			// volumes, the stack, and the droplet. Its launcher only says that
+			// it ran and then waits, with the stack's own busybox, so that the
+			// host can look at the guest's devices while the guest runs.
+			sd := &stackDrives{stack: realStackImage(art), droplet: realDropletImage(art)}
+			launcher := "#!/bin/sh\necho balloon-command-ran\nexec /bin/busybox sleep 120\n"
+			lf, err := os.Open(writeTempFile("launcher", launcher))
 			Expect(err).NotTo(HaveOccurred())
-			return markedArgv(tcgArgv(qemu, argv)), files
-		}, func(h *realBalloon) {
-			// Stage 1 compares every drive's serial and size with /rvm/disks
-			// and fails the boot before the command on a mismatch, so the
-			// command's line shows that each drive the guest has is the one
-			// it was told about.
-			h.waitFor("balloon-command-ran", realBootTimeout)
-			Expect(h.console.String()).NotTo(ContainSubstring("vm-launch guest setup"), h.details())
-
-			tree, err := h.monitor.humanCommand("info qtree")
+			DeferCleanup(lf.Close)
+			g := taskGuest("")
+			g.stack = &guestStack{
+				launcher: guestTool{name: "launcher", file: lf, size: int64(len(launcher))},
+				argv:     shellJoin([]string{stackLauncherPath, "/home/vcap/app", "", "{}"}),
+				cwd:      "/home/vcap",
+				hostname: "stack-guest-0",
+				hosts:    []byte("127.0.0.1 localhost\n"),
+			}
+			var atts []*attachment
+			var volumeDrives []guestDrive
+			var shares []shareSocket
+			var serials []string
+			for i := range maxVolumes {
+				path := "/home/vcap/data" + strconv.Itoa(i)
+				if slices.Contains(shared, i) {
+					dir := GinkgoT().TempDir()
+					Expect(os.Chmod(dir, 0o755)).To(Succeed())
+					shares = append(shares, serveStackShare(i, dir))
+					g.vols = append(g.vols, guestVolume{ContainerDir: path, Settings: volumeSettings{Mode: volumeShare}})
+					continue
+				}
+				atts = append(atts, &attachment{File: openSizedFile(defaultImageSize), Mode: attachFileImage, ID: qemuVolumeSerial(i), Index: i, Release: func() error { return nil }})
+				volumeDrives = append(volumeDrives, guestDrive{id: qemuVolumeSerial(i), kind: driveImage, bytes: defaultImageSize})
+				serials = append(serials, qemuVolumeSerial(i))
+				g.vols = append(g.vols, guestVolume{ContainerDir: path, ImageName: "volume.img"})
+			}
+			Expect(g.vols).To(HaveLen(4), "this spec is for the guest with the most volumes")
+			withRealRoot(&g)
+			root := realRootImage()
+			g.drives, err = newGuestDrivesWithStack(backend.VMQemu, nil, root, sd)
 			Expect(err).NotTo(HaveOccurred())
-			var devices, serials []string
-			for _, m := range regexp.MustCompile(`(?m)^\s+dev: (virtio-[a-z]+-device),`).FindAllStringSubmatch(tree, -1) {
-				devices = append(devices, m[1])
-			}
-			for _, m := range regexp.MustCompile(`(?m)^\s+serial = "([^"]*)"\r?$`).FindAllStringSubmatch(tree, -1) {
-				serials = append(serials, m[1])
-			}
-			// Nine devices, each on a virtio-mmio transport of its own, out
-			// of the 24 the microvm machine has: the NIC, the four volumes,
-			// the root, the stack, the droplet, and the balloon.
-			Expect(devices).To(ConsistOf(slices.Concat(
-				[]string{"virtio-net-device", "virtio-balloon-device"},
-				slices.Repeat([]string{"virtio-blk-device"}, maxVolumes+3),
-			)), tree)
-			Expect(serials).To(ConsistOf(qemuVolumeSerial(0), qemuVolumeSerial(1), qemuVolumeSerial(2), qemuVolumeSerial(3), qemuRootSerial, qemuStackSerial, qemuDropletSerial), tree)
+			g.drives.volumes = volumeDrives
+			marked := withUserspaceMark(newRealInitramfs(g))
 
-			// The balloon works beside all of them: the guest answers a read
-			// with statistics that fit its size.
-			stats := newQEMUGuestStats(h.monitor)
-			enable, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			Expect(stats.Enable(enable)).To(Succeed(), h.details())
-			var sample guestMemorySample
-			Eventually(func() error {
-				read, cancelRead := context.WithTimeout(context.Background(), metricsReadTimeout)
-				defer cancelRead()
-				var err error
-				sample, err = stats.Read(read)
-				return err
-			}, realBootTimeout, 2*time.Second).Should(Succeed(), h.details())
-			Expect(sample.check(uint64(realBalloonGuestMiB) << 20)).To(Succeed())
-		})
-	})
+			runRealBalloonGuest(func(qmp *os.File) ([]string, []*os.File) {
+				files, drives, initrdPath, monitorFD, rootPath := hypervisorFilesWithStack(atts, marked, qmp, root, sd)
+				argv, err := hypervisorArgvWithStack(backend.VMQemu, art, GinkgoT().TempDir(), initrdPath, realBalloonGuestMiB, g.nw, drives, rootPath, monitorFD, sd, shares...)
+				Expect(err).NotTo(HaveOccurred())
+				return markedArgv(tcgArgv(qemu, argv)), files
+			}, func(h *realBalloon) {
+				// Stage 1 compares every drive's serial and size with /rvm/disks
+				// and fails the boot before the command on a mismatch, so the
+				// command's line shows that each drive the guest has is the one
+				// it was told about.
+				h.waitFor("balloon-command-ran", realBootTimeout)
+				Expect(h.console.String()).NotTo(ContainSubstring("vm-launch guest setup"), h.details())
+
+				tree, err := h.monitor.humanCommand("info qtree")
+				Expect(err).NotTo(HaveOccurred())
+				var devices, seen []string
+				for _, m := range regexp.MustCompile(`(?m)^\s+dev: ((?:virtio|vhost-user)-[a-z]+-device),`).FindAllStringSubmatch(tree, -1) {
+					devices = append(devices, m[1])
+				}
+				for _, m := range regexp.MustCompile(`(?m)^\s+serial = "([^"]*)"\r?$`).FindAllStringSubmatch(tree, -1) {
+					seen = append(seen, m[1])
+				}
+				// Nine devices, each on a virtio-mmio transport of its own, out
+				// of the 24 the microvm machine has: the NIC, the four volumes,
+				// the root, the stack, the droplet, and the balloon.
+				Expect(devices).To(ConsistOf(slices.Concat(
+					[]string{"virtio-net-device", "virtio-balloon-device"},
+					slices.Repeat([]string{"virtio-blk-device"}, maxVolumes-len(shared)+3),
+					slices.Repeat([]string{"vhost-user-fs-device"}, len(shared)),
+				)), tree)
+				Expect(seen).To(ConsistOf(slices.Concat(serials, []string{qemuRootSerial, qemuStackSerial, qemuDropletSerial})), tree)
+
+				// The balloon works beside all of them: the guest answers a read
+				// with statistics that fit its size.
+				stats := newQEMUGuestStats(h.monitor)
+				enable, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				Expect(stats.Enable(enable)).To(Succeed(), h.details())
+				var sample guestMemorySample
+				Eventually(func() error {
+					read, cancelRead := context.WithTimeout(context.Background(), metricsReadTimeout)
+					defer cancelRead()
+					var err error
+					sample, err = stats.Read(read)
+					return err
+				}, realBootTimeout, 2*time.Second).Should(Succeed(), h.details())
+				Expect(sample.check(uint64(realBalloonGuestMiB) << 20)).To(Succeed())
+			})
+		},
+		Entry("with four private disk images", nil),
+		// The shares put the guest's RAM in a memfd, beside the balloon.
+		Entry("with two private disk images and two shares", []int{1, 3}),
+	)
 })

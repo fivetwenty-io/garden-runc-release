@@ -468,7 +468,8 @@ type preparedVolumes []preparedVolume
 
 // prepare asks v's provider for its disk, in the mode privateMode picks from
 // the provider's capabilities, and adds it. A share is skipped: its provider
-// is not asked, and nothing is added. A size setting on a block volume is
+// is not asked, and nothing is added. A volume without a provider is
+// refused before anything else. A size setting on a block volume is
 // refused first (refuseBlockSize), and so is an instance index at or above
 // the provider's MaxInstances (checkInstanceLimit), both without calling
 // Prepare. The attachment must be in that mode, and its file must be what
@@ -495,6 +496,12 @@ func (pv *preparedVolumes) prepare(v selectedVolume, signals <-chan os.Signal, b
 	// so the provider is never asked.
 	if v.Volume.Settings.Mode == volumeShare {
 		return nil, nil
+	}
+	// findVolumeProviders gives every volume a provider, so one without is
+	// refused here, in either guest, rather than attached in a mode no
+	// provider chose.
+	if v.Provider == nil {
+		return nil, fmt.Errorf("the volume at %s has no volume provider, so vm-launch cannot tell how to attach it", quoteForLog(v.Volume.ContainerDir))
 	}
 	caps := v.Provider.Capabilities(v.Mount)
 	mode := privateMode(caps)

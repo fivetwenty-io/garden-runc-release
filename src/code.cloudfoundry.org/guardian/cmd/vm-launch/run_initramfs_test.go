@@ -488,19 +488,27 @@ var _ = Describe("the initramfs of a guest with a stack", func() {
 		Expect(write(g)).To(MatchError("the launcher's argv is 131072 bytes quoted, over the 131071 bytes a guest takes"))
 	})
 
+	DescribeTable("builds a stack guest with a share or a block volume, which it mounts as it does a private disk image",
+		func(change func(*guestContents)) {
+			g := stackGuest()
+			change(&g)
+			Expect(write(g)).To(Succeed())
+		},
+		Entry("a share", func(g *guestContents) {
+			g.vols = []guestVolume{{ContainerDir: "/home/vcap/data", Settings: volumeSettings{Mode: volumeShare}}}
+		}),
+		Entry("a block volume after an image", func(g *guestContents) {
+			g.vols = []guestVolume{{ContainerDir: "/home/vcap/data", ImageName: "rvm-disk-0.img"}, {ContainerDir: "/home/vcap/disk"}}
+			g.drives.volumes = append(qemuImageDrives(defaultImageSize), guestDrive{id: qemuVolumeSerial(1), kind: driveBlock, bytes: defaultImageSize})
+		}),
+	)
+
 	DescribeTable("refuses a stack the guest could not run, so no initramfs is built",
 		func(change func(*guestContents), want string) {
 			g := stackGuest()
 			change(&g)
 			Expect(write(g)).To(MatchError(want))
 		},
-		Entry("a share", func(g *guestContents) {
-			g.vols = []guestVolume{{ContainerDir: "/home/vcap/data", Settings: volumeSettings{Mode: volumeShare}}}
-		}, `a guest with a stack mounts only private disk images, and volume 0 at "/home/vcap/data" is a share`),
-		Entry("a block volume after an image", func(g *guestContents) {
-			g.vols = []guestVolume{{ContainerDir: "/home/vcap/data", ImageName: "rvm-disk-0.img"}, {ContainerDir: "/home/vcap/disk"}}
-			g.drives.volumes = append(qemuImageDrives(defaultImageSize), guestDrive{id: qemuVolumeSerial(1), kind: driveBlock, bytes: defaultImageSize})
-		}, `a guest with a stack mounts only private disk images, and volume 1 at "/home/vcap/disk" is on a block drive`),
 		Entry("no launcher", func(g *guestContents) { g.stack.launcher = guestTool{} },
 			"a guest with a stack needs the launcher, and it has none"),
 		Entry("an empty launcher", func(g *guestContents) { g.stack.launcher.size = 0 },

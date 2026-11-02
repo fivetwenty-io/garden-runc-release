@@ -6,12 +6,14 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"code.cloudfoundry.org/guardian/backend"
@@ -20,55 +22,6 @@ import (
 )
 
 var _ = Describe("the volumes of the stack guest", func() {
-	Describe("stackModeAllowsVolumes", func() {
-		image := func(path string) selectedVolume {
-			return selectedVolume{Volume: guestVolume{ContainerDir: path}, Provider: fake("JuiceFS")}
-		}
-		share := func(path string) selectedVolume {
-			v := image(path)
-			v.Volume.Settings.Mode = volumeShare
-			return v
-		}
-		boshDisk := func(path string) selectedVolume {
-			p := fake("BOSH disk")
-			p.caps = capabilities{Modes: []attachMode{attachBlock}, Fence: fenceExclusiveOpen}
-			return selectedVolume{Volume: guestVolume{ContainerDir: path}, Provider: p}
-		}
-
-		It("allows an app without volumes and an app whose volumes are all private disk images", func() {
-			for _, selected := range [][]selectedVolume{nil, {image("/home/vcap/data")}, {image("/data"), image("/home/vcap/more")}} {
-				ok, why := stackModeAllowsVolumes(selected)
-				Expect(ok).To(BeTrue(), why)
-				Expect(why).To(BeEmpty())
-			}
-		})
-
-		It("allows a provider that offers both modes, which gives a private volume a disk image", func() {
-			v := image("/data")
-			v.Provider.(*fakeDiskProvider).caps = capabilities{Modes: []attachMode{attachBlock, attachFileImage}, Fence: fenceDistributedFlock}
-			ok, why := stackModeAllowsVolumes([]selectedVolume{v})
-			Expect(ok).To(BeTrue(), why)
-		})
-
-		DescribeTable("keeps the busybox guest for a share or a BOSH disk, naming the first such volume",
-			func(selected []selectedVolume, want string) {
-				ok, why := stackModeAllowsVolumes(selected)
-				Expect(ok).To(BeFalse())
-				Expect(why).To(Equal(want))
-			},
-			Entry("a share", []selectedVolume{share("/home/vcap/shared")},
-				`the volume at "/home/vcap/shared" is a share, which the stack guest does not mount yet`),
-			Entry("a BOSH disk", []selectedVolume{boshDisk("/home/vcap/disk")},
-				`the volume at "/home/vcap/disk" is a BOSH disk, which the stack guest does not mount yet`),
-			Entry("a share after an image and before a BOSH disk", []selectedVolume{image("/a"), share("/b"), boshDisk("/c")},
-				`the volume at "/b" is a share, which the stack guest does not mount yet`),
-			Entry("a share that the provider would serve as a disk image", []selectedVolume{share("/data")},
-				`the volume at "/data" is a share, which the stack guest does not mount yet`),
-			Entry("a volume without a provider", []selectedVolume{{Volume: guestVolume{ContainerDir: "/x"}}},
-				`the volume at "/x" has no provider, so the stack guest cannot tell what kind of disk it is`),
-		)
-	})
-
 	Describe("stage 2", func() {
 		It("formats a blank image for uid 2000 in the stack guest only, and checks, grows, and mounts it as the busybox guest does", func() {
 			Expect(strings.Count(guestVolumeSetup, guestVolumeMke2fsArgs)).To(Equal(1))
@@ -115,16 +68,24 @@ var _ = Describe("the volumes of the stack guest", func() {
 			Expect(s.initScriptWithVolumes(testNonce, false)).To(ContainSubstring(guestRunSection(testNonce, s.processes(), false, stackExec)))
 		})
 
-		It("unbinds after the processes the command left are stopped, and before any volume's last flush and unmount", func() {
+		It("unbinds each volume in that volume's own pass, after the processes the command left are stopped, and right before the volume's last flush and unmount", func() {
 			Expect(guestVolumeTeardown).To(Equal(guestVolumeTeardownStop + guestVolumeTeardownUnmount))
 			Expect(guestVolumeTeardownStop).To(Equal(guestVolumeTeardownFlush + guestVolumeTeardownTerm + guestVolumeTeardownKill))
 			Expect(guestVolumeTeardownKill).To(HaveSuffix("rvm_vbad=\n"))
-			Expect(guestStackVolumeTeardown).To(Equal(guestVolumeTeardownStop + guestStackVolumeUnbinds + guestVolumeTeardownUnmount))
-			Expect(guestStackRunVolumeTeardown).To(Equal(guestVolumeTeardownFlush + guestVolumeTeardownKill + guestStackVolumeUnbinds + guestVolumeTeardownUnmount))
+			Expect(strings.Count(guestVolumeTeardownUnmount, guestVolumeLastFlush)).To(Equal(1))
+			Expect(guestStackVolumeTeardownUnmount).To(Equal(strings.Replace(guestVolumeTeardownUnmount, guestVolumeLastFlush, "\t\trvm_vunbind\n"+guestVolumeLastFlush, 1)))
+			// The call follows the pass's case, so a volume that the pass
+			// skips is never unbound in it.
+			Expect(strings.Index(guestStackVolumeTeardownUnmount, "rvm_vunbind")).To(BeNumerically(">", strings.Index(guestStackVolumeTeardownUnmount, "\t\tesac\n")))
+			Expect(guestStackVolumeTeardown).To(Equal(guestVolumeTeardownStop + guestStackVolumeUnbind + guestStackVolumeTeardownUnmount))
+			Expect(guestStackRunVolumeTeardown).To(Equal(guestVolumeTeardownFlush + guestVolumeTeardownKill + guestStackVolumeUnbind + guestStackVolumeTeardownUnmount))
 			Expect(guestVolumeTeardownTerm).To(ContainSubstring("kill -TERM -1"))
-			Expect(guestStackVolumeUnbinds).To(ContainSubstring(`umount "$rvm_vat"`))
-			Expect(guestStackVolumeUnbinds).NotTo(ContainSubstring("sync"))
-			Expect(guestStackVolumeUnbinds).NotTo(ContainSubstring("kill"))
+			Expect(guestStackVolumeUnbind).To(ContainSubstring(`umount "$rvm_vat"`))
+			Expect(guestStackVolumeUnbind).NotTo(ContainSubstring("sync"))
+			Expect(guestStackVolumeUnbind).NotTo(ContainSubstring("kill"))
+			// The busybox guest has no binds, so its teardown never unbinds.
+			Expect(guestVolumeTeardown).NotTo(ContainSubstring("rvm_vunbind"))
+			Expect(initScript(testNonce, true)).NotTo(ContainSubstring("rvm_vunbind"))
 		})
 
 		It("fits a run section's wind-down and the one wait of the volume teardown after it 2 seconds before the host's stop deadline", func() {
@@ -176,6 +137,29 @@ var _ = Describe("the volumes of the stack guest", func() {
 			fallback := string(byName[strings.TrimPrefix(guestFallbackInit, "/")].data)
 			Expect(fallback).To(Equal(initScript(testNonce, true)))
 			Expect(fallback).NotTo(ContainSubstring("root_owner"))
+		})
+
+		It("runs the stack guest's stage 2 with a share and a BOSH disk beside an image, each by its volume index, and gives the busybox guest it falls back to the same volumes", func() {
+			g := stackGuest()
+			g.stack.fallback = true
+			g.vols = []guestVolume{
+				{ContainerDir: "/home/vcap/data", ImageName: "rvm-disk-0.img"},
+				{ContainerDir: "/home/vcap/shared", Settings: volumeSettings{Mode: volumeShare}},
+				{ContainerDir: "/home/vcap/disk"},
+			}
+			g.drives.volumes = []guestDrive{
+				{id: qemuVolumeSerial(0), kind: driveImage, bytes: defaultImageSize},
+				{id: qemuVolumeSerial(2), kind: driveBlock, bytes: defaultImageSize},
+			}
+			byName := archive(g)
+			Expect(string(byName["init"].data)).To(Equal(guestStackInit))
+			Expect(string(byName["rvm/init"].data)).To(Equal(g.stack.initScriptWithVolumes(testNonce, true)))
+			Expect(string(byName["rvm/mounts"].data)).To(Equal("RVM_VOLUMES=3\nRVM_SYNC_MOUNTS=true\n" +
+				"RVM_VOL0_KIND=image\nRVM_VOL0_PATH='/home/vcap/data'\nRVM_VOL0_IMAGE='rvm-disk-0.img'\n" +
+				"RVM_VOL1_KIND=share\nRVM_VOL1_PATH='/home/vcap/shared'\n" +
+				"RVM_VOL2_KIND=block\nRVM_VOL2_PATH='/home/vcap/disk'\n"))
+			Expect(string(byName["rvm/disks"].data)).To(ContainSubstring("RVM_VOL1_KIND=share\nRVM_VOL2_KIND=block\nRVM_VOL2_ID=rvm-vol2\n"))
+			Expect(string(byName[strings.TrimPrefix(guestFallbackInit, "/")].data)).To(Equal(initScript(testNonce, true)))
 		})
 
 		It("gives the busybox guest that a stack guest without volumes falls back to a stage 2 without them", func() {
@@ -249,15 +233,33 @@ echo 2000:2000
 `), 0o755)).To(Succeed())
 		})
 
-		// mountsFor is the part of /rvm/mounts that the binds and the
-		// teardown read, for an image volume at each of paths.
-		mountsFor := func(paths ...string) string {
+		// kindMounts is the part of /rvm/mounts that the binds and the
+		// teardown read, for a volume at each of paths of the kind at the
+		// same place in kinds. An image volume has an image name, and a
+		// share has no device.
+		kindMounts := func(kinds []string, paths ...string) string {
+			GinkgoHelper()
+			Expect(kinds).To(HaveLen(len(paths)))
 			m := "RVM_VOLUMES=" + string(rune('0'+len(paths))) + "\n"
 			for i, p := range paths {
 				n := string(rune('0' + i))
-				m += "RVM_VOL" + n + "_KIND=image\nRVM_VOL" + n + "_PATH=" + shellQuote(p) + "\nRVM_VOL" + n + "_IMAGE=volume.img\nrvm_vdev_" + n + "=/dev/vd" + string(rune('b'+i)) + "\n"
+				m += "RVM_VOL" + n + "_KIND=" + kinds[i] + "\nRVM_VOL" + n + "_PATH=" + shellQuote(p) + "\n"
+				if kinds[i] == string(driveImage) {
+					m += "RVM_VOL" + n + "_IMAGE=volume.img\n"
+				}
+				if kinds[i] != volumeKindShare {
+					m += "rvm_vdev_" + n + "=/dev/vd" + string(rune('b'+i)) + "\n"
+				}
 			}
 			return m
+		}
+		// mountsFor is kindMounts for an image volume at each of paths.
+		mountsFor := func(paths ...string) string {
+			kinds := make([]string, len(paths))
+			for i := range kinds {
+				kinds[i] = string(driveImage)
+			}
+			return kindMounts(kinds, paths...)
 		}
 
 		// runScript runs rvm_fail, pre, and script in shell, with the app
@@ -394,6 +396,21 @@ echo 2000:2000
 			shellEntries(""),
 		)
 
+		DescribeTable("gives the root:root top directory of a block volume to uid 2000 as it does an image's, and never reads or changes the owner of a share, which binds as the others do",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				Expect(os.WriteFile(owners, []byte("0:0 /home/vcap/data\n0:0 /home/vcap/shared\n0:0 /home/vcap/disk\n"), 0o644)).To(Succeed())
+				// A stat of the share would fail and print a line.
+				out, calls := runScript(shell, kindMounts([]string{string(driveImage), volumeKindShare, string(driveBlock)}, "/home/vcap/data", "/home/vcap/shared", "/home/vcap/disk"),
+					guestStackVolumeBinds+"echo BOUND\n", "STAT_FAIL_AT=/home/vcap/shared")
+				Expect(out).To(Equal("BOUND\n"), shell.name)
+				Expect(calls).To(Equal("chown 2000:2000 /home/vcap/data\n"+bindCalls("/home/vcap/data", "/home/vcap/data")+
+					bindCalls("/home/vcap/shared", "/home/vcap/shared")+
+					"chown 2000:2000 /home/vcap/disk\n"+bindCalls("/home/vcap/disk", "/home/vcap/disk")), shell.name)
+			},
+			shellEntries(""),
+		)
+
 		DescribeTable("prints a line that names the volume and goes on to bind every volume when its owner cannot be read or changed",
 			func(shellOf func() guestShell, env, line string) {
 				shell := shellOf()
@@ -421,15 +438,12 @@ echo 2000:2000
 		)
 
 		// unbindCalls are the calls of a teardown of image volumes at paths
-		// after the stop, with nothing failing: the unbinds, and then each
-		// volume's last flush and unmount, all last first.
+		// after the stop, with nothing failing: for each volume, last first,
+		// its unbind, its last flush, and its unmount.
 		unbindCalls := func(paths ...string) string {
 			calls := ""
 			for i := len(paths) - 1; i >= 0; i-- {
-				calls += "umount $DIR/app" + paths[i] + "\n"
-			}
-			for i := len(paths) - 1; i >= 0; i-- {
-				calls += "sync -f " + paths[i] + "\numount " + paths[i] + "\n"
+				calls += "umount $DIR/app" + paths[i] + "\nsync -f " + paths[i] + "\numount " + paths[i] + "\n"
 			}
 			return calls
 		}
@@ -444,14 +458,18 @@ echo 2000:2000
 		}
 		// teardownCalls are the calls of a teardown of image volumes at
 		// paths, with no process left behind and nothing failing: the early
-		// flush and the stop, then the unbinds, and then each volume's last
-		// flush and unmount, all last first.
+		// flush and the stop, and then each volume's unbind, last flush, and
+		// unmount, last first.
 		teardownCalls := func(paths ...string) string {
 			return earlyCalls(paths...) + "kill -TERM -1\nkill -KILL -1\n" + unbindCalls(paths...)
 		}
+		teardownWith := func(shell guestShell, script, mounts, status string, env ...string) (string, string) {
+			GinkgoHelper()
+			return runScript(shell, mounts+"(exit "+status+")\nrvm_status=$?\n", guestStackVolumeWalk+script+"echo \"status=$rvm_status\"\n", env...)
+		}
 		teardownOf := func(shell guestShell, script, status string, paths []string, env ...string) (string, string) {
 			GinkgoHelper()
-			return runScript(shell, mountsFor(paths...)+"(exit "+status+")\nrvm_status=$?\n", guestStackVolumeWalk+script+"echo \"status=$rvm_status\"\n", env...)
+			return teardownWith(shell, script, mountsFor(paths...), status, env...)
 		}
 		teardown := func(shell guestShell, status string, paths []string, env ...string) (string, string) {
 			GinkgoHelper()
@@ -459,7 +477,7 @@ echo 2000:2000
 		}
 		flushFailLine := "vm-launch guest: the command exited 0, but a volume did not flush or unmount, so the guest reports the status " + guestFlushFailStatus + "\n"
 
-		DescribeTable("unbinds every volume from the app root, last first, after the stop and before the volumes' own flushes and unmounts, and keeps a status of 0",
+		DescribeTable("unbinds each volume from the app root after the stop, last first, right before that volume's own last flush and unmount, and keeps a status of 0",
 			func(shellOf func() guestShell) {
 				shell := shellOf()
 				paths := []string{"/home/vcap/data", "/srv/two", "/srv/three"}
@@ -514,8 +532,8 @@ echo 2000:2000
 				out, calls := teardown(shell, "0", paths, env()...)
 				Expect(out).To(Equal(lineOf()+flushFailLine+"status="+guestFlushFailStatus+"\n"), shell.name)
 				Expect(calls).To(Equal(earlyCalls(paths...)+"kill -TERM -1\nkill -KILL -1\n"+
-					"umount $DIR/app/home/vcap/data\n"+
-					"sync -f /srv/two\numount /srv/two\nsync -f /home/vcap/data\numount /home/vcap/data\n"), shell.name)
+					"sync -f /srv/two\numount /srv/two\n"+
+					"umount $DIR/app/home/vcap/data\nsync -f /home/vcap/data\numount /home/vcap/data\n"), shell.name)
 			},
 			slices.Concat(
 				shellEntries("a directory that is not the volume's",
@@ -537,6 +555,42 @@ echo 2000:2000
 						return "vm-launch guest: reading what the app root holds at the path of the volume at /srv/two failed (stat: can't stat '" + filepath.Join(app, "srv", "two") + "': No such file or directory), so the guest cannot unbind the volume or unmount it cleanly\n"
 					}),
 			),
+		)
+
+		// mixedKinds and mixedPaths are the volumes of a guest with an image, a
+		// share, a BOSH disk, and a second share, in volume order.
+		mixedKinds := []string{string(driveImage), volumeKindShare, string(driveBlock), volumeKindShare}
+		mixedPaths := []string{"/home/vcap/data", "/home/vcap/shared", "/home/vcap/disk", "/srv/more"}
+		// mixedCalls are the calls of a teardown of the mixed volumes, with
+		// nothing failing: the early flush of the image and the BOSH disk,
+		// the stop, and then each drive volume's unbind, last flush, and
+		// unmount, last first, before each share's, last first.
+		mixedCalls := "sync -f /home/vcap/disk\nsync -f /home/vcap/data\nkill -TERM -1\nkill -KILL -1\n" +
+			unbindCalls("/home/vcap/data", "/home/vcap/disk") + unbindCalls("/home/vcap/shared", "/srv/more")
+
+		DescribeTable("unbinds, flushes, and unmounts every image and block volume before it unbinds any share, so a share that hangs never keeps a disk from its last flush",
+			func(shellOf func() guestShell) {
+				shell := shellOf()
+				out, calls := teardownWith(shell, guestStackVolumeTeardown, kindMounts(mixedKinds, mixedPaths...), "0")
+				Expect(out).To(Equal("status=0\n"), shell.name)
+				Expect(calls).To(Equal(mixedCalls), shell.name)
+			},
+			shellEntries(""),
+		)
+
+		DescribeTable("reports the failure status for a share whose bind does not unmount, after every drive volume is flushed and unmounted, and still unmounts the share and the others",
+			func(shellOf func() guestShell, status, want string) {
+				shell := shellOf()
+				out, calls := teardownWith(shell, guestStackVolumeTeardown, kindMounts(mixedKinds, mixedPaths...), status, "UMOUNT_FAIL_AT="+filepath.Join(app, "home", "vcap", "shared"))
+				line := "vm-launch guest: unbinding the volume at /home/vcap/shared from the app root failed (umount: can't unmount " + filepath.Join(app, "home", "vcap", "shared") + ": Device or resource busy), so the guest cannot unmount the volume cleanly\n"
+				if status == "0" {
+					line += flushFailLine
+				}
+				Expect(out).To(Equal(line+"status="+want+"\n"), shell.name)
+				Expect(calls).To(Equal(mixedCalls), shell.name)
+			},
+			append(shellEntries("after a command that exited 0", "0", guestFlushFailStatus),
+				shellEntries("after a command that failed, which keeps its status", "3", "3")...),
 		)
 
 		DescribeTable("after a run section, sends what is left SIGKILL with no SIGTERM first, and then unbinds, flushes, and unmounts every volume, last first",
@@ -582,6 +636,16 @@ func rootOwner(img *os.File) string {
 	return fmt.Sprintf("%d:%d", field(extInodeUID, extInodeUIDHigh), field(extInodeGID, extInodeGIDHigh))
 }
 
+// hostOwner returns the uid and gid of path on the host, as "uid:gid".
+func hostOwner(path string) string {
+	GinkgoHelper()
+	info, err := os.Stat(path)
+	Expect(err).NotTo(HaveOccurred())
+	st, ok := info.Sys().(*syscall.Stat_t)
+	Expect(ok).To(BeTrue())
+	return fmt.Sprintf("%d:%d", st.Uid, st.Gid)
+}
+
 // realStackVolumeLauncher is the test launcher of the stack guest with a
 // volume at /home/vcap/data. It prints who it runs as, the volume's line in
 // the app's mount table, and who owns the volume's root, prints the file that
@@ -597,13 +661,40 @@ fi
 echo "written-by-$(id -u)" >/home/vcap/data/proof && echo "vol-wrote=$(stat -c %u:%g /home/vcap/data/proof)"
 `
 
+// realStackVolume is one volume of a real stack guest at path: an image or
+// block volume of kind on img, or, with no kind, a share of the host
+// directory dir.
+type realStackVolume struct {
+	path string
+	kind driveKind
+	img  *os.File
+	dir  string
+}
+
+// serveStackShare serves dir with the real virtiofsd as the share of the
+// volume at index, on a socket in a short directory of its own, since a Unix
+// socket path is short, and returns the share's socket.
+func serveStackShare(index int, dir string) shareSocket {
+	GinkgoHelper()
+	vfs := realShareVirtiofsd()
+	sockDir, err := os.MkdirTemp("", "rvm-s")
+	Expect(err).NotTo(HaveOccurred())
+	DeferCleanup(func() { os.RemoveAll(sockDir) })
+	tag := shareTag(index)
+	sock := filepath.Join(sockDir, shareSocketName(tag))
+	serveRealShare(vfs, sock, dir)
+	return shareSocket{Index: index, Tag: tag, Path: sock}
+}
+
 var _ = Describe("the stack guest with a volume against a real QEMU", func() {
-	// bootStackVolume boots a real guest under TCG with the test stack, a
-	// droplet, the launcher realStackVolumeLauncher, and img as an image
-	// volume at /home/vcap/data, with a guest root image when withRoot is
-	// set, and returns the console output without carriage returns. It
-	// fails the spec unless QEMU exits 0 and the guest started the launcher.
-	bootStackVolume := func(img *os.File, withRoot bool) string {
+	// bootStackVolumes boots a real guest under TCG with the test stack, a
+	// droplet, the launcher realStackVolumeLauncher, and vols in volume
+	// order, with a guest root image when withRoot is set, and returns the
+	// console output without carriage returns. The real virtiofsd serves
+	// each share. tweak, when it is not nil, may change the guest and its
+	// stack drives before the drives are numbered. It fails the spec unless
+	// QEMU exits 0 and the guest started its command.
+	bootStackVolumes := func(withRoot bool, vols []realStackVolume, tweak func(*guestContents, *stackDrives)) string {
 		GinkgoHelper()
 		art := realArtifacts()
 		qemu := realQEMU()
@@ -620,26 +711,54 @@ var _ = Describe("the stack guest with a volume against a real QEMU", func() {
 			hostname: "stack-guest-0",
 			hosts:    []byte("127.0.0.1 localhost\n"),
 		}
-		g.vols = []guestVolume{{ContainerDir: "/home/vcap/data", ImageName: "volume.img"}}
+		var atts []*attachment
+		var volumeDrives []guestDrive
+		var shares []shareSocket
+		for i, v := range vols {
+			if v.kind == "" {
+				g.vols = append(g.vols, guestVolume{ContainerDir: v.path, Settings: volumeSettings{Mode: volumeShare}})
+				shares = append(shares, serveStackShare(i, v.dir))
+				continue
+			}
+			vol := guestVolume{ContainerDir: v.path}
+			if v.kind == driveImage {
+				vol.ImageName = "volume.img"
+			}
+			g.vols = append(g.vols, vol)
+			info, err := v.img.Stat()
+			Expect(err).NotTo(HaveOccurred())
+			// A block volume's file is a regular file here, which QEMU opens
+			// as it does an image, and only the drive's kind tells the guest
+			// that it is a block volume.
+			atts = append(atts, &attachment{File: v.img, Mode: attachFileImage, ID: qemuVolumeSerial(i), Index: i, Release: func() error { return nil }})
+			volumeDrives = append(volumeDrives, guestDrive{id: qemuVolumeSerial(i), kind: v.kind, bytes: info.Size()})
+		}
 		var root *os.File
 		if withRoot {
 			withRealRoot(&g)
 			root = realRootImage()
 		}
+		if tweak != nil {
+			tweak(&g, sd)
+		}
 		g.drives, err = newGuestDrivesWithStack(backend.VMQemu, nil, root, sd)
 		Expect(err).NotTo(HaveOccurred())
-		info, err := img.Stat()
-		Expect(err).NotTo(HaveOccurred())
-		g.drives.volumes = qemuImageDrives(info.Size())
+		g.drives.volumes = volumeDrives
 
 		f := newRealInitramfs(g)
-		files, drives, initrdPath, _, rootPath := hypervisorFilesWithStack(imageAttachments(img), withUserspaceMark(f), nil, root, sd)
-		hvArgv, err := hypervisorArgvWithStack(backend.VMQemu, art, GinkgoT().TempDir(), initrdPath, minGuestMemoryMiB, g.nw, drives, rootPath, 0, sd)
+		files, drives, initrdPath, _, rootPath := hypervisorFilesWithStack(atts, withUserspaceMark(f), nil, root, sd)
+		hvArgv, err := hypervisorArgvWithStack(backend.VMQemu, art, GinkgoT().TempDir(), initrdPath, minGuestMemoryMiB, g.nw, drives, rootPath, 0, sd, shares...)
 		Expect(err).NotTo(HaveOccurred())
 		code, stdout, stderr := bootRealQEMU(markedArgv(tcgArgv(qemu, hvArgv)), files)
 		Expect(code).To(Equal(0), "QEMU failed: %s\n%s", stderr, stdout)
 		Expect(stdout).To(ContainSubstring(startTag(testNonce)), stdout)
 		return strings.ReplaceAll(stdout, "\r", "")
+	}
+	// bootStackVolume is bootStackVolumes with img as the one volume, an
+	// image volume at /home/vcap/data.
+	bootStackVolume := func(img *os.File, withRoot bool) string {
+		GinkgoHelper()
+		return bootStackVolumes(withRoot, []realStackVolume{{path: "/home/vcap/data", kind: driveImage, img: img}}, nil)
 	}
 
 	DescribeTable("formats a new volume image for vcap, lets the app write to it as uid 2000 through a nosuid and nodev bind, stops with status 0 after a clean unmount, and finds the file at the next boot",
@@ -689,5 +808,124 @@ var _ = Describe("the stack guest with a volume against a real QEMU", func() {
 		Expect(out).To(MatchRegexp(`(?m)^vol-wrote=2000:2000$`), out)
 		Expect(out).To(ContainSubstring(exitTag(testNonce)+"0"), out)
 		Expect(rootOwner(img)).To(Equal("2000:2000"))
+	})
+
+	It("binds a share that the real virtiofsd serves with nosuid and nodev, leaves its top directory's owner as it is, lets the app write to it as uid 2000, and finds the file at the next boot", func() {
+		dir := GinkgoT().TempDir()
+		// Anyone may write to the top directory, which belongs to whoever
+		// runs the spec, so a guest that gave it to uid 2000 would show on
+		// the host, and the app can write there either way.
+		Expect(os.Chmod(dir, 0o777)).To(Succeed())
+		owner := hostOwner(dir)
+		share := []realStackVolume{{path: "/home/vcap/data", dir: dir}}
+		out := bootStackVolumes(false, share, nil)
+		Expect(out).NotTo(ContainSubstring("vm-launch guest"), out)
+		Expect(out).To(MatchRegexp(`(?m)^vol-id=2000$`), out)
+		Expect(out).To(MatchRegexp(`(?m)^vol-mount=`+shareTag(0)+` /home/vcap/data virtiofs \S*\bnosuid\b`), out)
+		Expect(out).To(MatchRegexp(`(?m)^vol-mount=`+shareTag(0)+` /home/vcap/data virtiofs \S*\bnodev\b`), out)
+		Expect(out).To(MatchRegexp(`(?m)^vol-root=`+owner+`$`), out)
+		Expect(out).To(MatchRegexp(`(?m)^vol-wrote=2000:2000$`), out)
+		Expect(out).NotTo(ContainSubstring("vol-found="), out)
+		Expect(out).To(ContainSubstring(exitTag(testNonce)+"0"), out)
+		Expect(hostOwner(dir)).To(Equal(owner))
+		proof := filepath.Join(dir, "proof")
+		Expect(os.ReadFile(proof)).To(Equal([]byte("written-by-2000\n")))
+		Expect(hostOwner(proof)).To(Equal("2000:2000"))
+
+		out = bootStackVolumes(false, share, nil)
+		Expect(out).NotTo(ContainSubstring("vm-launch guest"), out)
+		Expect(out).To(MatchRegexp(`(?m)^vol-found=written-by-2000$`), out)
+		Expect(out).To(MatchRegexp(`(?m)^vol-wrote=2000:2000$`), out)
+		Expect(out).To(ContainSubstring(exitTag(testNonce)+"0"), out)
+		Expect(hostOwner(dir)).To(Equal(owner))
+	})
+
+	// formatAsImage makes the filesystem that a BOSH disk already holds on
+	// img with a boot of the stack guest that mounts img as an image volume,
+	// and gives its root to root:root, as the BOSH agent formats a disk. It
+	// returns the filesystem's UUID.
+	formatAsImage := func(img *os.File) string {
+		GinkgoHelper()
+		out := bootStackVolume(img, false)
+		Expect(out).To(MatchRegexp(`(?m)^vol-wrote=2000:2000$`), out)
+		Expect(out).To(ContainSubstring(exitTag(testNonce)+"0"), out)
+		readExtImage(img).editRoot(func(inode []byte) {
+			for _, off := range []int{extInodeUID, extInodeGID, extInodeUIDHigh, extInodeGIDHigh} {
+				binary.LittleEndian.PutUint16(inode[off:], 0)
+			}
+		})
+		Expect(rootOwner(img)).To(Equal("0:0"))
+		return readExtImage(img).uuid()
+	}
+
+	// expectCleanImage boots the stack guest with img as an image volume,
+	// whose check before the mount finds the filesystem clean only if the
+	// boot before unmounted it, and expects the file the stack guest wrote.
+	expectCleanImage := func(img *os.File) {
+		GinkgoHelper()
+		out := bootStackVolume(img, false)
+		Expect(out).NotTo(ContainSubstring("recovering journal"), out)
+		Expect(out).To(MatchRegexp(`(?m)^rvm-volume: clean, [0-9]+/[0-9]+ files, [0-9]+/[0-9]+ blocks$`), out)
+		Expect(out).NotTo(ContainSubstring("vm-launch guest"), out)
+		Expect(out).To(MatchRegexp(`(?m)^vol-found=written-by-2000$`), out)
+		Expect(out).To(ContainSubstring(exitTag(testNonce)+"0"), out)
+	}
+
+	It("mounts a BOSH disk as a block volume without formatting or checking it, gives its root:root top directory to uid 2000 through a nosuid and nodev bind, and unmounts it cleanly", func() {
+		img := openSizedFile(defaultImageSize)
+		uuid := formatAsImage(img)
+
+		out := bootStackVolumes(false, []realStackVolume{{path: "/home/vcap/data", kind: driveBlock, img: img}}, nil)
+		Expect(out).NotTo(ContainSubstring("vm-launch guest"), out)
+		Expect(out).NotTo(ContainSubstring("rvm-volume: clean"), out)
+		Expect(out).To(MatchRegexp(`(?m)^vol-id=2000$`), out)
+		Expect(out).To(MatchRegexp(`(?m)^vol-mount=\S+ /home/vcap/data ext4 \S*\bnosuid\b`), out)
+		Expect(out).To(MatchRegexp(`(?m)^vol-mount=\S+ /home/vcap/data ext4 \S*\bnodev\b`), out)
+		Expect(out).To(MatchRegexp(`(?m)^vol-root=2000:2000$`), out)
+		Expect(out).To(MatchRegexp(`(?m)^vol-found=written-by-2000$`), out)
+		Expect(out).To(MatchRegexp(`(?m)^vol-wrote=2000:2000$`), out)
+		Expect(out).To(ContainSubstring(exitTag(testNonce)+"0"), out)
+		Expect(rootOwner(img)).To(Equal("2000:2000"))
+		Expect(readExtImage(img).uuid()).To(Equal(uuid), "the block volume was formatted")
+
+		expectCleanImage(img)
+	})
+
+	It("falls back to the busybox guest with a share and a BOSH disk when the stack image does not mount, which mounts both as root's and unmounts them cleanly", func() {
+		img := openSizedFile(defaultImageSize)
+		formatAsImage(img)
+		dir := GinkgoT().TempDir()
+		Expect(os.Chmod(dir, 0o755)).To(Succeed())
+
+		vols := []realStackVolume{{path: "/home/vcap/shared", dir: dir}, {path: "/home/vcap/disk", kind: driveBlock, img: img}}
+		out := bootStackVolumes(false, vols, func(g *guestContents, sd *stackDrives) {
+			// The superblock is gone, so the squashfs mount fails.
+			image, err := io.ReadAll(io.NewSectionReader(sd.stack, 0, 1<<30))
+			Expect(err).NotTo(HaveOccurred())
+			copy(image, make([]byte, 4096))
+			f, err := os.Open(writeTempFile("corrupt-stack", string(image)))
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(f.Close)
+			sd.stack = f
+
+			g.command = `echo "fallback-ran uid=$(id -u)"
+echo "disk-found=$(cat /home/vcap/disk/proof)"
+echo from-the-fallback >/home/vcap/shared/note
+grep -E ' /home/vcap/(shared|disk) ' /proc/mounts | cut -d ' ' -f 2,3 | sed 's/^/fallback-mount=/'`
+			g.stack.fallback = true
+		})
+		Expect(out).To(MatchRegexp(`(?m)^busybox guest: mounting the stack image /dev/vd[a-z] failed`), out)
+		Expect(out).To(MatchRegexp(`(?m)^fallback-ran uid=0$`), out)
+		Expect(out).To(MatchRegexp(`(?m)^disk-found=written-by-2000$`), out)
+		Expect(out).To(MatchRegexp(`(?m)^fallback-mount=/home/vcap/shared virtiofs$`), out)
+		Expect(out).To(MatchRegexp(`(?m)^fallback-mount=/home/vcap/disk ext4$`), out)
+		Expect(out).NotTo(ContainSubstring("vol-id="), out)
+		Expect(out).NotTo(ContainSubstring("vm-launch guest"), out)
+		Expect(out).To(ContainSubstring(exitTag(testNonce)+"0"), out)
+		Expect(os.ReadFile(filepath.Join(dir, "note"))).To(Equal([]byte("from-the-fallback\n")))
+		// The busybox guest leaves the owner of a BOSH disk's root as it is.
+		Expect(rootOwner(img)).To(Equal("0:0"))
+
+		expectCleanImage(img)
 	})
 })

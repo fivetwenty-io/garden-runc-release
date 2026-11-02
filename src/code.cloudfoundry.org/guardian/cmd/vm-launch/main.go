@@ -725,12 +725,13 @@ func run(argv []string, logger *log.Logger) int {
 		return exitLaunchError
 	}
 	// The guest runs the app on its stack only when the process is the CF
-	// launcher, Garden bound a usable stack image, every volume the app has
-	// is a private disk image, and the droplet image builds. Each condition is settled as soon as
-	// run can tell, and the first that fails gives the busybox guest, which
-	// is then exactly the guest of a launch without a stack image. guestMode
-	// is the line that names the guest and why, which run logs once the
-	// hypervisor is about to start.
+	// launcher, Garden bound a usable stack image, and the droplet image
+	// builds. The stack guest mounts every kind of volume that the busybox
+	// guest does. Each condition is settled as soon as run can tell, and the
+	// first that fails gives the busybox guest, which is then exactly the
+	// guest of a launch without a stack image. guestMode is the line that
+	// names the guest and why, which run logs once the hypervisor is about
+	// to start.
 	stackImg, why := stackCandidate(cfg.args)
 	defer func() { closeFile(stackImg, "the stack image", logger) }()
 	guestMode := ""
@@ -814,13 +815,6 @@ func run(argv []string, logger *log.Logger) int {
 		return exitLaunchError
 	}
 	defer tools.Close()
-	// The stack guest mounts private disk images only, so a share or a BOSH
-	// disk keeps the busybox guest, with the first such volume named.
-	if stackImg != nil && len(selected) > 0 {
-		if ok, why := stackModeAllowsVolumes(selected); !ok && !toBusybox(why) {
-			return exitLaunchError
-		}
-	}
 	// The stack guest's launcher, argv, working directory, and host files
 	// are gathered and checked here, so that a launch the stack guest could
 	// not run fails before anything is prepared. The launcher stays open
