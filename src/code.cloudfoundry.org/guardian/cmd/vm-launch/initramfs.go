@@ -1880,6 +1880,11 @@ type guestStack struct {
 	// volumes. Its stage 1 is guestImageInit, and its processes run as the
 	// image's user (see guestImage).
 	image *guestImage
+	// windDown is how long the run section waits for its processes to exit
+	// after one has exited or a stop has begun (see stopTiming), or 0 for
+	// guestWindDown. A guest with volumes winds down one second sooner, as
+	// guestVolumeWindDown is one second under guestWindDown.
+	windDown time.Duration
 }
 
 // guestSidecar is one sidecar's two files in the stack guest. argv is its

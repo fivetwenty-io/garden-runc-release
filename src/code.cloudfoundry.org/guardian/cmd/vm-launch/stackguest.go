@@ -2,7 +2,11 @@
 
 package main
 
-import "strings"
+import (
+	"strconv"
+	"strings"
+	"time"
+)
 
 // Paths of the stack guest. The app root is where stage 1 assembles the
 // stack, the droplet, and their writable layers, and where stage 2 runs the
@@ -207,6 +211,13 @@ func (s *guestStack) initScriptWithVolumes(nonce string, volume bool) string {
 	timeout := guestTimeoutSeconds
 	if volume {
 		timeout = guestVolumeTimeoutSeconds
+	}
+	if s.windDown > 0 {
+		wait := s.windDown
+		if volume {
+			wait -= guestWindDown - guestVolumeWindDown
+		}
+		timeout = strconv.Itoa(int(wait / time.Second))
 	}
 	return stage2Script(nonce, volume, true, checks, guestRunSectionWithin(nonce, procs, s.identity != nil, exec, timeout))
 }

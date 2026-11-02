@@ -53,6 +53,8 @@ const (
 // vm-launch's own description of the sidecars, which the guest gets as files
 // (see sidecarGuestFiles). CF_VM_SIDECAR_RELAY marks a launcher process as a
 // sidecar's log relay, and the guest never sees it (see relayEnv).
+// CF_VM_STOP_GRACE_SECONDS is Diego's graceful shutdown interval for
+// vm-launch alone (see stopGraceEnv).
 var guestEnvDenylist = map[string]bool{
 	"PATH":                    true,
 	"HOME":                    true,
@@ -69,6 +71,7 @@ var guestEnvDenylist = map[string]bool{
 	platformOptionsEnv:        true,
 	sidecarsEnvVar:            true,
 	relayEnv:                  true,
+	stopGraceEnv:              true,
 }
 
 // stackGuestEnvDenylist is guestEnvDenylist for a guest that runs the app on

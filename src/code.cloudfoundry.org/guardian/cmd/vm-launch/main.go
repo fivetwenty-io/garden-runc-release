@@ -211,8 +211,8 @@
 // The guest never gets PATH, HOME, TMPDIR, USER, PWD, OLDPWD, DEPS_DIR,
 // CF_INSTANCE_CERT, CF_INSTANCE_KEY, CF_SYSTEM_CERT_PATH,
 // SERVICE_BINDING_ROOT, VCAP_SERVICES_FILE_PATH, VCAP_PLATFORM_OPTIONS,
-// CF_VM_SIDECARS, or a name that starts with __GARDEN_, except that the stack
-// guest keeps PATH and USER, and CF_INSTANCE_CERT and CF_INSTANCE_KEY when it
+// CF_VM_SIDECARS, CF_VM_STOP_GRACE_SECONDS, or a name that starts with
+// __GARDEN_, except that the stack guest keeps PATH and USER, and CF_INSTANCE_CERT and CF_INSTANCE_KEY when it
 // holds the instance identity pair (see Sidecars and instance identity
 // below). It also never gets the variables that its
 // busybox sh sets for itself, because the shell would replace a value from
@@ -518,8 +518,9 @@ const killGrace = 5 * time.Second
 const transparentProxyFlag = "transparent-proxy"
 
 // stopDeadline is how long the hypervisor may keep running after the first
-// SIGTERM or SIGINT, which is all the time a guest command gets to stop. Diego
-// sends SIGKILL 10 seconds after its SIGTERM, and the 2 seconds left cover
+// SIGTERM or SIGINT, which is all the time a guest command gets to stop. It is
+// the default, for a process that Diego passes no interval (see stopTiming).
+// Diego sends SIGKILL 10 seconds after its SIGTERM, and the 2 seconds left cover
 // the kernel freeing the guest's memory and vm-launch's own cleanup and exit
 // line, for every guest size vm-launch allows. With a share, a virtiofsd that
 // outlives a killed QEMU holds the last reference to the guest's memory, and
@@ -897,6 +898,13 @@ func run(argv []string, logger *log.Logger) int {
 		stack.image = &guestImage{uid: imgUser.uid, gid: imgUser.gid}
 		stack.cwd = "/"
 	}
+	// Diego's graceful shutdown interval, when the executor passes it, sets
+	// how long the hypervisor may run after a signal and how long the stack
+	// guest winds down its processes.
+	hostDeadline, guestWindDownTime := stopTiming(lookupEnv, logger)
+	if stack != nil {
+		stack.windDown = guestWindDownTime
+	}
 	// The busybox guest gets the container's hostname and hosts file as the
 	// stack guest does. A file vm-launch cannot read is logged and left out,
 	// because the guest booted without one before.
@@ -1257,7 +1265,7 @@ func run(argv []string, logger *log.Logger) int {
 
 	logger.Print(guestMode)
 	cmd := newHypervisorCmd(hvArgv, files)
-	sup := supervisor{stdout: os.Stdout, stderr: os.Stderr, logger: logger, signals: sigs, grace: killGrace, deadline: stopDeadline, started: closeInherited}
+	sup := supervisor{stdout: os.Stdout, stderr: os.Stderr, logger: logger, signals: sigs, grace: killGrace, deadline: hostDeadline, started: closeInherited}
 	sup.logs, sup.firstExit = relayCallbacks(hub)
 	if len(shares) > 0 {
 		// A virtiofsd that ends while QEMU runs kills it, which takes QEMU's
