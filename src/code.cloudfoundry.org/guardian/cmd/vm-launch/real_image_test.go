@@ -135,8 +135,9 @@ func realDockerImage(art string) *os.File {
 // boots one with QEMU, for the user string spec resolved against the test
 // image's account files, with the launcher argv argv and the environment
 // that vm-launch gives a process whose HOME, PATH, and USER are Garden's
-// defaults. It returns the console output, with carriage returns removed,
-// and fails the spec unless QEMU exits 0 and the guest started the launcher.
+// defaults. It returns the console output, with carriage returns removed
+// and the app's lines unframed, and fails the spec unless QEMU exits 0 and
+// the guest started the launcher.
 func bootRealImageGuest(spec string, argv []string) string {
 	art := realArtifacts()
 	qemu := realQEMU()
@@ -177,7 +178,7 @@ func bootRealImageGuest(spec string, argv []string) string {
 	code, stdout, stderr := bootRealQEMU(markedArgv(tcgArgv(qemu, hvArgv)), files)
 	Expect(code).To(Equal(0), "QEMU failed: %s\n%s", stderr, stdout)
 	Expect(stdout).To(ContainSubstring(startTag(testNonce)), stdout)
-	return strings.ReplaceAll(stdout, "\r", "")
+	return unframeApp(strings.ReplaceAll(stdout, "\r", ""), testNonce)
 }
 
 var _ = Describe("the Docker image guest against a real QEMU", func() {
