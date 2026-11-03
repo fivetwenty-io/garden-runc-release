@@ -316,6 +316,22 @@ func Process(args ...string) specs.Process {
 	return specs.Process{Args: args}
 }
 
+// WithSeccomp returns a bundle with the given seccomp profile, or with none
+// for nil. The original bundle is not modified.
+func (b Bndl) WithSeccomp(profile *specs.LinuxSeccomp) Bndl {
+	b.CloneLinux().Spec.Linux.Seccomp = profile
+	return b
+}
+
+// Seccomp returns the bundle's seccomp profile, which is nil when it has
+// none or no Linux section.
+func (b Bndl) Seccomp() *specs.LinuxSeccomp {
+	if b.Spec.Linux == nil {
+		return nil
+	}
+	return b.Spec.Linux.Seccomp
+}
+
 func (b *Bndl) CloneLinux() Bndl {
 	l := copy(*b.Spec.Linux)
 	b.Spec.Linux = &l

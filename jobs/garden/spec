@@ -247,6 +247,39 @@ properties:
     description: "Set NoNewPrivileges on unprivileged container processes. Prevents privilege escalation via setuid binaries and file capabilities."
     default: false
 
+  garden.deny_vsock:
+    description: |
+      Deny socket(AF_VSOCK) to every process in every container that Garden
+      creates on the cell, through each container's seccomp profile, with one
+      exception. The profile also refuses io_uring, which could open the
+      socket around the filter, and drops 32-bit x86 and x32 from its
+      architectures, because a 32-bit socketcall(2) hides the address family
+      from the filter. A 32-bit program therefore cannot run in a container on
+      the cell, and the kernel kills it at its first system call. In a vm-qemu
+      container with the guest agent, the vm-launch process that relays cf ssh
+      sessions to the agent keeps the call, and every other process there, the
+      hypervisor and the app's own processes among them, runs under a filter
+      that denies it. In that container a command that is missing fails with
+      exit status 127 once its process has started, where it used to fail to
+      start, and a bare command name that only a relative PATH entry finds is
+      refused, as runc refuses it. A container keeps the profile it was
+      created with, so Garden gives a vm-qemu container the guest agent only
+      once no container or pea on the cell that predates the property can
+      still open a vsock socket, and it logs which containers hold the agent
+      back until then. When the property is false and Garden finds a container
+      that serves the guest agent from before, it keeps denying every new
+      container vsock until it restarts with no such container left. Off by
+      default, and then the profiles are the ones Garden rendered before the
+      property existed, even when Garden cannot list the containers on the
+      cell, which it then logs as an error. A container that runs under gVisor
+      ignores its seccomp profile, but gVisor offers its programs no vsock
+      sockets at all, so the gVisor containers on a mixed cell need no denial.
+      Garden gives no container the guest agent on a cell that runs every
+      container under runsc. garden.vm_guest_agent requires it, because
+      without it any process in a container on the cell can reach a guest
+      agent over vsock.
+    default: false
+
   garden.device_cgroup_rules:
     description: Device cgroup rules that will be applied to privileged containers. By default loop devices are allowed for privileged containers.
     default: ["b 7:* rwm", "c 10:237 rwm"]
@@ -357,7 +390,8 @@ properties:
       the agent, and cf ssh into it says why. It renders vm-guest-agent only
       when the value is true, and Garden then passes --guest-agent to
       vm-launch, so the default changes no argument.
-      It requires a vm-* entry in garden.execution_backends.
+      It requires a vm-* entry in garden.execution_backends, and
+      garden.deny_vsock.
     default: false
 
   garden.vm_volume_sync_mounts:

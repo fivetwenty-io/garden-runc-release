@@ -12,6 +12,7 @@ import (
 	spec "code.cloudfoundry.org/guardian/gardener/container-spec"
 	"code.cloudfoundry.org/guardian/rundmc/goci"
 	"code.cloudfoundry.org/guardian/rundmc/processes"
+	"code.cloudfoundry.org/guardian/rundmc/seccompvsock"
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -139,6 +140,19 @@ type ExecutionBackend struct {
 	// a vm-qemu container gets no node for it, and its guest runs without the
 	// agent rather than failing to be created.
 	HostVhostVsock bool
+
+	// VsockException says whether the vm-qemu container with the given
+	// handle may get /dev/vhost-vsock for the guest agent now. gdn says no
+	// while any other container on the cell can still create a vsock
+	// socket. Nil says yes.
+	//
+	// A container that VsockDenial denied vsock to is then the one
+	// exception. Its profile allows vsock again, because its wrapped
+	// vm-launch dials the agent over vsock, and its annotation says that
+	// every other process of the container runs under vm-launch's vsock
+	// filter: the init process, which this rule wraps, and every exec,
+	// which the process builder wraps.
+	VsockException func(handle string) bool
 }
 
 // NewExecutionBackend returns the rule with the default required artifact table.
@@ -163,6 +177,9 @@ func (r ExecutionBackend) Apply(bndl goci.Bndl, spec spec.DesiredContainerSpec) 
 	// reserveMiB is the reserve that a VM container's memory limit was raised
 	// by, or 0 when the limit was not raised.
 	reserveMiB := 0
+	// wrapInit says that the container's profile allows vsock again and its
+	// init process must start under vm-launch's vsock filter.
+	wrapInit := false
 	if backend.IsVM(kind) {
 		if bndl.Spec.Process == nil {
 			return goci.Bndl{}, fmt.Errorf("%w: %s needs a bundle process to confine", backend.ErrBackendUnavailable, kind)
@@ -179,10 +196,14 @@ func (r ExecutionBackend) Apply(bndl goci.Bndl, spec spec.DesiredContainerSpec) 
 		if kind == backend.VMFirecracker {
 			nodes = append(nodes, tunNode)
 		}
-		if r.GuestAgent && r.HostVhostVsock && kind == backend.VMQemu {
+		if r.GuestAgent && r.HostVhostVsock && kind == backend.VMQemu && (r.VsockException == nil || r.VsockException(spec.Handle)) {
 			vsock := vhostVsockNode
 			vsock.gid = r.KVMGid
 			nodes = append(nodes, vsock)
+			if bndl.Spec.Annotations[seccompvsock.AnnotationKey] == seccompvsock.AnnotationProfile {
+				bndl = bndl.WithSeccomp(seccompvsock.Allow(bndl.Seccomp()))
+				wrapInit = true
+			}
 		}
 		// Claimed last, because it creates host nodes. Nothing below can fail,
 		// and a failure later in the create is cleaned up by the destroy that
@@ -248,6 +269,9 @@ func (r ExecutionBackend) Apply(bndl goci.Bndl, spec spec.DesiredContainerSpec) 
 		process := bndl.Process()
 		process.Capabilities = processes.WithoutCapability(process.Capabilities, processes.CapSetGID)
 		process.NoNewPrivileges = true
+		if wrapInit {
+			process.Args = append([]string{VMLaunchMountPath, processes.VMLaunchDenyVsockCommand, "--"}, process.Args...)
+		}
 		bndl = bndl.WithProcess(process)
 		if m, ok := pdiDiskseqMount(nodes); ok {
 			bndl = bndl.WithMounts(m)
@@ -264,6 +288,9 @@ func (r ExecutionBackend) Apply(bndl goci.Bndl, spec spec.DesiredContainerSpec) 
 	}
 	if backend.IsVM(kind) && spec.VMImageDir != "" {
 		annotations[backend.ImageAnnotationKey] = backend.DockerImage
+	}
+	if wrapInit {
+		annotations[seccompvsock.AnnotationKey] = seccompvsock.AnnotationWrapper
 	}
 	bndl.Spec.Annotations = annotations
 

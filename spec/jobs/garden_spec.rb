@@ -680,7 +680,7 @@ describe 'garden' do
         end
 
         context 'when it is true' do
-          let(:garden_properties) { { 'execution_backends' => ['vm-qemu'], 'vm_guest_agent' => true } }
+          let(:garden_properties) { { 'execution_backends' => ['vm-qemu'], 'vm_guest_agent' => true, 'deny_vsock' => true } }
 
           it 'renders the key after the vm keys and nothing else new' do
             expect(server['vm-guest-agent']).to eql(true)
@@ -689,8 +689,16 @@ describe 'garden' do
         end
 
         it 'renders the key on a vm-firecracker cell too' do
-          rendered = IniParse.parse(render_with(['vm-firecracker'], { 'vm_guest_agent' => true }))['server']
+          rendered = IniParse.parse(render_with(['vm-firecracker'], { 'vm_guest_agent' => true, 'deny_vsock' => true }))['server']
           expect(rendered['vm-guest-agent']).to eql(true)
+        end
+
+        [['vm-qemu'], ['vm-firecracker'], %w[vm-qemu vm-firecracker]].each do |backends|
+          it "raises when it is true without garden.deny_vsock (#{backends.inspect})" do
+            [{}, { 'deny_vsock' => false }].each do |deny|
+              expect { render_with(backends, { 'vm_guest_agent' => true }.merge(deny)) }.to raise_error(/garden.vm_guest_agent requires garden.deny_vsock/)
+            end
+          end
         end
 
         [[], ['oci-gvisor']].each do |backends|
@@ -702,6 +710,47 @@ describe 'garden' do
         ['true', 1, []].each do |value|
           it "raises for #{value.inspect}, which is not true or false" do
             expect { render_with(['vm-qemu'], { 'vm_guest_agent' => value }) }.to raise_error(/garden.vm_guest_agent must be true or false/)
+          end
+        end
+      end
+
+      context 'deny_vsock' do
+        def render_with(backends, extra)
+          template.render({ 'garden' => { 'execution_backends' => backends }.merge(extra) })
+        end
+
+        it 'declares a default of false and a description' do
+          garden_spec = YAML.load_file(File.join(File.dirname(__FILE__), '../../jobs/garden/spec'))
+          property = garden_spec['properties']['garden.deny_vsock']
+          expect(property['default']).to eql(false)
+          expect(property['description']).not_to be_empty
+        end
+
+        [[], ['vm-qemu'], %w[vm-qemu vm-firecracker], ['oci-gvisor']].each do |backends|
+          it "renders byte for byte what it rendered before the property existed when it is false (#{backends.inspect})" do
+            expect(render_with(backends, { 'deny_vsock' => false })).to eql(render_with(backends, {}))
+            expect(render_with(backends, {})).not_to include('vsock')
+          end
+        end
+
+        [[], ['vm-qemu'], ['oci-gvisor']].each do |backends|
+          it "renders the key in the server section, after no-new-privileges, when it is true (#{backends.inspect})" do
+            rendered = render_with(backends, { 'deny_vsock' => true, 'no_new_privileges' => true })
+            expect(IniParse.parse(rendered)['server']['deny-vsock']).to eql(true)
+            expect(rendered).to include("  no-new-privileges = true\n  deny-vsock = true\n")
+            expect(rendered.sub("  deny-vsock = true\n", '')).to eql(render_with(backends, { 'no_new_privileges' => true }))
+          end
+        end
+
+        it 'lets the guest agent turn on' do
+          rendered = IniParse.parse(render_with(['vm-qemu'], { 'deny_vsock' => true, 'vm_guest_agent' => true }))['server']
+          expect(rendered['deny-vsock']).to eql(true)
+          expect(rendered['vm-guest-agent']).to eql(true)
+        end
+
+        ['true', 1, []].each do |value|
+          it "raises for #{value.inspect}, which is not true or false" do
+            expect { render_with(['vm-qemu'], { 'deny_vsock' => value }) }.to raise_error(/garden.deny_vsock must be true or false/)
           end
         end
       end

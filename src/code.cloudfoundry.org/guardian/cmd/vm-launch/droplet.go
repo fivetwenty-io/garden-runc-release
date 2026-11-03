@@ -64,6 +64,13 @@ type dropletImage struct {
 // carries the last lines of the tool's output. Cancelling ctx kills the tool,
 // and the error then wraps the context's error.
 func buildDropletImage(ctx context.Context, artifacts, home, workDir string, exclude ...string) (*dropletImage, error) {
+	return buildDropletImageConfined(ctx, nil, artifacts, home, workDir, exclude...)
+}
+
+// buildDropletImageConfined is buildDropletImage with the tool started from
+// an OS thread of its own after prepare has run on it (see startConfinedAs),
+// or started as any process is when prepare is nil.
+func buildDropletImageConfined(ctx context.Context, prepare func() error, artifacts, home, workDir string, exclude ...string) (*dropletImage, error) {
 	tool := filepath.Join(artifacts, artMksquashfs)
 	image := filepath.Join(workDir, "droplet.sqfs")
 	args := []string{
@@ -92,7 +99,7 @@ func buildDropletImage(ctx context.Context, artifacts, home, workDir string, exc
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 	cmd.WaitDelay = dropletKillWait
-	if err := cmd.Run(); err != nil {
+	if err := runConfined(cmd, prepare); err != nil {
 		_ = os.Remove(image)
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			err = fmt.Errorf("%w (%v)", ctxErr, err)
@@ -126,6 +133,12 @@ func buildDropletImage(ctx context.Context, artifacts, home, workDir string, exc
 // caller must not start the guest. An error that is not from a signal says
 // whether the build ran past timeout.
 func buildDropletImageWatching(sigs <-chan os.Signal, timeout time.Duration, artifacts, home, workDir string, exclude ...string) (*dropletImage, os.Signal, error) {
+	return buildDropletImageWatchingConfined(sigs, timeout, nil, artifacts, home, workDir, exclude...)
+}
+
+// buildDropletImageWatchingConfined is buildDropletImageWatching with the
+// tool started after prepare (see buildDropletImageConfined).
+func buildDropletImageWatchingConfined(sigs <-chan os.Signal, timeout time.Duration, prepare func() error, artifacts, home, workDir string, exclude ...string) (*dropletImage, os.Signal, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	caught := make(chan os.Signal, 1)
@@ -140,7 +153,7 @@ func buildDropletImageWatching(sigs <-chan os.Signal, timeout time.Duration, art
 		case <-stop:
 		}
 	}()
-	img, err := buildDropletImage(ctx, artifacts, home, workDir, exclude...)
+	img, err := buildDropletImageConfined(ctx, prepare, artifacts, home, workDir, exclude...)
 	close(stop)
 	<-ended
 	select {
@@ -183,4 +196,18 @@ func lastLines(s string, n int) string {
 		lines = lines[len(lines)-n:]
 	}
 	return "\n" + strings.Join(lines, "\n")
+}
+
+// runConfined runs cmd as cmd.Run does, starting it after prepare when
+// prepare is not nil (see startConfinedAs).
+func runConfined(cmd *exec.Cmd, prepare func() error) error {
+	if prepare == nil {
+		return cmd.Run()
+	}
+	release, err := startConfinedAs(cmd, prepare, "the droplet build")
+	if err != nil {
+		return err
+	}
+	defer release()
+	return cmd.Wait()
 }

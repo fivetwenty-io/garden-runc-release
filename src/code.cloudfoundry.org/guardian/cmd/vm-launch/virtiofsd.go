@@ -529,8 +529,11 @@ type shareServers struct {
 	// Specs that run the real virtiofsd where its filter cannot load change
 	// it.
 	seccomp string
-	logger  *log.Logger
-	servers []*shareServer
+	// denyVsock starts each virtiofsd unable to create a vsock socket (see
+	// denyChildVsockFlag).
+	denyVsock bool
+	logger    *log.Logger
+	servers   []*shareServer
 	// The lifecycle's timing as the launch began (see virtiofsdReadyTimeout
 	// and the rest), which the launch's goroutines read. exitWait is
 	// hypervisorExitWait for the guest's memory (see setGuestMemory).
@@ -714,7 +717,8 @@ func (s *shareServers) startOne(srv *shareServer) error {
 	// ExtraFiles[0] is the child's descriptor 3, virtiofsdListenFD.
 	cmd.ExtraFiles = []*os.File{srv.listener}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
-	release, err := startConfinedAs(cmd, func() error { return confineVirtiofsd(hypervisorCaps) }, "virtiofsd")
+	prepare := withVsockDenial(func() error { return confineVirtiofsd(hypervisorCaps) }, s.denyVsock)
+	release, err := startConfinedAs(cmd, prepare, "virtiofsd")
 	if cerr := logW.Close(); cerr != nil {
 		s.logger.Printf("closing vm-launch's copy of the log pipe of virtiofsd for the share at %s: %v", quoteForLog(srv.grant.Path), cerr)
 	}

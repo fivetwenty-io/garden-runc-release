@@ -129,6 +129,7 @@ type CommonCommand struct {
 		DestroyContainersOnStartup bool          `long:"destroy-containers-on-startup" description:"Clean up all the existing containers on startup."`
 		ApparmorProfile            string        `long:"apparmor" description:"Apparmor profile to use for unprivileged container processes"`
 		NoNewPrivileges            bool          `long:"no-new-privileges" description:"Set NoNewPrivileges on unprivileged container processes"`
+		DenyVsock                  bool          `long:"deny-vsock" description:"Deny vsock sockets to every container process through the seccomp profile, privileged containers included, which then get a profile that denies only what this takes. The profile makes socket(AF_VSOCK) and the io_uring calls fail, and it leaves out 32-bit x86 and x32, so 32-bit programs cannot run in containers while this is on. The one exception is the wrapped vm-launch of a vm-qemu container with the guest agent, which relays cf ssh sessions to its guest over vsock. Garden starts every other process of that container, its init process included, and every child of that vm-launch, under a filter that denies the same calls. A command that is missing from that container then fails with exit status 127 once its process has started, where it used to fail to start, and a bare command name that only a relative PATH entry finds is refused, as runc refuses it. --vm-guest-agent needs this flag, and Garden refuses it without it. Garden also gives no container the guest agent while a container or pea created without the denial still runs, and it keeps the denial for the rest of its run when it starts without this flag and finds a container that serves the guest agent. gVisor containers ignore the profile, but gVisor offers them no vsock sockets, so Garden goes by their annotation like any other container's, and it gives no container the guest agent on a cell that runs every container under runsc. Off by default, which leaves every profile as it was, even when Garden cannot list the containers, which it then logs as an error."`
 	} `group:"Container Lifecycle"`
 
 	Bin struct {
@@ -219,7 +220,7 @@ type CommonCommand struct {
 		VMVolumeShares      bool          `long:"vm-volume-shares" description:"Let an app on a vm-qemu container ask for a volume as a share in VM_VOLUMES. Garden passes --allow-volume-shares and the virtiofsd wrapper's path to vm-launch. Off by default, and a share is refused on vm-firecracker whatever its value."`
 		VMMaxVCPUs          uint          `long:"vm-max-vcpus" description:"The most vCPUs a vm-* guest gets. By default, which is 0, a guest gets one vCPU for each CPU its container may run on, up to 32, so that it can use every core of the cell the way a runC app can, and its container's CPU weight still bounds its total CPU time. Garden passes --max-vcpus to vm-launch only when this is set."`
 		VMFullMemoryLimit   bool          `long:"vm-full-memory-limit" description:"Give the guest of a vm-* container the whole memory limit that the app asked for, so that MEMORY_LIMIT in the guest equals the manifest limit. Garden raises the container's own memory limit by the hypervisor's reserve, about 130 MiB for a vm-qemu container and 100 MiB for a vm-firecracker container of 1 GiB, and passes --full-memory-limit to vm-launch. The cell is then oversubscribed by that reserve for each VM container, so Diego's memory accounting no longer bounds the cell. Off by default, and then the guest gets the limit less the reserve."`
-		VMGuestAgent        bool          `long:"vm-guest-agent" description:"Give each vm-* container the guest agent, which runs a cf ssh session, command, and signals inside the guest as the app user. Garden passes --guest-agent to vm-launch, binds vm-launch read-only over /bin/bash in the container so that diego-sshd's shell reaches the agent, and adds /dev/vhost-vsock to a vm-qemu container when the host has it. Off by default."`
+		VMGuestAgent        bool          `long:"vm-guest-agent" description:"Give each vm-* container the guest agent, which runs a cf ssh session, command, and signals inside the guest as the app user. Garden passes --guest-agent to vm-launch, binds vm-launch read-only over /bin/bash in the container so that diego-sshd's shell reaches the agent, and adds /dev/vhost-vsock to a vm-qemu container when the host has it. It needs --deny-vsock, and without it Garden logs that it refuses the agent and runs every VM without one. Off by default."`
 		VMVolumeAsyncMounts bool          `long:"vm-volume-async-mounts" description:"Mount a journalled ext4 image volume of a vm-* container without sync and dirsync, which vm-launch otherwise uses. A legacy ext2 image without a journal keeps them. Garden passes --volume-sync-mounts=false to vm-launch only when this is set. Off by default."`
 		VMMirrorMounts      bool          `long:"vm-mirror-mounts" description:"Carry the bind mounts of a vm-* container, such as the file-based service bindings at /etc/cf-service-bindings, into its guest at the same paths, by rule. Garden passes --mirror-mounts to vm-launch only when this is set. Off by default."`
 		VMVolumeHandoff     bool          `long:"vm-volume-handoff" description:"Let a vm-* container that holds a private disk image stop its guest early and hand the image over when a new instance of the same app process waits for it, such as during an evacuation, and let a waiting container ask for it. The old guest gets the usual stop and its deadline. The handoff never grants the image to anyone, and the image's flock stays the only fence. Garden passes --volume-handoff to vm-launch only when this is set. Off by default."`
@@ -689,6 +690,11 @@ func (cmd *CommonCommand) wireContainerizer(
 
 	bundleRules = append(bundleRules, cmd.wireKernelParams()...)
 
+	// Before the execution backend rule, which gives vsock back to a vm-qemu
+	// container that serves the guest agent.
+	vsockGate := newVsockGate(log, cmd.Containers.DenyVsock, cmd.runscCell())
+	bundleRules = append(bundleRules, bundlerules.VsockDenial{Deny: vsockGate.Deny})
+
 	// Registered last so that no earlier rule can undo its device and mount
 	// additions, and only when a backend other than oci-runc is enabled so
 	// that a cell without backend flags builds the same bundles as before.
@@ -696,8 +702,9 @@ func (cmd *CommonCommand) wireContainerizer(
 		executionBackendRule := bundlerules.NewExecutionBackend(cmd.ExecutionBackends.VMArtifactsDir, cmd.ExecutionBackends.VMLaunchBin, backends.kvmGid)
 		executionBackendRule.BlockVolumes = backends.blockVolumes
 		executionBackendRule.FullMemoryLimit = backends.fullMemoryLimit
-		executionBackendRule.GuestAgent = cmd.ExecutionBackends.VMGuestAgent
+		executionBackendRule.GuestAgent = backends.guestAgent
 		executionBackendRule.HostVhostVsock = backends.vhostVsock
+		executionBackendRule.VsockException = vsockGate.Exception
 		bundleRules = append(bundleRules, executionBackendRule)
 	}
 
@@ -862,6 +869,8 @@ func (cmd *CommonCommand) wireContainerizer(
 		streamer = rundmc.NewNstarStreamer(ociRuntime, nstar)
 	}
 
+	vsockGate.watch(ociRuntime, processDepot)
+
 	containerizerOpts = append(containerizerOpts, backends.containerizerOptions(ociRuntime)...)
 	containerizerOpts = append(containerizerOpts, rundmc.WithVMCgroupState(runcRoot))
 
@@ -911,6 +920,11 @@ type executionBackends struct {
 	// agent of a vm-qemu container needs. It is false unless the agent is on
 	// and vm-qemu is enabled.
 	vhostVsock bool
+
+	// guestAgent says that vm-* containers get the guest agent. It is false
+	// unless --vm-guest-agent is set, a vm-* backend is enabled, and
+	// --deny-vsock is set (see guestAgentAllowed).
+	guestAgent bool
 }
 
 // releaser returns the step that releases claimed block devices, or nil.
@@ -1107,8 +1121,10 @@ func (cmd *CommonCommand) wireExecutionBackends(log lager.Logger) (*executionBac
 	}
 
 	var vmLaunchFlags []string
+	guestAgent := false
 	if kvmGid != 0 {
-		vmLaunchFlags = cmd.vmLaunchVolumeFlags()
+		guestAgent = cmd.guestAgentAllowed(log)
+		vmLaunchFlags = cmd.vmLaunchVolumeFlags(guestAgent)
 	} else {
 		cmd.logUnusedVolumeFlags(log)
 	}
@@ -1137,11 +1153,11 @@ func (cmd *CommonCommand) wireExecutionBackends(log lager.Logger) (*executionBac
 		vmDockerRootFS = cmd.ExecutionBackends.VMDockerRootFS
 	}
 
-	vhostVsock := kvmGid != 0 && cmd.ExecutionBackends.VMGuestAgent && slices.Contains(kinds, backend.VMQemu) && hostHasVhostVsock(log)
+	vhostVsock := guestAgent && slices.Contains(kinds, backend.VMQemu) && hostHasVhostVsock(log)
 
 	log.Info("enabled", lager.Data{"backends": kinds, "kvm-gid": kvmGid, "block-volumes": blockVolumes != nil, "vm-launch-flags": vmLaunchFlags, "vm-stacks": vmStacks != nil, "vm-docker-images": vmDockerRootFS != ""})
 
-	return &executionBackends{registry: registry, kvmGid: kvmGid, blockVolumes: blockVolumes, vmLaunchFlags: vmLaunchFlags, fullMemoryLimit: kvmGid != 0 && cmd.ExecutionBackends.VMFullMemoryLimit, vmStacks: vmStacks, vmDockerRootFS: vmDockerRootFS, vhostVsock: vhostVsock}, nil
+	return &executionBackends{registry: registry, kvmGid: kvmGid, blockVolumes: blockVolumes, vmLaunchFlags: vmLaunchFlags, fullMemoryLimit: kvmGid != 0 && cmd.ExecutionBackends.VMFullMemoryLimit, vmStacks: vmStacks, vmDockerRootFS: vmDockerRootFS, vhostVsock: vhostVsock, guestAgent: guestAgent}, nil
 }
 
 // checkVMDockerFlags refuses Docker image flags that cannot work: a tarball
@@ -1238,15 +1254,32 @@ func (cmd *CommonCommand) logUnusedBlockVolumes(log lager.Logger) {
 	}
 }
 
+// guestAgentAllowed reports whether vm-* containers get the guest agent. The
+// agent needs --deny-vsock: without it any process on the cell could
+// create a vsock socket and dial a guest's agent, so Garden refuses the
+// agent, says so, and runs every VM without it, the way it would with
+// --vm-guest-agent unset.
+func (cmd *CommonCommand) guestAgentAllowed(log lager.Logger) bool {
+	if !cmd.ExecutionBackends.VMGuestAgent {
+		return false
+	}
+	if !cmd.Containers.DenyVsock {
+		log.Info("guest-agent-refused-without-vsock-denial", lager.Data{"needs": "--deny-vsock"})
+		return false
+	}
+	return true
+}
+
 // vmLaunchVolumeFlags returns the volume, QEMU sandbox, CPU, mount mirroring,
 // guest agent, and handoff flags for the wrapped vm-launch of a vm-* container,
-// which are empty for the defaults.
-func (cmd *CommonCommand) vmLaunchVolumeFlags() []string {
+// which are empty for the defaults. guestAgent says whether the agent is on
+// (see guestAgentAllowed).
+func (cmd *CommonCommand) vmLaunchVolumeFlags(guestAgent bool) []string {
 	flags := processes.VMLaunchVolumeFlags(cmd.ExecutionBackends.VMVolumeShares, bundlerules.VMVirtiofsdPath, !cmd.ExecutionBackends.VMVolumeAsyncMounts)
 	flags = append(flags, processes.VMLaunchQEMUSandboxFlags(cmd.ExecutionBackends.VMQemuSandbox)...)
 	flags = append(flags, processes.VMLaunchCPUFlags(cmd.ExecutionBackends.VMMaxVCPUs)...)
 	flags = append(flags, processes.VMLaunchMirrorMountsFlags(cmd.ExecutionBackends.VMMirrorMounts)...)
-	flags = append(flags, processes.VMLaunchGuestAgentFlags(cmd.ExecutionBackends.VMGuestAgent)...)
+	flags = append(flags, processes.VMLaunchGuestAgentFlags(guestAgent)...)
 	return append(flags, processes.VMLaunchHandoffFlags(cmd.ExecutionBackends.VMVolumeHandoff)...)
 }
 

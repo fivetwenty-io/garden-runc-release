@@ -586,7 +586,7 @@ const fullMemoryLimitFlag = "full-memory-limit"
 // instance keeps its image until it is stopped, as before the handoff.
 const volumeHandoffFlag = "volume-handoff"
 
-const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--volume-handoff] [--qemu-sandbox=OPTIONS] [--max-vcpus N] [--full-memory-limit] [--mirror-mounts] [--guest-agent] [--image-user USER [--image-default-env NAMES]] [--artifacts DIR] -- PATH [ARGS...]\n"
+const usage = "usage: vm-launch --backend vm-qemu|vm-firecracker [--transparent-proxy] [--allow-volume-shares] [--virtiofsd-path PATH] [--volume-sync-mounts=false] [--volume-handoff] [--qemu-sandbox=OPTIONS] [--max-vcpus N] [--full-memory-limit] [--mirror-mounts] [--guest-agent] [--deny-child-vsock] [--image-user USER [--image-default-env NAMES]] [--artifacts DIR] -- PATH [ARGS...]\n"
 
 type config struct {
 	backend   backend.Kind
@@ -631,6 +631,9 @@ type config struct {
 	// guestAgent gives the guest the agent that runs cf ssh sessions in it
 	// (see guestAgentFlag).
 	guestAgent bool
+	// denyChildVsock starts the hypervisor, virtiofsd, and the droplet build
+	// under the filter that denies vsock sockets (see denyChildVsockFlag).
+	denyChildVsock bool
 	// image, when set, makes this a launch of the Docker image guest (see
 	// imageguest.go).
 	image *imageConfig
@@ -667,8 +670,12 @@ func main() {
 // when it starts with "guest-agent", and otherwise the launch. The relay is
 // a sidecar's log process in the container. It skips the core dump and boot
 // setup, and makes itself undumpable on its own. The guest agent runs in
-// the guest, where stage 2 starts it.
+// the guest, where stage 2 starts it. "deny-vsock" runs a container process
+// that Garden denies vsock sockets to (see runDenyVsock).
 func dispatch(argv []string, logger *log.Logger) int {
+	if len(argv) > 0 && argv[0] == denyVsockCommand {
+		return runDenyVsock(argv[1:])
+	}
 	if len(argv) > 0 && argv[0] == "relay" {
 		return runRelay(argv[1:])
 	}
@@ -1111,7 +1118,7 @@ func run(argv []string, logger *log.Logger) int {
 		}
 		guestMode = fmt.Sprintf("image guest: the launcher runs on the Docker image as uid %d and gid %d, with an image of %d bytes", imgUser.uid, imgUser.gid, size)
 	} else if stack != nil {
-		img, sig, err := buildDropletImageWatching(sigs, dropletBuildTimeout, cfg.artifacts, dropletHome, workDir, containerDirs(vols)...)
+		img, sig, err := buildDropletImageWatchingConfined(sigs, dropletBuildTimeout, withVsockDenial(nil, cfg.denyChildVsock), cfg.artifacts, dropletHome, workDir, containerDirs(vols)...)
 		if sig != nil {
 			logger.Printf("received %v while the droplet image was building", sig)
 			return 128 + signalNumber(sig)
@@ -1349,6 +1356,7 @@ func run(argv []string, logger *log.Logger) int {
 	}
 	defer shareSrv.stop(0)
 	shareSrv.setGuestMemory(memMiB)
+	shareSrv.denyVsock = cfg.denyChildVsock
 	files, drivePaths, initrdPath, monitorFD, rootPath := hypervisorFilesWithStack(prepared.files(), initrd, qemuMonitor, rootImg, sd)
 	hvArgv, err := hypervisorArgvWithVCPUs(cfg.backend, cfg.artifacts, workDir, initrdPath, memMiB, vcpus, nw, drivePaths, rootPath, monitorFD, sd, shareSrv.sockets()...)
 	if err != nil {
@@ -1412,6 +1420,9 @@ func run(argv []string, logger *log.Logger) int {
 	if cfg.backend == backend.VMFirecracker {
 		sup.prepare = confinedPrepare(cmd)
 	}
+	// Only vm-launch relays to the guest agent, so the hypervisor starts
+	// unable to create a vsock socket when Garden asks for that.
+	sup.prepare = withVsockDenial(sup.prepare, cfg.denyChildVsock)
 	// The memory poller starts once the hypervisor has, and stops when the
 	// ports close, before the gates send their last commands on the
 	// monitor, or once the supervisor returns, before the exit line. A stop
@@ -1766,6 +1777,7 @@ func parseArgs(argv []string) (config, error) {
 	fullMemory := fs.Bool(fullMemoryLimitFlag, false, "give the guest the whole MEMORY_LIMIT, which Garden has raised the container's limit to hold")
 	mirror := fs.Bool(mirrorMountsFlag, false, "give a guest with an app root the container's small read-only bind mounts at their own paths, by rule")
 	guestAgent := fs.Bool(guestAgentFlag, false, "run cf ssh sessions in the guest through a guest agent, reached over vsock")
+	denyChildVsock := fs.Bool(denyChildVsockFlag, false, "start the hypervisor, virtiofsd, and the droplet build unable to create a vsock socket, which Garden denies to every process in the container but vm-launch")
 	imageUser := fs.String(imageUserFlag, "", "run the CF launcher on the Docker image that Garden bound into the container, as this user")
 	imageDefaults := fs.String(imageDefaultEnvFlag, "", "the names among HOME, PATH, and USER that hold Garden's defaults, which the Docker image's user replaces")
 	if err := fs.Parse(argv); err != nil {
@@ -1775,7 +1787,7 @@ func parseArgs(argv []string) (config, error) {
 		return config{}, fmt.Errorf("--%s must be 0 or more, got %d", maxVCPUsFlag, *maxVCPUs)
 	}
 
-	cfg := config{backend: backend.Kind(*kind), transparent: *transparent, allowVolumeShares: *allowShares, volumeSyncMounts: *syncMounts, volumeHandoff: *handoff, qemuSandbox: *sandbox, maxVCPUs: *maxVCPUs, fullMemoryLimit: *fullMemory, mirrorMounts: *mirror, guestAgent: *guestAgent}
+	cfg := config{backend: backend.Kind(*kind), transparent: *transparent, allowVolumeShares: *allowShares, volumeSyncMounts: *syncMounts, volumeHandoff: *handoff, qemuSandbox: *sandbox, maxVCPUs: *maxVCPUs, fullMemoryLimit: *fullMemory, mirrorMounts: *mirror, guestAgent: *guestAgent, denyChildVsock: *denyChildVsock}
 	virtiofsdSet, imageSet, imageDefaultsSet := false, false, false
 	fs.Visit(func(f *flag.Flag) {
 		virtiofsdSet = virtiofsdSet || f.Name == virtiofsdFlag

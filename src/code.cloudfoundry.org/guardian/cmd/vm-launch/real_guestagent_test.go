@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -131,6 +132,12 @@ type realAgentRun struct {
 	forward    string
 	forwardErr error
 	wrongKey   error
+	// qemuFilters is the number of seccomp filters that QEMU ran under
+	// once the first session had run, and wantFilters the number it would
+	// have with exactly the filters it should have: this process's, the
+	// vsock filter with denyChildVsock, and its own with -sandbox on.
+	qemuFilters, wantFilters int
+	filtersErr               error
 }
 
 // runRealAgentShim runs one shim session through the relay at socket with
@@ -209,8 +216,10 @@ func helloWithWrongKey(cid uint32) error {
 // through the supervisor, with the QEMU vsock device that vm-launch
 // reserves. Once QEMU runs, it runs three shim sessions, forwards a port
 // the guest does not declare, and tries the agent with a wrong key, and
-// then stops the guest with SIGTERM.
-func superviseRealAgent() realAgentRun {
+// then stops the guest with SIGTERM. With denyChildVsock, the supervisor
+// starts QEMU under the filter that denies vsock sockets, as
+// --deny-child-vsock makes it.
+func superviseRealAgent(denyChildVsock bool) realAgentRun {
 	art := realArtifacts()
 	qemu := realQEMU()
 	requireMicrovm(qemu)
@@ -288,6 +297,7 @@ func superviseRealAgent() realAgentRun {
 				agent.closeDevice()
 				close(running)
 			},
+			prepare: withVsockDenial(nil, denyChildVsock),
 		}
 		kill := func() {
 			select {
@@ -307,6 +317,17 @@ func superviseRealAgent() realAgentRun {
 		// The sessions start at once, and the relay waits for the agent
 		// while the guest boots, as it does for a cf ssh that comes early.
 		var run realAgentRun
+		own, err := seccompFilters("/proc/self/status")
+		Expect(err).NotTo(HaveOccurred())
+		run.wantFilters = own
+		if denyChildVsock {
+			run.wantFilters++
+		}
+		for i, a := range cmd.Args {
+			if a == "-sandbox" && i+1 < len(cmd.Args) && strings.HasPrefix(cmd.Args[i+1], "on") {
+				run.wantFilters++
+			}
+		}
 		interacted := make(chan struct{})
 		go func() {
 			defer close(interacted)
@@ -318,6 +339,13 @@ func superviseRealAgent() realAgentRun {
 			}
 			defer empty.Close()
 			run.identity = runRealAgentShim(socket, empty, []string{"-c", `id -u; id -g; cat /home/vcap/app/from-the-droplet; pwd; echo "$FROM_SHIM"`}, []string{"FROM_SHIM=from the shim", "PATH=/usr/bin:/bin"})
+			// A session ran, so QEMU runs and has set up its own sandbox.
+			select {
+			case <-running:
+				run.qemuFilters, run.filtersErr = seccompFilters(fmt.Sprintf("/proc/%d/status", qemuProc.Pid))
+			default:
+				run.filtersErr = errors.New("QEMU was not running after the first session")
+			}
 			run.oom = runRealAgentShim(socket, empty, []string{"-c", `cat /proc/self/oom_score_adj /proc/$PPID/oom_score_adj`}, []string{"PATH=/usr/bin:/bin"})
 			run.profile = runRealAgentShim(socket, empty, []string{"-c", `/tmp/lifecycle/shell /home/vcap/app 'echo "$FROM_BUILDPACK_PROFILE $FROM_APP_PROFILE"; pwd'`}, []string{"HOME=/home/vcap", "PATH=/usr/bin:/bin"})
 			piped, err := os.Open(writeTempFile("piped", "piped in\n"))
@@ -367,8 +395,23 @@ func superviseRealAgent() realAgentRun {
 }
 
 var _ = Describe("the guest agent against a real QEMU", func() {
+	It("runs a cf ssh session through the guest agent when QEMU starts unable to create a vsock socket and vm-launch keeps the call", func() {
+		r := superviseRealAgent(true)
+		all := "out: " + r.out + "\nlog: " + r.log
+
+		Expect(r.res.markerFound).To(BeTrue(), all)
+		Expect(r.out).To(ContainSubstring("app-listening\n"), all)
+		Expect(r.identity.err).NotTo(HaveOccurred(), all)
+		Expect(r.identity.exit).To(Equal(agentExit{Code: 0}), "%+v\n%s", r.identity, all)
+
+		// QEMU ran under the vsock filter, on top of the filters it has
+		// without it.
+		Expect(r.filtersErr).NotTo(HaveOccurred(), all)
+		Expect(r.qemuFilters).To(Equal(r.wantFilters), all)
+	})
+
 	It("runs cf ssh sessions through the guest agent in the stack guest as the app's user, with the lifecycle's shell, forwards a port the guest does not declare, and refuses a wrong key", func() {
-		r := superviseRealAgent()
+		r := superviseRealAgent(false)
 		all := "out: " + r.out + "\nlog: " + r.log
 
 		Expect(r.res.markerFound).To(BeTrue(), all)
@@ -378,6 +421,8 @@ var _ = Describe("the guest agent against a real QEMU", func() {
 		// in /home/vcap, and with the shim's environment.
 		Expect(r.identity.err).NotTo(HaveOccurred(), all)
 		Expect(r.identity.exit).To(Equal(agentExit{Code: 0}), "%+v\n%s", r.identity, all)
+		Expect(r.filtersErr).NotTo(HaveOccurred(), all)
+		Expect(r.qemuFilters).To(Equal(r.wantFilters), all)
 		Expect(r.identity.stdout).To(Equal("2000\n2000\ndroplet-file\n/home/vcap\nfrom the shim\n"), "%+v\n%s", r.identity, all)
 
 		// The lifecycle's shell is where Diego puts it, and it gives the
