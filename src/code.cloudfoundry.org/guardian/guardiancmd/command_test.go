@@ -462,6 +462,68 @@ var _ = Describe("execution backend flags", func() {
 			})
 		})
 
+		Context("with --gvisor-sentry-cpu", func() {
+			// statserName tells which statser the backends hand to gVisor
+			// containers: the base one, or the one that reads the Sentry.
+			statserName := func(backends *executionBackends) string {
+				base := new(runcontainerdfakes.FakeStatser)
+				got := backends.gvisorStatser(base)
+				if got == runcontainerd.Statser(base) {
+					return "base"
+				}
+				Expect(got).To(BeAssignableToTypeOf(&runcontainerd.GVisorStatser{}))
+				return "sentry"
+			}
+
+			BeforeEach(func() {
+				cmd.ExecutionBackends.Enabled = []string{"oci-gvisor"}
+				cmd.Containerd.Socket = "/run/containerd.sock"
+			})
+
+			It("hands gVisor containers the base statser when the flag is off", func() {
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(statserName(backends)).To(Equal("base"))
+			})
+
+			It("hands gVisor containers the Sentry statser, which runs the configured runsc", func() {
+				cmd.ExecutionBackends.GVisorSentryCPU = true
+				cmd.ExecutionBackends.GVisorRunscBin = "/opt/runsc"
+				cmd.ExecutionBackends.GVisorRunscRoot = "/run/runsc"
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(statserName(backends)).To(Equal("sentry"))
+				Expect(backends.gvisorSentryCPU).To(Equal(runcontainerd.ExecRunscEvents{Bin: "/opt/runsc", Root: "/run/runsc"}))
+			})
+
+			It("keeps the base statser, and logs it, when oci-gvisor is not enabled", func() {
+				cmd.ExecutionBackends.Enabled = []string{"vm-qemu"}
+				cmd.ExecutionBackends.VMLaunchBin = launchBin
+				cmd.ExecutionBackends.GVisorSentryCPU = true
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(statserName(backends)).To(Equal("base"))
+				Expect(log).To(gbytes.Say("gvisor-sentry-cpu-unused-without-the-gvisor-backend"))
+			})
+
+			It("keeps the base statser, and logs it, when no backend is enabled", func() {
+				cmd.ExecutionBackends.Enabled = nil
+				cmd.ExecutionBackends.GVisorSentryCPU = true
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(statserName(backends)).To(Equal("base"))
+				Expect(log).To(gbytes.Say("gvisor-sentry-cpu-unused-without-the-gvisor-backend"))
+			})
+
+			It("hands the base statser through on the nil value a CommonCommand holds before wiring", func() {
+				var backends *executionBackends
+				Expect(statserName(backends)).To(Equal("base"))
+			})
+		})
+
 		Context("when only vm-* backends are enabled", func() {
 			It("still passes backend dispatch to both, because every non-runc kind needs it", func() {
 				cmd.ExecutionBackends.Enabled = []string{"vm-qemu"}
@@ -578,6 +640,17 @@ var _ = Describe("execution backend flags", func() {
 		It("turns mount mirroring on with --vm-mirror-mounts and keeps it off by default", func() {
 			Expect(parse().ExecutionBackends.VMMirrorMounts).To(BeFalse())
 			Expect(parse("--vm-mirror-mounts").ExecutionBackends.VMMirrorMounts).To(BeTrue())
+		})
+
+		It("keeps the Sentry's gVisor CPU figure off by default and turns it on with --gvisor-sentry-cpu", func() {
+			Expect(parse().ExecutionBackends.GVisorSentryCPU).To(BeFalse())
+			Expect(parse().ExecutionBackends.GVisorRunscBin).To(Equal("/var/vcap/data/gvisor-runtime/runsc"))
+			Expect(parse().ExecutionBackends.GVisorRunscRoot).To(Equal("/var/vcap/data/gvisor-state/garden"))
+
+			parsed := parse("--gvisor-sentry-cpu", "--gvisor-runsc-bin", "/opt/runsc", "--gvisor-runsc-root", "/run/runsc")
+			Expect(parsed.ExecutionBackends.GVisorSentryCPU).To(BeTrue())
+			Expect(parsed.ExecutionBackends.GVisorRunscBin).To(Equal("/opt/runsc"))
+			Expect(parsed.ExecutionBackends.GVisorRunscRoot).To(Equal("/run/runsc"))
 		})
 
 		It("turns the handoff on with --vm-volume-handoff", func() {

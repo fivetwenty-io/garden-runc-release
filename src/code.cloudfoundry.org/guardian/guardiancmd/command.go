@@ -229,6 +229,10 @@ type CommonCommand struct {
 		VMStackCacheDir     string        `long:"vm-stack-cache-dir" default:"/var/vcap/data/vm-runtime/stacks" description:"Host directory that caches the stack images, one directory for each tarball digest."`
 		VMStackWait         time.Duration `long:"vm-stack-wait" default:"20s" description:"How long a VM container create waits for a stack image that is still being built. When it is not ready in that time the container is created without it."`
 
+		GVisorSentryCPU bool   `long:"gvisor-sentry-cpu" description:"Report the CPU of an oci-gvisor container as the Sentry's own accounting of the container's threads, from runsc events --sentry-usage, in place of the sandbox cgroup's figure, which also holds the Sentry, the gofer, and the netstack. The Sentry's figure leaves out the work they do for the app, so an app that does heavy I/O reads lower than its cost on the host. Any runsc failure reports the cgroup's figure. Requires the oci-gvisor backend and a runsc that has --sentry-usage. Off by default, and runC and vm-* containers never use it."`
+		GVisorRunscBin  string `long:"gvisor-runsc-bin" default:"/var/vcap/data/gvisor-runtime/runsc" description:"Path of the runsc binary that --gvisor-sentry-cpu runs. It must be the runsc that runs the cell's gVisor containers."`
+		GVisorRunscRoot string `long:"gvisor-runsc-root" default:"/var/vcap/data/gvisor-state/garden" description:"The runsc --root directory that holds the state of the cell's gVisor containers, which --gvisor-sentry-cpu passes to runsc."`
+
 		VMDockerRootFS          string `long:"vm-docker-rootfs" description:"Absolute path of the stack rootfs tarball that a vm-* container runs its hypervisor on when it asks for a Docker image, such as /var/vcap/packages/cflinuxfs4/rootfs.tar. Setting it lets a vm-* container boot a Docker image in its guest, which Garden turns into a squashfs and binds read-only at /opt/garden-vm/image. Requires a vm-* backend. Empty by default, which refuses a Docker image on a vm-* backend."`
 		VMDockerImageCacheDir   string `long:"vm-docker-image-cache-dir" default:"/var/vcap/data/vm-runtime/images" description:"Host directory that caches the guest images of Docker images, one directory for each set of image layers."`
 		VMDockerImageCacheBytes int64  `long:"vm-docker-image-cache-bytes" default:"10737418240" description:"How many bytes the guest images of Docker images may take in the cache. Garden evicts the least recently used images that no container holds, and refuses an image bigger than the whole cache."`
@@ -925,6 +929,11 @@ type executionBackends struct {
 	// unless --vm-guest-agent is set, a vm-* backend is enabled, and
 	// --deny-vsock is set (see guestAgentAllowed).
 	guestAgent bool
+
+	// gvisorSentryCPU runs runsc to read the Sentry's CPU figure of gVisor
+	// containers. It is nil unless --gvisor-sentry-cpu is set and oci-gvisor
+	// is enabled.
+	gvisorSentryCPU runcontainerd.RunscEvents
 }
 
 // releaser returns the step that releases claimed block devices, or nil.
@@ -986,6 +995,15 @@ func (b *executionBackends) runContainerdOptions(gvisorStatser runcontainerd.Sta
 		return nil
 	}
 	return []runcontainerd.Option{runcontainerd.WithBackendDispatch(gvisorStatser)}
+}
+
+// gvisorStatser returns the statser of gVisor containers: the base one, or,
+// when --gvisor-sentry-cpu is on, one that takes their CPU from the Sentry.
+func (b *executionBackends) gvisorStatser(base runcontainerd.Statser) runcontainerd.Statser {
+	if b == nil || b.gvisorSentryCPU == nil {
+		return base
+	}
+	return runcontainerd.NewGVisorStatser(base, b.gvisorSentryCPU)
 }
 
 // tapGroup returns the gid that owns the tap device of a vm-firecracker
@@ -1062,6 +1080,7 @@ func (cmd *CommonCommand) wireExecutionBackends(log lager.Logger) (*executionBac
 	if len(kinds) == 0 {
 		cmd.logUnusedBlockVolumes(log)
 		cmd.logUnusedVolumeFlags(log)
+		cmd.logUnusedGVisorFlags(log, false)
 		return &executionBackends{}, nil
 	}
 
@@ -1100,6 +1119,7 @@ func (cmd *CommonCommand) wireExecutionBackends(log lager.Logger) (*executionBac
 	if len(kinds) == 0 {
 		cmd.logUnusedBlockVolumes(log)
 		cmd.logUnusedVolumeFlags(log)
+		cmd.logUnusedGVisorFlags(log, false)
 		return &executionBackends{}, nil
 	}
 
@@ -1153,11 +1173,18 @@ func (cmd *CommonCommand) wireExecutionBackends(log lager.Logger) (*executionBac
 		vmDockerRootFS = cmd.ExecutionBackends.VMDockerRootFS
 	}
 
+	var gvisorSentryCPU runcontainerd.RunscEvents
+	gvisorEnabled := slices.ContainsFunc(kinds, backend.IsGvisor)
+	if gvisorEnabled && cmd.ExecutionBackends.GVisorSentryCPU {
+		gvisorSentryCPU = runcontainerd.ExecRunscEvents{Bin: cmd.ExecutionBackends.GVisorRunscBin, Root: cmd.ExecutionBackends.GVisorRunscRoot}
+	}
+	cmd.logUnusedGVisorFlags(log, gvisorEnabled)
+
 	vhostVsock := guestAgent && slices.Contains(kinds, backend.VMQemu) && hostHasVhostVsock(log)
 
-	log.Info("enabled", lager.Data{"backends": kinds, "kvm-gid": kvmGid, "block-volumes": blockVolumes != nil, "vm-launch-flags": vmLaunchFlags, "vm-stacks": vmStacks != nil, "vm-docker-images": vmDockerRootFS != ""})
+	log.Info("enabled", lager.Data{"backends": kinds, "kvm-gid": kvmGid, "block-volumes": blockVolumes != nil, "vm-launch-flags": vmLaunchFlags, "vm-stacks": vmStacks != nil, "vm-docker-images": vmDockerRootFS != "", "gvisor-sentry-cpu": gvisorSentryCPU != nil})
 
-	return &executionBackends{registry: registry, kvmGid: kvmGid, blockVolumes: blockVolumes, vmLaunchFlags: vmLaunchFlags, fullMemoryLimit: kvmGid != 0 && cmd.ExecutionBackends.VMFullMemoryLimit, vmStacks: vmStacks, vmDockerRootFS: vmDockerRootFS, vhostVsock: vhostVsock, guestAgent: guestAgent}, nil
+	return &executionBackends{registry: registry, kvmGid: kvmGid, blockVolumes: blockVolumes, vmLaunchFlags: vmLaunchFlags, fullMemoryLimit: kvmGid != 0 && cmd.ExecutionBackends.VMFullMemoryLimit, vmStacks: vmStacks, vmDockerRootFS: vmDockerRootFS, vhostVsock: vhostVsock, guestAgent: guestAgent, gvisorSentryCPU: gvisorSentryCPU}, nil
 }
 
 // checkVMDockerFlags refuses Docker image flags that cannot work: a tarball
@@ -1308,6 +1335,14 @@ func (cmd *CommonCommand) logUnusedVolumeFlags(log lager.Logger) {
 	}
 	if cmd.ExecutionBackends.VMVolumeHandoff {
 		log.Info("volume-handoff-unused-without-a-vm-backend")
+	}
+}
+
+// logUnusedGVisorFlags logs a gVisor setting that does nothing, because the
+// oci-gvisor backend is not enabled.
+func (cmd *CommonCommand) logUnusedGVisorFlags(log lager.Logger, gvisorEnabled bool) {
+	if cmd.ExecutionBackends.GVisorSentryCPU && !gvisorEnabled {
+		log.Info("gvisor-sentry-cpu-unused-without-the-gvisor-backend")
 	}
 }
 

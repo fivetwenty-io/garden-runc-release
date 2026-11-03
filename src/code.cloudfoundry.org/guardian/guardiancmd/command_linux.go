@@ -178,7 +178,7 @@ func (f *LinuxFactory) WireContainerd(processBuilder *processes.ProcBuilder, use
 		statser = runcontainerd.NewContainerdStatser(nerd)
 	}
 
-	containerdManager := runcontainerd.New(nerd, nerd, processBuilder, userLookupper, wireExecer(pidGetter), statser, f.config.Containerd.UseContainerdForProcesses, cgroupManager, f.WireMkdirer(), peaHandlesGetter, f.config.Containers.CleanupProcessDirsOnWait, nerdStopper, f.config.wiredBackends.runContainerdOptions(runcontainerd.NewContainerdStatser(nerd))...)
+	containerdManager := runcontainerd.New(nerd, nerd, processBuilder, userLookupper, wireExecer(pidGetter), statser, f.config.Containerd.UseContainerdForProcesses, cgroupManager, f.WireMkdirer(), peaHandlesGetter, f.config.Containers.CleanupProcessDirsOnWait, nerdStopper, f.config.wiredBackends.runContainerdOptions(f.config.wiredBackends.gvisorStatser(runcontainerd.NewContainerdStatser(nerd)))...)
 	f.taskPids = &containerdTaskPids{client: containerdClient, context: ctx}
 
 	peaRunner := runcontainerd.NewRunContainerPea(containerdManager, nerd, volumizer)
