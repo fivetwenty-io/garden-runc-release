@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -910,6 +911,45 @@ var _ = Describe("the guest agent relay", func() {
 		Expect(answer).To(Equal("error: this guest has no agent for cf ssh, because it is a spec"))
 	})
 
+	It("keeps a burst of 20 pings within the agent's hello slots, so that every one gets ok", func() {
+		// Each connection is slow to send its hello, so the agent holds
+		// one of its hello slots for each connection in its handshake.
+		var inHandshake, most atomic.Int32
+		dial := dialAgent(a)
+		startRelay(testAgentKey, func() (agentConn, error) {
+			c, err := dial()
+			if err != nil {
+				return nil, err
+			}
+			n := inHandshake.Add(1)
+			for m := most.Load(); n > m && !most.CompareAndSwap(m, n); m = most.Load() {
+			}
+			return &slowHello{agentConn: c, inHandshake: &inHandshake}, nil
+		}, "")
+
+		answers := make(chan string, 20)
+		for range 20 {
+			go func() {
+				defer GinkgoRecover()
+				c, err := net.Dial("unix", path)
+				Expect(err).NotTo(HaveOccurred())
+				defer c.Close()
+				_, err = io.WriteString(c, agentRelayPing+"\n")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(c.SetReadDeadline(time.Now().Add(10 * time.Second))).To(Succeed())
+				answer, err := readLine(c, agentMaxLine)
+				Expect(err).NotTo(HaveOccurred())
+				answers <- answer
+			}()
+		}
+		for range 20 {
+			Eventually(answers, 10*time.Second).Should(Receive(Equal("ok")))
+		}
+		Expect(most.Load()).To(BeNumerically("<=", agentMaxHandshakes))
+		Expect(most.Load()).To(BeNumerically(">", 1))
+		Eventually(a.pending).Should(BeEmpty())
+	})
+
 	It("refuses a client that runs as another user", func() {
 		if os.Getuid() == 0 {
 			Skip("root may always use the relay")
@@ -1688,3 +1728,23 @@ var _ = Describe("the guest agent's initramfs", func() {
 		Expect(string(byName["rvm/init"].data)).To(Equal(initScript(testNonce, false)))
 	})
 })
+
+// slowHello is the relay's side of a connection to the agent that takes
+// 100ms to send its first write, and that counts itself out of
+// inHandshake once its first read returns.
+type slowHello struct {
+	agentConn
+	inHandshake *atomic.Int32
+	wrote, read sync.Once
+}
+
+func (c *slowHello) Write(p []byte) (int, error) {
+	c.wrote.Do(func() { time.Sleep(100 * time.Millisecond) })
+	return c.agentConn.Write(p)
+}
+
+func (c *slowHello) Read(p []byte) (int, error) {
+	n, err := c.agentConn.Read(p)
+	c.read.Do(func() { c.inHandshake.Add(-1) })
+	return n, err
+}

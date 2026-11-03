@@ -94,6 +94,15 @@ const (
 	// vsock. Every other line still gets an error answer then.
 	agentRelayOff = "off: "
 
+	// agentMaxHandshakes caps how many of the relay's connections to the
+	// agent may be in their handshake at once, from the dial to the
+	// agent's first frame. The agent closes any connection beyond its
+	// guestAgentMaxPending hello slots before it reads a byte, so a burst
+	// of clients, such as a connection pool behind cf ssh -L, would
+	// otherwise lose pings and wait out retries. Half the agent's slots
+	// leaves the rest for the agent's other clients.
+	agentMaxHandshakes = guestAgentMaxPending / 2
+
 	// agentPingWait bounds the relay's whole round trip to the agent for a
 	// ping, its dial included, which is at most agentDialTimeout. A ping is
 	// tried once, so a guest that is still booting or whose agent is down
@@ -448,6 +457,10 @@ type agentRelay struct {
 	// done is closed by close, which ends every wait for the agent.
 	done chan struct{}
 	wg   sync.WaitGroup
+
+	// handshakes holds a token for each connection to the agent that is in
+	// its handshake, up to agentMaxHandshakes.
+	handshakes chan struct{}
 }
 
 // newAgentRelay listens at path, mode 0600, and serves clients until
@@ -464,7 +477,7 @@ func newAgentRelay(path string, key []byte, dial func() (agentConn, error), off 
 		ln.Close()
 		return nil, fmt.Errorf("making the guest agent socket %s private: %w", path, err)
 	}
-	r := &agentRelay{ln: ln, key: key, dial: dial, off: off, wait: wait, uid: os.Getuid(), logger: logger, conns: map[io.Closer]struct{}{}, done: make(chan struct{})}
+	r := &agentRelay{ln: ln, key: key, dial: dial, off: off, wait: wait, uid: os.Getuid(), logger: logger, conns: map[io.Closer]struct{}{}, done: make(chan struct{}), handshakes: make(chan struct{}, agentMaxHandshakes)}
 	r.wg.Add(1)
 	go r.serve()
 	return r, nil
@@ -768,9 +781,22 @@ var errAgentTooLate = errors.New("the guest agent answered too late")
 // while a whole agentTryRead is left before deadline, so the answer to the
 // go always has its full time, and a request accepted later starts
 // nothing. A connection still open when gone closes is closed, and a nil
-// gone never closes.
+// gone never closes. Each try holds one of r.handshakes from before its
+// dial until the agent's first frame, which the agent sends only after it
+// has freed the hello slot that the connection took.
 func (r *agentRelay) try(request []byte, deadline time.Time, gone <-chan struct{}) (agentConn, agentReady, bool, error) {
 	var ready agentReady
+	if err := r.startHandshake(deadline, gone); err != nil {
+		return nil, ready, false, err
+	}
+	handshaking := true
+	endHandshake := func() {
+		if handshaking {
+			handshaking = false
+			<-r.handshakes
+		}
+	}
+	defer endHandshake()
 	agent, err := r.dial()
 	if err != nil {
 		return nil, ready, true, err
@@ -805,6 +831,7 @@ func (r *agentRelay) try(request []byte, deadline time.Time, gone <-chan struct{
 	}
 	counted := &countingReader{r: agent}
 	typ, payload, err := readAgentFrame(counted)
+	endHandshake()
 	if err != nil {
 		return fail(counted.n == 0, fmt.Errorf("reading the guest agent's answer: %w", err))
 	}
@@ -832,6 +859,28 @@ func (r *agentRelay) try(request []byte, deadline time.Time, gone <-chan struct{
 		return fail(false, err)
 	}
 	return agent, ready, false, nil
+}
+
+// startHandshake takes one of r.handshakes, waiting for one until deadline,
+// the relay closes, or gone closes.
+func (r *agentRelay) startHandshake(deadline time.Time, gone <-chan struct{}) error {
+	select {
+	case r.handshakes <- struct{}{}:
+		return nil
+	default:
+	}
+	wait := time.NewTimer(time.Until(deadline))
+	defer wait.Stop()
+	select {
+	case r.handshakes <- struct{}{}:
+		return nil
+	case <-wait.C:
+		return fmt.Errorf("the relay already had %d connections in their handshake with the guest agent until its wait ended", agentMaxHandshakes)
+	case <-r.done:
+		return errAgentRelayClosed
+	case <-gone:
+		return errAgentClientGone
+	}
 }
 
 // minTime is the sooner of a and b.
