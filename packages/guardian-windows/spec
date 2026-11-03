@@ -22,6 +22,7 @@ files:
   - code.cloudfoundry.org/guardian/vendor/code.cloudfoundry.org/garden/server/timebomb/*.go # gosub
   - code.cloudfoundry.org/guardian/vendor/code.cloudfoundry.org/garden/transport/*.go # gosub
   - code.cloudfoundry.org/guardian/bindata/*.go # gosub
+  - code.cloudfoundry.org/guardian/backend/*.go # gosub
   - code.cloudfoundry.org/guardian/cmd/gdn/*.go # gosub
   - code.cloudfoundry.org/guardian/cmd/winit/*.go # gosub
   - code.cloudfoundry.org/guardian/gardener/*.go # gosub
@@ -60,6 +61,7 @@ files:
   - code.cloudfoundry.org/guardian/rundmc/peas/processwaiter/*.go # gosub
   - code.cloudfoundry.org/guardian/rundmc/preparerootfs/*.go # gosub
   - code.cloudfoundry.org/guardian/rundmc/processes/*.go # gosub
+  - code.cloudfoundry.org/guardian/rundmc/seccompvsock/*.go # gosub
   - code.cloudfoundry.org/guardian/rundmc/runcontainerd/*.go # gosub
   - code.cloudfoundry.org/guardian/rundmc/runcontainerd/nerd/*.go # gosub
   - code.cloudfoundry.org/guardian/rundmc/runcontainerd/privchecker/*.go # gosub
