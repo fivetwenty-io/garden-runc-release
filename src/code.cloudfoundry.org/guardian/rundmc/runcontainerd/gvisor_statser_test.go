@@ -305,6 +305,41 @@ func TestGVisorStatser_ServesConcurrentCallers(t *testing.T) {
 	}
 }
 
+// Callers for one handle see ages in the order they take the lock, so none of
+// them looks like a handle reuse and resets the state. A reset would make a
+// second runsc call inside the cache window.
+func TestGVisorStatser_ConcurrentCallersOnOneHandleDoNotReset(t *testing.T) {
+	runsc := &lockedRunscEvents{calls: map[string]int{}}
+	var mu sync.Mutex
+	var age time.Duration
+	base := new(runcontainerdfakes.FakeStatser)
+	base.StatsStub = func(lager.Logger, string) (gardener.StatsContainerMetrics, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		age += time.Millisecond
+		m := cgroupMetrics()
+		m.Age = age
+		return m, nil
+	}
+	statser := runcontainerd.NewGVisorStatser(base, runsc)
+
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 20 {
+				stats(t, statser, "a")
+			}
+		}()
+	}
+	wg.Wait()
+
+	if runsc.calls["a"] != 1 {
+		t.Errorf("runsc calls = %d, want 1: a reset cleared the cache", runsc.calls["a"])
+	}
+}
+
 func TestGVisorStatser_ForgetsContainersNobodyReads(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		runsc := &fakeRunscEvents{outputs: []string{

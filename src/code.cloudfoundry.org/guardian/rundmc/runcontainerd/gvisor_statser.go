@@ -153,14 +153,16 @@ func NewGVisorStatser(base Statser, runsc RunscEvents) *GVisorStatser {
 }
 
 func (s *GVisorStatser) Stats(log lager.Logger, id string) (gardener.StatsContainerMetrics, error) {
+	state := s.state(id)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	// The base read is under the lock, so callers for one handle see ages in
+	// the order they take the lock and a late caller cannot look like a reuse.
 	metrics, err := s.base.Stats(log, id)
 	if err != nil {
 		return gardener.StatsContainerMetrics{}, err
 	}
-
-	state := s.state(id)
-	state.mu.Lock()
-	defer state.mu.Unlock()
 
 	// A handle that a new container reuses starts from zero.
 	if metrics.Age < state.age {
