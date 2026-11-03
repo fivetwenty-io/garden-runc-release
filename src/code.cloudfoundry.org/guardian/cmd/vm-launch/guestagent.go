@@ -325,7 +325,8 @@ func (a *guestAgent) serve(l agentListener) error {
 }
 
 // handle serves one connection: the hello, the request, the go, and then
-// the session or the forward. A connection that finds every hello slot
+// the session or the forward. A ping gets its answer at once and nothing
+// more. A connection that finds every hello slot
 // taken is closed at once, before the agent reads a byte from it, and one
 // whose hello does not hold the boot's key is closed without an answer.
 // Every other refusal is an answer, which the relay never tries again.
@@ -350,8 +351,12 @@ func (a *guestAgent) handle(c agentConn) {
 	case err != nil:
 		return
 	}
+	// A ping takes no slot and needs no go, because it starts nothing.
 	slots, most, what := a.sessions, guestAgentMaxSessions, "sessions"
 	switch req.Kind {
+	case agentKindPing:
+		_ = fw.writeJSON(agentFrameReady, agentReady{})
+		return
 	case agentKindSession:
 	case agentKindForward:
 		slots, most, what = a.forwards, guestAgentMaxForwards, "forwards"

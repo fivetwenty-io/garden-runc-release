@@ -81,11 +81,22 @@ const (
 	// agentMaxLine is the most bytes the relay's first line may have.
 	agentMaxLine = 512
 
-	// agentRelayPing is the line that asks the relay only whether this
-	// guest has an agent. diego-sshd sends it before it serves scp, sftp,
-	// or a forward through the guest, and serves them in the container as
+	// agentRelayPing is the line that asks the relay whether this guest's
+	// agent answers. diego-sshd sends it before it serves scp, sftp, or a
+	// forward through the guest, and serves them in the container as
 	// before on any other answer.
 	agentRelayPing = "ping"
+
+	// agentPingWait bounds the relay's whole round trip to the agent for a
+	// ping, its dial included, which is at most agentDialTimeout. A ping is
+	// tried once, so a guest that is still booting or whose agent is down
+	// gets an error answer within this time rather than the wait that a
+	// session or a forward gets.
+	agentPingWait = 3 * time.Second
+
+	// agentPingSlow is how long a ping's round trip may take before the
+	// relay logs it.
+	agentPingSlow = time.Second
 )
 
 // guestAgentBinary is the agent's binary that goes into the initramfs,
@@ -410,9 +421,9 @@ func withFirecrackerVsock(path, udsPath string) error {
 // client connects to its Unix socket and writes one line: "session", after
 // which the connection carries the agent's frames, "forward HOST PORT",
 // after which it carries the raw bytes of a connection to that address in
-// the guest, or "ping", after which it carries nothing. The relay answers
-// "ok" or "error: " and the reason. Only the
-// relay knows the boot's key, which it sends as the hello on every
+// the guest, or "ping", which the relay answers once the agent has answered
+// it, after which the connection carries nothing. The relay answers "ok"
+// or "error: " and the reason. Only the relay knows the boot's key, which it sends as the hello on every
 // connection to the agent.
 type agentRelay struct {
 	ln   *net.UnixListener
@@ -542,10 +553,11 @@ func (r *agentRelay) handle(c *net.UnixConn) {
 		answer("%s", r.off)
 		return
 	}
-	// A ping asks only whether this guest has an agent, which does not
-	// change once the launch has started, so the relay answers it without
-	// dialing the agent.
 	if ping {
+		if err := r.ping(); err != nil {
+			answer("%v", err)
+			return
+		}
 		_, _ = io.WriteString(c, "ok\n")
 		return
 	}
@@ -610,6 +622,35 @@ func (r *agentRelay) handle(c *net.UnixConn) {
 	_, _ = io.Copy(c, agent)
 	c.Close()
 	<-done
+}
+
+// ping makes one round trip to the agent, the hello with the boot's key
+// and a ping request, and returns nil once the agent has answered it. It
+// tries once, within agentPingWait, and logs a ping that fails or that
+// takes longer than agentPingSlow.
+func (r *agentRelay) ping() error {
+	start := time.Now()
+	request, err := json.Marshal(agentRequest{Kind: agentKindPing})
+	if err != nil {
+		return fmt.Errorf("encoding the ping's request: %w", err)
+	}
+	agent, ready, _, err := r.try(request, start.Add(agentPingWait), nil)
+	if agent != nil {
+		r.untrack(agent)
+	}
+	if err == nil && ready.Error != "" {
+		err = errors.New(ready.Error)
+	}
+	took := time.Since(start).Round(time.Millisecond)
+	if err != nil {
+		err = fmt.Errorf("the guest agent did not answer a ping: %w", err)
+		r.logger.Printf("%v, after %v", err, took)
+		return err
+	}
+	if took > agentPingSlow {
+		r.logger.Printf("the guest agent took %v to answer a ping", took)
+	}
+	return nil
 }
 
 // checkPeer accepts a client running as vm-launch's own user or as root.
@@ -715,7 +756,8 @@ var errAgentTooLate = errors.New("the guest agent answered too late")
 // agentTryRead from its start and deadline. The relay sends the go only
 // while a whole agentTryRead is left before deadline, so the answer to the
 // go always has its full time, and a request accepted later starts
-// nothing. A connection still open when gone closes is closed.
+// nothing. A connection still open when gone closes is closed, and a nil
+// gone never closes.
 func (r *agentRelay) try(request []byte, deadline time.Time, gone <-chan struct{}) (agentConn, agentReady, bool, error) {
 	var ready agentReady
 	agent, err := r.dial()

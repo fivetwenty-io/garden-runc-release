@@ -426,6 +426,34 @@ var _ = Describe("the guest agent", func() {
 			Eventually(done).Should(BeClosed())
 			Expect(a.forwards).To(BeEmpty())
 		})
+
+		It("answers a ping at once, without a slot and without waiting for a go, and starts nothing", func() {
+			for range guestAgentMaxSessions {
+				a.sessions <- struct{}{}
+			}
+			for range guestAgentMaxForwards {
+				a.forwards <- struct{}{}
+			}
+			conn, done := serveAgent(a)
+			fw := &agentFrameWriter{w: conn}
+			Expect(fw.write(agentFrameHello, []byte(testAgentKey))).To(Succeed())
+			Expect(fw.writeJSON(agentFrameRequest, agentRequest{Kind: agentKindPing})).To(Succeed())
+			payload, err := readAgentFrameOf(conn, agentFrameReady)
+			Expect(err).NotTo(HaveOccurred())
+			var ready agentReady
+			Expect(json.Unmarshal(payload, &ready)).To(Succeed())
+			Expect(ready.Error).To(BeEmpty())
+			expectClosed(conn, done)
+			Expect(a.runDir).NotTo(BeADirectory())
+		})
+
+		It("closes a ping whose hello holds another key without an answer", func() {
+			conn, done := serveAgent(a)
+			fw := &agentFrameWriter{w: conn}
+			Expect(fw.write(agentFrameHello, []byte(strings.Repeat("cd", agentKeyBytes)))).To(Succeed())
+			_ = fw.writeJSON(agentFrameRequest, agentRequest{Kind: agentKindPing})
+			expectClosed(conn, done)
+		})
 	})
 
 	Describe("a session", func() {
@@ -751,7 +779,7 @@ var _ = Describe("the guest agent relay", func() {
 		Expect(answer).To(Equal(`error: "http" is not a port`))
 	})
 
-	It("answers a ping with ok, without dialing the agent, and then closes the connection", func() {
+	It("answers a ping with ok once the agent has answered it, and then closes the connection", func() {
 		var dials atomic.Int32
 		startRelay(testAgentKey, func() (agentConn, error) {
 			dials.Add(1)
@@ -762,7 +790,42 @@ var _ = Describe("the guest agent relay", func() {
 		Expect(c.SetReadDeadline(time.Now().Add(5 * time.Second))).To(Succeed())
 		_, err := c.Read(make([]byte, 1))
 		Expect(err).To(MatchError(io.EOF))
-		Expect(dials.Load()).To(BeZero())
+		Expect(dials.Load()).To(Equal(int32(1)))
+		Expect(a.runDir).NotTo(BeADirectory())
+	})
+
+	It("answers a ping with the reason, at once and without trying again, when the agent cannot be reached", func() {
+		var dials atomic.Int32
+		startRelay(testAgentKey, func() (agentConn, error) {
+			dials.Add(1)
+			return nil, errors.New("connecting to the guest's vsock: connection reset by peer")
+		}, "")
+		start := time.Now()
+		_, answer := ask(agentRelayPing)
+		Expect(answer).To(Equal("error: the guest agent did not answer a ping: connecting to the guest's vsock: connection reset by peer"))
+		Expect(time.Since(start)).To(BeNumerically("<", agentPingWait))
+		Expect(dials.Load()).To(Equal(int32(1)))
+		Expect(logs.String()).To(ContainSubstring("the guest agent did not answer a ping: connecting to the guest's vsock: connection reset by peer, after "))
+	})
+
+	It("answers a ping with an error within agentPingWait when the agent never answers, and when it holds another key", func() {
+		hung := make(chan *net.UnixConn, 1)
+		startRelay(testAgentKey, func() (agentConn, error) {
+			agentSide, relaySide := agentSocketPair()
+			hung <- agentSide
+			return relaySide, nil
+		}, "")
+		start := time.Now()
+		_, answer := ask(agentRelayPing)
+		Expect(answer).To(HavePrefix("error: the guest agent did not answer a ping: reading the guest agent's answer: "))
+		Expect(time.Since(start)).To(BeNumerically("~", agentPingWait, time.Second))
+		(<-hung).Close()
+
+		a.key = []byte(strings.Repeat("cd", agentKeyBytes))
+		path = filepath.Join(GinkgoT().TempDir(), "agent.sock")
+		startRelay(testAgentKey, dialAgent(a), "")
+		_, answer = ask(agentRelayPing)
+		Expect(answer).To(HavePrefix("error: the guest agent did not answer a ping: "))
 	})
 
 	It("answers a ping with the reason when the guest has no agent", func() {
