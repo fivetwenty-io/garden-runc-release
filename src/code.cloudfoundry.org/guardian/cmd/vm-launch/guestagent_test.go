@@ -64,6 +64,7 @@ func newTestAgent() *guestAgent {
 		dial:     net.DialTimeout,
 		logger:   log.New(GinkgoWriter, "guest agent: ", 0),
 		sessions: make(chan struct{}, guestAgentMaxSessions),
+		forwards: make(chan struct{}, guestAgentMaxForwards),
 		pending:  make(chan struct{}, guestAgentMaxPending),
 	}
 }
@@ -393,6 +394,37 @@ var _ = Describe("the guest agent", func() {
 			Expect(ready.Error).To(Equal(`the guest agent has no request of kind "exec"`))
 			Eventually(done).Should(BeClosed())
 			Expect(a.sessions).To(BeEmpty())
+		})
+
+		It("still runs a session when forwards take every forward slot, and still runs a forward when sessions take every session slot", func() {
+			for range guestAgentMaxForwards {
+				a.forwards <- struct{}{}
+			}
+			_, ready, done := startAgentSession(a, testAgentKey, agentRequest{Kind: agentKindForward, Host: "127.0.0.1", Port: upperServer()})
+			Expect(ready.Error).To(Equal("the guest already runs 64 forwards, which is as many as it allows"))
+			Eventually(done).Should(BeClosed())
+
+			s, ready, done := startAgentSession(a, testAgentKey, agentRequest{Kind: agentKindSession, Args: []string{"-c", "echo from the guest"}})
+			Expect(ready.Error).To(BeEmpty())
+			Expect(s.awaitExit()).To(Equal(agentExit{Code: 0}))
+			Eventually(s.ended, 10*time.Second).Should(BeClosed())
+			Expect(s.stdout.String()).To(Equal("from the guest\n"))
+			Eventually(done).Should(BeClosed())
+			for range guestAgentMaxForwards {
+				<-a.forwards
+			}
+
+			for range guestAgentMaxSessions {
+				a.sessions <- struct{}{}
+			}
+			s, ready, done = startAgentSession(a, testAgentKey, agentRequest{Kind: agentKindForward, Host: "127.0.0.1", Port: upperServer()})
+			Expect(ready.Error).To(BeEmpty())
+			Expect(s.fw.writeData(agentFrameData, []byte("abc"))).To(Succeed())
+			Expect(s.fw.write(agentFrameDataEnd, nil)).To(Succeed())
+			Eventually(s.ended, 10*time.Second).Should(BeClosed())
+			Expect(s.stdout.String()).To(Equal("ABC bye"))
+			Eventually(done).Should(BeClosed())
+			Expect(a.forwards).To(BeEmpty())
 		})
 	})
 

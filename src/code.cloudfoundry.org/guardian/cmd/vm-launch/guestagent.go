@@ -51,9 +51,14 @@ const (
 )
 
 const (
-	// guestAgentMaxSessions caps how many sessions and forwards the agent
-	// runs at once.
+	// guestAgentMaxSessions caps how many sessions the agent runs at once.
 	guestAgentMaxSessions = 32
+
+	// guestAgentMaxForwards caps how many forwards the agent runs at once.
+	// Forwards have their own cap, so that a cf ssh -L that a connection
+	// pool or a load test drives cannot take every slot and lock out cf
+	// ssh, scp, and sftp.
+	guestAgentMaxForwards = 64
 
 	// guestAgentMaxPending caps how many connections may wait for their
 	// hello at once. Any process on the cell can open a vsock connection to
@@ -127,8 +132,8 @@ type guestAgent struct {
 	dial         func(network, address string, timeout time.Duration) (net.Conn, error)
 	logger       *log.Logger
 
-	sessions, pending chan struct{}
-	seq               atomic.Uint64
+	sessions, forwards, pending chan struct{}
+	seq                         atomic.Uint64
 }
 
 // newGuestAgent returns the agent for mode with the key from its
@@ -150,6 +155,7 @@ func newGuestAgent(mode string, cfg guestAgentConfigFile, logger *log.Logger) (*
 		dial:     net.DialTimeout,
 		logger:   logger,
 		sessions: make(chan struct{}, guestAgentMaxSessions),
+		forwards: make(chan struct{}, guestAgentMaxForwards),
 		pending:  make(chan struct{}, guestAgentMaxPending),
 	}
 	switch mode {
@@ -344,15 +350,20 @@ func (a *guestAgent) handle(c agentConn) {
 	case err != nil:
 		return
 	}
-	select {
-	case a.sessions <- struct{}{}:
-		defer func() { <-a.sessions }()
+	slots, most, what := a.sessions, guestAgentMaxSessions, "sessions"
+	switch req.Kind {
+	case agentKindSession:
+	case agentKindForward:
+		slots, most, what = a.forwards, guestAgentMaxForwards, "forwards"
 	default:
-		refuse("the guest already runs %d sessions, which is as many as it allows", guestAgentMaxSessions)
+		refuse("the guest agent has no request of kind %q", req.Kind)
 		return
 	}
-	if req.Kind != agentKindSession && req.Kind != agentKindForward {
-		refuse("the guest agent has no request of kind %q", req.Kind)
+	select {
+	case slots <- struct{}{}:
+		defer func() { <-slots }()
+	default:
+		refuse("the guest already runs %d %s, which is as many as it allows", most, what)
 		return
 	}
 	if !a.awaitGo(c, fw) {
