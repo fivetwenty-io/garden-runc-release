@@ -83,9 +83,16 @@ const (
 
 	// agentRelayPing is the line that asks the relay whether this guest's
 	// agent answers. diego-sshd sends it before it serves scp, sftp, or a
-	// forward through the guest, and serves them in the container as
-	// before on any other answer.
+	// forward through the guest. On an answer that starts with
+	// agentRelayOff it serves them in the container as before, and on any
+	// other answer but ok it refuses scp and sftp, because the app's files
+	// are in the guest.
 	agentRelayPing = "ping"
+
+	// agentRelayOff starts the relay's answer to a ping when its guest has
+	// no agent by configuration, such as a vm-qemu container without
+	// vsock. Every other line still gets an error answer then.
+	agentRelayOff = "off: "
 
 	// agentPingWait bounds the relay's whole round trip to the agent for a
 	// ping, its dial included, which is at most agentDialTimeout. A ping is
@@ -550,6 +557,10 @@ func (r *agentRelay) handle(c *net.UnixConn) {
 		return
 	}
 	if r.dial == nil {
+		if ping {
+			_, _ = io.WriteString(c, agentRelayOff+r.off+"\n")
+			return
+		}
 		answer("%s", r.off)
 		return
 	}

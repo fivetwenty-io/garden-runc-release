@@ -879,6 +879,8 @@ var _ = Describe("the guest agent relay", func() {
 				Expect(answer).To(Equal("ok"), text)
 			case "error:":
 				Expect(answer).To(MatchRegexp(`^error: \S`), text)
+			case "off:":
+				Expect(answer).To(MatchRegexp(`^off: \S`), text)
 			default:
 				Fail("the contract has no answer " + want)
 			}
@@ -900,9 +902,11 @@ var _ = Describe("the guest agent relay", func() {
 		Expect(cases).To(Equal(8))
 	})
 
-	It("answers a ping with the reason when the guest has no agent", func() {
+	It("answers a ping with off and the reason when the guest has no agent, so that diego-sshd serves as it does without one", func() {
 		startRelay(testAgentKey, nil, "this guest has no agent for cf ssh, because it is a spec")
 		_, answer := ask(agentRelayPing)
+		Expect(answer).To(Equal("off: this guest has no agent for cf ssh, because it is a spec"))
+		_, answer = ask("forward 127.0.0.1 8080")
 		Expect(answer).To(Equal("error: this guest has no agent for cf ssh, because it is a spec"))
 	})
 

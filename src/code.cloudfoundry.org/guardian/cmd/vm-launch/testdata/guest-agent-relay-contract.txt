@@ -14,8 +14,12 @@
 # The line is what the client writes, without its newline. PORT stands for a
 # TCP port that echoes what it reads.
 #
-# The answer is "ok" exactly, or "error:", which stands for "error: " and a
-# reason that is not empty.
+# The answer is "ok" exactly, "error:", which stands for "error: " and a
+# reason that is not empty, or "off:", which stands for "off: " and a reason
+# that is not empty. The relay answers a ping with "off:" only when its guest
+# has no agent by configuration, and diego-sshd then serves as it does in a
+# container without the agent. Any other answer but ok means the agent is
+# down.
 #
 # After is "eof" when the relay closes the connection after its answer, and
 # "stream" when the connection then carries the raw bytes of the forward.
@@ -24,6 +28,6 @@ agent | forward 127.0.0.1 PORT | ok | stream
 agent | forward 127.0.0.1 notaport | error: | eof
 agent | forward 127.0.0.1 | error: | eof
 agent | shell | error: | eof
-off | ping | error: | eof
+off | ping | off: | eof
 off | forward 127.0.0.1 PORT | error: | eof
 down | ping | error: | eof
