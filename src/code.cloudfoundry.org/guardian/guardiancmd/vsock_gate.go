@@ -60,7 +60,13 @@ type vsockProcessDirs interface {
 // vsock for the rest of its run, because that agent still answers on vsock.
 // Otherwise it denies nothing, and every bundle is the one it was before the
 // denial existed. When it cannot list the containers, it denies nothing,
-// logs the error, and lists them again at the next create.
+// logs the error, and lists them again at the next create. A bundle that it
+// cannot read or parse, it logs once and skips, and it still stops looking,
+// so that one corrupt entry in the depot does not make every create list
+// the containers again. With the flag, such a bundle refuses the guest
+// agent instead, because the container or pea it belongs to may still run
+// without the denial. gdn writes every bundle whole, by renaming it into
+// place, so a bundle that is being written is either missing or complete.
 //
 // The gate never counts the container being created, whose directory may
 // already be in the depot without its bundle, and it skips any container
@@ -119,13 +125,17 @@ func (g *vsockGate) Deny(handle string) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if !g.settled {
-		denials, err := g.denials(handle)
+		unreadable := map[string]error{}
+		denials, err := g.denials(handle, unreadable)
 		if err != nil {
 			g.listFailed("vsock-denial-not-applied-without-container-list", err)
 			return false
 		}
 		g.listSucceeded()
 		g.settled = true
+		for other, err := range unreadable {
+			g.log.Error("skipped-unreadable-bundle", err, lager.Data{"handle": other})
+		}
 		for other, denial := range denials {
 			if denial == seccompvsock.AnnotationWrapper {
 				g.agentsRemain = true
@@ -156,7 +166,7 @@ func (g *vsockGate) Exception(handle string) bool {
 	if g.settled {
 		return true
 	}
-	denials, err := g.denials(handle)
+	denials, err := g.denials(handle, nil)
 	if err != nil {
 		g.listFailed("guest-agent-refused-without-container-list", err)
 		return false
@@ -197,7 +207,11 @@ func (g *vsockGate) listSucceeded() {
 // slash. One whose profile does not deny vsock maps to "" even when its
 // annotation says otherwise, and one that has no bundle, or went away while
 // the gate looked, is left out.
-func (g *vsockGate) denials(creating string) (map[string]string, error) {
+//
+// When unreadable is nil, denials fails on the first bundle it cannot read
+// or parse. Otherwise it records each such bundle, or process directory
+// that it cannot list, in unreadable under the same key, and goes on.
+func (g *vsockGate) denials(creating string, unreadable map[string]error) (map[string]string, error) {
 	if g.bundles == nil {
 		return nil, errors.New("no runtime to list containers from")
 	}
@@ -223,7 +237,12 @@ func (g *vsockGate) denials(creating string) (map[string]string, error) {
 			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("reading the bundle of %s: %w", handle, err)
+			err = fmt.Errorf("reading the bundle of %s: %w", handle, err)
+			if unreadable == nil {
+				return nil, err
+			}
+			unreadable[handle] = err
+			continue
 		}
 		denials[handle] = vsockDenialOf(bndl)
 	}
@@ -240,7 +259,12 @@ func (g *vsockGate) denials(creating string) (map[string]string, error) {
 			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("listing the processes of %s: %w", sandbox, err)
+			err = fmt.Errorf("listing the processes of %s: %w", sandbox, err)
+			if unreadable == nil {
+				return nil, err
+			}
+			unreadable[sandbox+"/processes"] = err
+			continue
 		}
 		for _, dir := range dirs {
 			pea := filepath.Base(dir)
@@ -255,7 +279,12 @@ func (g *vsockGate) denials(creating string) (map[string]string, error) {
 				continue
 			}
 			if err != nil {
-				return nil, fmt.Errorf("reading the bundle of pea %s in %s: %w", pea, sandbox, err)
+				err = fmt.Errorf("reading the bundle of pea %s in %s: %w", pea, sandbox, err)
+				if unreadable == nil {
+					return nil, err
+				}
+				unreadable[sandbox+"/"+pea] = err
+				continue
 			}
 			denials[sandbox+"/"+pea] = vsockDenialOf(bndl)
 		}

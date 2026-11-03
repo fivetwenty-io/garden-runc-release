@@ -26,14 +26,28 @@ func (b BundleSaver) Save(bundle Bndl, path string) error {
 	return save(bundle.Spec, filepath.Join(path, "config.json"))
 }
 
+// save writes value as JSON to a temporary file beside path and renames it
+// into place, so that a reader sees either the old file or the whole new
+// one, never one that is empty or half written. The file is readable only
+// by its owner.
 func save(value interface{}, path string) error {
-	w, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	w, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return fmt.Errorf("Failed to save bundle: %s", err)
 	}
-	defer w.Close()
+	defer os.Remove(w.Name())
 
-	return json.NewEncoder(w).Encode(value)
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		w.Close()
+		return fmt.Errorf("Failed to save bundle: %s", err)
+	}
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("Failed to save bundle: %s", err)
+	}
+	if err := os.Rename(w.Name(), path); err != nil {
+		return fmt.Errorf("Failed to save bundle: %s", err)
+	}
+	return nil
 }
 
 func readJSONInto(path string, object interface{}) error {

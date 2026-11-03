@@ -243,6 +243,39 @@ var _ = Describe("vsockGate", func() {
 				Expect(g.Exception("new-container")).To(BeTrue())
 			})
 
+			It("without the flag, skips a bundle it cannot parse, logs it once, and still settles", func() {
+				Expect(os.MkdirAll(filepath.Join(dir, "broken"), 0o700)).To(Succeed())
+				Expect(os.WriteFile(filepath.Join(dir, "broken", "config.json"), []byte("{"), 0o600)).To(Succeed())
+				Expect(os.MkdirAll(filepath.Join(dir, "app", "processes", "broken-pea"), 0o700)).To(Succeed())
+				Expect(os.WriteFile(filepath.Join(dir, "app", "processes", "broken-pea", "config.json"), []byte(`{"ociVersion":`), 0o600)).To(Succeed())
+
+				containers := depot.New(dir, &goci.BundleSaver{}, &goci.BndlLoader{})
+				off := newVsockGate(logger, false, false)
+				off.watch(runrunc.NewBundleManager(containers, execrunner.NewProcessDirDepot(containers)), execrunner.NewProcessDirDepot(containers))
+				Expect(off.Deny("new-container")).To(BeFalse())
+				Expect(aboveDebug(logger)).To(Equal([]string{
+					"gate.vsock-gate.skipped-unreadable-bundle",
+					"gate.vsock-gate.skipped-unreadable-bundle",
+				}))
+				Expect(logger.Buffer().Contents()).To(ContainSubstring(`"handle":"broken"`))
+				Expect(logger.Buffer().Contents()).To(ContainSubstring(`"handle":"app/broken-pea"`))
+
+				Expect(off.Deny("another-container")).To(BeFalse())
+				Expect(aboveDebug(logger)).To(HaveLen(2))
+
+				save(filepath.Join(dir, "agent"), vsockBundle(backend.VMQemu, seccompvsock.AnnotationWrapper))
+				again := newVsockGate(logger, false, false)
+				again.watch(runrunc.NewBundleManager(containers, execrunner.NewProcessDirDepot(containers)), execrunner.NewProcessDirDepot(containers))
+				Expect(again.Deny("new-container")).To(BeTrue())
+			})
+
+			It("with the flag, refuses the guest agent while a bundle cannot be parsed", func() {
+				Expect(os.MkdirAll(filepath.Join(dir, "app", "processes", "broken-pea"), 0o700)).To(Succeed())
+				Expect(os.WriteFile(filepath.Join(dir, "app", "processes", "broken-pea", "config.json"), []byte("{"), 0o600)).To(Succeed())
+				Expect(g.Exception("new-container")).To(BeFalse())
+				Expect(logger).To(gbytes.Say(`guest-agent-refused-without-container-list.*"consecutive-failures":1,"error":"reading the bundle of pea broken-pea in app`))
+			})
+
 			It("without the flag, denies nothing and logs no error", func() {
 				containers := depot.New(dir, &goci.BundleSaver{}, &goci.BndlLoader{})
 				off := newVsockGate(logger, false, false)

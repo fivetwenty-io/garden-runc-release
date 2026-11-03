@@ -92,6 +92,51 @@ var _ = Describe("Bundle Serialization", func() {
 		})
 	})
 
+	Describe("Saving while another process reads", func() {
+		It("never lets a reader see a config.json that is empty or half written", func() {
+			if runtime.GOOS == "windows" {
+				Skip("a reader on Windows holds the file against a rename")
+			}
+			env := make([]string, 4096)
+			for i := range env {
+				env[i] = "SOME_VARIABLE=some value that takes up room"
+			}
+			big := bndle.WithProcess(specs.Process{Env: env})
+
+			done := make(chan struct{})
+			go func() {
+				defer GinkgoRecover()
+				defer close(done)
+				for i := 0; i < 200; i++ {
+					Expect(bundleSaver.Save(big, tmp)).To(Succeed())
+				}
+			}()
+
+			// The reader keeps going until the writer is done, so that a
+			// failure here never leaves the writer running into later specs.
+			loader := &goci.BndlLoader{}
+			var loadErr error
+			for reading := true; reading; {
+				select {
+				case <-done:
+					reading = false
+				default:
+				}
+				if _, err := loader.Load(tmp); err != nil && loadErr == nil {
+					loadErr = err
+				}
+			}
+			Expect(loadErr).NotTo(HaveOccurred())
+		})
+
+		It("leaves no temporary file beside config.json", func() {
+			entries, err := os.ReadDir(tmp)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(entries).To(HaveLen(1))
+			Expect(entries[0].Name()).To(Equal("config.json"))
+		})
+	})
+
 	Describe("Loading", func() {
 		Context("when config.json exist", func() {
 			It("loads the bundle from config.json", func() {
