@@ -2707,6 +2707,46 @@ var _ = Describe("Rundmc", func() {
 			Expect(stats).To(Equal(containerStats.CPU))
 		})
 
+		Context("when the statser marks the CPU figure as final", func() {
+			BeforeEach(func() {
+				fakeOCIRuntime.StatsReturns(gardener.StatsContainerMetrics{
+					CPU:      garden.ContainerCPUStat{Usage: 41},
+					Memory:   garden.ContainerMemoryStat{TotalUsageTowardLimit: 7},
+					CPUFinal: true,
+				}, nil)
+				fakeCPUCgrouper.ReadTotalCgroupUsageReturns(garden.ContainerCPUStat{Usage: 900, User: 600, System: 300}, nil)
+			})
+
+			It("keeps the statser's figure and does not read the cgroup", func() {
+				metrics, err := containerizer.Metrics(logger, "foo")
+				Expect(err).NotTo(HaveOccurred())
+
+				Expect(metrics.CPU).To(Equal(garden.ContainerCPUStat{Usage: 41}))
+				Expect(metrics.Memory.TotalUsageTowardLimit).To(Equal(uint64(7)))
+				Expect(fakeCPUCgrouper.ReadTotalCgroupUsageCallCount()).To(Equal(0))
+			})
+
+			It("does not fail when the cgroup could not be read", func() {
+				fakeCPUCgrouper.ReadTotalCgroupUsageReturns(garden.ContainerCPUStat{}, errors.New("cgroup-error"))
+
+				metrics, err := containerizer.Metrics(logger, "foo")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(metrics.CPU.Usage).To(Equal(uint64(41)))
+			})
+		})
+
+		Context("when the statser does not mark the CPU figure as final", func() {
+			It("replaces it with the cgroup's, as it does for runC and for gVisor with the flag off", func() {
+				fakeOCIRuntime.StatsReturns(gardener.StatsContainerMetrics{CPU: garden.ContainerCPUStat{Usage: 41}}, nil)
+				fakeCPUCgrouper.ReadTotalCgroupUsageReturns(garden.ContainerCPUStat{Usage: 900, User: 600, System: 300}, nil)
+
+				metrics, err := containerizer.Metrics(logger, "foo")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(metrics.CPU).To(Equal(garden.ContainerCPUStat{Usage: 900, User: 600, System: 300}))
+				Expect(fakeCPUCgrouper.ReadTotalCgroupUsageCallCount()).To(Equal(1))
+			})
+		})
+
 		Context("when cpu entitlement per share is defined", func() {
 			var entitlementPerSharePercent float64
 

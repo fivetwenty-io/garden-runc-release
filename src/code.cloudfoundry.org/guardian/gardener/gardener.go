@@ -155,6 +155,11 @@ type StatsContainerMetrics struct {
 	Memory garden.ContainerMemoryStat
 	Pid    garden.ContainerPidStat
 	Age    time.Duration
+
+	// CPUFinal says that the statser took CPU from a source that the cell's
+	// cgroup reading must not replace. Only the gVisor statser that reads the
+	// Sentry's own figure sets it.
+	CPUFinal bool
 }
 
 type ActualContainerMetrics struct {
