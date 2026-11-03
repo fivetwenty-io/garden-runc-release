@@ -14,18 +14,21 @@ import (
 
 var _ = Describe("VsockDenial", func() {
 	var (
-		deny    bool
-		asked   int
-		rule    bundlerules.VsockDenial
-		bndl    goci.Bndl
-		profile *specs.LinuxSeccomp
+		deny     bool
+		asked    int
+		askedFor string
+		rule     bundlerules.VsockDenial
+		bndl     goci.Bndl
+		profile  *specs.LinuxSeccomp
 	)
 
 	BeforeEach(func() {
 		deny = true
 		asked = 0
-		rule = bundlerules.VsockDenial{Deny: func() bool {
+		askedFor = ""
+		rule = bundlerules.VsockDenial{Deny: func(handle string) bool {
 			asked++
+			askedFor = handle
 			return deny
 		}}
 		profile = allowListSeccomp()
@@ -41,10 +44,11 @@ var _ = Describe("VsockDenial", func() {
 	}
 
 	It("denies the container vsock and records it, while gdn says to deny", func() {
-		out := apply(bndl, spec.DesiredContainerSpec{})
+		out := apply(bndl, spec.DesiredContainerSpec{Handle: "new-container"})
 		Expect(out.Seccomp()).To(Equal(seccompvsock.Deny(allowListSeccomp())))
 		Expect(out.Spec.Annotations).To(Equal(map[string]string{"existing": "annotation", seccompvsock.AnnotationKey: seccompvsock.AnnotationProfile}))
 		Expect(asked).To(Equal(1))
+		Expect(askedFor).To(Equal("new-container"))
 	})
 
 	It("gives a privileged container, which has no profile, one that denies vsock", func() {
@@ -76,7 +80,7 @@ var _ = Describe("VsockDenial", func() {
 		vm := bundlerules.NewExecutionBackend(GinkgoT().TempDir(), "/var/vcap/packages/guardian/bin/vm-launch", 991)
 		vm.GuestAgent = true
 		vm.HostVhostVsock = true
-		vm.VsockException = func() bool { return true }
+		vm.VsockException = func(string) bool { return true }
 
 		peaSpec := spec.DesiredContainerSpec{}
 		out, err := vm.Apply(apply(bndl, peaSpec), peaSpec)

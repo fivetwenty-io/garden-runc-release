@@ -264,16 +264,18 @@ properties:
       start, and a bare command name that only a relative PATH entry finds is
       refused, as runc refuses it. A container keeps the profile it was
       created with, so Garden gives a vm-qemu container the guest agent only
-      once no container on the cell that predates the property can still open
-      a vsock socket, and it logs which containers hold the agent back until
-      then. When the property is false and Garden finds a container that
-      serves the guest agent from before, it keeps denying every new container
-      vsock until it restarts with no such container left. Off by default, and
-      then the profiles are the ones Garden rendered before the property
-      existed. A container that runs under gVisor ignores its seccomp profile,
-      so the denial does not hold there, and Garden gives no container the
-      guest agent on a cell that runs every container under runsc or while an
-      oci-gvisor container runs. garden.vm_guest_agent requires it, because
+      once no container or pea on the cell that predates the property can
+      still open a vsock socket, and it logs which containers hold the agent
+      back until then. When the property is false and Garden finds a container
+      that serves the guest agent from before, it keeps denying every new
+      container vsock until it restarts with no such container left. Off by
+      default, and then the profiles are the ones Garden rendered before the
+      property existed, even when Garden cannot list the containers on the
+      cell, which it then logs as an error. A container that runs under gVisor
+      ignores its seccomp profile, but gVisor offers its programs no vsock
+      sockets at all, so the gVisor containers on a mixed cell need no denial.
+      Garden gives no container the guest agent on a cell that runs every
+      container under runsc. garden.vm_guest_agent requires it, because
       without it any process in a container on the cell can reach a guest
       agent over vsock.
     default: false

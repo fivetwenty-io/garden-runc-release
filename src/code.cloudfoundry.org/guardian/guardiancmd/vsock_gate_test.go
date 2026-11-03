@@ -2,10 +2,17 @@ package guardiancmd
 
 import (
 	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 
 	"code.cloudfoundry.org/garden"
 	"code.cloudfoundry.org/guardian/backend"
+	"code.cloudfoundry.org/guardian/rundmc/depot"
+	"code.cloudfoundry.org/guardian/rundmc/execrunner"
 	"code.cloudfoundry.org/guardian/rundmc/goci"
+	"code.cloudfoundry.org/guardian/rundmc/runrunc"
 	"code.cloudfoundry.org/guardian/rundmc/seccompvsock"
 	"code.cloudfoundry.org/lager/v3"
 	"code.cloudfoundry.org/lager/v3/lagertest"
@@ -90,14 +97,14 @@ var _ = Describe("vsockGate", func() {
 
 	gate := func(flag bool) *vsockGate {
 		g := newVsockGate(logger, flag, false)
-		g.watch(cell)
+		g.watch(cell, nil)
 		return g
 	}
 
 	Context("with --deny-vsock", func() {
 		It("denies every container vsock without looking at the cell", func() {
 			g := gate(true)
-			Expect(g.Deny()).To(BeTrue())
+			Expect(g.Deny("new")).To(BeTrue())
 			Expect(cell.listings).To(Equal(0))
 		})
 
@@ -105,27 +112,38 @@ var _ = Describe("vsockGate", func() {
 			cell.bundles["app"] = vsockBundle(backend.OCIRunc, seccompvsock.AnnotationProfile)
 			cell.bundles["agent"] = vsockBundle(backend.VMQemu, seccompvsock.AnnotationWrapper)
 			g := gate(true)
-			Expect(g.Exception()).To(BeTrue())
-			Expect(g.Exception()).To(BeTrue())
+			Expect(g.Exception("new")).To(BeTrue())
+			Expect(g.Exception("newer")).To(BeTrue())
 			Expect(cell.listings).To(Equal(1))
 		})
 
 		It("makes the exception on an empty cell, and skips a container that goes away while it looks", func() {
 			cell.gone = map[string]bool{"destroyed": true}
-			Expect(gate(true).Exception()).To(BeTrue())
+			Expect(gate(true).Exception("new")).To(BeTrue())
+		})
+
+		It("does not count the container being created, which it is about to deny", func() {
+			cell.bundles["new"] = vsockBundle(backend.VMQemu, "")
+			Expect(gate(true).Exception("new")).To(BeTrue())
+		})
+
+		It("skips a container whose bundle has gone from the depot", func() {
+			cell.bundles["half-destroyed"] = goci.Bndl{}
+			cell.infoErr = fmt.Errorf("Failed to load bundle: %w", &fs.PathError{Op: "open", Path: "/depot/half-destroyed/config.json", Err: fs.ErrNotExist})
+			Expect(gate(true).Exception("new")).To(BeTrue())
 		})
 
 		It("refuses the exception while a container created without the denial runs, says which, and looks again next time", func() {
 			cell.bundles["old"] = vsockBundle(backend.OCIRunc, "")
-			cell.bundles["new"] = vsockBundle(backend.OCIRunc, seccompvsock.AnnotationProfile)
+			cell.bundles["denied"] = vsockBundle(backend.OCIRunc, seccompvsock.AnnotationProfile)
 			g := gate(true)
-			Expect(g.Exception()).To(BeFalse())
+			Expect(g.Exception("new")).To(BeFalse())
 			Expect(logger).To(gbytes.Say("guest-agent-refused-while-containers-lack-vsock-denial"))
 			Expect(logger.Buffer().Contents()).To(ContainSubstring(`"old"`))
-			Expect(logger.Buffer().Contents()).NotTo(ContainSubstring(`"new"`))
+			Expect(logger.Buffer().Contents()).NotTo(ContainSubstring(`"denied"`))
 
 			delete(cell.bundles, "old")
-			Expect(g.Exception()).To(BeTrue())
+			Expect(g.Exception("new")).To(BeTrue())
 			Expect(cell.listings).To(Equal(2))
 		})
 
@@ -133,45 +151,111 @@ var _ = Describe("vsockGate", func() {
 			bndl := vsockBundle(backend.OCIRunc, seccompvsock.AnnotationProfile)
 			bndl = bndl.WithSeccomp(nil)
 			cell.bundles["claims"] = bndl
-			Expect(gate(true).Exception()).To(BeFalse())
+			Expect(gate(true).Exception("new")).To(BeFalse())
 		})
 
-		It("counts a gVisor container as open whatever its annotation, because runsc ignores the profile", func() {
+		// gVisor's kernel has no AF_VSOCK family, so a gVisor container
+		// cannot create a vsock socket whatever its profile, and the gate
+		// goes by its annotation like any other container's.
+		It("goes by a gVisor container's annotation like any other's", func() {
 			cell.bundles["gvisor"] = vsockBundle(backend.OCIGvisor, seccompvsock.AnnotationProfile)
-			Expect(gate(true).Exception()).To(BeFalse())
+			Expect(gate(true).Exception("new")).To(BeTrue())
+
+			cell.bundles["old-gvisor"] = vsockBundle(backend.OCIGvisor, "")
+			Expect(gate(true).Exception("new")).To(BeFalse())
 		})
 
-		It("refuses the exception on a cell that runs every container under runsc", func() {
+		It("refuses the exception on a cell that runs every container under runsc, and says so once", func() {
 			g := newVsockGate(logger, true, true)
-			g.watch(cell)
-			Expect(g.Exception()).To(BeFalse())
+			g.watch(cell, nil)
+			Expect(g.Exception("new")).To(BeFalse())
+			Expect(g.Exception("newer")).To(BeFalse())
 			Expect(cell.listings).To(Equal(0))
+			Expect(logger.LogMessages()).To(Equal([]string{"gate.vsock-gate.guest-agent-refused-on-gvisor-cell"}))
 		})
 
 		It("looks at the peas too when the runtime lists them apart", func() {
 			g := newVsockGate(logger, true, false)
-			g.watch(fakeVsockPeaBundles{fakeVsockBundles: cell, peas: map[string]goci.Bndl{"old-pea": vsockBundle(backend.OCIRunc, "")}})
-			Expect(g.Exception()).To(BeFalse())
+			g.watch(fakeVsockPeaBundles{fakeVsockBundles: cell, peas: map[string]goci.Bndl{"old-pea": vsockBundle(backend.OCIRunc, "")}}, nil)
+			Expect(g.Exception("new")).To(BeFalse())
 		})
 
-		It("refuses the exception, and looks again, when it cannot list or read the containers", func() {
+		It("refuses the exception, logs an error that counts the failures and names the container, and looks again, when it cannot list or read the containers", func() {
 			cell.listErr = errors.New("no list")
 			g := gate(true)
-			Expect(g.Exception()).To(BeFalse())
+			Expect(g.Exception("new")).To(BeFalse())
+			Expect(logger).To(gbytes.Say(`guest-agent-refused-without-container-list.*"consecutive-failures":1`))
+			Expect(logger.LogMessages()).To(HaveLen(1))
+			Expect(logger.Logs()[0].LogLevel).To(Equal(lager.ERROR))
+
 			cell.listErr = nil
 			cell.bundles["app"] = vsockBundle(backend.OCIRunc, seccompvsock.AnnotationProfile)
 			cell.infoErr = errors.New("no bundle")
-			Expect(g.Exception()).To(BeFalse())
-			cell.infoErr = nil
-			Expect(g.Exception()).To(BeTrue())
+			Expect(g.Exception("new")).To(BeFalse())
+			Expect(logger).To(gbytes.Say(`"consecutive-failures":2,"error":"reading the bundle of app: no bundle"`))
 
-			Expect(newVsockGate(logger, true, false).Exception()).To(BeFalse())
+			cell.infoErr = nil
+			Expect(g.Exception("new")).To(BeTrue())
+			Expect(logger).To(gbytes.Say(`container-list-recovered.*"after-failures":2`))
+
+			Expect(newVsockGate(logger, true, false).Exception("new")).To(BeFalse())
+		})
+
+		Context("on a runc mode depot", func() {
+			var (
+				dir string
+				g   *vsockGate
+			)
+
+			save := func(path string, bndl goci.Bndl) {
+				GinkgoHelper()
+				Expect(os.MkdirAll(path, 0o700)).To(Succeed())
+				Expect(goci.BundleSaver{}.Save(bndl, path)).To(Succeed())
+			}
+
+			BeforeEach(func() {
+				dir = GinkgoT().TempDir()
+				// The networker makes the directory of the container
+				// being created before anything writes its config.json.
+				Expect(os.MkdirAll(filepath.Join(dir, "new-container"), 0o700)).To(Succeed())
+				save(filepath.Join(dir, "app"), vsockBundle(backend.OCIRunc, seccompvsock.AnnotationProfile))
+				save(filepath.Join(dir, "app", "processes", "denied-pea"), vsockBundle(backend.OCIRunc, seccompvsock.AnnotationProfile))
+				Expect(os.MkdirAll(filepath.Join(dir, "app", "processes", "an-exec"), 0o700)).To(Succeed())
+				Expect(os.WriteFile(filepath.Join(dir, "stray"), nil, 0o600)).To(Succeed())
+
+				containers := depot.New(dir, &goci.BundleSaver{}, &goci.BndlLoader{})
+				g = newVsockGate(logger, true, false)
+				g.watch(runrunc.NewBundleManager(containers, execrunner.NewProcessDirDepot(containers)), execrunner.NewProcessDirDepot(containers))
+			})
+
+			It("skips the container being created, the exec, and the stray file, and makes the exception", func() {
+				Expect(g.Exception("new-container")).To(BeTrue())
+				Expect(aboveDebug(logger)).To(BeEmpty())
+			})
+
+			It("refuses the exception while a pea that runc runs lacks the denial, and names it", func() {
+				save(filepath.Join(dir, "app", "processes", "old-pea"), vsockBundle(backend.OCIRunc, ""))
+				Expect(g.Exception("new-container")).To(BeFalse())
+				Expect(logger).To(gbytes.Say(`guest-agent-refused-while-containers-lack-vsock-denial.*"app/old-pea"`))
+				Expect(logger.Buffer().Contents()).NotTo(ContainSubstring("denied-pea"))
+
+				Expect(os.RemoveAll(filepath.Join(dir, "app", "processes", "old-pea"))).To(Succeed())
+				Expect(g.Exception("new-container")).To(BeTrue())
+			})
+
+			It("without the flag, denies nothing and logs no error", func() {
+				containers := depot.New(dir, &goci.BundleSaver{}, &goci.BndlLoader{})
+				off := newVsockGate(logger, false, false)
+				off.watch(runrunc.NewBundleManager(containers, execrunner.NewProcessDirDepot(containers)), execrunner.NewProcessDirDepot(containers))
+				Expect(off.Deny("new-container")).To(BeFalse())
+				Expect(aboveDebug(logger)).To(BeEmpty())
+			})
 		})
 	})
 
 	Context("without --deny-vsock", func() {
 		It("never makes the guest agent exception", func() {
-			Expect(gate(false).Exception()).To(BeFalse())
+			Expect(gate(false).Exception("new")).To(BeFalse())
 			Expect(cell.listings).To(Equal(0))
 		})
 
@@ -179,28 +263,46 @@ var _ = Describe("vsockGate", func() {
 			cell.bundles["app"] = vsockBundle(backend.OCIRunc, seccompvsock.AnnotationProfile)
 			cell.bundles["vm"] = vsockBundle(backend.VMQemu, "")
 			g := gate(false)
-			Expect(g.Deny()).To(BeFalse())
-			Expect(g.Deny()).To(BeFalse())
+			Expect(g.Deny("new")).To(BeFalse())
+			Expect(g.Deny("newer")).To(BeFalse())
 			Expect(cell.listings).To(Equal(1))
 		})
 
 		It("keeps denying for the rest of its run when a container serves the guest agent from an earlier run", func() {
 			cell.bundles["agent"] = vsockBundle(backend.VMQemu, seccompvsock.AnnotationWrapper)
 			g := gate(false)
-			Expect(g.Deny()).To(BeTrue())
+			Expect(g.Deny("new")).To(BeTrue())
 			Expect(logger).To(gbytes.Say("vsock-denial-kept-for-guest-agent-containers"))
 
 			delete(cell.bundles, "agent")
-			Expect(g.Deny()).To(BeTrue())
+			Expect(g.Deny("newer")).To(BeTrue())
 			Expect(cell.listings).To(Equal(1))
 		})
 
-		It("denies, and looks again next time, when it cannot list the containers", func() {
+		It("denies nothing, logs an error that counts the failures, and looks again, when it cannot list the containers", func() {
 			cell.listErr = errors.New("no list")
 			g := gate(false)
-			Expect(g.Deny()).To(BeTrue())
+			Expect(g.Deny("new")).To(BeFalse())
+			Expect(g.Deny("newer")).To(BeFalse())
+			Expect(logger).To(gbytes.Say(`vsock-denial-not-applied-without-container-list.*"consecutive-failures":1`))
+			Expect(logger).To(gbytes.Say(`vsock-denial-not-applied-without-container-list.*"consecutive-failures":2`))
+			Expect(logger.Logs()[0].LogLevel).To(Equal(lager.ERROR))
+
 			cell.listErr = nil
-			Expect(g.Deny()).To(BeFalse())
+			cell.bundles["agent"] = vsockBundle(backend.VMQemu, seccompvsock.AnnotationWrapper)
+			Expect(g.Deny("newest")).To(BeTrue())
 		})
 	})
 })
+
+// aboveDebug gives the messages that the gate logged above debug level,
+// leaving out the depot's own lookups.
+func aboveDebug(logger *lagertest.TestLogger) []string {
+	var messages []string
+	for _, log := range logger.Logs() {
+		if log.LogLevel > lager.DEBUG {
+			messages = append(messages, log.Message)
+		}
+	}
+	return messages
+}

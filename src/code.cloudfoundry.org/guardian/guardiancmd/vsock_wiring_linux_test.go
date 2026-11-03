@@ -35,12 +35,21 @@ type vsockRules struct {
 	denial              bundlerules.VsockDenial
 	vm                  bundlerules.ExecutionBackend
 	denialAt, backendAt int
+	// all is every rule of the containerizer, in order.
+	all []rundmc.BundlerRule
 }
 
 func wireVsockContainerizer(t *testing.T, denyVsock bool) vsockRules {
 	t.Helper()
+	return wireVsockContainerizerIn(t, denyVsock, t.TempDir(), lager.NewLogger("vsock-wiring"))
+}
+
+// wireVsockContainerizerIn wires a runc mode containerizer whose depot is
+// the directory dir.
+func wireVsockContainerizerIn(t *testing.T, denyVsock bool, dir string, log lager.Logger) vsockRules {
+	t.Helper()
 	cmd := &CommonCommand{}
-	cmd.Containers.Dir = t.TempDir()
+	cmd.Containers.Dir = dir
 	cmd.Containers.DenyVsock = denyVsock
 	registry, err := backend.NewRegistry(backend.VMQemu)
 	if err != nil {
@@ -49,12 +58,12 @@ func wireVsockContainerizer(t *testing.T, denyVsock bool) vsockRules {
 	backends := &executionBackends{registry: registry, kvmGid: 991}
 	cmd.wiredBackends = backends
 	factory := runtimeWiringFactory{LinuxFactory: &LinuxFactory{config: cmd}}
-	containerizer, _, err := cmd.wireContainerizer(lager.NewLogger("vsock-wiring"), factory, nil, nil, 1, depot.NetworkDepot{}, nil, backends)
+	containerizer, _, err := cmd.wireContainerizer(log, factory, nil, nil, 1, depot.NetworkDepot{}, nil, backends)
 	if err != nil {
 		t.Fatal(err)
 	}
-	rules := vsockRules{denialAt: -1, backendAt: -1}
-	for i, rule := range wiredBundleRules(t, containerizer) {
+	rules := vsockRules{denialAt: -1, backendAt: -1, all: wiredBundleRules(t, containerizer)}
+	for i, rule := range rules.all {
 		switch r := rule.(type) {
 		case bundlerules.Base:
 			rules.base = r
@@ -92,10 +101,10 @@ func TestContainerizerDeniesVsockExactlyWhenTheDenialIsOn(t *testing.T) {
 		if rules.denial.Deny == nil || rules.vm.VsockException == nil {
 			t.Fatal("the vsock rules have no gate")
 		}
-		if on && !rules.denial.Deny() {
+		if on && !rules.denial.Deny("new-container") {
 			t.Errorf("the vsock denial rule does not deny with the denial on")
 		}
-		if !on && rules.vm.VsockException() {
+		if !on && rules.vm.VsockException("new-container") {
 			t.Errorf("the execution backend rule may give vsock back with the denial off")
 		}
 	}

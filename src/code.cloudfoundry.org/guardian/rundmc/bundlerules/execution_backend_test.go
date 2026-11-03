@@ -280,6 +280,7 @@ var _ = Describe("ExecutionBackendRule", func() {
 
 				BeforeEach(func() {
 					denied = seccompvsock.Deny(allowListSeccomp())
+					desiredSpec.Handle = "agent-container"
 					inputBndl = inputBndl.WithSeccomp(denied)
 					inputBndl.Spec.Process.Args = []string{"/tmp/garden-init"}
 					inputBndl.Spec.Annotations[seccompvsock.AnnotationKey] = seccompvsock.AnnotationProfile
@@ -343,8 +344,9 @@ var _ = Describe("ExecutionBackendRule", func() {
 
 					BeforeEach(func() {
 						asked = 0
-						rule.VsockException = func() bool {
+						rule.VsockException = func(handle string) bool {
 							asked++
+							Expect(handle).To(Equal("agent-container"))
 							return false
 						}
 					})
@@ -357,7 +359,7 @@ var _ = Describe("ExecutionBackendRule", func() {
 
 				When("gdn makes the exception", func() {
 					BeforeEach(func() {
-						rule.VsockException = func() bool { return true }
+						rule.VsockException = func(string) bool { return true }
 					})
 
 					It("gives the container vsock and /dev/vhost-vsock", func() {
@@ -603,7 +605,7 @@ var _ = Describe("ExecutionBackendRule", func() {
 
 			It("keeps the vsock denial and never asks for the exception, because only a vm-qemu guest's agent is reached over vsock", func() {
 				denied := seccompvsock.Deny(allowListSeccomp())
-				rule.VsockException = func() bool {
+				rule.VsockException = func(string) bool {
 					Fail("asked for the vsock exception")
 					return true
 				}

@@ -14,7 +14,7 @@ func (b *BndlLoader) Load(path string) (Bndl, error) {
 	bundle := Bndl{}
 	err := readJSONInto(filepath.Join(path, "config.json"), &bundle.Spec)
 	if err != nil {
-		return bundle, fmt.Errorf("Failed to load bundle: %s", err)
+		return bundle, fmt.Errorf("Failed to load bundle: %w", err)
 	}
 
 	return bundle, nil

@@ -9,18 +9,19 @@ import (
 // VsockDenial denies vsock sockets to every process of a container whose
 // bundle it applies to while Deny says so, and records the denial in the
 // bundle's annotations, so that later execs and later runs of gdn know what
-// the container was created with. It leaves a bundle alone while Deny says
-// not to, and when Deny is nil.
+// the container was created with. Deny gets the handle of the container
+// being created. The rule leaves a bundle alone while Deny says not to, and
+// when Deny is nil.
 //
 // It runs before ExecutionBackend, which gives vsock back to the one VM
 // container kind that serves a guest agent over it and turns the record
 // into the one that says the container's other processes are wrapped.
 type VsockDenial struct {
-	Deny func() bool
+	Deny func(handle string) bool
 }
 
-func (r VsockDenial) Apply(bndl goci.Bndl, _ spec.DesiredContainerSpec) (goci.Bndl, error) {
-	if r.Deny == nil || !r.Deny() {
+func (r VsockDenial) Apply(bndl goci.Bndl, spec spec.DesiredContainerSpec) (goci.Bndl, error) {
+	if r.Deny == nil || !r.Deny(spec.Handle) {
 		return bndl, nil
 	}
 	bndl = bndl.WithSeccomp(seccompvsock.Deny(bndl.Seccomp()))

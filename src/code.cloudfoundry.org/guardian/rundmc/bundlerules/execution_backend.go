@@ -141,9 +141,10 @@ type ExecutionBackend struct {
 	// agent rather than failing to be created.
 	HostVhostVsock bool
 
-	// VsockException says whether a vm-qemu container may get
-	// /dev/vhost-vsock for the guest agent now. gdn says no while any
-	// container on the cell can still create a vsock socket. Nil says yes.
+	// VsockException says whether the vm-qemu container with the given
+	// handle may get /dev/vhost-vsock for the guest agent now. gdn says no
+	// while any other container on the cell can still create a vsock
+	// socket. Nil says yes.
 	//
 	// A container that VsockDenial denied vsock to is then the one
 	// exception. Its profile allows vsock again, because its wrapped
@@ -151,7 +152,7 @@ type ExecutionBackend struct {
 	// every other process of the container runs under vm-launch's vsock
 	// filter: the init process, which this rule wraps, and every exec,
 	// which the process builder wraps.
-	VsockException func() bool
+	VsockException func(handle string) bool
 }
 
 // NewExecutionBackend returns the rule with the default required artifact table.
@@ -195,7 +196,7 @@ func (r ExecutionBackend) Apply(bndl goci.Bndl, spec spec.DesiredContainerSpec) 
 		if kind == backend.VMFirecracker {
 			nodes = append(nodes, tunNode)
 		}
-		if r.GuestAgent && r.HostVhostVsock && kind == backend.VMQemu && (r.VsockException == nil || r.VsockException()) {
+		if r.GuestAgent && r.HostVhostVsock && kind == backend.VMQemu && (r.VsockException == nil || r.VsockException(spec.Handle)) {
 			vsock := vhostVsockNode
 			vsock.gid = r.KVMGid
 			nodes = append(nodes, vsock)
