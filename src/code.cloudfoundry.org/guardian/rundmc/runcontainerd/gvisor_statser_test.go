@@ -221,8 +221,14 @@ func TestGVisorStatser_ReportsTheBaseFigureUntilTheFirstSentryReading(t *testing
 		runsc.err = nil
 		time.Sleep(gvisorBackoff + time.Second)
 		recovered := stats(t, statser, "app")
-		if !recovered.CPUFinal || recovered.CPU.Usage != 5000 {
-			t.Errorf("recovered = %+v, want the Sentry's 5000, marked", recovered.CPU)
+		if !recovered.CPUFinal || recovered.CPU.Usage < failed.CPU.Usage {
+			t.Errorf("recovered = %+v after %+v, want a marked figure that has not fallen", recovered.CPU, failed.CPU)
+		}
+
+		runsc.outputs = []string{usageOutput(5000), usageOutput(2000000000)}
+		time.Sleep(6 * time.Second)
+		if got := stats(t, statser, "app"); got.CPU.Usage != 2000000000 {
+			t.Errorf("figure after the Sentry passes the held one = %d, want 2000000000", got.CPU.Usage)
 		}
 	})
 }

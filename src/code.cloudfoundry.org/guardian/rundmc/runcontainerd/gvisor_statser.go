@@ -130,6 +130,10 @@ type gvisorCPUState struct {
 	reported uint64
 	failing  bool
 
+	// lastReported is the base figure reported before the first Sentry
+	// reading, which the Sentry figure must not fall below.
+	lastReported uint64
+
 	// failedAt and failErr are the last runsc failure, which answers calls
 	// until the backoff ends.
 	failedAt time.Time
@@ -161,7 +165,7 @@ func (s *GVisorStatser) Stats(log lager.Logger, id string) (gardener.StatsContai
 	// A handle that a new container reuses starts from zero.
 	if metrics.Age < state.age {
 		state.sample, state.sampleAt, state.sampled = 0, time.Time{}, false
-		state.reported, state.failing = 0, false
+		state.reported, state.lastReported, state.failing = 0, 0, false
 		state.failedAt, state.failErr = time.Time{}, nil
 	}
 	state.age = metrics.Age
@@ -177,6 +181,7 @@ func (s *GVisorStatser) Stats(log lager.Logger, id string) (gardener.StatsContai
 	}
 	if err != nil {
 		if !state.sampled {
+			state.lastReported = max(state.lastReported, metrics.CPU.Usage)
 			return metrics, nil
 		}
 		metrics.CPU = garden.ContainerCPUStat{Usage: state.reported}
@@ -188,7 +193,9 @@ func (s *GVisorStatser) Stats(log lager.Logger, id string) (gardener.StatsContai
 	// The figure falls when a short-lived exec exits, because the Sentry drops
 	// the CPU of a process that has no parent, and a falling figure would read
 	// as a negative rate, so the reported figure waits for the count to catch up.
-	state.reported = max(state.reported, usage)
+	// The counter never falls, so after a step from the cgroup figure it holds
+	// flat until the Sentry figure catches up.
+	state.reported = max(state.reported, state.lastReported, usage)
 
 	metrics.CPU = garden.ContainerCPUStat{Usage: state.reported}
 	metrics.CPUFinal = true
