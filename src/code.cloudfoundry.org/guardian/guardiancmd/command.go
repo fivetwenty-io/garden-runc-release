@@ -1176,7 +1176,15 @@ func (cmd *CommonCommand) wireExecutionBackends(log lager.Logger) (*executionBac
 	var gvisorSentryCPU runcontainerd.RunscEvents
 	gvisorEnabled := slices.ContainsFunc(kinds, backend.IsGvisor)
 	if gvisorEnabled && cmd.ExecutionBackends.GVisorSentryCPU {
-		gvisorSentryCPU = runcontainerd.ExecRunscEvents{Bin: cmd.ExecutionBackends.GVisorRunscBin, Root: cmd.ExecutionBackends.GVisorRunscRoot}
+		runner := runcontainerd.ExecRunscEvents{Bin: cmd.ExecutionBackends.GVisorRunscBin, Root: cmd.ExecutionBackends.GVisorRunscRoot}
+		// A runsc that cannot answer would switch every container between the
+		// Sentry's figure and the cgroup's, so the Sentry path stays off for
+		// the life of the process.
+		if err := probeSentryUsage(runner); err != nil {
+			log.Error("gvisor-sentry-cpu-disabled", err, lager.Data{"bin": runner.Bin, "root": runner.Root})
+		} else {
+			gvisorSentryCPU = runner
+		}
 	}
 	cmd.logUnusedGVisorFlags(log, gvisorEnabled)
 
@@ -1399,6 +1407,10 @@ func withoutVMBackends(kinds []backend.Kind) []backend.Kind {
 	}
 	return kept
 }
+
+// probeSentryUsage checks the runsc that --gvisor-sentry-cpu runs. Tests
+// replace it.
+var probeSentryUsage = func(r runcontainerd.ExecRunscEvents) error { return r.Probe() }
 
 func checkExecutable(path string) error {
 	if path == "" {

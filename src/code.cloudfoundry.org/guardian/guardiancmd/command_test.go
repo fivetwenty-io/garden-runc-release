@@ -475,9 +475,27 @@ var _ = Describe("execution backend flags", func() {
 				return "sentry"
 			}
 
+			var probeErr error
+
 			BeforeEach(func() {
 				cmd.ExecutionBackends.Enabled = []string{"oci-gvisor"}
 				cmd.Containerd.Socket = "/run/containerd.sock"
+
+				probeErr = nil
+				original := probeSentryUsage
+				probeSentryUsage = func(runcontainerd.ExecRunscEvents) error { return probeErr }
+				DeferCleanup(func() { probeSentryUsage = original })
+			})
+
+			It("keeps the base statser, and logs an error, when the runsc probe fails", func() {
+				cmd.ExecutionBackends.GVisorSentryCPU = true
+				probeErr = errors.New("runsc events does not accept --sentry-usage")
+
+				backends, err := cmd.wireExecutionBackends(log)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(statserName(backends)).To(Equal("base"))
+				Expect(backends.gvisorSentryCPU).To(BeNil())
+				Expect(log).To(gbytes.Say("gvisor-sentry-cpu-disabled"))
 			})
 
 			It("hands gVisor containers the base statser when the flag is off", func() {
