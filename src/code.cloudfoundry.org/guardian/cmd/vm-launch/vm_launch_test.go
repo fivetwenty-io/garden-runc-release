@@ -1759,17 +1759,35 @@ var _ = Describe("run with a stack image", func() {
 	})
 
 	// withBoshDisk gives the app one volume that the BOSH disk provider
-	// owns, on a fake device node, and returns the volume's directory. The
-	// spec skips where the process may not create a block device node, as
-	// the specs of the guest's drive search do.
+	// owns, on a device node for a loop device that the spec attaches to a
+	// sparse file of its own and detaches in its cleanup, and returns the
+	// volume's directory. The spec skips where the process may not attach a
+	// loop device or create a block device node, as the specs of the guest's
+	// drive search do.
 	withBoshDisk := func() string {
 		GinkgoHelper()
 		volDir := filepath.Join(dir, "volume")
 		infoDir := filepath.Join(dir, "info")
 		Expect(os.Mkdir(volDir, 0o755)).To(Succeed())
 		Expect(os.Mkdir(infoDir, 0o755)).To(Succeed())
+		if _, err := os.Stat("/dev/loop-control"); err != nil {
+			Skip("this host has no /dev/loop-control: " + err.Error())
+		}
+		if os.Geteuid() != 0 {
+			Skip("attaching a loop device needs root")
+		}
+		if _, err := exec.LookPath("losetup"); err != nil {
+			Skip("losetup is not installed")
+		}
+		backing := filepath.Join(GinkgoT().TempDir(), "disk.img")
+		Expect(os.WriteFile(backing, nil, 0o600)).To(Succeed())
+		Expect(os.Truncate(backing, 64<<20)).To(Succeed())
+		dev := runTool("losetup", "--find", "--show", backing)
+		DeferCleanup(func() { runTool("losetup", "--detach", dev) })
+		var st unix.Stat_t
+		Expect(unix.Stat(dev, &st)).To(Succeed())
 		node := filepath.Join(dir, "disk-node")
-		if err := unix.Mknod(node, unix.S_IFBLK|0o600, int(unix.Mkdev(7, 0))); err != nil {
+		if err := unix.Mknod(node, unix.S_IFBLK|0o600, int(st.Rdev)); err != nil {
 			Skip("this process cannot create a block device node: " + err.Error())
 		}
 		savedInfo, savedOpts := mountInfoPath, defaultImageOptions
