@@ -828,6 +828,78 @@ var _ = Describe("the guest agent relay", func() {
 		Expect(answer).To(HavePrefix("error: the guest agent did not answer a ping: "))
 	})
 
+	It("keeps the contract that diego-sshd's specs check their fake relay against", func() {
+		data, err := os.ReadFile(filepath.Join("testdata", "guest-agent-relay-contract.txt"))
+		Expect(err).NotTo(HaveOccurred())
+		echo, err := net.Listen("tcp", "127.0.0.1:0")
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = echo.Close() })
+		go func() {
+			for {
+				c, err := echo.Accept()
+				if err != nil {
+					return
+				}
+				go func() {
+					defer c.Close()
+					_, _ = io.Copy(c, c)
+				}()
+			}
+		}()
+		port := strconv.Itoa(echo.Addr().(*net.TCPAddr).Port)
+
+		dir := GinkgoT().TempDir()
+		paths := map[string]string{}
+		for _, state := range []string{"agent", "off", "down"} {
+			path = filepath.Join(dir, state+".sock")
+			paths[state] = path
+			switch state {
+			case "agent":
+				startRelay(testAgentKey, dialAgent(a), "")
+			case "off":
+				startRelay(testAgentKey, nil, "this guest has no agent for cf ssh, because it is a spec")
+			case "down":
+				startRelay(testAgentKey, func() (agentConn, error) { return nil, errors.New("the agent is down") }, "")
+			}
+		}
+
+		cases := 0
+		for _, text := range strings.Split(string(data), "\n") {
+			if text == "" || strings.HasPrefix(text, "#") {
+				continue
+			}
+			fields := strings.Split(text, " | ")
+			Expect(fields).To(HaveLen(4), text)
+			state, line, want, after := fields[0], strings.ReplaceAll(fields[1], "PORT", port), fields[2], fields[3]
+			Expect(paths).To(HaveKey(state), text)
+			path = paths[state]
+			c, answer := ask(line)
+			switch want {
+			case "ok":
+				Expect(answer).To(Equal("ok"), text)
+			case "error:":
+				Expect(answer).To(MatchRegexp(`^error: \S`), text)
+			default:
+				Fail("the contract has no answer " + want)
+			}
+			Expect(c.SetReadDeadline(time.Now().Add(10 * time.Second))).To(Succeed())
+			switch after {
+			case "eof":
+				_, err := c.Read(make([]byte, 1))
+				Expect(err).To(MatchError(io.EOF), text)
+			case "stream":
+				_, err := io.WriteString(c, "through the guest")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(c.CloseWrite()).To(Succeed())
+				Expect(io.ReadAll(c)).To(Equal([]byte("through the guest")), text)
+			default:
+				Fail("the contract has no after " + after)
+			}
+			cases++
+		}
+		Expect(cases).To(Equal(8))
+	})
+
 	It("answers a ping with the reason when the guest has no agent", func() {
 		startRelay(testAgentKey, nil, "this guest has no agent for cf ssh, because it is a spec")
 		_, answer := ask(agentRelayPing)
