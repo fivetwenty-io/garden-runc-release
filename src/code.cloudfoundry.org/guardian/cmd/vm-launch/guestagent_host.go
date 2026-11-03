@@ -80,6 +80,12 @@ const (
 
 	// agentMaxLine is the most bytes the relay's first line may have.
 	agentMaxLine = 512
+
+	// agentRelayPing is the line that asks the relay only whether this
+	// guest has an agent. diego-sshd sends it before it serves scp, sftp,
+	// or a forward through the guest, and serves them in the container as
+	// before on any other answer.
+	agentRelayPing = "ping"
 )
 
 // guestAgentBinary is the agent's binary that goes into the initramfs,
@@ -402,9 +408,10 @@ func withFirecrackerVsock(path, udsPath string) error {
 
 // agentRelay is where clients in the container reach the guest agent. A
 // client connects to its Unix socket and writes one line: "session", after
-// which the connection carries the agent's frames, or "forward HOST PORT",
+// which the connection carries the agent's frames, "forward HOST PORT",
 // after which it carries the raw bytes of a connection to that address in
-// the guest. The relay answers "ok" or "error: " and the reason. Only the
+// the guest, or "ping", after which it carries nothing. The relay answers
+// "ok" or "error: " and the reason. Only the
 // relay knows the boot's key, which it sends as the hello on every
 // connection to the agent.
 type agentRelay struct {
@@ -515,6 +522,7 @@ func (r *agentRelay) handle(c *net.UnixConn) {
 		return
 	}
 	var forward *agentRequest
+	var ping bool
 	switch fields := strings.Fields(line); {
 	case len(fields) == 1 && fields[0] == agentKindSession:
 	case len(fields) == 3 && fields[0] == agentKindForward:
@@ -524,12 +532,21 @@ func (r *agentRelay) handle(c *net.UnixConn) {
 			return
 		}
 		forward = &agentRequest{Kind: agentKindForward, Host: fields[1], Port: port}
+	case len(fields) == 1 && fields[0] == agentRelayPing:
+		ping = true
 	default:
-		answer("the guest agent relay takes %q or %q, not %q", agentKindSession, agentKindForward+" HOST PORT", line)
+		answer("the guest agent relay takes %q, %q, or %q, not %q", agentKindSession, agentKindForward+" HOST PORT", agentRelayPing, line)
 		return
 	}
 	if r.dial == nil {
 		answer("%s", r.off)
+		return
+	}
+	// A ping asks only whether this guest has an agent, which does not
+	// change once the launch has started, so the relay answers it without
+	// dialing the agent.
+	if ping {
+		_, _ = io.WriteString(c, "ok\n")
 		return
 	}
 	// A session's request comes from the client, which sends it right after

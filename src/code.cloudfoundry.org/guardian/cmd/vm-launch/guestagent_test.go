@@ -713,9 +713,29 @@ var _ = Describe("the guest agent relay", func() {
 	It("refuses a first line it does not know and a forward whose port is not a number", func() {
 		startRelay(testAgentKey, dialAgent(a), "")
 		_, answer := ask("shell")
-		Expect(answer).To(Equal(`error: the guest agent relay takes "session" or "forward HOST PORT", not "shell"`))
+		Expect(answer).To(Equal(`error: the guest agent relay takes "session", "forward HOST PORT", or "ping", not "shell"`))
 		_, answer = ask("forward 127.0.0.1 http")
 		Expect(answer).To(Equal(`error: "http" is not a port`))
+	})
+
+	It("answers a ping with ok, without dialing the agent, and then closes the connection", func() {
+		var dials atomic.Int32
+		startRelay(testAgentKey, func() (agentConn, error) {
+			dials.Add(1)
+			return dialAgent(a)()
+		}, "")
+		c, answer := ask(agentRelayPing)
+		Expect(answer).To(Equal("ok"))
+		Expect(c.SetReadDeadline(time.Now().Add(5 * time.Second))).To(Succeed())
+		_, err := c.Read(make([]byte, 1))
+		Expect(err).To(MatchError(io.EOF))
+		Expect(dials.Load()).To(BeZero())
+	})
+
+	It("answers a ping with the reason when the guest has no agent", func() {
+		startRelay(testAgentKey, nil, "this guest has no agent for cf ssh, because it is a spec")
+		_, answer := ask(agentRelayPing)
+		Expect(answer).To(Equal("error: this guest has no agent for cf ssh, because it is a spec"))
 	})
 
 	It("refuses a client that runs as another user", func() {
