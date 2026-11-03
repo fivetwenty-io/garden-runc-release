@@ -139,10 +139,23 @@ func libseccompVacuous(what string) {
 
 // loadedProfile is what a probe child found under one profile, and the
 // filter the kernel held for it, which is nil when this process may not
-// read it.
+// read it, and then readErr says why.
 type loadedProfile struct {
-	calls  map[string]string
-	filter *bpf.VM
+	calls   map[string]string
+	filter  *bpf.VM
+	readErr error
+}
+
+// readBack is the filter the kernel held for the probe. When this process
+// could not read it, readBack notes loudly that the x86-64, 32-bit x86, and
+// x32 checks go unmade, and returns nil, or fails the spec when
+// GUARDIANCMD_REQUIRE_LIBSECCOMP_SPECS is set.
+func (l loadedProfile) readBack() *bpf.VM {
+	GinkgoHelper()
+	if l.filter == nil {
+		libseccompVacuous(fmt.Sprintf("this process may not read a filter back from the kernel (%v), so the x86-64, 32-bit x86, and x32 calls go unchecked", l.readErr))
+	}
+	return l.filter
 }
 
 // loadProfile runs a probe child under the named profile.
@@ -177,11 +190,9 @@ func loadProfile(which string) loadedProfile {
 	tid, err := strconv.Atoi(loaded.calls["tid"])
 	Expect(err).NotTo(HaveOccurred())
 	if which != "none" {
-		loaded.filter, err = readFilter(tid)
-		if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
-			libseccompVacuous(fmt.Sprintf("this process may not read a filter back from the kernel (%v), so the x86-64, 32-bit x86, and x32 calls go unchecked", err))
-		} else {
-			Expect(err).NotTo(HaveOccurred())
+		loaded.filter, loaded.readErr = readFilter(tid)
+		if !errors.Is(loaded.readErr, unix.EPERM) && !errors.Is(loaded.readErr, unix.EACCES) {
+			Expect(loaded.readErr).NotTo(HaveOccurred())
 		}
 	}
 	return loaded
@@ -303,9 +314,9 @@ var _ = Describe("Garden's profiles as runc loads them with libseccomp", Ordered
 		It("denies vsock and io_uring and kills 32-bit x86 and x32 calls in the "+which+" profile", func() {
 			loaded := loadProfile(which)
 			expectNativeDenial(loaded.calls)
-			if loaded.filter != nil {
-				expectX86Denial(loaded.filter)
-				expectNo32Bit(loaded.filter)
+			if filter := loaded.readBack(); filter != nil {
+				expectX86Denial(filter)
+				expectNo32Bit(filter)
 			}
 		})
 	}
@@ -316,19 +327,19 @@ var _ = Describe("Garden's profiles as runc loads them with libseccomp", Ordered
 			Expect(loaded.calls["io_uring"]).To(Equal("EPERM"))
 			Expect(loaded.calls["vsock"]).To(Equal(unfiltered["vsock"]))
 			Expect(loaded.calls["unix"]).To(Equal("ok"))
-			if loaded.filter != nil {
-				Expect(verdict(loaded.filter, auditArchX86_64, 41, seccompvsock.AFVsock)).To(Equal(retAllow))
-				Expect(verdict(loaded.filter, auditArchX86_64, 425, 1)).To(Equal(retErrnoEPERM))
-				expectNo32Bit(loaded.filter)
+			if filter := loaded.readBack(); filter != nil {
+				Expect(verdict(filter, auditArchX86_64, 41, seccompvsock.AFVsock)).To(Equal(retAllow))
+				Expect(verdict(filter, auditArchX86_64, 425, 1)).To(Equal(retErrnoEPERM))
+				expectNo32Bit(filter)
 			}
 		})
 	}
 
 	It("shows, in Garden's own profile, the 32-bit socketcall(2) that the denial closes", func() {
 		loaded := loadProfile("garden")
-		if loaded.filter != nil {
-			Expect(verdict(loaded.filter, auditArchI386, 102, 1)).To(Equal(retAllow))
-			Expect(verdict(loaded.filter, auditArchX86_64, 41, seccompvsock.AFVsock)).To(Equal(retAllow))
+		if filter := loaded.readBack(); filter != nil {
+			Expect(verdict(filter, auditArchI386, 102, 1)).To(Equal(retAllow))
+			Expect(verdict(filter, auditArchX86_64, 41, seccompvsock.AFVsock)).To(Equal(retAllow))
 		}
 	})
 })
