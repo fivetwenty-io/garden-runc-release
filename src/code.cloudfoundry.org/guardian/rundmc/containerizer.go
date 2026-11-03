@@ -937,19 +937,23 @@ func (c *Containerizer) Metrics(log lager.Logger, handle string) (gardener.Actua
 		return gardener.ActualContainerMetrics{}, err
 	}
 
-	totalCPUUsage, err := c.cpuCgrouper.ReadTotalCgroupUsage(handle, containerMetrics.CPU)
-	if err != nil {
-		if os.IsNotExist(err) || strings.Contains(err.Error(), "no such file or directory") {
-			totalCPUUsage = containerMetrics.CPU
-		} else {
-			return gardener.ActualContainerMetrics{}, err
+	// A statser that took the figure from the Sentry says so, and the cgroup,
+	// which covers the whole sandbox, then does not replace it.
+	if !containerMetrics.CPUFinal {
+		totalCPUUsage, err := c.cpuCgrouper.ReadTotalCgroupUsage(handle, containerMetrics.CPU)
+		if err != nil {
+			if os.IsNotExist(err) || strings.Contains(err.Error(), "no such file or directory") {
+				totalCPUUsage = containerMetrics.CPU
+			} else {
+				return gardener.ActualContainerMetrics{}, err
+			}
 		}
-	}
 
-	containerMetrics.CPU = garden.ContainerCPUStat{
-		Usage:  totalCPUUsage.Usage,
-		User:   totalCPUUsage.User,
-		System: totalCPUUsage.System,
+		containerMetrics.CPU = garden.ContainerCPUStat{
+			Usage:  totalCPUUsage.Usage,
+			User:   totalCPUUsage.User,
+			System: totalCPUUsage.System,
+		}
 	}
 
 	actualContainerMetrics := gardener.ActualContainerMetrics{
