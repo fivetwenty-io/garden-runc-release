@@ -420,6 +420,37 @@ properties:
       Setting true requires a vm-* entry in garden.execution_backends.
     default: false
 
+  garden.gvisor_sentry_cpu:
+    description: |
+      Report the CPU of an oci-gvisor container as the Sentry's own
+      accounting of the container's threads, in place of the sandbox cgroup's
+      figure. The cgroup also holds the Sentry, the gofer, and the netstack,
+      so a gVisor app reads several times its own use against its CPU
+      entitlement. Garden asks runsc for the figure with runsc events --stats
+      --sentry-usage, which needs the runsc build that has that flag, and any
+      runsc failure reports the cgroup's figure as before. The Sentry's figure
+      leaves out the work that the Sentry, the gofer, and the netstack do for
+      the app, so an app that does heavy I/O reads lower than its cost on the
+      host. The default, false, changes no figure. The job renders
+      gvisor-sentry-cpu only when the value is true, and runC and vm-*
+      containers never use it. Setting true requires oci-gvisor in
+      garden.execution_backends.
+    default: false
+
+  garden.gvisor_runsc_bin:
+    description: |
+      Path of the runsc binary that garden.gvisor_sentry_cpu runs. It must be
+      the runsc that runs the cell's gVisor containers. Garden reads it only
+      when garden.gvisor_sentry_cpu is true.
+    default: /var/vcap/data/gvisor-runtime/runsc
+
+  garden.gvisor_runsc_root:
+    description: |
+      The runsc --root directory that holds the state of the cell's gVisor
+      containers, which garden.gvisor_sentry_cpu passes to runsc. Garden reads
+      it only when garden.gvisor_sentry_cpu is true.
+    default: /var/vcap/data/gvisor-state/garden
+
   garden.vm_volume_handoff:
     description: |
       Hand a private disk image volume over from a running vm-* instance to

@@ -952,6 +952,76 @@ describe 'garden' do
         end
       end
 
+      context 'gvisor sentry cpu properties' do
+        def render_with(backends, extra)
+          template.render({ 'garden' => { 'execution_backends' => backends }.merge(extra) })
+        end
+
+        def render_server(backends, extra)
+          IniParse.parse(render_with(backends, extra))['server']
+        end
+
+        it 'declares false and the lab paths as the defaults, with descriptions' do
+          garden_spec = YAML.load_file(File.join(File.dirname(__FILE__), '../../jobs/garden/spec'))
+          properties = garden_spec['properties']
+          expect(properties['garden.gvisor_sentry_cpu']['default']).to eql(false)
+          expect(properties['garden.gvisor_runsc_bin']['default']).to eql('/var/vcap/data/gvisor-runtime/runsc')
+          expect(properties['garden.gvisor_runsc_root']['default']).to eql('/var/vcap/data/gvisor-state/garden')
+          %w[garden.gvisor_sentry_cpu garden.gvisor_runsc_bin garden.gvisor_runsc_root].each do |name|
+            expect(properties[name]['description']).not_to be_empty
+          end
+        end
+
+        [[], ['vm-qemu'], %w[vm-qemu vm-firecracker], ['oci-gvisor'], %w[oci-gvisor vm-qemu]].each do |backends|
+          it "renders byte for byte what it rendered before the properties existed when the flag is off (#{backends.inspect})" do
+            expect(render_with(backends, { 'gvisor_sentry_cpu' => false })).to eql(render_with(backends, {}))
+            expect(render_with(backends, { 'gvisor_runsc_bin' => '/opt/runsc', 'gvisor_runsc_root' => '/run/runsc' })).to eql(render_with(backends, {}))
+            expect(render_with(backends, {})).not_to include('gvisor-')
+          end
+        end
+
+        it 'renders the three keys after the execution backend lines when it is true, and parses them back' do
+          raw = render_with(['oci-gvisor'], { 'gvisor_sentry_cpu' => true })
+          expect(raw).to end_with("\n; execution backends\n  execution-backend = oci-gvisor\n  gvisor-sentry-cpu = true\n  gvisor-runsc-bin = /var/vcap/data/gvisor-runtime/runsc\n  gvisor-runsc-root = /var/vcap/data/gvisor-state/garden\n")
+          server = IniParse.parse(raw)['server']
+          expect(server['gvisor-sentry-cpu']).to eql(true)
+          expect(server['gvisor-runsc-bin']).to eql('/var/vcap/data/gvisor-runtime/runsc')
+          expect(server['gvisor-runsc-root']).to eql('/var/vcap/data/gvisor-state/garden')
+        end
+
+        it 'renders the configured paths' do
+          server = render_server(['oci-gvisor'], { 'gvisor_sentry_cpu' => true, 'gvisor_runsc_bin' => '/opt/runsc', 'gvisor_runsc_root' => '/run/runsc' })
+          expect(server['gvisor-runsc-bin']).to eql('/opt/runsc')
+          expect(server['gvisor-runsc-root']).to eql('/run/runsc')
+        end
+
+        it 'changes only the gvisor lines on a cell with a vm-* backend too' do
+          rendered = render_with(%w[oci-gvisor vm-qemu], { 'gvisor_sentry_cpu' => true })
+          without = rendered.sub(/  gvisor-sentry-cpu = true\n  gvisor-runsc-bin = .*\n  gvisor-runsc-root = .*\n/, '')
+          expect(without).to eql(render_with(%w[oci-gvisor vm-qemu], {}))
+        end
+
+        ['false', 'true', 'yes', 0, []].each do |value|
+          it "raises for #{value.inspect}, which is not a boolean" do
+            expect { render_with(['oci-gvisor'], { 'gvisor_sentry_cpu' => value }) }.to raise_error(/garden.gvisor_sentry_cpu must be true or false/)
+          end
+        end
+
+        [[], ['vm-qemu'], %w[vm-qemu vm-firecracker]].each do |backends|
+          it "raises for true when the backends are #{backends.inspect}" do
+            expect { render_with(backends, { 'gvisor_sentry_cpu' => true }) }
+              .to raise_error(/garden.gvisor_sentry_cpu requires oci-gvisor in garden.execution_backends, because only a gVisor container has a Sentry to read/)
+          end
+        end
+
+        ['', 'runsc'].each do |value|
+          it "raises for a runsc path of #{value.inspect}, which is not absolute" do
+            expect { render_with(['oci-gvisor'], { 'gvisor_sentry_cpu' => true, 'gvisor_runsc_bin' => value }) }.to raise_error(/garden.gvisor_runsc_bin must be an absolute path/)
+            expect { render_with(['oci-gvisor'], { 'gvisor_sentry_cpu' => true, 'gvisor_runsc_root' => value }) }.to raise_error(/garden.gvisor_runsc_root must be an absolute path/)
+          end
+        end
+      end
+
       context 'qemu sandbox property' do
         let(:sandbox_default) { 'on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny' }
 

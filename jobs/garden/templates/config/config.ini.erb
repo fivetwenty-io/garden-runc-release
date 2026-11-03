@@ -339,6 +339,23 @@ end -%>
   unless vm_mirror_mounts == true || vm_mirror_mounts == false
     raise "garden.vm_mirror_mounts must be true or false, got #{vm_mirror_mounts.inspect}"
   end
+  gvisor_sentry_cpu = p("garden.gvisor_sentry_cpu")
+  unless gvisor_sentry_cpu == true || gvisor_sentry_cpu == false
+    raise "garden.gvisor_sentry_cpu must be true or false, got #{gvisor_sentry_cpu.inspect}"
+  end
+  gvisor_runsc_bin = p("garden.gvisor_runsc_bin")
+  gvisor_runsc_root = p("garden.gvisor_runsc_root")
+  if gvisor_sentry_cpu
+    unless execution_backends.include?("oci-gvisor")
+      raise "garden.gvisor_sentry_cpu requires oci-gvisor in garden.execution_backends, because only a gVisor container has a Sentry to read"
+    end
+    unless gvisor_runsc_bin.is_a?(String) && gvisor_runsc_bin.start_with?("/")
+      raise "garden.gvisor_runsc_bin must be an absolute path, got #{gvisor_runsc_bin.inspect}"
+    end
+    unless gvisor_runsc_root.is_a?(String) && gvisor_runsc_root.start_with?("/")
+      raise "garden.gvisor_runsc_root must be an absolute path, got #{gvisor_runsc_root.inspect}"
+    end
+  end
   vm_stack_tarballs = p("garden.vm_stack_tarballs")
   unless vm_stack_tarballs.is_a?(Array)
     raise "garden.vm_stack_tarballs must be a list of absolute paths, got #{vm_stack_tarballs.inspect}"
@@ -408,6 +425,11 @@ end -%>
 ; execution backends
 <% execution_backends.each do |backend| -%>
   execution-backend = <%= backend %>
+<% end -%>
+<% if gvisor_sentry_cpu -%>
+  gvisor-sentry-cpu = true
+  gvisor-runsc-bin = <%= gvisor_runsc_bin %>
+  gvisor-runsc-root = <%= gvisor_runsc_root %>
 <% end -%>
 <% if vm_backend_enabled -%>
   vm-artifacts-dir = <%= vm_artifacts_dir %>
