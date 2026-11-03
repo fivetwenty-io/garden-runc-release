@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -63,6 +65,7 @@ func newTestAgent() *guestAgent {
 		dial:     net.DialTimeout,
 		logger:   log.New(GinkgoWriter, "guest agent: ", 0),
 		sessions: make(chan struct{}, guestAgentMaxSessions),
+		forwards: make(chan struct{}, guestAgentMaxForwards),
 		pending:  make(chan struct{}, guestAgentMaxPending),
 	}
 }
@@ -393,6 +396,65 @@ var _ = Describe("the guest agent", func() {
 			Eventually(done).Should(BeClosed())
 			Expect(a.sessions).To(BeEmpty())
 		})
+
+		It("still runs a session when forwards take every forward slot, and still runs a forward when sessions take every session slot", func() {
+			for range guestAgentMaxForwards {
+				a.forwards <- struct{}{}
+			}
+			_, ready, done := startAgentSession(a, testAgentKey, agentRequest{Kind: agentKindForward, Host: "127.0.0.1", Port: upperServer()})
+			Expect(ready.Error).To(Equal("the guest already runs 64 forwards, which is as many as it allows"))
+			Eventually(done).Should(BeClosed())
+
+			s, ready, done := startAgentSession(a, testAgentKey, agentRequest{Kind: agentKindSession, Args: []string{"-c", "echo from the guest"}})
+			Expect(ready.Error).To(BeEmpty())
+			Expect(s.awaitExit()).To(Equal(agentExit{Code: 0}))
+			Eventually(s.ended, 10*time.Second).Should(BeClosed())
+			Expect(s.stdout.String()).To(Equal("from the guest\n"))
+			Eventually(done).Should(BeClosed())
+			for range guestAgentMaxForwards {
+				<-a.forwards
+			}
+
+			for range guestAgentMaxSessions {
+				a.sessions <- struct{}{}
+			}
+			s, ready, done = startAgentSession(a, testAgentKey, agentRequest{Kind: agentKindForward, Host: "127.0.0.1", Port: upperServer()})
+			Expect(ready.Error).To(BeEmpty())
+			Expect(s.fw.writeData(agentFrameData, []byte("abc"))).To(Succeed())
+			Expect(s.fw.write(agentFrameDataEnd, nil)).To(Succeed())
+			Eventually(s.ended, 10*time.Second).Should(BeClosed())
+			Expect(s.stdout.String()).To(Equal("ABC bye"))
+			Eventually(done).Should(BeClosed())
+			Expect(a.forwards).To(BeEmpty())
+		})
+
+		It("answers a ping at once, without a slot and without waiting for a go, and starts nothing", func() {
+			for range guestAgentMaxSessions {
+				a.sessions <- struct{}{}
+			}
+			for range guestAgentMaxForwards {
+				a.forwards <- struct{}{}
+			}
+			conn, done := serveAgent(a)
+			fw := &agentFrameWriter{w: conn}
+			Expect(fw.write(agentFrameHello, []byte(testAgentKey))).To(Succeed())
+			Expect(fw.writeJSON(agentFrameRequest, agentRequest{Kind: agentKindPing})).To(Succeed())
+			payload, err := readAgentFrameOf(conn, agentFrameReady)
+			Expect(err).NotTo(HaveOccurred())
+			var ready agentReady
+			Expect(json.Unmarshal(payload, &ready)).To(Succeed())
+			Expect(ready.Error).To(BeEmpty())
+			expectClosed(conn, done)
+			Expect(a.runDir).NotTo(BeADirectory())
+		})
+
+		It("closes a ping whose hello holds another key without an answer", func() {
+			conn, done := serveAgent(a)
+			fw := &agentFrameWriter{w: conn}
+			Expect(fw.write(agentFrameHello, []byte(strings.Repeat("cd", agentKeyBytes)))).To(Succeed())
+			_ = fw.writeJSON(agentFrameRequest, agentRequest{Kind: agentKindPing})
+			expectClosed(conn, done)
+		})
 	})
 
 	Describe("a session", func() {
@@ -713,9 +775,179 @@ var _ = Describe("the guest agent relay", func() {
 	It("refuses a first line it does not know and a forward whose port is not a number", func() {
 		startRelay(testAgentKey, dialAgent(a), "")
 		_, answer := ask("shell")
-		Expect(answer).To(Equal(`error: the guest agent relay takes "session" or "forward HOST PORT", not "shell"`))
+		Expect(answer).To(Equal(`error: the guest agent relay takes "session", "forward HOST PORT", or "ping", not "shell"`))
 		_, answer = ask("forward 127.0.0.1 http")
 		Expect(answer).To(Equal(`error: "http" is not a port`))
+	})
+
+	It("answers a ping with ok once the agent has answered it, and then closes the connection", func() {
+		var dials atomic.Int32
+		startRelay(testAgentKey, func() (agentConn, error) {
+			dials.Add(1)
+			return dialAgent(a)()
+		}, "")
+		c, answer := ask(agentRelayPing)
+		Expect(answer).To(Equal("ok"))
+		Expect(c.SetReadDeadline(time.Now().Add(5 * time.Second))).To(Succeed())
+		_, err := c.Read(make([]byte, 1))
+		Expect(err).To(MatchError(io.EOF))
+		Expect(dials.Load()).To(Equal(int32(1)))
+		Expect(a.runDir).NotTo(BeADirectory())
+	})
+
+	It("answers a ping with the reason, at once and without trying again, when the agent cannot be reached", func() {
+		var dials atomic.Int32
+		startRelay(testAgentKey, func() (agentConn, error) {
+			dials.Add(1)
+			return nil, errors.New("connecting to the guest's vsock: connection reset by peer")
+		}, "")
+		start := time.Now()
+		_, answer := ask(agentRelayPing)
+		Expect(answer).To(Equal("error: the guest agent did not answer a ping: connecting to the guest's vsock: connection reset by peer"))
+		Expect(time.Since(start)).To(BeNumerically("<", agentPingWait))
+		Expect(dials.Load()).To(Equal(int32(1)))
+		Expect(logs.String()).To(ContainSubstring("the guest agent did not answer a ping: connecting to the guest's vsock: connection reset by peer, after "))
+	})
+
+	It("answers a ping with an error within agentPingWait when the agent never answers, and when it holds another key", func() {
+		hung := make(chan *net.UnixConn, 1)
+		startRelay(testAgentKey, func() (agentConn, error) {
+			agentSide, relaySide := agentSocketPair()
+			hung <- agentSide
+			return relaySide, nil
+		}, "")
+		start := time.Now()
+		_, answer := ask(agentRelayPing)
+		Expect(answer).To(HavePrefix("error: the guest agent did not answer a ping: reading the guest agent's answer: "))
+		Expect(time.Since(start)).To(BeNumerically("~", agentPingWait, time.Second))
+		(<-hung).Close()
+
+		a.key = []byte(strings.Repeat("cd", agentKeyBytes))
+		path = filepath.Join(GinkgoT().TempDir(), "agent.sock")
+		startRelay(testAgentKey, dialAgent(a), "")
+		_, answer = ask(agentRelayPing)
+		Expect(answer).To(HavePrefix("error: the guest agent did not answer a ping: "))
+	})
+
+	It("keeps the contract that diego-sshd's specs check their fake relay against", func() {
+		data, err := os.ReadFile(filepath.Join("testdata", "guest-agent-relay-contract.txt"))
+		Expect(err).NotTo(HaveOccurred())
+		echo, err := net.Listen("tcp", "127.0.0.1:0")
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = echo.Close() })
+		go func() {
+			for {
+				c, err := echo.Accept()
+				if err != nil {
+					return
+				}
+				go func() {
+					defer c.Close()
+					_, _ = io.Copy(c, c)
+				}()
+			}
+		}()
+		port := strconv.Itoa(echo.Addr().(*net.TCPAddr).Port)
+
+		dir := GinkgoT().TempDir()
+		paths := map[string]string{}
+		for _, state := range []string{"agent", "off", "down"} {
+			path = filepath.Join(dir, state+".sock")
+			paths[state] = path
+			switch state {
+			case "agent":
+				startRelay(testAgentKey, dialAgent(a), "")
+			case "off":
+				startRelay(testAgentKey, nil, "this guest has no agent for cf ssh, because it is a spec")
+			case "down":
+				startRelay(testAgentKey, func() (agentConn, error) { return nil, errors.New("the agent is down") }, "")
+			}
+		}
+
+		cases := 0
+		for _, text := range strings.Split(string(data), "\n") {
+			if text == "" || strings.HasPrefix(text, "#") {
+				continue
+			}
+			fields := strings.Split(text, " | ")
+			Expect(fields).To(HaveLen(4), text)
+			state, line, want, after := fields[0], strings.ReplaceAll(fields[1], "PORT", port), fields[2], fields[3]
+			Expect(paths).To(HaveKey(state), text)
+			path = paths[state]
+			c, answer := ask(line)
+			switch want {
+			case "ok":
+				Expect(answer).To(Equal("ok"), text)
+			case "error:":
+				Expect(answer).To(MatchRegexp(`^error: \S`), text)
+			case "off:":
+				Expect(answer).To(MatchRegexp(`^off: \S`), text)
+			default:
+				Fail("the contract has no answer " + want)
+			}
+			Expect(c.SetReadDeadline(time.Now().Add(10 * time.Second))).To(Succeed())
+			switch after {
+			case "eof":
+				_, err := c.Read(make([]byte, 1))
+				Expect(err).To(MatchError(io.EOF), text)
+			case "stream":
+				_, err := io.WriteString(c, "through the guest")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(c.CloseWrite()).To(Succeed())
+				Expect(io.ReadAll(c)).To(Equal([]byte("through the guest")), text)
+			default:
+				Fail("the contract has no after " + after)
+			}
+			cases++
+		}
+		Expect(cases).To(Equal(8))
+	})
+
+	It("answers a ping with off and the reason when the guest has no agent, so that diego-sshd serves as it does without one", func() {
+		startRelay(testAgentKey, nil, "this guest has no agent for cf ssh, because it is a spec")
+		_, answer := ask(agentRelayPing)
+		Expect(answer).To(Equal("off: this guest has no agent for cf ssh, because it is a spec"))
+		_, answer = ask("forward 127.0.0.1 8080")
+		Expect(answer).To(Equal("error: this guest has no agent for cf ssh, because it is a spec"))
+	})
+
+	It("keeps a burst of 20 pings within the agent's hello slots, so that every one gets ok", func() {
+		// Each connection is slow to send its hello, so the agent holds
+		// one of its hello slots for each connection in its handshake.
+		var inHandshake, most atomic.Int32
+		dial := dialAgent(a)
+		startRelay(testAgentKey, func() (agentConn, error) {
+			c, err := dial()
+			if err != nil {
+				return nil, err
+			}
+			n := inHandshake.Add(1)
+			for m := most.Load(); n > m && !most.CompareAndSwap(m, n); m = most.Load() {
+			}
+			return &slowHello{agentConn: c, inHandshake: &inHandshake}, nil
+		}, "")
+
+		answers := make(chan string, 20)
+		for range 20 {
+			go func() {
+				defer GinkgoRecover()
+				c, err := net.Dial("unix", path)
+				Expect(err).NotTo(HaveOccurred())
+				defer c.Close()
+				_, err = io.WriteString(c, agentRelayPing+"\n")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(c.SetReadDeadline(time.Now().Add(10 * time.Second))).To(Succeed())
+				answer, err := readLine(c, agentMaxLine)
+				Expect(err).NotTo(HaveOccurred())
+				answers <- answer
+			}()
+		}
+		for range 20 {
+			Eventually(answers, 10*time.Second).Should(Receive(Equal("ok")))
+		}
+		Expect(most.Load()).To(BeNumerically("<=", agentMaxHandshakes))
+		Expect(most.Load()).To(BeNumerically(">", 1))
+		Eventually(a.pending).Should(BeEmpty())
 	})
 
 	It("refuses a client that runs as another user", func() {
@@ -1005,6 +1237,21 @@ var _ = Describe("the guest agent relay", func() {
 		Expect(stderr.String()).To(Equal("to stderr\n"))
 	})
 
+	It("passes megabytes of arbitrary bytes through the shim's session both ways unchanged, as scp and sftp need", func() {
+		startRelay(testAgentKey, dialAgent(a), "")
+		data := make([]byte, 4<<20)
+		_, err := rand.Read(data)
+		Expect(err).NotTo(HaveOccurred())
+		shim, stdout, stderr := newShim(string(data), nil, make(chan os.Signal))
+		exit, err := shim.run([]string{"-c", "cat > upload && cat upload && exit 3"})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(exit).To(Equal(agentExit{Code: 3}))
+		Expect(stderr.String()).To(BeEmpty())
+		got := []byte(stdout.String())
+		Expect(len(got)).To(Equal(len(data)))
+		Expect(bytes.Equal(got, data)).To(BeTrue())
+	})
+
 	It("passes the shim's signals to the session's process", func() {
 		startRelay(testAgentKey, dialAgent(a), "")
 		sigs := make(chan os.Signal, 1)
@@ -1053,6 +1300,37 @@ var _ = Describe("the guest agent relay", func() {
 		Expect(c.CloseWrite()).To(Succeed())
 		Expect(c.SetReadDeadline(time.Now().Add(10 * time.Second))).To(Succeed())
 		Expect(io.ReadAll(c)).To(Equal([]byte("THROUGH THE RELAY bye")))
+	})
+
+	It("passes megabytes of arbitrary bytes through a forward unchanged", func() {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = ln.Close() })
+		go func() {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+			_, _ = io.Copy(c, c)
+		}()
+		startRelay(testAgentKey, dialAgent(a), "")
+		c, answer := ask("forward 127.0.0.1 " + strconv.Itoa(ln.Addr().(*net.TCPAddr).Port))
+		Expect(answer).To(Equal("ok"))
+		data := make([]byte, 4<<20)
+		_, err = rand.Read(data)
+		Expect(err).NotTo(HaveOccurred())
+		go func() {
+			defer GinkgoRecover()
+			_, err := c.Write(data)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(c.CloseWrite()).To(Succeed())
+		}()
+		Expect(c.SetReadDeadline(time.Now().Add(30 * time.Second))).To(Succeed())
+		got, err := io.ReadAll(c)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(len(got)).To(Equal(len(data)))
+		Expect(bytes.Equal(got, data)).To(BeTrue())
 	})
 
 	It("says why a forward did not connect", func() {
@@ -1450,3 +1728,23 @@ var _ = Describe("the guest agent's initramfs", func() {
 		Expect(string(byName["rvm/init"].data)).To(Equal(initScript(testNonce, false)))
 	})
 })
+
+// slowHello is the relay's side of a connection to the agent that takes
+// 100ms to send its first write, and that counts itself out of
+// inHandshake once its first read returns.
+type slowHello struct {
+	agentConn
+	inHandshake *atomic.Int32
+	wrote, read sync.Once
+}
+
+func (c *slowHello) Write(p []byte) (int, error) {
+	c.wrote.Do(func() { time.Sleep(100 * time.Millisecond) })
+	return c.agentConn.Write(p)
+}
+
+func (c *slowHello) Read(p []byte) (int, error) {
+	n, err := c.agentConn.Read(p)
+	c.read.Do(func() { c.inHandshake.Add(-1) })
+	return n, err
+}

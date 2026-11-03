@@ -71,10 +71,12 @@ const (
 	agentFrameHeaderLen      = 5
 )
 
-// The kinds of request.
+// The kinds of request. A ping asks only that the agent answer, which
+// tells the relay that the guest's agent is up and holds the boot's key.
 const (
 	agentKindSession = "session"
 	agentKindForward = "forward"
+	agentKindPing    = "ping"
 )
 
 // agentRequest is what a client asks the agent for. A session runs the
