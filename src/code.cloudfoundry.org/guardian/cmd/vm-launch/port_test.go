@@ -1505,6 +1505,19 @@ rvm_round_end() { rvm_rounds=$((rvm_rounds + 1)); [ "$rvm_rounds" -lt ` + strcon
 		shellEntries(""),
 	)
 
+	DescribeTable("reports every port at the second and fourth look, every 8 seconds, once every port is up",
+		func(shellOf func() guestShell) {
+			shell := shellOf()
+			up := procNetLine("00000000:1F90", "0A")
+			all := listenLine(8080, true)
+			Expect(watchPorts(shell, []int{8080}, up, "", rounds(1), []int{8080})).To(BeEmpty(), shell.name)
+			Expect(watchPorts(shell, []int{8080}, up, "", rounds(2), []int{8080})).To(Equal(all), shell.name)
+			Expect(watchPorts(shell, []int{8080}, up, "", rounds(3), []int{8080})).To(Equal(all), shell.name)
+			Expect(watchPorts(shell, []int{8080}, up, "", rounds(4), []int{8080})).To(Equal(all+all), shell.name)
+		},
+		shellEntries(""),
+	)
+
 	DescribeTable("reports the last answer in the full report when that look fails",
 		func(shellOf func() guestShell) {
 			shell := shellOf()

@@ -750,8 +750,9 @@ const guestSetLimits = `ulimit -n "$RVM_NOFILE_HARD" && ulimit -S -n "$RVM_NOFIL
 // changes. The ports change independently of each other. Every
 // guestListenRefresh seconds of waiting, to the next look, it prints the
 // answer for every port whether or not it changed, so a listen line that
-// vm-launch lost, as when the console dropped it, is made good within about
-// that many seconds, or within the wait of a look when that is longer; vm-launch takes each
+// vm-launch lost, as when the console dropped it, is made good within 5
+// seconds while any port is down, and within 8 seconds once every port is up;
+// vm-launch takes each
 // line as the port's state, so a line that repeats the state changes
 // nothing. It starts after the start tag, so vm-launch reads every listen
 // line as part of the command's run. The kernel writes an IPv4
@@ -949,8 +950,9 @@ const guestListenRefresh = 5
 // app starts to listen, still come at the pace of the state before them, so a
 // port that closes is seen at most this many seconds late, while a guest that
 // is idle with its app listening reads its tables a quarter as often. The
-// refresh counts seconds of waiting, so it stays about guestListenRefresh
-// seconds at either pace.
+// refresh counts seconds of waiting, so it comes every 5 seconds while any
+// port is down, and every second look, which is every 8 seconds, once every
+// port is up.
 const guestListenSteadyWait = 4
 
 // guestListenTick is the FIFO the listen watcher waits on. The initramfs of
