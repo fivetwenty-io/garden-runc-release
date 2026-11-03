@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -1025,6 +1026,21 @@ var _ = Describe("the guest agent relay", func() {
 		Expect(stderr.String()).To(Equal("to stderr\n"))
 	})
 
+	It("passes megabytes of arbitrary bytes through the shim's session both ways unchanged, as scp and sftp need", func() {
+		startRelay(testAgentKey, dialAgent(a), "")
+		data := make([]byte, 4<<20)
+		_, err := rand.Read(data)
+		Expect(err).NotTo(HaveOccurred())
+		shim, stdout, stderr := newShim(string(data), nil, make(chan os.Signal))
+		exit, err := shim.run([]string{"-c", "cat > upload && cat upload && exit 3"})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(exit).To(Equal(agentExit{Code: 3}))
+		Expect(stderr.String()).To(BeEmpty())
+		got := []byte(stdout.String())
+		Expect(len(got)).To(Equal(len(data)))
+		Expect(bytes.Equal(got, data)).To(BeTrue())
+	})
+
 	It("passes the shim's signals to the session's process", func() {
 		startRelay(testAgentKey, dialAgent(a), "")
 		sigs := make(chan os.Signal, 1)
@@ -1073,6 +1089,37 @@ var _ = Describe("the guest agent relay", func() {
 		Expect(c.CloseWrite()).To(Succeed())
 		Expect(c.SetReadDeadline(time.Now().Add(10 * time.Second))).To(Succeed())
 		Expect(io.ReadAll(c)).To(Equal([]byte("THROUGH THE RELAY bye")))
+	})
+
+	It("passes megabytes of arbitrary bytes through a forward unchanged", func() {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() { _ = ln.Close() })
+		go func() {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+			_, _ = io.Copy(c, c)
+		}()
+		startRelay(testAgentKey, dialAgent(a), "")
+		c, answer := ask("forward 127.0.0.1 " + strconv.Itoa(ln.Addr().(*net.TCPAddr).Port))
+		Expect(answer).To(Equal("ok"))
+		data := make([]byte, 4<<20)
+		_, err = rand.Read(data)
+		Expect(err).NotTo(HaveOccurred())
+		go func() {
+			defer GinkgoRecover()
+			_, err := c.Write(data)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(c.CloseWrite()).To(Succeed())
+		}()
+		Expect(c.SetReadDeadline(time.Now().Add(30 * time.Second))).To(Succeed())
+		got, err := io.ReadAll(c)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(len(got)).To(Equal(len(data)))
+		Expect(bytes.Equal(got, data)).To(BeTrue())
 	})
 
 	It("says why a forward did not connect", func() {
