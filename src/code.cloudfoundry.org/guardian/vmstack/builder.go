@@ -175,21 +175,32 @@ func New(config Config) *Builder {
 	return b
 }
 
+// ErrNotListed and ErrStillBuilding are the reasons Image gives, in its
+// error, for a tarball that has no image yet. A build that failed gives its
+// own error instead.
+var (
+	ErrNotListed     = errors.New("garden.vm_stack_tarballs does not list it")
+	ErrStillBuilding = errors.New("its image is still building")
+)
+
 // Image returns the cache directory that holds the finished image of a
 // listed tarball. It starts a build when there is no image, waits at most the
-// configured bound for it, and returns false when the bound passes first. The
-// build carries on after Image returns, so a later call finds the image.
-func (b *Builder) Image(log lager.Logger, tarball string) (string, bool) {
+// configured bound for it, and returns an error that wraps ErrStillBuilding
+// when the bound passes first. The build carries on after Image returns, so
+// a later call finds the image. A tarball that is not listed gives an error
+// that wraps ErrNotListed, and a failed build gives one that wraps the
+// build's error.
+func (b *Builder) Image(log lager.Logger, tarball string) (string, error) {
 	log = log.Session("vm-stack-image", lager.Data{"tarball": tarball})
 
 	path := filepath.Clean(tarball)
 	if !b.listed[path] {
 		log.Info("tarball-not-listed")
-		return "", false
+		return "", fmt.Errorf("the stack tarball %s has no image on this cell, because %w", path, ErrNotListed)
 	}
 
 	if dir, ok := b.ready(path); ok {
-		return dir, true
+		return dir, nil
 	}
 
 	f := b.resolve(path)
@@ -203,15 +214,15 @@ func (b *Builder) Image(log lager.Logger, tarball string) (string, bool) {
 		case <-f.done:
 		default:
 			log.Info("still-building", lager.Data{"wait": b.wait.String()})
-			return "", false
+			return "", fmt.Errorf("the stack tarball %s has no image on this cell yet, because %w after %s, and a later create finds it", path, ErrStillBuilding, b.wait)
 		}
 	}
 
 	if f.err != nil {
 		log.Error("no-image", f.err)
-		return "", false
+		return "", fmt.Errorf("the stack tarball %s has no image on this cell, because building it failed: %w", path, f.err)
 	}
-	return f.dir, true
+	return f.dir, nil
 }
 
 // Clean removes every cache entry whose key matches no listed tarball's

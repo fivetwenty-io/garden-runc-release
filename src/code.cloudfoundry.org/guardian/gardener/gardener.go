@@ -45,10 +45,10 @@ const CleanupRetrySleep = 3 * time.Second
 const VolumizerSession = "volumizer"
 
 // VMStackImager returns the directory that holds rootfs.squashfs for a stack
-// tarball, after waiting at most its configured bound, or false when the image
-// is not ready.
+// tarball, after waiting at most its configured bound, or an error that says
+// why the tarball has no image.
 type VMStackImager interface {
-	Image(log lager.Logger, tarball string) (dir string, ok bool)
+	Image(log lager.Logger, tarball string) (dir string, err error)
 }
 
 // VMImager builds the guest image of a VM container that asks for a Docker
@@ -259,26 +259,30 @@ func New(
 
 // vmStackDir asks the stack imager for the image directory of a VM container's
 // stack tarball. It returns an empty string when the builder is off, when the
-// backend is not a VM backend, when the spec names no tarball, or when the image
-// is not ready, and it never fails the create.
-func (g *Gardener) vmStackDir(log lager.Logger, k backend.Kind, containerSpec garden.ContainerSpec) string {
+// backend is not a VM backend, or when the spec names no tarball. With the
+// builder on, a VM container that names a stack tarball boots that stack and
+// nothing else, so an image the imager cannot give, because its tarball is
+// not listed, its build failed, or it is still building, fails the create
+// with the imager's reason rather than leaving vm-launch to boot a guest
+// without the stack.
+func (g *Gardener) vmStackDir(log lager.Logger, k backend.Kind, containerSpec garden.ContainerSpec) (string, error) {
 	if g.VMStacks == nil || !backend.IsVM(k) {
-		return ""
+		return "", nil
 	}
 	tarball := backend.StackTarball(containerSpec)
 	if tarball == "" {
-		return ""
+		return "", nil
 	}
 
 	startedAt := time.Now()
-	dir, ok := g.VMStacks.Image(log, tarball)
-	data := lager.Data{"tarball": tarball, "dir": dir, "ready": ok, "elapsed": time.Since(startedAt).String()}
-	if !ok {
-		log.Info("vm-stack-image-not-ready", data)
-		return ""
+	dir, err := g.VMStacks.Image(log, tarball)
+	data := lager.Data{"tarball": tarball, "dir": dir, "elapsed": time.Since(startedAt).String()}
+	if err != nil {
+		log.Error("vm-stack-image-missing", err, data)
+		return "", fmt.Errorf("the %s container needs the image of its stack, and %w", k, err)
 	}
 	log.Info("vm-stack-image-ready", data)
-	return dir
+	return dir, nil
 }
 
 // dockerGuestImage returns the Docker image of a VM container whose guest
@@ -369,7 +373,10 @@ func (g *Gardener) Create(containerSpec garden.ContainerSpec) (ctr garden.Contai
 	// that refuse the create at once. A Docker image guest has no use for it.
 	var vmStackDir string
 	if !dockerGuest {
-		vmStackDir = g.vmStackDir(log, executionBackend, containerSpec)
+		vmStackDir, err = g.vmStackDir(log, executionBackend, containerSpec)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	defer func() {

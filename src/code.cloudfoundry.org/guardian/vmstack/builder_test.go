@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"code.cloudfoundry.org/lager/v3"
 	"code.cloudfoundry.org/lager/v3/lagertest"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -117,7 +119,7 @@ cp %[5]s "$out"
 			go func(i int) {
 				defer GinkgoRecover()
 				defer wg.Done()
-				dirs[i], oks[i] = b.Image(logger, tarball)
+				dirs[i], oks[i] = b.imageOK(logger, tarball)
 			}(i)
 		}
 		wg.Wait()
@@ -132,7 +134,7 @@ cp %[5]s "$out"
 
 	It("runs sqfstar under nice with the lz4 options, the tarball on standard input, and a temporary output beside the image", func() {
 		b := New(config)
-		dir, ok := b.Image(logger, tarball)
+		dir, ok := b.imageOK(logger, tarball)
 		Expect(ok).To(BeTrue())
 
 		args, err := os.ReadFile(runs)
@@ -160,10 +162,10 @@ cp %[5]s "$out"
 	})
 
 	It("reuses a finished image after a new Builder starts, without a second build", func() {
-		first, ok := New(config).Image(logger, tarball)
+		first, ok := New(config).imageOK(logger, tarball)
 		Expect(ok).To(BeTrue())
 
-		second, ok := New(config).Image(logger, tarball)
+		second, ok := New(config).imageOK(logger, tarball)
 		Expect(ok).To(BeTrue())
 		Expect(second).To(Equal(first))
 		Expect(runCount()).To(Equal(1))
@@ -175,7 +177,7 @@ cp %[5]s "$out"
 		b.afterHash = func(string) { hashes.Add(1) }
 
 		for range 3 {
-			_, ok := b.Image(logger, tarball)
+			_, ok := b.imageOK(logger, tarball)
 			Expect(ok).To(BeTrue())
 		}
 		Expect(hashes.Load()).To(Equal(int32(1)))
@@ -187,7 +189,7 @@ cp %[5]s "$out"
 			Expect(os.MkdirAll(dir, 0755)).To(Succeed())
 			Expect(os.WriteFile(filepath.Join(dir, imageName), content, 0644)).To(Succeed())
 
-			got, ok := New(config).Image(logger, tarball)
+			got, ok := New(config).imageOK(logger, tarball)
 			Expect(ok).To(BeTrue())
 			Expect(got).To(Equal(dir))
 			Expect(runCount()).To(Equal(1))
@@ -207,13 +209,13 @@ cp %[5]s "$out"
 		b := New(config)
 
 		start := time.Now()
-		_, ok := b.Image(logger, tarball)
+		_, ok := b.imageOK(logger, tarball)
 		Expect(ok).To(BeFalse())
 		Expect(time.Since(start)).To(BeNumerically("<", time.Second))
 		Expect(logger.LogMessages()).To(ContainElement(HaveSuffix("still-building")))
 
 		Eventually(func() bool {
-			_, ok := b.Image(logger, tarball)
+			_, ok := b.imageOK(logger, tarball)
 			return ok
 		}, 10*time.Second, 200*time.Millisecond).Should(BeTrue())
 		Expect(runCount()).To(Equal(1))
@@ -223,7 +225,7 @@ cp %[5]s "$out"
 		other := filepath.Join(work, "other.tar")
 		Expect(os.WriteFile(other, []byte("another tarball\n"), 0644)).To(Succeed())
 
-		_, ok := New(config).Image(logger, other)
+		_, ok := New(config).imageOK(logger, other)
 		Expect(ok).To(BeFalse())
 		Expect(runCount()).To(Equal(0))
 		Expect(cacheDir).NotTo(BeADirectory())
@@ -232,13 +234,43 @@ cp %[5]s "$out"
 
 	It("matches a listed tarball by its cleaned path", func() {
 		config.Tarballs = []string{filepath.Join(work, ".", "rootfs.tar")}
-		_, ok := New(config).Image(logger, filepath.Join(work, "x", "..", "rootfs.tar"))
+		_, ok := New(config).imageOK(logger, filepath.Join(work, "x", "..", "rootfs.tar"))
 		Expect(ok).To(BeTrue())
+	})
+
+	Describe("the reason for a missing image", func() {
+		It("names a tarball that is not listed and the property that lists tarballs", func() {
+			other := filepath.Join(work, "other.tar")
+			_, err := New(config).Image(logger, other)
+			Expect(errors.Is(err, ErrNotListed)).To(BeTrue())
+			Expect(err).To(MatchError("the stack tarball " + other + " has no image on this cell, because garden.vm_stack_tarballs does not list it"))
+		})
+
+		It("says the image is still building, and how long the create waited", func() {
+			writeFake(2*time.Second, "")
+			config.Wait = 100 * time.Millisecond
+			b := New(config)
+			_, err := b.Image(logger, tarball)
+			Expect(errors.Is(err, ErrStillBuilding)).To(BeTrue())
+			Expect(err).To(MatchError("the stack tarball " + tarball + " has no image on this cell yet, because its image is still building after 100ms, and a later create finds it"))
+			Eventually(func() error {
+				_, err := b.Image(logger, tarball)
+				return err
+			}, 10*time.Second, 200*time.Millisecond).Should(Succeed())
+		})
+
+		It("carries the error of a failed build", func() {
+			writeFake(0, `echo "sqfstar: tar file is corrupt" >&2; exit 1`)
+			_, err := New(config).Image(logger, tarball)
+			Expect(err).To(MatchError(HavePrefix("the stack tarball " + tarball + " has no image on this cell, because building it failed: ")))
+			Expect(err).To(MatchError(ContainSubstring("tar file is corrupt")))
+			Expect(errors.Is(err, ErrNotListed) || errors.Is(err, ErrStillBuilding)).To(BeFalse())
+		})
 	})
 
 	It("returns false for a listed tarball that does not exist", func() {
 		Expect(os.Remove(tarball)).To(Succeed())
-		_, ok := New(config).Image(logger, tarball)
+		_, ok := New(config).imageOK(logger, tarball)
 		Expect(ok).To(BeFalse())
 		Expect(runCount()).To(Equal(0))
 	})
@@ -252,7 +284,7 @@ cp %[5]s "$out"
 			}
 		}
 
-		dir, ok := b.Image(logger, tarball)
+		dir, ok := b.imageOK(logger, tarball)
 		Expect(ok).To(BeTrue())
 		Expect(hashes.Load()).To(Equal(int32(2)))
 		Expect(dir).To(Equal(filepath.Join(cacheDir, keyOf(tarball))))
@@ -264,7 +296,7 @@ cp %[5]s "$out"
 		writeFake(0, fmt.Sprintf("echo more >> %s", tarball))
 		key := keyOf(tarball)
 
-		_, ok := New(config).Image(logger, tarball)
+		_, ok := New(config).imageOK(logger, tarball)
 		Expect(ok).To(BeFalse())
 		Expect(filepath.Join(cacheDir, key, imageName)).NotTo(BeAnExistingFile())
 		Expect(tempFiles(filepath.Join(cacheDir, key))).To(BeEmpty())
@@ -277,19 +309,19 @@ cp %[5]s "$out"
 			b := New(config)
 			dir := filepath.Join(cacheDir, keyOf(tarball))
 
-			_, ok := b.Image(logger, tarball)
+			_, ok := b.imageOK(logger, tarball)
 			Expect(ok).To(BeFalse())
 			Expect(filepath.Join(dir, imageName)).NotTo(BeAnExistingFile())
 			Expect(tempFiles(dir)).To(BeEmpty())
 			Expect(string(logger.Buffer().Contents())).To(ContainSubstring(logged))
 
-			_, ok = b.Image(logger, tarball)
+			_, ok = b.imageOK(logger, tarball)
 			Expect(ok).To(BeFalse())
 			Expect(runCount()).To(Equal(1))
 
 			writeFake(0, "")
 			b.backoff = 0
-			got, ok := b.Image(logger, tarball)
+			got, ok := b.imageOK(logger, tarball)
 			Expect(ok).To(BeTrue())
 			// The repaired sqfstar is a new binary, so the image has a new key.
 			Expect(got).To(Equal(filepath.Join(cacheDir, keyOf(tarball))))
@@ -312,7 +344,7 @@ cp %[5]s "$out"
 		b.timeout = 300 * time.Millisecond
 
 		start := time.Now()
-		_, ok := b.Image(logger, tarball)
+		_, ok := b.imageOK(logger, tarball)
 		Expect(ok).To(BeFalse())
 		Expect(time.Since(start)).To(BeNumerically("<", 5*time.Second))
 		dir := filepath.Join(cacheDir, keyOf(tarball))
@@ -327,7 +359,7 @@ cp %[5]s "$out"
 		stale := filepath.Join(dir, tempPrefix+"123456")
 		Expect(os.WriteFile(stale, []byte("partial"), 0644)).To(Succeed())
 
-		_, ok := New(config).Image(logger, tarball)
+		_, ok := New(config).imageOK(logger, tarball)
 		Expect(ok).To(BeTrue())
 		Expect(stale).NotTo(BeAnExistingFile())
 		Expect(tempFiles(dir)).To(BeEmpty())
@@ -343,7 +375,7 @@ cp %[5]s "$out"
 
 		config.Wait = 300 * time.Millisecond
 		b := New(config)
-		_, ok := b.Image(logger, tarball)
+		_, ok := b.imageOK(logger, tarball)
 		Expect(ok).To(BeFalse())
 		Expect(runCount()).To(Equal(0))
 
@@ -353,7 +385,7 @@ cp %[5]s "$out"
 		Expect(unix.Flock(int(held.Fd()), unix.LOCK_UN)).To(Succeed())
 
 		Eventually(func() bool {
-			_, ok := b.Image(logger, tarball)
+			_, ok := b.imageOK(logger, tarball)
 			return ok
 		}, 5*time.Second, 50*time.Millisecond).Should(BeTrue())
 		Expect(runCount()).To(Equal(0))
@@ -371,12 +403,12 @@ cp %[5]s "$out"
 			Expect(os.WriteFile(config.CacheDir, []byte("not a directory"), 0644)).To(Succeed())
 			b := New(config)
 
-			_, ok := b.Image(logger, tarball)
+			_, ok := b.imageOK(logger, tarball)
 			Expect(ok).To(BeFalse())
 			Expect(logger.LogMessages()).To(ContainElement(HaveSuffix("build-failed")))
 
 			Expect(os.Remove(config.CacheDir)).To(Succeed())
-			_, ok = b.Image(logger, tarball)
+			_, ok = b.imageOK(logger, tarball)
 			Expect(ok).To(BeFalse())
 			Expect(runCount()).To(Equal(0))
 			Expect(string(logger.Buffer().Contents())).To(ContainSubstring("the next try waits until"))
@@ -404,12 +436,12 @@ cp %[5]s "$out"
 			b := New(config)
 			b.backoff = 100 * time.Millisecond
 
-			_, ok := b.Image(logger, tarball)
+			_, ok := b.imageOK(logger, tarball)
 			Expect(ok).To(BeFalse())
 			Expect(b.failures).To(HaveLen(1))
 			Expect(os.Remove(config.CacheDir)).To(Succeed())
 			Eventually(func() bool {
-				_, ok := b.Image(logger, tarball)
+				_, ok := b.imageOK(logger, tarball)
 				return ok
 			}, 5*time.Second, 50*time.Millisecond).Should(BeTrue())
 			Expect(b.failures).To(BeEmpty())
@@ -454,21 +486,21 @@ fi
 
 		It("trusts an image it just built and does not run unsquashfs on it", func() {
 			b := New(config)
-			_, ok := b.Image(logger, tarball)
+			_, ok := b.imageOK(logger, tarball)
 			Expect(ok).To(BeTrue())
-			_, ok = b.Image(logger, tarball)
+			_, ok = b.imageOK(logger, tarball)
 			Expect(ok).To(BeTrue())
 			Expect(runCount()).To(Equal(1))
 			Expect(checkCount()).To(Equal(0))
 		})
 
 		It("checks an image from an earlier process once and then trusts it", func() {
-			_, ok := New(config).Image(logger, tarball)
+			_, ok := New(config).imageOK(logger, tarball)
 			Expect(ok).To(BeTrue())
 
 			b := New(config)
 			for range 3 {
-				_, ok = b.Image(logger, tarball)
+				_, ok = b.imageOK(logger, tarball)
 				Expect(ok).To(BeTrue())
 			}
 			Expect(runCount()).To(Equal(1))
@@ -478,14 +510,14 @@ fi
 		})
 
 		It("removes an image that passes the superblock test and fails the listing, and builds it again", func() {
-			_, ok := New(config).Image(logger, tarball)
+			_, ok := New(config).imageOK(logger, tarball)
 			Expect(ok).To(BeTrue())
 			image := filepath.Join(cacheDir, keyOf(tarball), imageName)
 			Expect(os.WriteFile(verdict, []byte("fail"), 0644)).To(Succeed())
 			before := must(statID(image))
 
 			b := New(config)
-			dir, ok := b.Image(logger, tarball)
+			dir, ok := b.imageOK(logger, tarball)
 			Expect(ok).To(BeTrue())
 			Expect(dir).To(Equal(filepath.Join(cacheDir, keyOf(tarball))))
 			Expect(runCount()).To(Equal(2))
@@ -516,7 +548,7 @@ fi
 			Expect(os.WriteFile(verdict, []byte("fail"), 0644)).To(Succeed())
 
 			b := New(config)
-			_, ok := b.Image(logger, tarball)
+			_, ok := b.imageOK(logger, tarball)
 			Expect(ok).To(BeFalse())
 			Expect(b.failures).To(HaveLen(1))
 		})
@@ -559,14 +591,14 @@ fi
 
 		It("builds a new image and Clean removes the old one after the binary changes", func() {
 			b := New(config)
-			oldDir, ok := b.Image(logger, tarball)
+			oldDir, ok := b.imageOK(logger, tarball)
 			Expect(ok).To(BeTrue())
 			Expect(runCount()).To(Equal(1))
 
 			writeFake(0, "# a newer sqfstar")
 
 			b = New(config)
-			newDir, ok := b.Image(logger, tarball)
+			newDir, ok := b.imageOK(logger, tarball)
 			Expect(ok).To(BeTrue())
 			Expect(newDir).NotTo(Equal(oldDir))
 			Expect(runCount()).To(Equal(2))
@@ -581,13 +613,13 @@ fi
 			saved := sqfstarArgs
 			defer func() { sqfstarArgs = saved }()
 
-			oldDir, ok := New(config).Image(logger, tarball)
+			oldDir, ok := New(config).imageOK(logger, tarball)
 			Expect(ok).To(BeTrue())
 
 			sqfstarArgs = append(append([]string{}, saved...), "-no-xattrs")
 
 			b := New(config)
-			newDir, ok := b.Image(logger, tarball)
+			newDir, ok := b.imageOK(logger, tarball)
 			Expect(ok).To(BeTrue())
 			Expect(newDir).NotTo(Equal(oldDir))
 
@@ -598,12 +630,12 @@ fi
 
 		It("notices a sqfstar binary that is replaced while the builder runs", func() {
 			b := New(config)
-			oldDir, ok := b.Image(logger, tarball)
+			oldDir, ok := b.imageOK(logger, tarball)
 			Expect(ok).To(BeTrue())
 
 			writeFake(0, "# a newer sqfstar")
 
-			newDir, ok := b.Image(logger, tarball)
+			newDir, ok := b.imageOK(logger, tarball)
 			Expect(ok).To(BeTrue())
 			Expect(newDir).NotTo(Equal(oldDir))
 		})
@@ -623,7 +655,7 @@ fi
 
 		It("removes an entry for an old hash and keeps the current one", func() {
 			b := New(config)
-			dir, ok := b.Image(logger, tarball)
+			dir, ok := b.imageOK(logger, tarball)
 			Expect(ok).To(BeTrue())
 
 			b.Clean()
@@ -636,7 +668,7 @@ fi
 
 		It("removes the entries of a listed tarball that no longer exists", func() {
 			b := New(config)
-			dir, ok := b.Image(logger, tarball)
+			dir, ok := b.imageOK(logger, tarball)
 			Expect(ok).To(BeTrue())
 			Expect(os.Remove(tarball)).To(Succeed())
 
@@ -702,7 +734,7 @@ fi
 		It("keeps every owner and mode from a pax tarball", func() {
 			Expect(os.WriteFile(tarball, paxStack(), 0644)).To(Succeed())
 			config.Sqfstar = filepath.Join(art, "sqfstar")
-			dir, ok := New(config).Image(logger, tarball)
+			dir, ok := New(config).imageOK(logger, tarball)
 			Expect(ok).To(BeTrue(), string(logger.Buffer().Contents()))
 			image := filepath.Join(dir, imageName)
 
@@ -729,7 +761,7 @@ fi
 			Expect(os.WriteFile(tarball, paxStack(), 0644)).To(Succeed())
 			config.Sqfstar = filepath.Join(art, "sqfstar")
 			config.Unsquashfs = filepath.Join(art, "unsquashfs")
-			dir, ok := New(config).Image(logger, tarball)
+			dir, ok := New(config).imageOK(logger, tarball)
 			Expect(ok).To(BeTrue(), string(logger.Buffer().Contents()))
 			image := filepath.Join(dir, imageName)
 
@@ -747,7 +779,7 @@ fi
 
 			logger = lagertest.NewTestLogger("vmstack")
 			config.Logger = logger
-			dir, ok = New(config).Image(logger, tarball)
+			dir, ok = New(config).imageOK(logger, tarball)
 			Expect(ok).To(BeTrue(), string(logger.Buffer().Contents()))
 			Expect(logger.LogMessages()).To(ContainElement(HaveSuffix("removing-bad-image")))
 			Expect(exec.Command(config.Unsquashfs, "-ll", filepath.Join(dir, imageName)).Run()).To(Succeed())
@@ -822,4 +854,11 @@ func ownersAndModes(listing, prefix string) map[string]string {
 func must[T any](v T, err error) T {
 	Expect(err).NotTo(HaveOccurred())
 	return v
+}
+
+// imageOK is Image with its error folded into the ok of the specs that
+// predate the error, which ask only whether an image came back.
+func (b *Builder) imageOK(log lager.Logger, tarball string) (string, bool) {
+	dir, err := b.Image(log, tarball)
+	return dir, err == nil
 }

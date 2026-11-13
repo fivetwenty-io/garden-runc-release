@@ -26,14 +26,14 @@ import (
 
 type fakeVMStackImager struct {
 	dir string
-	ok  bool
+	err error
 
 	tarballs []string
 }
 
-func (f *fakeVMStackImager) Image(_ lager.Logger, tarball string) (string, bool) {
+func (f *fakeVMStackImager) Image(_ lager.Logger, tarball string) (string, error) {
 	f.tarballs = append(f.tarballs, tarball)
-	return f.dir, f.ok
+	return f.dir, f.err
 }
 
 // argsRecordingCreator builds the image plugin's create command for every
@@ -428,7 +428,7 @@ var _ = Describe("Gardener", func() {
 					var err error
 					gdnr.Backends, err = backend.NewRegistry(backend.VMQemu, backend.OCIGvisor)
 					Expect(err).NotTo(HaveOccurred())
-					imager = &fakeVMStackImager{dir: "/var/vcap/data/vm-runtime/stacks/abc", ok: true}
+					imager = &fakeVMStackImager{dir: "/var/vcap/data/vm-runtime/stacks/abc"}
 					gdnr.VMStacks = imager
 				})
 
@@ -439,11 +439,25 @@ var _ = Describe("Gardener", func() {
 					Expect(logger).To(gbytes.Say("vm-stack-image-ready"))
 				})
 
-				It("creates the container with no stack directory when the image is not ready", func() {
-					imager.dir, imager.ok = "", false
-					createWith("vm-qemu", stackURI)
-					Expect(createdSpec().VMStackDir).To(BeEmpty())
-					Expect(logger).To(gbytes.Say("vm-stack-image-not-ready"))
+				It("fails the create with the imager's reason when the stack has no image", func() {
+					imager.dir, imager.err = "", errors.New("the stack tarball /var/vcap/packages/cflinuxfs4/rootfs.tar has no image on this cell, because garden.vm_stack_tarballs does not list it")
+					_, err := gdnr.Create(garden.ContainerSpec{
+						Handle:     "some-ctr",
+						Image:      garden.ImageRef{URI: stackURI},
+						Properties: garden.Properties{backend.AnnotationKey: "vm-qemu"},
+					})
+					Expect(err).To(MatchError("the vm-qemu container needs the image of its stack, and the stack tarball /var/vcap/packages/cflinuxfs4/rootfs.tar has no image on this cell, because garden.vm_stack_tarballs does not list it"))
+					Expect(errors.Is(err, imager.err)).To(BeTrue())
+					Expect(containerizer.CreateCallCount()).To(Equal(0))
+					Expect(volumizer.CreateCallCount()).To(Equal(0))
+					Expect(networker.NetworkCallCount()).To(Equal(0))
+					Expect(logger).To(gbytes.Say("vm-stack-image-missing"))
+				})
+
+				It("does not fail an oci-runc create on a stack the imager has no image for", func() {
+					imager.dir, imager.err = "", errors.New("no image")
+					createWith("oci-runc", stackURI)
+					Expect(imager.tarballs).To(BeEmpty())
 				})
 
 				It("does not call the imager when the spec names no tarball", func() {
@@ -516,7 +530,7 @@ var _ = Describe("Gardener", func() {
 					gdnr.Backends, err = backend.NewRegistry(backend.VMQemu, backend.VMFirecracker, backend.OCIGvisor)
 					Expect(err).NotTo(HaveOccurred())
 					imager = &fakeVMImager{dir: "/var/vcap/data/vm-runtime/images/containers/some-ctr", env: []string{"PATH=/image/bin", "IMAGE=1"}}
-					stacks = &fakeVMStackImager{dir: "/var/vcap/data/vm-runtime/stacks/abc", ok: true}
+					stacks = &fakeVMStackImager{dir: "/var/vcap/data/vm-runtime/stacks/abc"}
 					gdnr.VMImages = imager
 					gdnr.VMDockerRootFS = dockerRootFS
 					gdnr.VMStacks = stacks

@@ -496,18 +496,22 @@ properties:
       /opt/garden-vm/stack, and its guest runs the real stack. Garden builds
       each image in the background at start and caches it under
       /var/vcap/data/vm-runtime/stacks. The default, an empty list, builds
-      nothing and leaves every container as it is today. Each entry renders
-      one --vm-stack-tarball, and a non-empty list requires a vm-* entry in
+      nothing and leaves every container as it is today. With a non-empty
+      list, a VM container whose rootfs is a stack tarball that the list
+      leaves out fails to create, with an error that names the tarball, so
+      list every stack that VM apps can run on. Each entry renders one
+      --vm-stack-tarball, and a non-empty list requires a vm-* entry in
       garden.execution_backends.
     default: []
 
   garden.vm_stack_wait_seconds:
     description: |
       How long a VM container create waits for a stack image that is still
-      being built, in seconds. When the image is not ready in that time, the
-      container is created without it and starts the way it does without a
-      stack. It renders --vm-stack-wait, and only when garden.vm_stack_tarballs
-      is not empty.
+      being built, in seconds. When the image is not ready in that time, or
+      its build failed, the create fails with an error that says so, and
+      Diego retries the instance, which finds the image once it is built. It
+      renders --vm-stack-wait, and only when garden.vm_stack_tarballs is not
+      empty.
     default: 20
 
   garden.vm_docker_rootfs:
