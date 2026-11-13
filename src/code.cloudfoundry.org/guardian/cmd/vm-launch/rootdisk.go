@@ -165,3 +165,21 @@ func createRootImage(workDir string, size int64) (*os.File, error) {
 	}
 	return f, nil
 }
+
+// probeDirectIO reports whether the open guest root image f can be opened
+// again for direct I/O, which is how QEMU opens it through /proc/self/fd
+// when its root drive asks for cache.direct (see withDirectRootDrive). It
+// opens and closes a second descriptor and leaves f as it was. A file
+// system without direct I/O refuses the open with EINVAL.
+func probeDirectIO(f *os.File) error {
+	path := fmt.Sprintf("/proc/self/fd/%d", f.Fd())
+	g, err := os.OpenFile(path, os.O_RDWR|unix.O_DIRECT|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("opening the guest root image for direct I/O: %w", err)
+	}
+	return g.Close()
+}
+
+// rootDirectIO is the direct I/O probe that run applies to the guest root
+// image. It is a variable so that specs can choose the answer.
+var rootDirectIO = probeDirectIO

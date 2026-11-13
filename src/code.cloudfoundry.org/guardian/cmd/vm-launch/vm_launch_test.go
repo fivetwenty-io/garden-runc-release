@@ -1119,10 +1119,38 @@ var _ = Describe("run with a guest root image", func() {
 
 		argv, err := os.ReadFile(argvFile)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(string(argv)).To(HaveSuffix("\n" + strings.Join(concat(goldenQEMUMonitor("4"), goldenQEMURootDrive("5"), goldenQEMUBalloon), "\n") + "\n"))
+		Expect(string(argv)).To(HaveSuffix("\n" + strings.Join(concat(goldenQEMUMonitor("4"), goldenQEMUDirectRootDrive("5"), goldenQEMUBalloon), "\n") + "\n"))
 		Expect(string(argv)).To(ContainSubstring("\n-initrd\n/proc/self/fd/3\n"))
 		Expect(logBuf.String()).NotTo(ContainSubstring("does not apply"))
 		Expect(os.ReadDir(tmp)).To(BeEmpty())
+	})
+
+	It("keeps QEMU's cached root drive, and says so once, when the root image takes no direct I/O", func() {
+		rootDirectIO = func(*os.File) error {
+			return errors.New("opening the guest root image for direct I/O: invalid argument")
+		}
+		argvFile := writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"),
+			initramfsAt("3")+rootImageAt("5", rootSize)+noFilesUnder(tmp)+initramfsReleased+rootImageReleased)
+		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
+
+		argv, err := os.ReadFile(argvFile)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(argv)).To(HaveSuffix("\n" + strings.Join(concat(goldenQEMUMonitor("4"), goldenQEMURootDrive("5"), goldenQEMUBalloon), "\n") + "\n"))
+		Expect(strings.Count(logBuf.String(), "opening the guest root image for direct I/O: invalid argument; QEMU caches the guest's disk writes in the container's memory\n")).To(Equal(1))
+	})
+
+	It("probes the root image that QEMU gets for direct I/O", func() {
+		var probed []string
+		rootDirectIO = func(f *os.File) error {
+			target, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", f.Fd()))
+			Expect(err).NotTo(HaveOccurred())
+			probed = append(probed, target)
+			return nil
+		}
+		writeFakeHypervisor(filepath.Join(art, "qemu/ld-linux-x86-64.so.2"), initramfsAt("3")+rootImageAt("5", rootSize))
+		Expect(runVM(backend.VMQemu)).To(Equal(0), logBuf.String())
+		Expect(probed).To(HaveLen(1))
+		Expect(probed[0]).To(HaveSuffix("/root.img (deleted)"))
 	})
 
 	It("gives Firecracker the root image as a drive with discard on the Sync engine", func() {
@@ -1519,7 +1547,7 @@ var _ = Describe("run with a stack image", func() {
 
 		argv, err := os.ReadFile(argvFile)
 		Expect(err).NotTo(HaveOccurred())
-		drives := concat(goldenQEMUMonitor("4"), goldenQEMURootDrive("5"), qemuReadOnlyDrive(stackDriveID, qemuStackSerial, 6), qemuReadOnlyDrive(dropletDriveID, qemuDropletSerial, 7), goldenQEMUBalloon)
+		drives := concat(goldenQEMUMonitor("4"), goldenQEMUDirectRootDrive("5"), qemuReadOnlyDrive(stackDriveID, qemuStackSerial, 6), qemuReadOnlyDrive(dropletDriveID, qemuDropletSerial, 7), goldenQEMUBalloon)
 		Expect(string(argv)).To(HaveSuffix("\n" + strings.Join(drives, "\n") + "\n"))
 
 		raw, err := os.ReadFile(initrdCopy)
@@ -1631,10 +1659,28 @@ var _ = Describe("run with a stack image", func() {
 		Expect(logBuf.String()).To(ContainSubstring("busybox guest: the stack image cannot be opened: open " + stackImagePath + ": no such file or directory\n"))
 	})
 
-	It("keeps today's guest when the stack image is not an lz4 squashfs", func() {
+	It("refuses to start, rather than fall back, when the bound stack image is not an lz4 squashfs", func() {
 		Expect(os.Remove(stackImg)).To(Succeed())
 		writeSuperblock(stackImg, squashfsMagic, 1)
-		expectTodaysGuest([]string{launcher, "app", "true", ""}, "the stack image "+stackImg+" uses squashfs compressor 1, and the guest reads only lz4")
+		argvFile := writeFakeHypervisor(qemu, "")
+		Expect(runWith(backend.VMQemu, []string{launcher, "app", "true", ""})).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(Equal("Garden bound a stack for this app, and the stack image " + stackImg + " uses squashfs compressor 1, and the guest reads only lz4, so the app cannot run on its stack; vm-launch does not fall back to the busybox guest\n"))
+		Expect(argvFile).NotTo(BeAnExistingFile())
+	})
+
+	It("refuses to start when Garden bound the stack directory and it holds no image", func() {
+		Expect(os.Remove(stackImg)).To(Succeed())
+		argvFile := writeFakeHypervisor(qemu, "")
+		Expect(runWith(backend.VMQemu, []string{launcher, "app", "true", ""})).To(Equal(exitLaunchError))
+		Expect(logBuf.String()).To(Equal("Garden bound a stack for this app, and the stack image cannot be opened: open " + stackImg + ": no such file or directory, so the app cannot run on its stack; vm-launch does not fall back to the busybox guest\n"))
+		Expect(argvFile).NotTo(BeAnExistingFile())
+	})
+
+	It("keeps today's guest for a process that is not the CF launcher, even with a bound stack directory and no image", func() {
+		Expect(os.Remove(stackImg)).To(Succeed())
+		_, argv := guestOf([]string{"/bin/sh", "-c", "echo hi"})
+		Expect(argv).NotTo(ContainSubstring("rvm-stack"))
+		Expect(logBuf.String()).To(ContainSubstring("busybox guest: the process is not the CF launcher\n"))
 	})
 
 	It("gives the guest that a failed droplet build leaves the container's hosts file and hostname", func() {

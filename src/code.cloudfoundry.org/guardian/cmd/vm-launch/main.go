@@ -851,6 +851,14 @@ func run(argv []string, logger *log.Logger) int {
 		}
 	default:
 		stackImg, why = stackCandidate(cfg.args)
+		// Garden binds the stack's directory only when the app asked for a
+		// stack and Garden has its image, so a launcher that finds the
+		// directory and no usable image in it has lost its stack, and the
+		// busybox guest would only fail the app later with less to go on.
+		if stackImg == nil && isLauncher(cfg.args) && stackBound() {
+			logger.Print("Garden bound a stack for this app, and " + why + ", so the app cannot run on its stack; vm-launch does not fall back to the busybox guest")
+			return exitLaunchError
+		}
 	}
 	defer func() { closeFile(stackImg, "the stack image", logger) }()
 	guestMode := ""
@@ -1362,6 +1370,18 @@ func run(argv []string, logger *log.Logger) int {
 	if err != nil {
 		logger.Print(err)
 		return exitLaunchError
+	}
+	// QEMU writes the guest root image with direct I/O whenever the image's
+	// file system takes it, so that the guest's disk writes never fill the
+	// container's memory cgroup with page cache (see qemuRootCacheDirect).
+	// An image that refuses direct I/O keeps the cached drive, and one line
+	// says so.
+	if cfg.backend == backend.VMQemu && rootImg != nil {
+		if err := rootDirectIO(rootImg); err != nil {
+			logger.Printf("%v; QEMU caches the guest's disk writes in the container's memory", err)
+		} else {
+			hvArgv = withDirectRootDrive(hvArgv)
+		}
 	}
 	if cfg.backend == backend.VMQemu {
 		hvArgv = withQEMUSandbox(hvArgv, cfg.qemuSandbox)
@@ -1935,6 +1955,14 @@ func stackCandidate(args []string) (*os.File, string) {
 		return nil, "the process is not the CF launcher"
 	}
 	return openStackImage()
+}
+
+// stackBound reports whether Garden bound a stack directory into the
+// container, which it does only for a VM container whose stack image it has
+// (see bundlerules.VMStackMountPath).
+func stackBound() bool {
+	info, err := os.Stat(filepath.Dir(stackImagePath))
+	return err == nil && info.IsDir()
 }
 
 // Where vm-launch reads what the stack guest gets from the container. They

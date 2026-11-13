@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -596,20 +597,55 @@ func hypervisorFilesWithStack(vols []*attachment, initrd, monitor, root *os.File
 	return files, drives, initrdPath, monitorFD, rootPath
 }
 
+// qemuRootDrivePrefix starts the -drive value of the guest root image (see
+// qemuRootDrive), and the root drive's caching is one of the two settings
+// below.
+const qemuRootDrivePrefix = "if=none,id=" + rootDriveID + ",file="
+
+// qemuRootCacheUnsafe caches the root image's writes in the host's page
+// cache and drops the guest's flushes. qemuRootCacheDirect writes the image
+// with direct I/O and still drops the flushes. The host kernel charges page
+// cache to the container's memory cgroup, where guest RAM already sits, and
+// a guest that writes faster than the cache writes back fills the cgroup
+// with dirty pages it cannot reclaim, so the cgroup kills QEMU. Direct I/O
+// keeps the guest's writes out of the page cache, so the cgroup holds only
+// the guest and QEMU itself.
+const (
+	qemuRootCacheUnsafe = "cache=unsafe"
+	qemuRootCacheDirect = "cache.direct=on,cache.no-flush=on"
+)
+
+// withDirectRootDrive returns argv, a QEMU command line, with its guest root
+// drive switched from qemuRootCacheUnsafe to qemuRootCacheDirect. run
+// applies it when the root image takes direct I/O (see probeDirectIO), and
+// argv without a root drive comes back as it is.
+func withDirectRootDrive(argv []string) []string {
+	out := slices.Clone(argv)
+	for i := 1; i < len(out); i++ {
+		if out[i-1] != "-drive" || !strings.HasPrefix(out[i], qemuRootDrivePrefix) {
+			continue
+		}
+		out[i] = strings.Replace(out[i], ","+qemuRootCacheUnsafe+",", ","+qemuRootCacheDirect+",", 1)
+	}
+	return out
+}
+
 // qemuRootDrive returns the QEMU options that attach the guest root image,
 // which the hypervisor opens as rootPath, with the serial qemuRootSerial as
 // its identity (see newGuestDrives). The drive is raw for the reasons
 // the volume's is (see qemuArgv). Unsafe caching drops the guest's flushes,
-// which costs nothing because the data never outlives the VM, and
-// discard=unmap turns the guest's discards into holes in the image, so that
-// the blocks the guest frees go back to the container's quota. With
+// which costs nothing because the data never outlives the VM, and run moves
+// the drive to direct I/O when the image takes it (see withDirectRootDrive).
+// With either caching, discard=unmap turns the guest's discards into holes
+// in the image, so that the blocks the guest frees go back to the
+// container's quota. With
 // detect-zeroes=unmap, which needs discard=unmap, a write of zeros becomes a
 // hole too, so the zeros that mke2fs writes into every inode table at format
 // time take no blocks.
 func qemuRootDrive(rootPath string) []string {
 	return []string{
-		"-drive", "if=none,id=" + rootDriveID + ",file=" + rootPath +
-			",format=raw,cache=unsafe,aio=threads,file.locking=off,werror=report,rerror=report,discard=unmap,detect-zeroes=unmap",
+		"-drive", qemuRootDrivePrefix + rootPath +
+			",format=raw," + qemuRootCacheUnsafe + ",aio=threads,file.locking=off,werror=report,rerror=report,discard=unmap,detect-zeroes=unmap",
 		"-device", "virtio-blk-device,drive=" + rootDriveID + ",serial=" + qemuRootSerial,
 	}
 }

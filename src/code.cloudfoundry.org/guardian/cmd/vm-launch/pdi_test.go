@@ -433,7 +433,7 @@ stat -L -c %d%r%i /proc/self/fd/3 /proc/self/fd/5 >`+shellQuote(filepath.Join(ou
 		"-drive", "if=none,id=vol0,format=raw,file.driver=file,file.filename=/dev/fdset/3,cache=writeback,aio=threads,file.locking=off,file.auto-read-only=off,werror=report,rerror=report,discard=ignore",
 		"-device", "virtio-blk-device,drive=vol0,serial=rvm-vol0",
 		"-chardev", "socket,id=qmp0,fd=5,server=off", "-mon", "chardev=qmp0,mode=control",
-		"-drive", "if=none,id=root0,file=/proc/self/fd/6,format=raw,cache=unsafe,aio=threads,file.locking=off,werror=report,rerror=report,discard=unmap,detect-zeroes=unmap",
+		"-drive", "if=none,id=root0,file=/proc/self/fd/6,format=raw,cache.direct=on,cache.no-flush=on,aio=threads,file.locking=off,werror=report,rerror=report,discard=unmap,detect-zeroes=unmap",
 		"-device", "virtio-blk-device,drive=root0,serial=rvm-root",
 		"-device", "virtio-balloon-device,id=balloon0,deflate-on-oom=on,free-page-reporting=on",
 	}

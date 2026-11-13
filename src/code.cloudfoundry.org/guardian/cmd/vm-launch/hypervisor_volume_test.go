@@ -92,6 +92,14 @@ var (
 			"-device", "virtio-blk-device,drive=root0,serial=rvm-root",
 		}
 	}
+	// goldenQEMUDirectRootDrive is goldenQEMURootDrive with the direct I/O
+	// caching that run gives an image that takes it.
+	goldenQEMUDirectRootDrive = func(fd string) []string {
+		return []string{
+			"-drive", "if=none,id=root0,file=/proc/self/fd/" + fd + ",format=raw,cache.direct=on,cache.no-flush=on,aio=threads,file.locking=off,werror=report,rerror=report,discard=unmap,detect-zeroes=unmap",
+			"-device", "virtio-blk-device,drive=root0,serial=rvm-root",
+		}
+	}
 )
 
 // withInitrd returns a golden QEMU command line with its -initrd argument
