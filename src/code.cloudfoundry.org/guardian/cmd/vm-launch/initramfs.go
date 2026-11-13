@@ -535,7 +535,7 @@ func stage2Script(nonce string, volume, stack bool, checks, section string) stri
 	if !stack {
 		setup += guestHostnameSetup
 	}
-	setup += guestLimitsSetup + guestEnvChecks
+	setup += guestLimitsSetup + guestIRQSetup + guestEnvChecks
 	if stack {
 		setup += guestStackChecks
 	}
@@ -730,6 +730,45 @@ if [ "$rvm_nr_open" -lt "$RVM_NOFILE_HARD" ]; then
 	echo "$RVM_NOFILE_HARD" >/proc/sys/fs/nr_open || rvm_fail "raising fs.nr_open to $RVM_NOFILE_HARD failed"
 fi
 ( ` + guestSetLimits + ` ) || rvm_fail "setting the open files limit to $RVM_NOFILE_SOFT soft and $RVM_NOFILE_HARD hard failed"
+`
+
+// guestIRQSetup keeps the guest's console and its network on different
+// vCPUs. The console is an emulated 8250 UART that takes one VM exit per
+// byte, and the guest sends a burst of the command's output from the UART's
+// interrupt handler, which holds the vCPU that the interrupt lands on for
+// the whole burst. The guest kernel spreads interrupts on its own, and when
+// it puts the network device's interrupt on that same vCPU, a log burst
+// delays every packet, so a health check through the guest's network times
+// out and the instance is stopped with the rest of its output still in the
+// guest. Stage 2 therefore pins the console's interrupt to the first vCPU
+// and every virtio-net device's interrupt to the last. A guest with one vCPU
+// keeps the kernel's placement, and a pin that the kernel refuses only
+// warns, because the guest runs either way. Interrupts are found by name in
+// /proc/interrupts, where a virtio device's line ends with the name the
+// virtio-net driver lists under /sys/bus/virtio/drivers/virtio_net.
+const guestIRQSetup = `rvm_irq_of() {
+	while read -r rvm_q rvm_qr; do
+		case " $rvm_qr " in *" $1 "*) echo "${rvm_q%:}"; return 0 ;; esac
+	done </proc/interrupts
+	return 1
+}
+rvm_irq_pin() {
+	{ echo "$2" >"/proc/irq/$1/smp_affinity_list"; } 2>/dev/null || echo "vm-launch guest setup: pinning interrupt $1 ($3) to vCPU $2 failed; the kernel keeps its own placement"
+}
+if read -r rvm_cpus </sys/devices/system/cpu/online 2>/dev/null; then
+	rvm_last=${rvm_cpus##*[-,]}
+	if [ -n "$rvm_last" ] && [ "$rvm_last" != 0 ]; then
+		if rvm_q=$(rvm_irq_of ttyS0); then
+			rvm_irq_pin "$rvm_q" 0 ttyS0
+		fi
+		for rvm_d in /sys/bus/virtio/drivers/virtio_net/virtio*; do
+			[ -e "$rvm_d" ] || continue
+			if rvm_q=$(rvm_irq_of "${rvm_d##*/}"); then
+				rvm_irq_pin "$rvm_q" "$rvm_last" "${rvm_d##*/}"
+			fi
+		done
+	fi
+fi
 `
 
 // guestSetLimits sets the open-files limit of the shell that runs it: both
